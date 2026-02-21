@@ -6,6 +6,7 @@ from .visualizer import SoundWaveVisualizer
 from .mirror import MirrorPanel
 import numpy as np
 import sounddevice as sd
+import re
 
 try:
     from core.gemini_worker import GeminiWorker
@@ -249,12 +250,29 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Audio Error")
 
     # Gemini Slots
-    def handle_gemini_response(self, text):
+    def handle_gemini_response(self, text: str):
         self.mirror.log_event("Gemini", text.strip())
-        # Strip "Echo: " if using the dummy loop, but for real Gemini it will be raw text.
-        # For now, let's just speak it.
-        clean_text = text.replace("Echo: ", "").strip()
-        self.speak(clean_text)
+        
+        # Check for skill execution
+        skill_result = self.cerebrum.parse_and_execute(text)
+        if skill_result:
+            self.mirror.log_event("Cerebrum", skill_result)
+            self.status_label.setText(f"Executed: {skill_result[:50]}...")
+            
+            # Clean the text of the command for TTS
+            clean_text = re.sub(r"!amity\s+\w+\s+\w+.*", "", text, flags=re.IGNORECASE).strip()
+            if clean_text:
+                self.speak(clean_text)
+            
+            # Speak result
+            if "Executed" in skill_result:
+                 parts = skill_result.split(": ", 1)
+                 if len(parts) > 1:
+                     self.speak(parts[1])
+        else:
+            clean_text = text.replace("Echo: ", "").strip()
+            if clean_text:
+                self.speak(clean_text)
 
     def handle_gemini_error(self, text):
         self.mirror.log_event("Error", f"Gemini Error: {text}")

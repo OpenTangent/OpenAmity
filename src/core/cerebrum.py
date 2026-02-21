@@ -70,3 +70,31 @@ class Cerebrum:
         if skill_name in self.skills:
             return self.skills[skill_name].execute(command, *args, **kwargs)
         return f"Error: Skill '{skill_name}' not found."
+
+    def parse_and_execute(self, text: str) -> str:
+        """Parses the text for '!amity <skill> <command>' and executes it."""
+        import re
+        # Regex for '!amity skill command args'
+        match = re.search(r"!amity\s+(\w+)\s+(\w+)(?:\s+(.*))?", text, re.IGNORECASE)
+        if match:
+            skill_name = match.group(1)
+            command = match.group(2)
+            args_str = match.group(3) or ""
+            args = args_str.split()
+            
+            # Find skill (case-insensitive search)
+            target_skill = None
+            for name, skill in self.skills.items():
+                if name.lower() == skill_name.lower():
+                    target_skill = skill
+                    break
+            
+            if target_skill:
+                try:
+                    result = target_skill.execute(command, *args)
+                    return f"Executed '{skill_name} {command}': {result}"
+                except Exception as e:
+                    return f"Error executing '{skill_name} {command}': {e}"
+            else:
+                return f"Skill '{skill_name}' not found."
+        return None
