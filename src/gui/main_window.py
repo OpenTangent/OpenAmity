@@ -15,6 +15,7 @@ try:
     from core.memory import MemorySystem
     from core.vision import VisualCortex
     from core.cerebrum import Cerebrum
+    from core.mission_control import MissionControl
 except ImportError:
     from ..core.gemini_worker import GeminiWorker
     from ..core.audio_input import AudioService
@@ -22,6 +23,7 @@ except ImportError:
     from ..core.memory import MemorySystem
     from ..core.vision import VisualCortex
     from ..core.cerebrum import Cerebrum
+    from ..core.mission_control import MissionControl
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -101,12 +103,14 @@ class MainWindow(QMainWindow):
         # Workers
         self.memory_system = MemorySystem()
         self.cerebrum = Cerebrum()
+        self.mission_control = MissionControl()
         
         # Build System Prompt
         self.system_prompt = self.memory_system.get_system_prompt()
         self.system_prompt += "\n" + self.cerebrum.get_amity_manual()
+        self.system_prompt += "\n" + self.mission_control.get_active_goals_summary()
         
-        self.mirror.log_event("System", "Soul Jar and Amity Manual loaded.")
+        self.mirror.log_event("System", "Soul Jar, Amity Manual, and Mission Control loaded.")
 
         self.vision = VisualCortex()
         self.vision.frame_ready.connect(self.update_camera_preview)
