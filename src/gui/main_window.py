@@ -13,12 +13,14 @@ try:
     from core.audio_output import TTSWorker
     from core.memory import MemorySystem
     from core.vision import VisualCortex
+    from core.cerebrum import Cerebrum
 except ImportError:
     from ..core.gemini_worker import GeminiWorker
     from ..core.audio_input import AudioService
     from ..core.audio_output import TTSWorker
     from ..core.memory import MemorySystem
     from ..core.vision import VisualCortex
+    from ..core.cerebrum import Cerebrum
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -97,8 +99,13 @@ class MainWindow(QMainWindow):
 
         # Workers
         self.memory_system = MemorySystem()
+        self.cerebrum = Cerebrum()
+        
+        # Build System Prompt
         self.system_prompt = self.memory_system.get_system_prompt()
-        self.mirror.log_event("System", "Soul Jar loaded.")
+        self.system_prompt += "\n" + self.cerebrum.get_amity_manual()
+        
+        self.mirror.log_event("System", "Soul Jar and Amity Manual loaded.")
 
         self.vision = VisualCortex()
         self.vision.frame_ready.connect(self.update_camera_preview)
