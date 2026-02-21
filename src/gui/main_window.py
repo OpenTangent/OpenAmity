@@ -1,6 +1,7 @@
 
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSplitter, QLabel
 from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtGui import QPixmap
 from .visualizer import SoundWaveVisualizer
 from .mirror import MirrorPanel
 import numpy as np
@@ -11,11 +12,13 @@ try:
     from core.audio_input import AudioService
     from core.audio_output import TTSWorker
     from core.memory import MemorySystem
+    from core.vision import VisualCortex
 except ImportError:
     from ..core.gemini_worker import GeminiWorker
     from ..core.audio_input import AudioService
     from ..core.audio_output import TTSWorker
     from ..core.memory import MemorySystem
+    from ..core.vision import VisualCortex
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -58,15 +61,31 @@ class MainWindow(QMainWindow):
         self.btn_toggle_mirror.clicked.connect(self.toggle_mirror)
         self.controls_layout.addWidget(self.btn_toggle_mirror)
         
+        self.btn_camera = QPushButton("Camera")
+        self.btn_camera.setCheckable(True)
+        self.btn_camera.clicked.connect(self.toggle_camera)
+        self.controls_layout.addWidget(self.btn_camera)
+
+        self.btn_yolo = QPushButton("YOLO: OFF")
+        self.btn_yolo.setCheckable(True)
+        self.btn_yolo.setStyleSheet("color: #888; border-color: #888;")
+        self.btn_yolo.clicked.connect(self.toggle_yolo)
+        self.controls_layout.addWidget(self.btn_yolo)
+        
         self.btn_gemini = QPushButton("Start Brain")
         self.btn_gemini.clicked.connect(self.toggle_gemini)
         self.controls_layout.addWidget(self.btn_gemini)
         
-        self.btn_test_tts = QPushButton("Test Voice")
-        self.btn_test_tts.clicked.connect(self.test_tts)
-        self.controls_layout.addWidget(self.btn_test_tts)
-
         self.left_layout.addLayout(self.controls_layout)
+
+        # Camera Preview
+        self.camera_preview = QLabel()
+        self.camera_preview.setAlignment(Qt.AlignCenter)
+        self.camera_preview.setStyleSheet("background-color: #000; border: 1px solid #333;")
+        self.camera_preview.setMinimumSize(320, 240)
+        self.camera_preview.hide()
+        # Insert before visualizer or mirror? Let's put it above visualizer.
+        self.left_layout.insertWidget(1, self.camera_preview) # Index 1 (after status label)
 
         # Right Panel (Mirror)
         self.mirror = MirrorPanel()
@@ -80,6 +99,10 @@ class MainWindow(QMainWindow):
         self.memory_system = MemorySystem()
         self.system_prompt = self.memory_system.get_system_prompt()
         self.mirror.log_event("System", "Soul Jar loaded.")
+
+        self.vision = VisualCortex()
+        self.vision.frame_ready.connect(self.update_camera_preview)
+        self.vision.error_occurred.connect(lambda e: self.mirror.log_event("Vision Error", e))
 
         self.gemini_worker = GeminiWorker(self)
         self.gemini_worker.response_received.connect(self.handle_gemini_response)
@@ -105,6 +128,33 @@ class MainWindow(QMainWindow):
         """)
         
         self.tts_worker = None
+
+    def toggle_camera(self):
+        if self.btn_camera.isChecked():
+            self.vision.start_camera()
+            self.camera_preview.show()
+            self.btn_camera.setText("Camera ON")
+            self.mirror.log_event("Vision", "Camera active.")
+        else:
+            self.vision.stop_camera()
+            self.camera_preview.hide()
+            self.btn_camera.setText("Camera OFF")
+            self.mirror.log_event("Vision", "Camera stopped.")
+
+    def update_camera_preview(self, q_img):
+        # Scale for preview
+        pixmap = QPixmap.fromImage(q_img)
+        self.camera_preview.setPixmap(pixmap.scaled(self.camera_preview.size(), Qt.KeepAspectRatio))
+
+    def toggle_yolo(self):
+        if self.btn_yolo.isChecked():
+            self.btn_yolo.setText("YOLO: ON")
+            self.btn_yolo.setStyleSheet("color: #FF0000; border-color: #FF0000; font-weight: bold;")
+            self.mirror.log_event("System", "SAFETY OVERRIDE: YOLO MODE ENGAGED.")
+        else:
+            self.btn_yolo.setText("YOLO: OFF")
+            self.btn_yolo.setStyleSheet("color: #888; border-color: #888;")
+            self.mirror.log_event("System", "Safety protocols re-engaged.")
 
     def toggle_visualizer(self):
         self.visualizer.set_active(not self.visualizer.is_active)
@@ -170,8 +220,18 @@ class MainWindow(QMainWindow):
         self.mirror.log_event("Ear", f"Heard: {text}")
         self.status_label.setText(f"Heard: {text}")
         if self.gemini_worker.is_running():
+            image_path = None
+            if self.btn_camera.isChecked():
+                image_path = self.vision.snapshot()
+                if image_path:
+                    self.mirror.log_event("Vision", f"Image captured: {image_path}")
+            
             self.mirror.log_event("User", text)
-            self.gemini_worker.send_prompt(text)
+            
+            # Check YOLO status
+            yolo_mode = self.btn_yolo.isChecked()
+            
+            self.gemini_worker.send_prompt(text, image_path=image_path, yolo=yolo_mode)
         else:
             self.mirror.log_event("System", "Brain not running, ignoring input.")
             self.speak("My brain is currently offline.")
