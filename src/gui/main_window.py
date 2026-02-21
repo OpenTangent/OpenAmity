@@ -233,17 +233,28 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Heard: {text}")
         if self.gemini_worker.is_running():
             image_path = None
+            yolo_mode = self.btn_yolo.isChecked()
+            
+            # --- Vision ---
             if self.btn_camera.isChecked():
-                image_path = self.vision.snapshot()
+                image_path = self.vision.save_snapshot()
                 if image_path:
                     self.mirror.log_event("Vision", f"Image captured: {image_path}")
             
+            # --- Hippocampus (Contextual Retrieval) ---
+            relevant_memories = self.memory_system.retrieve_relevant_memories(text, n_results=2)
+            
+            prompt = text
+            if relevant_memories:
+                # Retrieve document text from the list/tuple returned by Chroma
+                # Chroma returns a list of strings if just one query
+                memory_context = "\n[Hippocampus Recall]:\n" + "\n".join([f"- {m}" for m in relevant_memories])
+                prompt = f"{memory_context}\n\n[User]: {text}"
+                self.mirror.log_event("Hippocampus", "Context injected.")
+            
             self.mirror.log_event("User", text)
             
-            # Check YOLO status
-            yolo_mode = self.btn_yolo.isChecked()
-            
-            self.gemini_worker.send_prompt(text, image_path=image_path, yolo=yolo_mode)
+            self.gemini_worker.send_prompt(prompt, image_path=image_path, yolo=yolo_mode)
         else:
             self.mirror.log_event("System", "Brain not running, ignoring input.")
             self.speak("My brain is currently offline.")
