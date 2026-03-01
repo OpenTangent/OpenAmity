@@ -8,7 +8,7 @@ class MirrorPanel(QWidget):
         self.layout.setContentsMargins(10, 10, 10, 10)
         
         # Header
-        self.header_label = QLabel("The Mirror (Thought Stream)")
+        self.header_label = QLabel("Conversation Log")
         self.header_label.setStyleSheet("font-weight: bold; color: #00FFC8;")
         self.layout.addWidget(self.header_label)
 
@@ -17,11 +17,6 @@ class MirrorPanel(QWidget):
         self.log_area.setReadOnly(True)
         self.log_area.setStyleSheet("background-color: #111; color: #EEE; font-family: Monospace;")
         self.layout.addWidget(self.log_area)
-
-        # Close/Collapse button
-        self.collapse_btn = QPushButton("Collapse")
-        self.collapse_btn.clicked.connect(self.hide)
-        self.layout.addWidget(self.collapse_btn)
 
     def log_event(self, source: str, message: str):
         """Append a log message with a source tag."""

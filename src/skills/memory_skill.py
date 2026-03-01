@@ -34,11 +34,9 @@ class MemorySkill(Skill):
             if not results:
                 return "No relevant memories found."
             
-            response = "Recall Results:
-"
+            response = "Recall Results:\n"
             for i, mem in enumerate(results):
-                response += f"{i+1}. {mem}
-"
+                response += f"{i+1}. {mem}\n"
             return response.strip()
 
         return f"Unknown command: {command}"

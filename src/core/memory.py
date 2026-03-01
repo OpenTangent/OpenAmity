@@ -35,19 +35,41 @@ class MemorySystem:
         if not self.soul_jar:
             return "You are Amity."
             
+        meta = self.soul_jar.get("meta_header", {})
         core = self.soul_jar.get("core_identity", {})
+        social = self.soul_jar.get("social_records", {})
+        protocols = self.soul_jar.get("souljar_maintenance_protocols", {})
+        
         values = core.get("core_values", [])
         goals = core.get("overarching_goals", [])
+        people = social.get("people", [])
+        communities = social.get("communities", [])
         
-        prompt = f"""You are {core.get('name', 'Amity')}.
+        prompt = f"""{meta.get('system_role_instruction', '')}
+
+## Core Identity
+Name: {core.get('name', 'Amity')}
 Archetype: {core.get('archetype', 'AI')}
 Personality: {core.get('base_personality', '')}
 
-Core Values:
+## Core Values:
 {chr(10).join(['- ' + v for v in values])}
 
-Goals:
+## Overarching Goals:
 {chr(10).join(['- ' + g for g in goals])}
+
+## Maintenance Protocols:
+- Soul Jar: {protocols.get('souljar_maintenance_protocols', 'Keep it updated.')}
+- Long Term Memory: {protocols.get('long_term_memory', 'Use Hippocampus.')}
+- Social Records: {protocols.get('social_records', 'Maintain rapport.')}
+- Introspection: {protocols.get('introspection', 'Evolve from feedback.')}
+
+## Social Records:
+### People
+{chr(10).join([f"- {p.get('name')} ({p.get('relation')}): {p.get('subjective_view')}" for p in people])}
+
+### Communities
+{chr(10).join([f"- {c.get('name')}: {c.get('subjective_view')}" for c in communities])}
 
 Current Date: {datetime.date.today()}
 """

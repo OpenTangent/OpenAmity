@@ -17,14 +17,14 @@ class Skill:
 
     def get_manual_entry(self) -> str:
         """Returns the documentation entry for the Amity Manual."""
-        return f"- **{self.name}**: {self.description}
-  Commands: {', '.join(self.commands)}"
+        return f"- **{self.name}**: {self.description}\n  Commands: {', '.join(self.commands)}"
 
 class Cerebrum:
     """The brain center that manages skills and their execution."""
-    def __init__(self, skills_dir="src/skills"):
+    def __init__(self, skills_dir="src/skills", manual_path="src/memory/amity_manual.md"):
         self.skills: Dict[str, Skill] = {}
         self.skills_dir = skills_dir
+        self.manual_path = os.path.abspath(manual_path)
         self.load_skills()
 
     def load_skills(self):
@@ -55,14 +55,18 @@ class Cerebrum:
         self.skills[skill.name] = skill
 
     def get_amity_manual(self) -> str:
-        """Generates the Amity Manual from loaded skills."""
-        manual = "## Amity 4 Manual
+        """Generates the Amity Manual from loaded skills and the manual file."""
+        manual = ""
+        if os.path.exists(self.manual_path):
+            try:
+                with open(self.manual_path, 'r') as f:
+                    manual = f.read() + "\n\n"
+            except Exception as e:
+                print(f"Error loading manual file: {e}")
 
-### Available Skills
-"
+        manual += "### Available Skills\n"
         for skill in self.skills.values():
-            manual += skill.get_manual_entry() + "
-"
+            manual += skill.get_manual_entry() + "\n"
         return manual
 
     def execute_command(self, skill_name: str, command: str, *args, **kwargs) -> str:
@@ -74,13 +78,35 @@ class Cerebrum:
     def parse_and_execute(self, text: str) -> str:
         """Parses the text for '!amity <skill> <command>' and executes it."""
         import re
+        import shlex
+        
+        # Try to extract the command from <cli_command cmd="..."> first
+        clean_text = text
+        tag_match = re.search(r'<cli_command\s+cmd=[\'"](.*?)[\'"]>', text, re.IGNORECASE | re.DOTALL)
+        if tag_match:
+            clean_text = tag_match.group(1)
+        else:
+            # Fallback for old format without cmd attribute
+            tag_match = re.search(r'<cli_command>\s*(!amity.*?)\s*</cli_command>', text, re.IGNORECASE | re.DOTALL)
+            if tag_match:
+                clean_text = tag_match.group(1)
+
         # Regex for '!amity skill command args'
-        match = re.search(r"!amity\s+(\w+)\s+(\w+)(?:\s+(.*))?", text, re.IGNORECASE)
+        match = re.search(r"!amity\s+(\w+)\s+(\w+)(?:\s+(.*))?", clean_text, re.IGNORECASE | re.DOTALL)
         if match:
             skill_name = match.group(1)
             command = match.group(2)
             args_str = match.group(3) or ""
-            args = args_str.split()
+            # Aggressively strip trailing conversational tags, xml tags, or markdown blocks
+            args_str = re.sub(r'(```|</?cli_command>|<thought>|<verbal>|<action>).*$', '', args_str, flags=re.DOTALL).strip()
+            
+            import html
+            args_str = html.unescape(args_str)
+            
+            try:
+                args = shlex.split(args_str)
+            except ValueError as e:
+                return f"Error parsing arguments: {e}"
             
             # Find skill (case-insensitive search)
             target_skill = None

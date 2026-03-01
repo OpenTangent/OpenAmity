@@ -84,34 +84,27 @@ class MissionControl:
 
     def get_active_goals_summary(self) -> str:
         """Generates a summary of active goals for the system prompt."""
-        summary = "### Mission Control (Active Goals)
-"
+        summary = "### Mission Control (Active Goals)\n"
         
         # Overarching
         overarching = self.get_goals(type="overarching", status="in_progress")
         if overarching:
-            summary += "**Overarching Goals:**
-"
+            summary += "**Overarching Goals:**\n"
             for g in overarching:
-                summary += f"- [{g['id']}] {g['description']}
-"
+                summary += f"- [{g['id']}] {g['description']}\n"
         
         # Long-Term
         long_term = self.get_goals(type="long_term", status="in_progress")
         if long_term:
-            summary += "**Long-Term Goals:**
-"
+            summary += "**Long-Term Goals:**\n"
             for g in long_term:
-                summary += f"- [{g['id']}] {g['description']}
-"
+                summary += f"- [{g['id']}] {g['description']}\n"
                 
         # Short-Term
         short_term = self.get_goals(type="short_term", status="in_progress")
         if short_term:
-            summary += "**Current Objectives:**
-"
+            summary += "**Current Objectives:**\n"
             for g in short_term:
-                summary += f"- [{g['id']}] {g['description']}
-"
+                summary += f"- [{g['id']}] {g['description']}\n"
         
         return summary
