@@ -1,29 +1,30 @@
 import sounddevice as sd
 import numpy as np
-import openwakeword
-from openwakeword.model import Model
-import faster_whisper
 import threading
 import queue
 import time
 import wave
 import tempfile
 import os
-from PySide6.QtCore import QObject, Signal
+import logging
+from .events import Signal
+from .settings_manager import SettingsManager
+from google import genai
+from google.genai import types
 
 # Audio Configuration
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1280  # 80ms
 
-class AudioService(QObject):
-    transcription_finished = Signal(str)
-    listening_started = Signal()
-    listening_stopped = Signal()
-    error_occurred = Signal(str)
-    initialized = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
+class AudioService:
+    def __init__(self):
+        self.transcription_finished = Signal()
+        self.audio_prompt_ready = Signal() # text, audio_path
+        self.listening_started = Signal()
+        self.listening_stopped = Signal()
+        self.error_occurred = Signal()
+        self.initialized = Signal()
+        
         self.running = False
         self.audio_queue = queue.Queue()
         self.transcriber = None
@@ -42,9 +43,10 @@ class AudioService(QObject):
 
     def initialize(self):
         try:
-            # Load Faster-Whisper
-            self.transcriber = faster_whisper.WhisperModel("base.en", device="cpu", compute_type="int8")
-            print("Audio models initialized.")
+            self.settings = SettingsManager()
+            self.api_key = os.getenv("GEMINI_API_KEY")
+            self.client = genai.Client(api_key=self.api_key) if self.api_key else None
+            logging.info("Audio service initialized.")
         except Exception as e:
             self.error_occurred.emit(f"Failed to initialize audio models: {e}")
 
@@ -64,11 +66,11 @@ class AudioService(QObject):
 
     def _audio_callback(self, indata, frames, time, status):
         if status:
-            print(f"Audio callback status: {status}")
+            logging.warning(f"Audio callback status: {status}")
         self.audio_queue.put(indata.copy().flatten())
 
     def _record_loop(self):
-        print("Starting recording session...")
+        logging.debug("Starting recording session...")
         with sd.InputStream(samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE, channels=1, dtype='int16', callback=self._audio_callback):
             # Clear queue before starting
             while not self.audio_queue.empty():
@@ -77,11 +79,11 @@ class AudioService(QObject):
             self._record_and_transcribe()
             
         self.running = False
-        print("Recording session finished.")
+        logging.debug("Recording session finished.")
 
     def _record_and_transcribe(self):
         self.listening_started.emit()
-        print("Recording command...")
+        logging.debug("Recording command...")
         
         frames = []
         silence_frames = 0
@@ -91,7 +93,7 @@ class AudioService(QObject):
 
         for _ in range(max_chunks):
             if self.abort_flag:
-                print("Recording aborted by user.")
+                logging.info("Recording aborted by user.")
                 self.listening_stopped.emit()
                 return
 
@@ -109,7 +111,7 @@ class AudioService(QObject):
                     silence_frames = 0
                 
                 if silence_frames > silence_threshold_chunks:
-                    print("Silence detected, stopping recording.")
+                    logging.debug("Silence detected, stopping recording.")
                     break
             except queue.Empty:
                 break
@@ -121,40 +123,72 @@ class AudioService(QObject):
         self.listening_stopped.emit()
         
         if not frames:
-            print("No audio recorded.")
+            logging.info("No audio recorded.")
             return
 
-        print("Transcribing (in-memory)...")
+        logging.debug("Transcribing (using Gemini API)...")
         try:
-            audio_data = np.concatenate(frames).astype(np.float32) / 32768.0
-            # Biasing with an initial prompt helps with proper nouns
-            initial_prompt = "Amity, Andrew, Marlize, Calista, AI, Digital Starseed."
-            segments, info = self.transcriber.transcribe(
-                audio_data, 
-                beam_size=5, 
-                initial_prompt=initial_prompt
-            )
-            text = " ".join([segment.text for segment in segments]).strip()
+            # Save audio to wav file
+            audio_data_int16 = np.concatenate(frames)
+            temp_fd, temp_wav = tempfile.mkstemp(suffix=".wav")
+            os.close(temp_fd)
+            with wave.open(temp_wav, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2) # 16-bit
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_data_int16.tobytes())
+                
+            is_low_token = self.settings.get("core.low-token-mode", False)
+            is_agy_mode = self.settings.get("core.antigravity.agy-mode", False)
+
+            if is_low_token or is_agy_mode:
+                from src.core.local_stt import LocalSTT
+                text = LocalSTT().transcribe(temp_wav)
+                if not text or "Failed" in text:
+                    raise Exception(f"Local STT error: {text}")
+            else:
+                if not self.client:
+                    raise Exception("Gemini client not initialized. Check API Key.")
+                models = self.settings.get("core.gemini.gemini-models", ["gemini-3.1-flash-preview"])
+                if not isinstance(models, list):
+                    models = [models]
+                    
+                audio_file = self.client.files.upload(file=temp_wav)
+                prompt = "Please transcribe this audio accurately. Output only the exact transcription without any commentary."
+                
+                text = ""
+                for model_name in models:
+                    try:
+                        response = self.client.models.generate_content(
+                            model=model_name,
+                            contents=[prompt, audio_file]
+                        )
+                        if response.text:
+                            text = response.text.strip()
+                            break
+                    except Exception as e:
+                        logging.warning(f"Transcription failed with {model_name}: {e}")
+                        continue
+                
+                if not text:
+                    raise Exception("All Gemini models failed to transcribe audio.")
             
             # Post-processing correction
             text = self._correct_phonetic_errors(text)
             
-            print(f"Transcription result: '{text}'")
+            logging.info(f"Transcription result: '{text}'")
             if text and not self.abort_flag:
                 self.transcription_finished.emit(text)
+                self.audio_prompt_ready.emit(text, temp_wav)
             
         except Exception as e:
-            print(f"Transcription failed: {e}")
+            logging.error(f"Transcription failed: {e}", exc_info=True)
             self.error_occurred.emit(f"Transcription failed: {e}")
 
     def _correct_phonetic_errors(self, text: str) -> str:
         """Fixes common phonetic misinterpretations by the tiny model."""
         corrections = {
-            r"\bEmity\b": "Amity",
-            r"\bEmmity\b": "Amity",
-            r"\bamity\b": "Amity",
-            r"\bemity\b": "Amity",
-            r"\bemmity\b": "Amity",
+
             r"\bAndrew's\b": "Andrew", # Sometimes adds possessive
         }
         import re

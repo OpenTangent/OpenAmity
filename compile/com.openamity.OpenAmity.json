@@ -1,0 +1,82 @@
+{
+    "app-id": "com.openamity.OpenAmity",
+    "runtime": "org.kde.Platform",
+    "runtime-version": "6.8",
+    "sdk": "org.kde.Sdk",
+    "base": "io.qt.PySide.BaseApp",
+    "base-version": "6.8",
+    "command": "run_OpenAmity.sh",
+    "finish-args": [
+        "--share=network",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--socket=pulseaudio",
+        "--device=all",
+        "--filesystem=xdg-download"
+    ],
+    "modules": [
+        {
+            "name": "portaudio",
+            "buildsystem": "cmake-ninja",
+            "config-opts": [
+                "-DCMAKE_BUILD_TYPE=Release"
+            ],
+            "sources": [
+                {
+                    "type": "git",
+                    "url": "https://github.com/PortAudio/portaudio.git",
+                    "tag": "v19.7.0",
+                    "commit": "147dd722548358763a8b649b3e4b41dfffbcfbb6"
+                }
+            ]
+        },
+        "python3-requirements.json",
+        {
+            "name": "nodejs",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cp -a * /app/"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz",
+                    "sha256": "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
+                }
+            ]
+        },
+        {
+            "name": "chroma-onnx-model",
+            "buildsystem": "simple",
+            "build-commands": [
+                "mkdir -p /app/share/chroma_onnx/all-MiniLM-L6-v2",
+                "cp onnx.tar.gz /app/share/chroma_onnx/all-MiniLM-L6-v2/onnx.tar.gz"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "url": "https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz",
+                    "sha256": "913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3"
+                }
+            ]
+        },
+        {
+            "name": "open_amity",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -D compile/com.openamity.OpenAmity.desktop /app/share/applications/com.openamity.OpenAmity.desktop",
+                "install -D compile/com.openamity.OpenAmity.metainfo.xml /app/share/metainfo/com.openamity.OpenAmity.metainfo.xml",
+                "install -D src/assets/com.openamity.OpenAmity.png /app/share/icons/hicolor/512x512/apps/com.openamity.OpenAmity.png",
+                "cp -r src /app/src",
+                "cp run_OpenAmity.sh /app/bin/run_OpenAmity.sh",
+                "chmod +x /app/bin/run_OpenAmity.sh"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": ".."
+                }
+            ]
+        }
+    ]
+}

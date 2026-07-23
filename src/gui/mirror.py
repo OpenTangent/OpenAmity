@@ -15,7 +15,7 @@ class MirrorPanel(QWidget):
         # Log area
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
-        self.log_area.setStyleSheet("background-color: #111; color: #EEE; font-family: Monospace;")
+        self.log_area.setStyleSheet("background-color: #111; color: #EEE; font-family: 'Ubuntu Mono';")
         self.layout.addWidget(self.log_area)
 
     def log_event(self, source: str, message: str):

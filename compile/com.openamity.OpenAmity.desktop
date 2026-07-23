@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Open Amity
+Comment=Open Amity AI Companion
+Exec=run_OpenAmity.sh
+Icon=com.openamity.OpenAmity
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=com.openamity.OpenAmity

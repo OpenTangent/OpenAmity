@@ -2,9 +2,25 @@ __pycache__/
 *.pyc
 .env
 .venv
+GEMINI.md
 dist/
 build/
 *.egg-info/
 .idea/
 .vscode/
 test_imports.py
+
+# Large binaries and releases
+*.flatpak
+onnx.tar.gz
+
+# Node and WhatsApp state
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+
+# State databases and logs
+pulses.db
+trajectory.json
+chroma.sqlite3
+logs/

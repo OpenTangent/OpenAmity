@@ -1,0 +1,17 @@
+PySide6
+google-genai
+sounddevice
+numpy
+python-dotenv
+Pillow
+markdown
+mempalace
+pyspellchecker
+Mastodon.py
+piper-tts
+requests
+google-antigravity
+qrcode
+faster-whisper
+psutil
+ddgs

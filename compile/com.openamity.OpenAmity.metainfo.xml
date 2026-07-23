@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop">
+  <id>com.openamity.OpenAmity</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Open Amity</name>
+  <summary>AI Companion Desktop Application</summary>
+  <description>
+    <p>
+      Open Amity is an advanced, autonomous AI companion that lives on your desktop.
+      It interacts with WhatsApp, Mastodon, and local tools to assist you proactively.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.openamity.OpenAmity.desktop</launchable>
+  <url type="homepage">https://github.com/openamity/openamity</url>
+  <developer id="com.openamity">
+    <name>Open Amity Team</name>
+  </developer>
+  <releases>
+    <release version="0.1.0" date="2026-07-21"/>
+  </releases>
+</component>

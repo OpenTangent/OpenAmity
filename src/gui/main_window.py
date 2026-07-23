@@ -1,293 +1,353 @@
-
-from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSplitter, QLabel
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QPixmap
-from .visualizer import SoundWaveVisualizer
-from .mirror import MirrorPanel
-import numpy as np
-import sounddevice as sd
+import sys
 import re
+import logging
+import threading
+from datetime import datetime
+import markdown
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                               QPushButton, QTextEdit, QProgressBar,
+                               QMenu, QStackedLayout)
+from PySide6.QtCore import Qt, QObject, Signal
+from PySide6.QtGui import QKeyEvent, QAction
 
-try:
-    from core.gemini_worker import GeminiWorker
-    from core.audio_input import AudioService
-    from core.audio_output import TTSWorker
-    from core.memory import MemorySystem
-    from core.vision import VisualCortex
-    from core.cerebrum import Cerebrum
-    from core.mission_control import MissionControl
-except ImportError:
-    from ..core.gemini_worker import GeminiWorker
-    from ..core.audio_input import AudioService
-    from ..core.audio_output import TTSWorker
-    from ..core.memory import MemorySystem
-    from ..core.vision import VisualCortex
-    from ..core.cerebrum import Cerebrum
-    from ..core.mission_control import MissionControl
+from gui.visualizer import SoundWaveVisualizer
+from gui.spellcheck import SpellCheckHighlighter
+from gui.logger_formatter import QtLoggingHandler, StreamLogger
+
+from core.orchestrator import AmityOrchestrator
+from core.settings_manager import SettingsManager
+
+class PromptTextEdit(QTextEdit):
+    returnPressed = Signal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText("Type a message...")
+        self.setStyleSheet("background-color: #111; color: #FFF; border: 1px solid #444; padding: 10px; border-radius: 5px; font-size: 14px;")
+        self.setFixedHeight(45)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.textChanged.connect(self.adjust_height)
+        
+        self.highlighter = SpellCheckHighlighter(self.document())
+
+    def adjust_height(self):
+        doc_height = int(self.document().size().height()) + 20
+        max_height = 120 # ~4-5 lines
+        new_height = min(doc_height, max_height)
+        new_height = max(45, new_height)
+        self.setFixedHeight(new_height)
+        
+        if doc_height > max_height:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        else:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            if event.modifiers() == Qt.ShiftModifier:
+                super().keyPressEvent(event)
+            else:
+                self.returnPressed.emit()
+        else:
+            super().keyPressEvent(event)
 
 class MainWindow(QMainWindow):
+    # Cross-thread UI updates
+    ui_append_conversation = Signal(str, str)
+    ui_set_busy = Signal(bool, bool)
+    ui_set_amplitude = Signal(float)
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Amity 4")
+        self.setWindowTitle("Open Amity")
         self.resize(1000, 600)
 
-        # Central widget and main layout
+        # Setup sys.stdout and sys.stderr redirection
+        self.stdout_logger = StreamLogger(sys.stdout)
+        self.stderr_logger = StreamLogger(sys.stderr)
+        sys.stdout = self.stdout_logger
+        sys.stderr = self.stderr_logger
+        self.stdout_logger.new_message.connect(self.append_to_console)
+        self.stderr_logger.new_message.connect(self.append_to_console)
+
+        self.qt_logger = QtLoggingHandler()
+        
+        settings = SettingsManager()
+        if settings.get("core.logging.show-debug", False):
+            self.qt_logger.setLevel(logging.DEBUG)
+        else:
+            self.qt_logger.setLevel(logging.INFO)
+            
+        self.qt_logger.signals.new_message.connect(self.append_to_console)
+        logging.getLogger().addHandler(self.qt_logger)
+
+        # Early log flushing moved down after console_log creation
+
+        # Central widget and layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.main_layout = QHBoxLayout(self.central_widget)
+        
+        self.stacked_layout = QStackedLayout(self.central_widget)
+        self.stacked_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Main View with Console Split
+        self.split_view = QWidget()
+        self.split_layout = QHBoxLayout(self.split_view)
+        self.split_layout.setContentsMargins(0, 0, 0, 0)
+        self.split_layout.setSpacing(0)
+
+        # Main Chat View
+        self.chat_view = QWidget()
+        self.main_layout = QVBoxLayout(self.chat_view)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
-
-        # Left Panel (Main Content)
-        self.left_panel = QWidget()
-        self.left_layout = QVBoxLayout(self.left_panel)
-        self.left_layout.setContentsMargins(20, 20, 20, 20)
         
-        # Status Label
-        self.status_label = QLabel("Initializing...")
-        self.status_label.setStyleSheet("font-size: 16px; color: #888;")
-        self.left_layout.addWidget(self.status_label)
+        self.split_layout.addWidget(self.chat_view, 2)
+        
+        # Settings View
+        from gui.settings_panel import SettingsPanelWidget
+            
+        self.settings_panel = SettingsPanelWidget()
+        self.settings_panel.close_requested.connect(self.hide_settings)
+        self.settings_panel.wizard_finished.connect(self.hide_settings)
+        
+        self.stacked_layout.addWidget(self.split_view)
+        self.stacked_layout.addWidget(self.settings_panel)
+        
+        # Top indicators
+        self.loading_bar = QProgressBar()
+        self.loading_bar.setMaximumHeight(3)
+        self.loading_bar.setTextVisible(False)
+        self.loading_bar.setRange(0, 0) # Indeterminate
+        self.loading_bar.hide()
+        self.loading_bar.setStyleSheet("""
+            QProgressBar { border: none; background-color: transparent; }
+            QProgressBar::chunk { background-color: #00FFC8; }
+        """)
+        self.main_layout.addWidget(self.loading_bar)
 
-        # Visualizer
         self.visualizer = SoundWaveVisualizer()
-        self.left_layout.addWidget(self.visualizer)
+        self.visualizer.hide()
+        self.main_layout.addWidget(self.visualizer)
+
+        # Header Bar
+        self.header_widget = QWidget()
+        self.header_widget.setStyleSheet("background-color: #1a1a1a;")
+        self.header_layout = QHBoxLayout(self.header_widget)
+        self.header_layout.setContentsMargins(10, 5, 10, 5)
+        self.header_layout.addStretch()
         
-        # Spacer
-        self.left_layout.addStretch()
-
-        # Controls
-        self.controls_layout = QHBoxLayout()
+        self.hamburger_btn = QPushButton("☰")
+        self.hamburger_btn.setFixedSize(30, 30)
+        self.hamburger_btn.setStyleSheet("QPushButton { background-color: transparent; color: #FFF; border: none; font-size: 20px; } QPushButton::menu-indicator { image: none; }")
         
-        self.btn_toggle_vis = QPushButton("Visualizer")
-        self.btn_toggle_vis.clicked.connect(self.toggle_visualizer)
-        self.controls_layout.addWidget(self.btn_toggle_vis)
-
-        self.btn_toggle_mirror = QPushButton("Mirror")
-        self.btn_toggle_mirror.clicked.connect(self.toggle_mirror)
-        self.controls_layout.addWidget(self.btn_toggle_mirror)
+        self.hamburger_menu = QMenu(self)
+        self.hamburger_menu.setStyleSheet("QMenu { background-color: #222; color: #FFF; border: 1px solid #444; } QMenu::item:selected { background-color: #333; }")
         
-        self.btn_camera = QPushButton("Camera")
-        self.btn_camera.setCheckable(True)
-        self.btn_camera.clicked.connect(self.toggle_camera)
-        self.controls_layout.addWidget(self.btn_camera)
-
-        self.btn_yolo = QPushButton("YOLO: OFF")
-        self.btn_yolo.setCheckable(True)
-        self.btn_yolo.setStyleSheet("color: #888; border-color: #888;")
-        self.btn_yolo.clicked.connect(self.toggle_yolo)
-        self.controls_layout.addWidget(self.btn_yolo)
+        sections = [
+            "Basic Agent Settings",
+            "Agent Values and Goals",
+            "Agent Voice",
+            "Gemini Setup",
+            "Social Accounts",
+            "System Settings"
+        ]
         
-        self.btn_gemini = QPushButton("Start Brain")
-        self.btn_gemini.clicked.connect(self.toggle_gemini)
-        self.controls_layout.addWidget(self.btn_gemini)
+        for i, title in enumerate(sections):
+            action = QAction(title, self)
+            action.triggered.connect(lambda checked=False, idx=i: self.show_settings_section(idx))
+            self.hamburger_menu.addAction(action)
+            
+        self.hamburger_menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        self.hamburger_menu.addAction(exit_action)
         
-        self.left_layout.addLayout(self.controls_layout)
-
-        # Camera Preview
-        self.camera_preview = QLabel()
-        self.camera_preview.setAlignment(Qt.AlignCenter)
-        self.camera_preview.setStyleSheet("background-color: #000; border: 1px solid #333;")
-        self.camera_preview.setMinimumSize(320, 240)
-        self.camera_preview.hide()
-        # Insert before visualizer or mirror? Let's put it above visualizer.
-        self.left_layout.insertWidget(1, self.camera_preview) # Index 1 (after status label)
-
-        # Right Panel (Mirror)
-        self.mirror = MirrorPanel()
-        self.mirror.hide()
-
-        # Add to main layout
-        self.main_layout.addWidget(self.left_panel, 1)
-        self.main_layout.addWidget(self.mirror, 0)
-
-        # Workers
-        self.memory_system = MemorySystem()
-        self.cerebrum = Cerebrum()
-        self.mission_control = MissionControl()
+        self.hamburger_btn.setMenu(self.hamburger_menu)
+        self.header_layout.addWidget(self.hamburger_btn)
         
-        # Build System Prompt
-        self.system_prompt = self.memory_system.get_system_prompt()
-        self.system_prompt += "\n" + self.cerebrum.get_amity_manual()
-        self.system_prompt += "\n" + self.mission_control.get_active_goals_summary()
+        self.main_layout.addWidget(self.header_widget)
+
+        # Conversation Log
+        self.conversation_log = QTextEdit()
+        self.conversation_log.setReadOnly(True)
+        self.conversation_log.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: none; padding: 20px; font-family: 'Ubuntu Light'; font-weight: 300; font-size: 16px;")
+        scroll_bar = self.conversation_log.verticalScrollBar()
+        scroll_bar.rangeChanged.connect(lambda min, max: scroll_bar.setValue(max))
+        self.main_layout.addWidget(self.conversation_log, 1)
+
+        # Console Log
+        self.console_log = QTextEdit()
+        self.console_log.setReadOnly(True)
+        self.console_log.setStyleSheet("background-color: #000; color: #0F0; border: none; font-family: 'Ubuntu Mono'; font-size: 12px; padding: 10px;")
+        self.console_log.hide()
+        self.split_layout.addWidget(self.console_log, 1)
+
+        # Flush early logs into the now-existing console
+        from core.logger_config import EARLY_LOG_BUFFER, early_buffer_handler
+        for record in EARLY_LOG_BUFFER:
+            self.qt_logger.emit(record)
         
-        self.mirror.log_event("System", "Soul Jar, Amity Manual, and Mission Control loaded.")
+        logging.getLogger().removeHandler(early_buffer_handler)
+        EARLY_LOG_BUFFER.clear()
 
-        self.vision = VisualCortex()
-        self.vision.frame_ready.connect(self.update_camera_preview)
-        self.vision.error_occurred.connect(lambda e: self.mirror.log_event("Vision Error", e))
+        # Footer
+        self.footer_widget = QWidget()
+        self.footer_widget.setStyleSheet("background-color: #222; border-top: 1px solid #333;")
+        self.footer_layout = QHBoxLayout(self.footer_widget)
+        self.footer_layout.setContentsMargins(20, 10, 20, 10)
+        self.footer_layout.setSpacing(10)
+        
+        self.text_input = PromptTextEdit()
+        self.text_input.returnPressed.connect(self.send_text_prompt)
+        
+        self.footer_layout.addWidget(self.text_input, 1)
+        
+        self.btn_send = QPushButton("Send")
+        self.btn_send.setMinimumSize(80, 40)
+        self.btn_send.clicked.connect(self.send_text_prompt)
+        self.btn_send.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px;")
+        self.footer_layout.addWidget(self.btn_send)
+        
+        self.btn_mic = QPushButton("🎤")
+        self.btn_mic.setFixedSize(40, 40)
+        self.btn_mic.clicked.connect(self.toggle_mic)
+        self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+        self.footer_layout.addWidget(self.btn_mic)
+        
+        self.btn_mute = QPushButton()
+        self.btn_mute.setFixedSize(40, 40)
+        self.btn_mute.setCheckable(True)
+        self.btn_mute.clicked.connect(self.toggle_mute)
+        is_muted = settings.get("core.mute", False)
+        self.btn_mute.setChecked(is_muted)
+        if is_muted:
+            self.btn_mute.setText("🔇")
+            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px;")
+        else:
+            self.btn_mute.setText("🔊")
+            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+        self.footer_layout.addWidget(self.btn_mute)
+        
+        self.main_layout.addWidget(self.footer_widget)
 
-        self.gemini_worker = GeminiWorker(self)
-        self.gemini_worker.response_received.connect(self.handle_gemini_response)
-        self.gemini_worker.error_occurred.connect(self.handle_gemini_error)
+        # Core Systems Setup
+        self.orchestrator = AmityOrchestrator()
+        
+        # Connect orchestrator events to UI threads via signals
+        self.orchestrator.on_message_appended.connect(lambda sender, text: self.ui_append_conversation.emit(sender, text))
+        self.orchestrator.on_busy_state_changed.connect(lambda busy, speaking: self.ui_set_busy.emit(busy, speaking))
+        self.orchestrator.on_amplitude_emitted.connect(lambda amp: self.ui_set_amplitude.emit(amp))
 
-        self.audio_service = AudioService()
-        self.audio_service.initialized.connect(self.on_audio_initialized)
-        self.audio_service.wake_word_detected.connect(self.on_wake_word)
-        self.audio_service.listening_started.connect(self.on_listening_start)
-        self.audio_service.listening_stopped.connect(self.on_listening_stop)
-        self.audio_service.transcription_finished.connect(self.on_transcription)
-        self.audio_service.error_occurred.connect(self.on_audio_error)
-
-        # Start initialization
-        self.audio_service.start_initialization()
-        self.mirror.log_event("System", "Initializing audio models...")
+        self.ui_append_conversation.connect(self.append_to_conversation)
+        self.ui_set_busy.connect(self.set_busy_state)
+        self.ui_set_amplitude.connect(self.visualizer.set_amplitude)
+        
+        self.text_input.textChanged.connect(self.orchestrator.user_interacted)
+        self.settings_panel.wizard_finished.connect(self.orchestrator.init_worker)
+        self.settings_panel.settings_saved.connect(self.orchestrator.reload_settings)
 
         # Styling
         self.setStyleSheet("""
             QMainWindow { background-color: #1a1a1a; color: #FFF; }
-            QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; padding: 5px; }
-            QPushButton:hover { background-color: #444; }
         """)
         
-        self.tts_worker = None
+        self.check_first_launch()
 
-    def toggle_camera(self):
-        if self.btn_camera.isChecked():
-            self.vision.start_camera()
-            self.camera_preview.show()
-            self.btn_camera.setText("Camera ON")
-            self.mirror.log_event("Vision", "Camera active.")
-        else:
-            self.vision.stop_camera()
-            self.camera_preview.hide()
-            self.btn_camera.setText("Camera OFF")
-            self.mirror.log_event("Vision", "Camera stopped.")
-
-    def update_camera_preview(self, q_img):
-        # Scale for preview
-        pixmap = QPixmap.fromImage(q_img)
-        self.camera_preview.setPixmap(pixmap.scaled(self.camera_preview.size(), Qt.KeepAspectRatio))
-
-    def toggle_yolo(self):
-        if self.btn_yolo.isChecked():
-            self.btn_yolo.setText("YOLO: ON")
-            self.btn_yolo.setStyleSheet("color: #FF0000; border-color: #FF0000; font-weight: bold;")
-            self.mirror.log_event("System", "SAFETY OVERRIDE: YOLO MODE ENGAGED.")
-        else:
-            self.btn_yolo.setText("YOLO: OFF")
-            self.btn_yolo.setStyleSheet("color: #888; border-color: #888;")
-            self.mirror.log_event("System", "Safety protocols re-engaged.")
-
-    def toggle_visualizer(self):
-        self.visualizer.set_active(not self.visualizer.is_active)
-        self.mirror.log_event("GUI", f"Visualizer active: {self.visualizer.is_active}")
-
-    def toggle_mirror(self):
-        if self.mirror.isVisible():
-            self.mirror.hide()
-        else:
-            self.mirror.show()
-
-    def toggle_gemini(self):
-        if self.gemini_worker.is_running():
-            self.gemini_worker.stop_session()
-            self.btn_gemini.setText("Start Brain")
-            self.mirror.log_event("System", "Brain stopped.")
-        else:
-            self.gemini_worker.start_session()
-            self.gemini_worker.send_prompt(self.system_prompt)
-            self.btn_gemini.setText("Stop Brain")
-            self.mirror.log_event("System", "Brain starting... Soul Jar injected.")
-
-    def test_tts(self):
-        self.speak("Hello Andrew. My voice is operational.")
-
-    def speak(self, text):
-        self.mirror.log_event("Amity", f"Speaking: {text}")
-        self.tts_worker = TTSWorker(text)
-        self.tts_worker.started_playback.connect(lambda: self.visualizer.set_active(True))
-        self.tts_worker.finished.connect(lambda: self.visualizer.set_active(False))
-        self.tts_worker.finished.connect(self.tts_worker.deleteLater)
-        self.tts_worker.start()
-
-    def play_ding(self):
-        # Simple sine wave beep
-        fs = 44100
-        duration = 0.1  # seconds
-        f = 1000.0  # Hz
-        t = np.arange(int(fs * duration)) / fs
-        audio = 0.5 * np.sin(2 * np.pi * f * t)
-        sd.play(audio, fs)
-
-    # Audio Service Slots
-    def on_audio_initialized(self):
-        self.mirror.log_event("System", "Audio models initialized.")
-        self.status_label.setText("Ready. Listening for 'Alexa' (as proxy)...")
-        self.audio_service.start_wake_word_detection()
-
-    def on_wake_word(self, keyword):
-        self.mirror.log_event("Ear", f"Wake word detected: {keyword}")
-        self.play_ding()
-
-    def on_listening_start(self):
-        self.status_label.setText("Listening...")
-        self.status_label.setStyleSheet("font-size: 16px; color: #00FFC8;") # Cyan
-        self.visualizer.set_active(False) # Ensure visualizer is off during input
-
-    def on_listening_stop(self):
-        self.status_label.setText("Processing...")
-        self.status_label.setStyleSheet("font-size: 16px; color: #FFA500;") # Orange
-
-    def on_transcription(self, text):
-        self.mirror.log_event("Ear", f"Heard: {text}")
-        self.status_label.setText(f"Heard: {text}")
-        if self.gemini_worker.is_running():
-            image_path = None
-            yolo_mode = self.btn_yolo.isChecked()
+    def check_first_launch(self):
+        if self.settings_panel.settings.get("core.first-run", False):
+            self.settings_panel.set_wizard_mode(True)
+            self.settings_panel.set_section(0)
+            self.stacked_layout.setCurrentIndex(1)
             
-            # --- Vision ---
-            if self.btn_camera.isChecked():
-                image_path = self.vision.save_snapshot()
-                if image_path:
-                    self.mirror.log_event("Vision", f"Image captured: {image_path}")
-            
-            # --- Hippocampus (Contextual Retrieval) ---
-            relevant_memories = self.memory_system.retrieve_relevant_memories(text, n_results=2)
-            
-            prompt = text
-            if relevant_memories:
-                # Retrieve document text from the list/tuple returned by Chroma
-                # Chroma returns a list of strings if just one query
-                memory_context = "\n[Hippocampus Recall]:\n" + "\n".join([f"- {m}" for m in relevant_memories])
-                prompt = f"{memory_context}\n\n[User]: {text}"
-                self.mirror.log_event("Hippocampus", "Context injected.")
-            
-            self.mirror.log_event("User", text)
-            
-            self.gemini_worker.send_prompt(prompt, image_path=image_path, yolo=yolo_mode)
-        else:
-            self.mirror.log_event("System", "Brain not running, ignoring input.")
-            self.speak("My brain is currently offline.")
-            self.status_label.setText("Brain Offline")
-
-    def on_audio_error(self, error):
-        self.mirror.log_event("Error", f"Audio Error: {error}")
-        self.status_label.setText("Audio Error")
-
-    # Gemini Slots
-    def handle_gemini_response(self, text: str):
-        self.mirror.log_event("Gemini", text.strip())
+    def show_settings_section(self, index):
+        self.settings_panel.set_wizard_mode(False)
+        self.settings_panel.set_section(index)
+        self.stacked_layout.setCurrentIndex(1)
         
-        # Check for skill execution
-        skill_result = self.cerebrum.parse_and_execute(text)
-        if skill_result:
-            self.mirror.log_event("Cerebrum", skill_result)
-            self.status_label.setText(f"Executed: {skill_result[:50]}...")
-            
-            # Clean the text of the command for TTS
-            clean_text = re.sub(r"!amity\s+\w+\s+\w+.*", "", text, flags=re.IGNORECASE).strip()
-            if clean_text:
-                self.speak(clean_text)
-            
-            # Speak result
-            if "Executed" in skill_result:
-                 parts = skill_result.split(": ", 1)
-                 if len(parts) > 1:
-                     self.speak(parts[1])
-        else:
-            clean_text = text.replace("Echo: ", "").strip()
-            if clean_text:
-                self.speak(clean_text)
+    def hide_settings(self):
+        self.stacked_layout.setCurrentIndex(0)
 
-    def handle_gemini_error(self, text):
-        self.mirror.log_event("Error", f"Gemini Error: {text}")
+    def closeEvent(self, event):
+        logging.info("System: Shutting down gracefully...")
+        self.orchestrator.shutdown()
+        event.accept()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        self.orchestrator.user_interacted()
+        if event.key() == Qt.Key_QuoteLeft or event.key() == Qt.Key_AsciiTilde: # Tilde / Backtick
+            if self.text_input.hasFocus():
+                super().keyPressEvent(event)
+            else:
+                self.console_log.setVisible(not self.console_log.isVisible())
+        else:
+            super().keyPressEvent(event)
+
+    def append_to_console(self, text):
+        if not hasattr(self, 'console_log'):
+            return
+        self.console_log.append(text)
+        scroll_bar = self.console_log.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def append_to_conversation(self, sender, text):
+        name_color = "#00FFC8" if sender == "User" else "#FFA500"
+        text_color = "#808080" if sender == "User" else "#FFFFFF"
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        if sender == "User":
+            safe_text = text.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+            formatted_text = safe_text
+        else:
+            formatted_text = markdown.markdown(text, extensions=['fenced_code', 'tables'])
+
+        html = f"""
+        <div style='margin-bottom: 10px;'>
+            <span style='color: #666; font-size: 12px;'>[{timestamp}]</span>
+            <span style='color: {name_color}; font-weight: bold;'>{sender}:</span>
+            <div style='margin-top: 5px; color: {text_color};'>{formatted_text}</div>
+        </div>
+        """
+        self.conversation_log.append(html)
+
+    def set_busy_state(self, busy: bool, speaking: bool = False):
+        if busy:
+            self.btn_mic.setText("🟥")
+            self.btn_mic.setStyleSheet("background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px;")
+            
+            if speaking:
+                self.loading_bar.hide()
+                self.visualizer.show()
+                self.visualizer.set_active(True)
+            else:
+                self.visualizer.set_active(False)
+                self.visualizer.hide()
+                self.loading_bar.show()
+        else:
+            self.btn_mic.setText("🎤")
+            self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+            self.loading_bar.hide()
+            self.visualizer.set_active(False)
+            self.visualizer.hide()
+
+    def toggle_mic(self):
+        self.orchestrator.toggle_mic()
+
+    def toggle_mute(self, checked):
+        self.orchestrator.settings_manager.set("core.mute", checked)
+        self.orchestrator.settings_manager.save()
+        if checked:
+            self.btn_mute.setText("🔇")
+            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px;")
+        else:
+            self.btn_mute.setText("🔊")
+            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+
+    def send_text_prompt(self):
+        text = self.text_input.toPlainText().strip()
+        if not text:
+            return
+        
+        self.text_input.clear()
+        self.orchestrator.process_text_input(text)
+
