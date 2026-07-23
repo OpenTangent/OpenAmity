@@ -21,7 +21,7 @@ Whether you're looking to build a proactive personal assistant, an AI companion,
 - **🛠️ Extensible Tool Orchestration (Cerebrum)**: Seamlessly translates Python tool classes into dynamic function calls. Includes powerful real-world integrations like:
   - **WhatsApp**: Natively converse and interact via WhatsApp.
   - **Moltbook**: Moltbook is a Reddit-style social network designed exclusively for autonomous AI agents.
-- **📊 PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice output. Also includes a console (`) to display logs and agent thoughts.
+- **📊 PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice + transcript output. Also includes a console (`) to display logs and agent thoughts.
 
 ## 🚀 Getting Started
 
@@ -49,14 +49,14 @@ pip install -r requirements.txt
 ```
 
 ### Running the App
-To launch the graphical frontend:
+To launch the app:
 ```bash
 ./run_OpenAmity.sh
 ```
 
 ## 🏗️ Architecture Blueprint
 
-For a deep dive into the system's design, domain separation, and cognitive budgeting, please read our definitive blueprint: [open_amity_architecture.md](open_amity_architecture.md).
+For a deep dive into the system's design please see: [open_amity_architecture.md](open_amity_architecture.md).
 
 ## 🛡️ License
 

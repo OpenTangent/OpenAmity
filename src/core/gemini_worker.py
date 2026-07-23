@@ -14,6 +14,7 @@ load_dotenv()
 
 class GeminiWorker:
     def __init__(self):
+        logging.debug(f"GeminiWorker.__init__ called. Existing thought_received: {hasattr(self, 'thought_received')}")
         self.thought_received = Signal() # text, list of function calls
         self.error_occurred = Signal()
         
@@ -52,10 +53,13 @@ class GeminiWorker:
         return self.running
 
     def start_session(self, system_instruction=None, tools=None):
+        logging.debug("start_session called in GeminiWorker")
         if not getattr(self, 'available', False):
             logging.error("Attempted to start session but GeminiWorker is unavailable.")
             self.error_occurred.emit("Session Start Error: Gemini Worker is not available")
             return
+            
+        logging.debug("Gemini client successfully initialized for start_session")
 
         self.sys_instruct = system_instruction
         self.tools = tools
@@ -86,7 +90,8 @@ class GeminiWorker:
 
             self.thinker_config = types.GenerateContentConfig(
                 system_instruction=self.sys_instruct,
-                tools=tool_list if tool_list else None
+                tools=tool_list if tool_list else None,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
             )
 
             # Reset to top of list if this is a fresh start
@@ -118,11 +123,14 @@ class GeminiWorker:
         self.is_processing = False
 
     def send_prompt(self, prompt: str, image_path: str = None, yolo: bool = False, audio_path: str = None):
+        logging.debug("send_prompt called in GeminiWorker")
         if not self.running or not self.thinker_chat:
+            logging.error(f"Attempted to send prompt but session is not running. running: {self.running}, thinker_chat: {self.thinker_chat is not None}")
             self.error_occurred.emit("Session not started.")
             return
 
         self._abort_flag = False
+        logging.debug("Starting _process_thought thread...")
         self.is_processing = True
         threading.Thread(target=self._process_thought, args=(prompt, image_path, yolo, audio_path), daemon=True).start()
 
@@ -223,22 +231,30 @@ class GeminiWorker:
 
         for idx in range(start_idx, len(self.thinking_models)):
             model_name = self.thinking_models[idx]
+            logging.debug(f"_process_thought attempting to use model: {model_name}")
 
             # Re-init chat if we fallback
             if model_name != self.current_thinker_model or not self.thinker_chat:
+                logging.debug(f"Re-initializing chat for model {model_name}")
                 self.current_thinker_model = model_name
                 old_history = self.thinker_chat.history if (self.thinker_chat and hasattr(self.thinker_chat, 'history')) else None
                 try:
                     self.thinker_chat = self.client.chats.create(model=model_name, config=self.thinker_config, history=old_history)
-                except Exception:
+                except Exception as ex:
+                    logging.debug(f"Failed creating chat with history: {ex}. Falling back to fresh chat.")
                     self.thinker_chat = self.client.chats.create(model=model_name, config=self.thinker_config)
-
+            
             try:
+                logging.debug(f"Calling self.thinker_chat.send_message_stream with content length {len(content)}...")
                 response_stream = self.thinker_chat.send_message_stream(message=content)
+                logging.debug("send_message_stream returned.")
                 full_text = ""
                 function_calls = []
-                for chunk in response_stream:
+                logging.debug("Beginning to iterate over response_stream...")
+                for chunk_num, chunk in enumerate(response_stream):
+                    logging.debug(f"Received chunk {chunk_num} from response_stream")
                     if getattr(self, '_abort_flag', False):
+                        logging.debug("_abort_flag is True, returning from _process_thought")
                         self.is_processing = False
                         return
                     if getattr(chunk, 'parts', None):
@@ -248,7 +264,9 @@ class GeminiWorker:
                     if chunk.function_calls:
                         function_calls.extend(chunk.function_calls)
                 
+                logging.debug("Finished iterating over response_stream.")
                 if getattr(self, '_abort_flag', False):
+                    logging.debug("_abort_flag is True after stream, returning")
                     return
                     
                 # Truncate history to prevent unbounded context growth
@@ -268,6 +286,7 @@ class GeminiWorker:
                         new_history.insert(0, types.Content(role="user", parts=[warning_part]))
                         self.thinker_chat.history = new_history
                         
+                logging.debug(f"About to emit thought_received. Callback count: {len(self.thought_received._callbacks)}")
                 self.thought_received.emit(full_text, function_calls)
                 self.is_processing = False
                 return

@@ -9,6 +9,8 @@ build/
 .idea/
 .vscode/
 test_imports.py
+backup.sh
+github_upload.sh
 
 # Large binaries and releases
 *.flatpak

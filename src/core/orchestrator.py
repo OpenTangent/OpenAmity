@@ -101,14 +101,15 @@ class AmityOrchestrator:
         if not self.gemini_worker:
             self.init_worker()
         elif not getattr(self.gemini_worker, 'available', False):
-            self.gemini_worker.__init__()
+            self.gemini_worker = None
+            self.init_worker()
             
         if self.gemini_worker and getattr(self.gemini_worker, 'available', False):
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
             
         if hasattr(self, 'agy_worker') and self.agy_worker and not getattr(self.agy_worker, 'available', False):
-            self.agy_worker.__init__()
+            self.agy_worker = None
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
         self.is_busy = busy
@@ -146,17 +147,22 @@ class AmityOrchestrator:
             self.process_input(text)
 
     def finish_thinking(self):
+        logging.debug("finish_thinking called")
         self.is_thinking = False
         self.check_cycle_completion()
 
     def check_cycle_completion(self):
         is_speaking = (self.tts_worker and self.tts_worker.is_alive()) or len(self.speech_queue) > 0
+        logging.debug(f"check_cycle_completion evaluated is_speaking: {is_speaking}, is_thinking: {self.is_thinking}")
         if not self.is_thinking and not is_speaking:
+            logging.debug("check_cycle_completion calling set_busy_state(False)")
             self.set_busy_state(False)
             if self.prompt_queue:
+                logging.debug("check_cycle_completion popping next prompt from queue")
                 next_prompt = self.prompt_queue.pop(0)
                 self.process_input(next_prompt)
         else:
+            logging.debug("check_cycle_completion calling set_busy_state(True)")
             self.set_busy_state(True, speaking=is_speaking)
 
     def process_input(self, text, audio_path=None):
@@ -192,7 +198,9 @@ class AmityOrchestrator:
         if not self.gemini_worker.running:
             logging.info("System: Brain offline. Starting session...")
             tools = self.cerebrum.get_all_tool_declarations()
+            logging.debug("Calling self.gemini_worker.start_session...")
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
+            logging.debug("start_session returned.")
             
         self.append_to_conversation("User", text)
         self.is_thinking = True
@@ -209,7 +217,10 @@ class AmityOrchestrator:
         threading.Thread(target=self._async_query_prep, args=(text, self.recent_history.copy(), audio_path), daemon=True).start()
 
     def _async_query_prep(self, text, history, audio_path):
+        logging.debug("_async_query_prep started.")
+        logging.debug("Calling reformulate_query...")
         reformulated = self.gemini_worker.reformulate_query(text, history)
+        logging.debug(f"reformulate_query returned: {reformulated}")
         if reformulated != text:
             logging.debug(f"System: Reformulated query -> {reformulated}")
         
@@ -219,7 +230,9 @@ class AmityOrchestrator:
             self.last_action_result = None
             
         prompt += f"[User]: {self.current_user_prompt}"
+        logging.debug(f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
         self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
+        logging.debug("gemini_worker.send_prompt returned.")
 
     def process_pulse(self, text="Autonomy Pulse"):
         if not self.gemini_worker or not getattr(self.gemini_worker, 'available', False):
@@ -283,16 +296,24 @@ class AmityOrchestrator:
         logging.error(f"Audio Error: {error}")
         self.finish_thinking()
 
-    def handle_gemini_thought(self, text: str, function_calls: list = None):
+    def handle_gemini_thought(self, text: str, function_calls: list):
+        logging.debug(f"handle_gemini_thought called with text length: {len(text)}, function_calls count: {len(function_calls) if function_calls else 0}")
+        if getattr(self, 'is_silent_pulse', False):
+            logging.debug("handle_gemini_thought returning early due to is_silent_pulse")
+            return
+            
         clean_text = text.strip() if text else ""
         if clean_text:
-            logging.getLogger("agent.thinker").info(f"[Weight: {self.current_task_weight:.1f}] {clean_text}")
+            logging.debug("handle_gemini_thought logging agent thought to info")
+            logging.info(f"Agent Thought: {clean_text}")
             self.accumulated_thoughts += clean_text + "\n"
-
+            
         if not function_calls:
+            logging.debug("handle_gemini_thought found no function calls, calling finish_thinking")
             self.finish_thinking()
             return
 
+        logging.debug("handle_gemini_thought starting _async_tool_execution thread")
         threading.Thread(target=self._async_tool_execution, args=(function_calls, self.current_task_weight), daemon=True).start()
 
     def _async_tool_execution(self, function_calls, current_weight):

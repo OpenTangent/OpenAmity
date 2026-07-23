@@ -311,6 +311,8 @@ class MainWindow(QMainWindow):
         self.conversation_log.append(html)
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
+        import logging
+        logging.debug(f"main_window.set_busy_state called with busy={busy}, speaking={speaking}")
         if busy:
             self.btn_mic.setText("🟥")
             self.btn_mic.setStyleSheet("background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px;")

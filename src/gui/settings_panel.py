@@ -589,9 +589,13 @@ class SettingsPanelWidget(QWidget):
         self.ui_fallback_voice.setText(self.settings.get("core.tts.piper.model-name-piper", "cori"))
         self.ui_prefer_local_tts.setChecked(self.settings.get("core.tts.piper.prefer-piper", False))
         
-        self.ui_agy_mode.setChecked(self.settings.get("core.antigravity.agy-mode", False))
+        agy_mode = self.settings.get("core.antigravity.agy-mode", False)
+        if agy_mode:
+            self.ui_agy_mode.setChecked(True)
+        else:
+            self.ui_use_gemini_api.setChecked(True)
+            
         api_key = self.settings.get_env("GEMINI_API_KEY", "")
-        self.ui_use_gemini_api.setChecked(bool(api_key))
         self.ui_gemini_api_key.setText(api_key)
         
         self.ui_mastodon_url.setText(self.settings.get_env("MASTODON_API_BASE_URL", "https://mastodon.social"))
