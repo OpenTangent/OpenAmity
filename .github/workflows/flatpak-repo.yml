@@ -25,6 +25,11 @@ jobs:
       - name: Sync Version Metadata
         run: python3 compile/sync_version_metadata.py
 
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
       - name: Build Flatpak and Generate Repo
         uses: andyholmes/flatter@main
         with:
@@ -32,7 +37,7 @@ jobs:
             compile/com.openamity.OpenAmity.json
           upload-pages-artifact: true
           # To sign the repository, you need to add FLATPAK_GPG_KEY as a repository secret.
-          gpg-key: ${{ secrets.FLATPAK_GPG_KEY }}
+          gpg-sign: ${{ secrets.FLATPAK_GPG_KEY }}
           # Currently commented out. When you add the secret, uncomment the line above.
 
   deploy:
