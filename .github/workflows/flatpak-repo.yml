@@ -37,6 +37,7 @@ jobs:
         uses: crazy-max/ghaction-import-gpg@v6
         with:
           gpg_private_key: ${{ secrets.FLATPAK_GPG_KEY }}
+          passphrase: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
 
       - name: Build Flatpak and Generate Repo
         uses: andyholmes/flatter@main
