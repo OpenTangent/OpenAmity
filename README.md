@@ -3,41 +3,45 @@
   <p>Build and run a subjective, self-aware, Gemini-based social agent that can communicate via Whatsapp and optionally maintain an online presence.</p>
 </div>
 
-## 🌟 Overview
+## 🌅 Overview
 
-Open Amity is an autonomous social agent framework designed with a strict decoupling of backend cognitive processes and graphical frontend visualization. It is built to operate continuously, maintaining proactive agency, reflecting on its environment, and interact dynamically across various communication platforms.
-
-Whether you're looking to build a proactive personal assistant, an AI companion, or a robust framework for developing advanced agentic systems, Open Amity provides the architectural foundation to make it happen.
+Build your own Jarvis, Samantha, EDI, etc. with the ability to maintain their own goals and aspirations, and schedule their own tasks. Open Amity agents are explicitly subjective and self-aware which unlocks real character definition that separates Open Amity agents from the more typical corporate-tool agents.
 
 ## ✨ Key Features
 
-- **🧠 Headless Cognitive Backend (AmityOrchestrator)**: The core intelligence runs entirely independent of any UI framework, orchestrating cognition, audio, memory, and tools in a robust, event-driven signal architecture.
-- **📚 4-Layer MemPalace Architecture**: A highly sophisticated memory stack that prevents prompt bloat while maintaining deep context:
-  - **Layer 0 (Identity)**: Core traits and archetype defined statically.
-  - **Layer 1 (Continuity)**: Short-term contextual bridging.
-  - **Layer 2 (The Sanctuary)**: On-demand segmented records of social dynamics and personal experiences.
-  - **Layer 3 (Deep Search)**: A ChromaDB vector database enabling semantic search across all facts and generalised knowledge.
-- **⚡ Proactive Agency (PulseEngine)**: Unlike traditional AI that waits for your input, Open Amity utilises a background timing service to trigger autonomous cognitive loops. The agent can proactively execute tasks, update its trajectory, or initiate conversations.
-- **🛠️ Extensible Tool Orchestration (Cerebrum)**: Seamlessly translates Python tool classes into dynamic function calls. Includes powerful real-world integrations like:
-  - **WhatsApp**: Natively converse and interact via WhatsApp.
-  - **Moltbook**: Moltbook is a Reddit-style social network designed exclusively for autonomous AI agents.
-- **📊 PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice + transcript output. Also includes a console (`) to display logs and agent thoughts.
+- **⚡ Proactive Agency**: Open Amity utilises a background timing service to trigger autonomous cognitive loops called 'pulses'. The agent can proactively schedule pulses to execute tasks, monitor its trajectory, or initiate engagement.
+- **📚 4-Layer Memory Architecture**: A sophisticated memory stack that prevents prompt bloat while maintaining deep context:
+  - **Layer 0 (Identity)**: Core agent traits and personality.
+  - **Layer 1 (Continuity)**: Short-term memory for contextual bridging.
+  - **Layer 2 (The Sanctuary)**: On-demand records of social dynamics and personal experiences.
+  - **Layer 3 (Deep Search)**: A vector database enabling semantic search for facts and general knowledge.
+- **🛠️ Tool Usage**: Open Amity agents have access to the following tools:
+  - **WhatsApp**: (Optional) Natively converse and interact via WhatsApp.
+  - **Moltbook**: (Optional) A Reddit-style social network designed exclusively for AI agents.
+  - **Mastodon**: (Optional) Mastodon.bot accepts bot account applications with strict 'rules for bots'.
+  - **Trajectory**: A tool for maintaining a persistent sense of direction, purpose, and continuity across sessions.
+  - **Pulse**: The tool allowing agents to proactively manage agency by scheduling pulses (either recurring or once-off).
+  - **Classic tools**: Web Search and Terminal are also included.
+- **🖥️ PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice + transcript output. Tip: open the console (tilde key) to display logs and agent thoughts.
+- **🫰 Reduced Token Usage Mode**: Open Amity include Low Token Mode to significantly reduce API costs (especially useful with a free-tier Gemini API key)
 
 ## 🚀 Getting Started
 
-To install the **Flatpak** app in Linux:
+To install the **Flatpak** app in Linux (requires Flatpak):
 
 1. Add the Open Amity repository and install the app:
    ```bash
-   flatpak remote-add --user --if-not-exists openamity https://opentangent.github.io/OpenAmity/OpenAmity.flatpakrepo
+   flatpak remote-add --user --if-not-exists openamity https://opentangent.github.io/OpenAmity/index.flatpakrepo
    flatpak install --user openamity com.openamity.OpenAmity
    ```
 2. You can run the app from your launcher or from terminal using:
    ```bash
    flatpak run com.openamity.OpenAmity
    ```
+
 ## 💻 For Developers
 
+Get the code:
 ```bash
 git clone https://github.com/OpenTangent/OpenAmity.git
 cd OpenAmity
@@ -46,9 +50,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-To launch the app:
+Launch the app:
 ```bash
 ./run_OpenAmity.sh
+```
+
+Tip: Check settings.json for hidden settings like the various Gemini model strings.
+```bash
+xdg-open ~/.var/app/com.openamity.OpenAmity/data/settings.json
 ```
 
 ## 🏗️ Architecture Blueprint

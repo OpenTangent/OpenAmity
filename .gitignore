@@ -8,8 +8,6 @@ build/
 *.egg-info/
 .idea/
 .vscode/
-backup.sh
-github_upload.sh
 
 # Large binaries and releases
 *.flatpak
@@ -25,3 +23,5 @@ pulses.db
 trajectory.json
 chroma.sqlite3
 logs/
+build-dir/
+.flatpak-builder/
