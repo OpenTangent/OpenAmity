@@ -29,8 +29,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
-          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y flathub org.kde.Sdk//6.8 org.kde.Platform//6.8 io.qt.PySide.BaseApp//6.8
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub org.kde.Sdk//6.8 org.kde.Platform//6.8 io.qt.PySide.BaseApp//6.8
+
+      - name: Import GPG Key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.FLATPAK_GPG_KEY }}
 
       - name: Build Flatpak and Generate Repo
         uses: andyholmes/flatter@main
@@ -38,9 +44,7 @@ jobs:
           files: |
             compile/com.openamity.OpenAmity.json
           upload-pages-artifact: true
-          # To sign the repository, you need to add FLATPAK_GPG_KEY as a repository secret.
-          gpg-sign: ${{ secrets.FLATPAK_GPG_KEY }}
-          # Currently commented out. When you add the secret, uncomment the line above.
+          gpg-sign: ${{ steps.gpg.outputs.fingerprint }}
 
   deploy:
     needs: build
