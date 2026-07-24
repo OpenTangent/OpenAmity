@@ -25,16 +25,17 @@ Whether you're looking to build a proactive personal assistant, an AI companion,
 
 ## 🚀 Getting Started
 
-A precompiled **Flatpak** package is included.
+A precompiled **Flatpak** package is available and will automatically update in the background when new versions are released.
 
-1. Navigate to the **[Releases](https://github.com/OpenTangent/OpenAmity/releases)** page in this repository.
-2. Download the latest `OpenAmity.flatpak` file.
-3. Install and run it on your Linux system with:
+1. Add the Open Amity repository and install the app on your Linux system by running:
    ```bash
-   flatpak install --user ./OpenAmity.flatpak
+   flatpak remote-add --user --if-not-exists openamity https://opentangent.github.io/OpenAmity/OpenAmity.flatpakrepo
+   flatpak install --user openamity com.openamity.OpenAmity
+   ```
+2. Run the application:
+   ```bash
    flatpak run com.openamity.OpenAmity
    ```
-
 ## 💻 For Developers
 
 Open Amity is built primarily in Python with a focus on clean, decoupled architecture.

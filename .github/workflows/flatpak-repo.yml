@@ -1,0 +1,47 @@
+name: Build and Publish Flatpak Repository
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Sync Version Metadata
+        run: python3 compile/sync_version_metadata.py
+
+      - name: Build Flatpak and Generate Repo
+        uses: andyholmes/flatter@main
+        with:
+          files: |
+            compile/com.openamity.OpenAmity.json
+          upload-pages-artifact: true
+          # To sign the repository, you need to add FLATPAK_GPG_KEY as a repository secret.
+          gpg-key: ${{ secrets.FLATPAK_GPG_KEY }}
+          # Currently commented out. When you add the secret, uncomment the line above.
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

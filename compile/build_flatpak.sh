@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+# NOTE: For future Flathub submission:
+# Flathub builds do not run custom scripts like this one. They only consume
+# the manifest (.json or .yaml) and source code directly from git.
+# This script remains useful for local testing and building.
+
 # Change directory to the script's location
 cd "$(dirname "$0")"
 

@@ -3,6 +3,12 @@ import os
 import subprocess
 import sys
 
+# NOTE: For future Flathub submission:
+# Flathub builds do not run this script. They require the generated 
+# `python3-requirements.json` to be committed directly to your git repository.
+# Continue to run this script locally only when requirements.txt changes, 
+# and commit the updated .json file.
+
 REQUIREMENTS_FILE = "../requirements.txt"
 FLATPAK_REQS_FILE = "requirements-flatpak.txt"
 GENERATOR_URL = "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/pip/flatpak-pip-generator.py"

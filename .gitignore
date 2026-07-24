@@ -8,7 +8,6 @@ build/
 *.egg-info/
 .idea/
 .vscode/
-test_imports.py
 backup.sh
 github_upload.sh
 

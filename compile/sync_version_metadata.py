@@ -2,6 +2,11 @@ import os
 import re
 from datetime import datetime
 
+# NOTE: For future Flathub submission:
+# Flathub builds do not run custom scripts prior to flatpak-builder.
+# When submitting to Flathub, changes made to com.openamity.OpenAmity.metainfo.xml
+# by this script MUST be committed to your git repository before tagging a release.
+
 def main():
     # Paths
     compile_dir = os.path.dirname(os.path.abspath(__file__))
