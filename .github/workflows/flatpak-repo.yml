@@ -25,10 +25,12 @@ jobs:
       - name: Sync Version Metadata
         run: python3 compile/sync_version_metadata.py
 
-      - name: Install flatpak-builder
+      - name: Install flatpak-builder and dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.kde.Sdk//6.8 org.kde.Platform//6.8 io.qt.PySide.BaseApp//6.8
 
       - name: Build Flatpak and Generate Repo
         uses: andyholmes/flatter@main
