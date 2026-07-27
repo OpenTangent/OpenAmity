@@ -49,10 +49,7 @@ class AmityOrchestrator:
         self.speech_queue = []
         self.prompt_queue = []
         
-        self.system_prompt = self.mempalace_manager.wake_up()
-        self.system_prompt += "\n" + self.cerebrum.get_agent_manual()
-        if self.settings_manager.get("core.low-token-mode", False):
-            self.system_prompt += "\n\n[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]"
+        self.build_system_prompt()
         
         self.pulse_engine = PulseEngine(self)
         self.pulse_engine.trigger_pulse.connect(self.process_pulse)
@@ -95,7 +92,15 @@ class AmityOrchestrator:
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
+    def build_system_prompt(self):
+        self.system_prompt = self.mempalace_manager.wake_up()
+        self.system_prompt += "\n" + self.cerebrum.get_agent_manual()
+        if self.settings_manager.get("core.low-token-mode", False):
+            self.system_prompt += "\n\n[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]"
+
     def reload_settings(self):
+        self.mempalace_manager.reload_settings()
+        self.build_system_prompt()
         self.cerebrum.reload_skills()
         
         if not self.gemini_worker:

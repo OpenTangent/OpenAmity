@@ -13,7 +13,7 @@ class TerminalSkill(Tool):
         return [
             {
                 "name": "Terminal_run",
-                "description": "Executes a bash command on the local system. Use this to interact with the file system, install packages, run scripts, and manage the system. IMPORTANT: When creating or saving files, organize them into standard XDG directories (e.g., ~/Documents, ~/Pictures, ~/Downloads) under a sub-directory named after yourself (e.g., ~/Documents/<YourName>/).",
+                "description": "Executes a bash command on the local system. Use this to interact with the file system, install packages, run scripts, and manage the system. IMPORTANT: Due to Flatpak sandboxing, you only have host access to ~/Documents, ~/Pictures, ~/Downloads, and ~/Desktop. When creating or saving files, organize them into these standard XDG directories under a sub-directory named after yourself (e.g., ~/Documents/<YourName>/). Use ~/Documents/<YourName>/.scratch/ as a scratch space for temporary files or files not intended for the user to use/view.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -23,7 +23,7 @@ class TerminalSkill(Tool):
                         },
                         "as_sudo": {
                             "type": "BOOLEAN",
-                            "description": "Set to true if the command requires superuser/sudo privileges."
+                            "description": "Set to true if the command requires superuser/sudo privileges. The system admin must add the SUDO_PASSWORD to the .env file for this to work."
                         }
                     },
                     "required": ["command_str"]
@@ -44,6 +44,9 @@ class TerminalSkill(Tool):
         env_sudo_pass = os.environ.get("SUDO_PASSWORD", "")
 
         try:
+            cwd_path = os.path.expanduser("~/Documents/OpenAmity")
+            os.makedirs(cwd_path, exist_ok=True)
+            
             if as_sudo:
                 if not env_sudo_pass or env_sudo_pass == "your_password_here":
                     return "Error: SUDO_PASSWORD is not configured in the environment. Please add it to the .env file."
@@ -55,7 +58,7 @@ class TerminalSkill(Tool):
                     text=True, 
                     capture_output=True,
                     check=False,
-                    cwd=os.path.expanduser("~")
+                    cwd=cwd_path
                 )
             else:
                 full_command = ["bash", "-c", command_str]
@@ -64,7 +67,7 @@ class TerminalSkill(Tool):
                     text=True, 
                     capture_output=True,
                     check=False,
-                    cwd=os.path.expanduser("~")
+                    cwd=cwd_path
                 )
 
             output = result.stdout

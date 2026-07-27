@@ -12,7 +12,10 @@
         "--socket=fallback-x11",
         "--socket=pulseaudio",
         "--device=all",
-        "--filesystem=xdg-download"
+        "--filesystem=xdg-download",
+        "--filesystem=xdg-documents",
+        "--filesystem=xdg-pictures",
+        "--filesystem=xdg-desktop"
     ],
     "modules": [
         {

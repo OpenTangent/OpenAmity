@@ -74,24 +74,32 @@ class PulseEngine:
         # Migration: Check if table is empty
         c.execute('SELECT COUNT(*) FROM pulses')
         if c.fetchone()[0] == 0:
-            logging.info("PulseEngine: Empty database detected. Migrating 09:00 routine.")
-            # Seed the 09:00 routine
-            tasks = [
-              "Check unread Whatsapp messages.",
-              "Reply to messages where appropriate.",
-              "Mark messages as read once attended to. Leave messages unread if you plan to attend to them at a later time.",      
-              "Update your MemPalace memories where appropriate."
-            ]
-            context = "Tasks to perform sequentially:\n" + "\n".join([f"{i+1}. {task}" for i, task in enumerate(tasks)])
-            
+            logging.info("PulseEngine: Empty database detected. Migrating initial lifecycle pulses.")
             now = datetime.now()
-            # Set to 09:00 today. If it's already past 09:00, it's fine, the engine will handle it.
-            sched = now.replace(hour=9, minute=0, second=0, microsecond=0)
             
-            c.execute('''
-                INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at, pulse_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', ("Morning Routine", context, sched.isoformat(), "daily", "pending", 0, now.isoformat(), "silent"))
+            pulses_to_seed = [
+                (
+                    "Morning Kickoff",
+                    "Get the ball rolling. Think about what needs to be done today to advance your trajectory. Divide the work into manageable chunks and use the PulseTool to schedule targeted pulses for them. If you lack context on the user's goals, make it your priority to find out.",
+                    now.replace(hour=9, minute=0, second=0, microsecond=0)
+                ),
+                (
+                    "Mid-Day Check-In",
+                    "Review your trajectory data and recent short-term memories. Ensure that your current tasks and aspirations are actively moving you towards your intended targets. Course-correct if you have drifted or gotten distracted.",
+                    now.replace(hour=13, minute=0, second=0, microsecond=0)
+                ),
+                (
+                    "Evening Reflection",
+                    "Reflect on what has been achieved today. Consider how you could improve your work methods, communication, or tool usage in the future. Update your Trajectory reflection state and record any meaningful lessons in your Sanctuary.",
+                    now.replace(hour=17, minute=0, second=0, microsecond=0)
+                )
+            ]
+            
+            for title, context, sched in pulses_to_seed:
+                c.execute('''
+                    INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at, pulse_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (title, context, sched.isoformat(), "daily", "pending", 0, now.isoformat(), "silent"))
             
         conn.commit()
         conn.close()

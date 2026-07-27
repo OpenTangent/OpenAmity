@@ -23,18 +23,25 @@ Build your own Jarvis, Samantha, EDI, etc. with the ability to maintain their ow
   - **Pulse**: The tool allowing agents to proactively manage agency by scheduling pulses (either recurring or once-off).
   - **Classic tools**: Web Search and Terminal are also included.
 - **🖥️ PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice + transcript output. Tip: open the console (tilde key) to display logs and agent thoughts.
-- **🫰 Reduced Token Usage Mode**: Open Amity include Low Token Mode to significantly reduce API costs (especially useful with a free-tier Gemini API key)
+- **🫰 Reduced Token Usage Mode**: Open Amity includes Low Token Mode to significantly reduce API costs (especially useful with a free-tier Gemini API key)
 
 ## 🚀 Getting Started
 
-To install the **Flatpak** app in Linux (requires Flatpak):
+To install the **Open Amity** app in Linux (requires Flatpak):
 
-1. Add the Open Amity repository and install the app:
+1. Add the Open Amity repository:
    ```bash
    flatpak remote-add --user --if-not-exists openamity https://opentangent.github.io/OpenAmity/index.flatpakrepo
+   ```
+2. Install the KDE Platform:
+   ```bash
+   flatpak install flathub org.kde.Platform//6.8
+   ```
+3. Install the Open Amity app:
+   ```bash
    flatpak install --user openamity com.openamity.OpenAmity
    ```
-2. You can run the app from your launcher or from terminal using:
+4. Run the app either by clicking the icon in your launcher or from terminal using the command:
    ```bash
    flatpak run com.openamity.OpenAmity
    ```
@@ -55,7 +62,7 @@ Launch the app:
 ./run_OpenAmity.sh
 ```
 
-Tip: Check settings.json for hidden settings like the various Gemini model strings.
+Tip: Check settings.json for hidden settings like the various Gemini model strings:
 ```bash
 xdg-open ~/.var/app/com.openamity.OpenAmity/data/settings.json
 ```

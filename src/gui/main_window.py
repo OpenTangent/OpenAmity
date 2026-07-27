@@ -212,7 +212,7 @@ class MainWindow(QMainWindow):
         self.btn_mic = QPushButton("🎤")
         self.btn_mic.setFixedSize(40, 40)
         self.btn_mic.clicked.connect(self.toggle_mic)
-        self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+        self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
         self.footer_layout.addWidget(self.btn_mic)
         
         self.btn_mute = QPushButton()
@@ -223,10 +223,10 @@ class MainWindow(QMainWindow):
         self.btn_mute.setChecked(is_muted)
         if is_muted:
             self.btn_mute.setText("🔇")
-            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px;")
+            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
         else:
             self.btn_mute.setText("🔊")
-            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
         self.footer_layout.addWidget(self.btn_mute)
         
         self.main_layout.addWidget(self.footer_widget)
@@ -315,7 +315,7 @@ class MainWindow(QMainWindow):
         logging.debug(f"main_window.set_busy_state called with busy={busy}, speaking={speaking}")
         if busy:
             self.btn_mic.setText("🟥")
-            self.btn_mic.setStyleSheet("background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px;")
+            self.btn_mic.setStyleSheet("background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
             
             if speaking:
                 self.loading_bar.hide()
@@ -327,7 +327,7 @@ class MainWindow(QMainWindow):
                 self.loading_bar.show()
         else:
             self.btn_mic.setText("🎤")
-            self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+            self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
@@ -340,10 +340,10 @@ class MainWindow(QMainWindow):
         self.orchestrator.settings_manager.save()
         if checked:
             self.btn_mute.setText("🔇")
-            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px;")
+            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
         else:
             self.btn_mute.setText("🔊")
-            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px;")
+            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
 
     def send_text_prompt(self):
         text = self.text_input.toPlainText().strip()

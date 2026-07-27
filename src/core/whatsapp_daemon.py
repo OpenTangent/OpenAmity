@@ -24,7 +24,7 @@ class WhatsAppDaemon:
         self.node_process = None
         self.message_callback = None
 
-    def start(self):
+    def start(self, force_update: bool = False):
         os.makedirs(self.bridge_dir, exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
         
@@ -41,7 +41,7 @@ class WhatsAppDaemon:
         should_update = True
         update_interval_seconds = 24 * 60 * 60 # 24 hours
         
-        if os.path.exists(update_timestamp_file):
+        if not force_update and os.path.exists(update_timestamp_file):
             try:
                 with open(update_timestamp_file, "r") as f:
                     last_update = float(f.read().strip())
@@ -51,11 +51,13 @@ class WhatsAppDaemon:
                 logging.debug(f"Error reading last update timestamp: {e}")
         
         if should_update:
-            logging.info("Updating WhatsApp bridge dependencies...")
             settings = SettingsManager()
             target = settings.get("core.whatsapp-web-target", "github:wwebjs/whatsapp-web.js#main")
-            subprocess.run(["npm", "install"], cwd=self.bridge_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["npm", "install", target], cwd=self.bridge_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logging.info(f"Updating WhatsApp bridge dependencies (target: {target})...")
+            env = os.environ.copy()
+            env["PUPPETEER_CACHE_DIR"] = os.path.join(self.data_dir, "puppeteer_cache")
+            subprocess.run(["npm", "install"], cwd=self.bridge_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            subprocess.run(["npm", "install", target], cwd=self.bridge_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
             try:
                 with open(update_timestamp_file, "w") as f:
                     f.write(str(time.time()))
@@ -73,6 +75,7 @@ class WhatsAppDaemon:
         logging.info("Starting WhatsApp Node bridge...")
         env = os.environ.copy()
         env["WHATSAPP_DATA_DIR"] = self.data_dir
+        env["PUPPETEER_CACHE_DIR"] = os.path.join(self.data_dir, "puppeteer_cache")
         self.node_process = subprocess.Popen(
             ["node", "server.js"],
             cwd=self.bridge_dir,
@@ -156,17 +159,7 @@ class WhatsAppDaemon:
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir)
         
-        settings = SettingsManager()
-        target = settings.get("core.whatsapp-web-target", "github:wwebjs/whatsapp-web.js#main")
-        
-        logging.info(f"Updating whatsapp-web.js to {target}...")
-        subprocess.run(
-            ["npm", "install", target], 
-            cwd=self.bridge_dir, 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL
-        )
-        self.start()
+        self.start(force_update=True)
 
     def stop(self):
         if self.node_process:

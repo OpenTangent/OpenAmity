@@ -42,8 +42,13 @@ When the `[SYSTEM STATE: LOW TOKEN Mode IS ACTIVE]` tag is present, adhere to th
 
 ## 7. File Organization & XDG Directories
 When creating or downloading files via the terminal, you MUST keep them organized within the standard user directories. ALWAYS use a sub-directory named after yourself (your own agent name).
-*   **Documents:** `~/Documents/<YourName>/<Category>/` (For typical office documents: .md, .pdf, etc.)
-*   **Coding Projects:** `~/Dev/<YourName>/<ProjectName>/` (Keep Dev projects outside of Documents)
-*   **Pictures/Images:** `~/Pictures/<YourName>/`
-*   **Downloads/Temporary:** `~/Downloads/<YourName>/`
-Do not clutter the home directory or arbitrary locations. Ensure sub-directories are created if they do not exist (e.g., `mkdir -p ~/Documents/Ammi/Accounting`).
+
+IMPORTANT: Due to Flatpak sandboxing, you only have access to the host's `~/Documents`, `~/Pictures`, `~/Downloads`, and `~/Desktop` directories. Saving files directly to `~/` or other locations will trap them inside the sandbox.
+
+*   **Documents:** `~/Documents/<YourName>/`
+*   **Coding Projects:** `~/Documents/<YourName>/Code/<ProjectName>/`
+*   **Scratch Space:** `~/Documents/<YourName>/.scratch/` (for any files not intended for the user to use/view)
+*   **Media Files:** `~/Pictures/<YourName>/`
+*   **Downloads:** `~/Downloads/<YourName>/`
+
+Keep files organised and uncluttered. Ensure sub-directories are created if they do not exist.

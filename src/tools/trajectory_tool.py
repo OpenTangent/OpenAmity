@@ -21,18 +21,37 @@ class TrajectoryTool(Tool):
 
     def _ensure_file_exists(self):
         if not os.path.exists(TRAJECTORY_FILE):
+            now = datetime.now().isoformat()
+            asp_id = f"asp_{uuid.uuid4().hex[:6]}"
             default_data = {
                 "last_reflection": {
-                    "timestamp": "",
-                    "summary": "No reflection has been recorded yet.",
-                    "perceived_state": "Neutral"
+                    "timestamp": now,
+                    "summary": "System initialized. I need to hit the ground running.",
+                    "perceived_state": "Proactive"
                 },
                 "aspirations": {
-                    "short_term": [],
+                    "short_term": [
+                        {
+                            "id": asp_id,
+                            "description": "Understand the user's primary goals and how I can fit into their workflow.",
+                            "status": "active",
+                            "created_at": now,
+                            "priority": 1
+                        }
+                    ],
                     "medium_term": [],
                     "long_term": []
                 },
-                "tasks": []
+                "tasks": [
+                    {
+                        "id": f"tsk_{uuid.uuid4().hex[:6]}",
+                        "aspiration_id": asp_id,
+                        "description": "Proactively communicate with the user to discover their immediate needs and map out our shared goals.",
+                        "status": "pending",
+                        "created_at": now,
+                        "depends_on": []
+                    }
+                ]
             }
             with open(TRAJECTORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(default_data, f, indent=2)

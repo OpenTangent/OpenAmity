@@ -54,7 +54,7 @@ echo ""
 
 # 4. Bump patch version
 echo -e "${BLUE}[4/5] Bumping patch version for next deployment...${NC}"
-python3 -c '
+python3 - << 'EOF'
 import re
 import sys
 
@@ -62,11 +62,11 @@ try:
     with open("src/core/version.py", "r") as f:
         content = f.read()
     
-    match = re.search(r"__version__\s*=\s*[\"\'](\d+)\.(\d+)\.(\d+)[\"\']", content)
+    match = re.search(r"__version__\s*=\s*[\"'](\d+)\.(\d+)\.(\d+)[\"']", content)
     if match:
         major, minor, patch = match.groups()
         new_version = f"{major}.{minor}.{int(patch)+1}"
-        new_content = re.sub(r"__version__\s*=\s*[\"\'].*[\"\']", f"__version__ = \"{new_version}\"", content)
+        new_content = re.sub(r"__version__\s*=\s*[\"'].*[\"']", f"__version__ = \"{new_version}\"", content)
         
         with open("src/core/version.py", "w") as f:
             f.write(new_content)
@@ -78,7 +78,7 @@ try:
 except Exception as e:
     print(f"Error bumping version: {e}")
     sys.exit(1)
-'
+EOF
 echo ""
 
 # 5. Print GitHub Release Instructions

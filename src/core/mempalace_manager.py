@@ -43,6 +43,13 @@ class MemPalaceManager:
         
         # Ensure sanctuary is initialized (Layer 2 data)
         self.initialize_sanctuary()
+        
+        # Ensure default short-term memory is seeded if not present
+        self.initialize_short_term_memory()
+
+    def reload_settings(self):
+        """Reload settings and sync identity"""
+        self._sync_identity()
 
     def _sync_identity(self):
         """Convert soul_jar.json to a plain text identity.txt for MemPalace Layer 0"""
@@ -175,6 +182,21 @@ class MemPalaceManager:
             return f"\n--- Core Self Perception ---\n{res}\n"
         return ""
         
+    def initialize_short_term_memory(self):
+        """Seed a proactive short-term memory if the file doesn't exist."""
+        path = os.path.join(self.palace_path, "short_term_mem.json")
+        if not os.path.exists(path):
+            seed_memory = [{
+                "id": str(uuid.uuid4())[:8],
+                "date": datetime.datetime.now().isoformat(),
+                "content": "System initialized. My immediate goal is to understand who the user is, what their goals are, and how I play a role. I should populate my trajectory data with tasks and aspirations that move us towards our shared goals."
+            }]
+            try:
+                with open(path, 'w') as f:
+                    json.dump(seed_memory, f, indent=2)
+            except Exception as e:
+                logging.error(f"Error seeding short term memories: {e}")
+
     def _load_short_term_memories(self) -> list:
         path = os.path.join(self.palace_path, "short_term_mem.json")
         if os.path.exists(path):
