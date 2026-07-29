@@ -19,7 +19,7 @@ The agent's cognition relies on a unified single-model architecture managed by `
 Context management is centralized under the **MemPalace** framework (`src/core/mempalace_manager.py`), a 4-Layer unified memory stack.
 - **Layer 0 (Identity)**: The immutable foundation. `soul_jar.json` is compiled into a static `identity.txt` plain text prompt, injected at the start of every cognitive cycle to define the agent's core traits, archetype, and values.
 - **Layer 1 (Continuity)**: The short-term memory (`short_term_context.txt`), providing immediate contextual bridging between recent tasks and thoughts.
-- **Layer 2 (The Sanctuary)**: Explicitly segmented wings and rooms (e.g., `sanctuary/people`, `sanctuary/self`) storing dynamic identity elements, social records, and character-defining subjective experiences. Retrieved on-demand to prevent prompt bloat.
+- **Layer 2 (The Sanctuary)**: Explicitly segmented wings and rooms (e.g., `sanctuary/people`, `sanctuary/mirrors`) storing dynamic identity elements, social records, Theory of Mind, and character-defining subjective experiences. Theory of Mind records (Mirrors) actively filter the static Layer 0 to provide a dynamically evolving, subjective self-perception. Retrieved on-demand to prevent prompt bloat.
 - **Layer 3 (Deep Search)**: A ChromaDB vector database (`chroma.sqlite3`) enabling semantic search across all facts, events, and generalized knowledge.
 
 ## 4. Agency, Rhythms, & Goals

@@ -100,7 +100,7 @@ def main():
         f"./{GENERATOR_SCRIPT}",
         f"--requirements-file={FLATPAK_REQS_FILE}",
         "--output=python3-requirements",
-        "--runtime=org.kde.Sdk//6.8",
+        "--runtime=org.kde.Sdk//6.11",
         prefer_wheels_arg
     ]
     

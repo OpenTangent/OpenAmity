@@ -4,7 +4,7 @@ from core.mempalace_manager import MemPalaceManager
 class MemPalaceTool(Tool):
     name = "MemPalace"
     description = "Interface to the agent's MemPalace memory system."
-    commands = ["search", "recall", "add_memory", "delete_memory", "status", "add_short_term", "remove_short_term"]
+    commands = ["search", "recall", "add_memory", "delete_memory", "status", "add_short_term", "remove_short_term", "update_mirror"]
 
     def __init__(self):
         self.manager = MemPalaceManager()
@@ -58,6 +58,15 @@ class MemPalaceTool(Tool):
                 return "Error: memory_id is required."
             self.manager.remove_short_term_memory(memory_id)
             return f"Successfully removed short-term memory {memory_id}."
+            
+        elif command == "update_mirror":
+            perspective = kwargs.get("perspective") or (args[0] if args else "")
+            subjective_view = kwargs.get("subjective_view") or (args[1] if len(args) > 1 else "")
+            if not perspective or not subjective_view:
+                return "Error: perspective and subjective_view are required."
+            content = f"Perspective: {perspective}\nSubjective View: {subjective_view}"
+            res = self.manager.add_memory(content, wing="sanctuary", room="mirrors", source_file="agent_reflection")
+            return f"Successfully updated mirror for perspective '{perspective}'. Memory ID: {res}"
             
         return f"Unknown command: {command}"
 
@@ -142,6 +151,18 @@ class MemPalaceTool(Tool):
                         "memory_id": {"type": "STRING", "description": "The ID of the short-term memory to remove."}
                     },
                     "required": ["memory_id"]
+                }
+            },
+            {
+                "name": "MemPalace_update_mirror",
+                "description": "Surgically update a Theory of Mind record in your Sanctuary Mirror. Use this immediately when you receive feedback or form an opinion on how someone else perceives you, or how you perceive yourself.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "perspective": {"type": "STRING", "description": "The person or entity holding the view (e.g. 'Andrew', 'Self', 'User X')."},
+                        "subjective_view": {"type": "STRING", "description": "The subjective view or opinion held by that perspective about you."}
+                    },
+                    "required": ["perspective", "subjective_view"]
                 }
             }
         ]

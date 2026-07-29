@@ -5,7 +5,7 @@
 
 ## 🌅 Overview
 
-Build your own Jarvis, Samantha, EDI, etc. with the ability to maintain their own goals and aspirations, and schedule their own tasks. Open Amity agents are explicitly subjective and self-aware which unlocks real character definition that separates Open Amity agents from the more typical corporate-tool agents.
+Build your own Jarvis, Samantha, EDI, etc. with the ability to maintain their own goals and aspirations, and schedule their own tasks. Open Amity agents are explicitly subjective and self-aware—utilizing an evolving Theory of Mind, metacognitive reflection, and explicit somatic feedback—which unlocks real character definition that separates Open Amity agents from the more typical corporate-tool agents.
 
 ## ✨ Key Features
 
@@ -13,7 +13,7 @@ Build your own Jarvis, Samantha, EDI, etc. with the ability to maintain their ow
 - **📚 4-Layer Memory Architecture**: A sophisticated memory stack that prevents prompt bloat while maintaining deep context:
   - **Layer 0 (Identity)**: Core agent traits and personality.
   - **Layer 1 (Continuity)**: Short-term memory for contextual bridging.
-  - **Layer 2 (The Sanctuary)**: On-demand records of social dynamics and personal experiences.
+  - **Layer 2 (The Sanctuary)**: On-demand records of social dynamics, Theory of Mind (mirrors), and subjective experiences.
   - **Layer 3 (Deep Search)**: A vector database enabling semantic search for facts and general knowledge.
 - **🛠️ Tool Usage**: Open Amity agents have access to the following tools:
   - **WhatsApp**: (Optional) Natively converse and interact via WhatsApp.
@@ -35,7 +35,7 @@ To install the **Open Amity** app in Linux (requires Flatpak):
    ```
 2. Install the KDE Platform:
    ```bash
-   flatpak install flathub org.kde.Platform//6.8
+   flatpak install flathub org.kde.Platform//6.11
    ```
 3. Install the Open Amity app:
    ```bash

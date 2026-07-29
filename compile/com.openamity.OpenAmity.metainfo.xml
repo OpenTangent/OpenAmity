@@ -17,6 +17,8 @@
     <name>Open Amity Team</name>
   </developer>
   <releases>
+    <release version="0.1.9" date="2026-07-29"/>
+
     <release version="0.1.8" date="2026-07-27"/>
 
     <release version="0.1.7" date="2026-07-24"/>

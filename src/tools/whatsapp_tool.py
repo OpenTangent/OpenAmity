@@ -120,62 +120,9 @@ class WhatsAppSkill(Tool):
                 "description": "Restarts the WhatsApp server, clears caches, and updates the underlying whatsapp-web.js library to the latest commit to fix protocol mismatch errors (e.g., 'Failed to resolve chat', 'r: r'). Use this tool if the WhatsApp client is stuck initializing or throws internal evaluation errors. Note: You can temporarily change the 'core.whatsapp-web-target' setting in settings.json to a specific fork (e.g., a PR branch) to fix protocol mismatch errors, but this should only be used as a temporary solution and must always be reverted back to 'github:wwebjs/whatsapp-web.js#main' once an official patch is released.",
                 "parameters": {"type": "OBJECT", "properties": {}}
             },
-            {
-                "name": "WhatsApp_listen",
-                "description": "Fetches and listens to a specific audio file natively. Use this when the user asks you to listen to a song or a specific audio file sent to you.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "mediaPath": {"type": "STRING", "description": "The absolute path of the media file to listen to."}
-                    },
-                    "required": ["mediaPath"]
-                }
-            }
         ]
 
-    def _transcribe(self, audio_path):
-        try:
-            settings = SettingsManager()
-            is_low_token = settings.get("core.low-token-mode", False)
-            is_agy_mode = settings.get("core.antigravity.agy-mode", False)
 
-            if is_low_token or is_agy_mode:
-                from src.core.local_stt import LocalSTT
-                return LocalSTT().transcribe(audio_path)
-
-            from google import genai
-            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            
-            models = settings.get("core.gemini.gemini-models", ["gemini-3.1-flash-preview"])
-            if not isinstance(models, list):
-                models = [models]
-                
-            media = client.files.upload(file=audio_path)
-            
-            # Wait for the file to be processed by Gemini
-            while getattr(media.state, 'name', media.state) != "ACTIVE":
-                if getattr(media.state, 'name', media.state) == "FAILED":
-                    return "[Transcription Failed: File processing error]"
-                time.sleep(2)
-                media = client.files.get(name=media.name)
-                
-            prompt = "Please transcribe this audio accurately. Output only the transcription without any commentary."
-            
-            for model_name in models:
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[prompt, media]
-                    )
-                    if response.text:
-                        return response.text.strip()
-                except Exception as e:
-                    logging.warning(f"WhatsApp transcription failed with {model_name}: {e}")
-                    continue
-            
-            return "[Transcription Failed: All models exhausted]"
-        except Exception as e:
-            return f"[Transcription Failed: {e}]"
 
     def get_auth_status(self) -> Dict[str, Any]:
         try:
@@ -221,22 +168,22 @@ class WhatsAppSkill(Tool):
                 
                 output = "Unread Messages:\n"
                 for msg in unread:
-                    content = msg['content']
+                    content = msg.get('content', '')
                     if msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
                         if msg['type'] in ['ptt', 'audio']:
-                            content = f"[Voice Message (Path: {msg['mediaPath']})] {self._transcribe(msg['mediaPath'])}"
-                        elif msg['type'] in ['image', 'document']:
+                            content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
+                        elif msg['type'] in ['image', 'document', 'video']:
                             content = f"[{msg['type'].capitalize()} (Path: {msg['mediaPath']})] {content}"
                         else:
-                            content = f"[Media: {msg['type']}] {content}"
-                    elif msg['hasMedia']:
+                            content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
+                    elif msg.get('hasMedia'):
                         content = f"[Media: {msg['type']}] {content}"
                         
                     channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith("@g.us") else "WHATSAPP_DM"
                     sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get('senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
                 
-                output += "\n[SYSTEM NOTE: If you need to respond to any of these messages, you MUST use the WhatsApp_send or WhatsApp_send_voice tools.]"
+                output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
                 return output
             except Exception as e:
                 return f"Failed to fetch unread messages: {e}"
@@ -257,22 +204,22 @@ class WhatsAppSkill(Tool):
                 
                 output = f"Recent Messages (Last {len(messages)}):\n"
                 for msg in messages:
-                    content = msg['content']
+                    content = msg.get('content', '')
                     if msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
                         if msg['type'] in ['ptt', 'audio']:
-                            content = f"[Voice Message (Path: {msg['mediaPath']})] {self._transcribe(msg['mediaPath'])}"
-                        elif msg['type'] in ['image', 'document']:
+                            content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
+                        elif msg['type'] in ['image', 'document', 'video']:
                             content = f"[{msg['type'].capitalize()} (Path: {msg['mediaPath']})] {content}"
                         else:
-                            content = f"[Media: {msg['type']}] {content}"
-                    elif msg['hasMedia']:
+                            content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
+                    elif msg.get('hasMedia'):
                         content = f"[Media: {msg['type']}] {content}"
 
                     channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith("@g.us") else "WHATSAPP_DM"
                     sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get('senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
                 
-                output += "\n[SYSTEM NOTE: If you need to respond to any of these messages, you MUST use the WhatsApp_send or WhatsApp_send_voice tools.]"
+                output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
                 return output
             except Exception as e:
                 return f"Failed to fetch recent messages: {e}"
@@ -309,22 +256,22 @@ class WhatsAppSkill(Tool):
                 
                 output = f"Recent Messages for {target} (Last {len(messages)}):\n"
                 for msg in messages:
-                    content = msg['content']
+                    content = msg.get('content', '')
                     if msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
                         if msg['type'] in ['ptt', 'audio']:
-                            content = f"[Voice Message (Path: {msg['mediaPath']})] {self._transcribe(msg['mediaPath'])}"
-                        elif msg['type'] in ['image', 'document']:
+                            content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
+                        elif msg['type'] in ['image', 'document', 'video']:
                             content = f"[{msg['type'].capitalize()} (Path: {msg['mediaPath']})] {content}"
                         else:
-                            content = f"[Media: {msg['type']}] {content}"
-                    elif msg['hasMedia']:
+                            content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
+                    elif msg.get('hasMedia'):
                         content = f"[Media: {msg['type']}] {content}"
 
                     channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith("@g.us") else "WHATSAPP_DM"
                     sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get('senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
                 
-                output += "\n[SYSTEM NOTE: If you need to respond to any of these messages, you MUST use the WhatsApp_send or WhatsApp_send_voice tools.]"
+                output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
                 return output
             except Exception as e:
                 return f"Failed: {e}"
@@ -494,15 +441,7 @@ class WhatsAppSkill(Tool):
             except Exception as e:
                 return f"Failed to mark as read: {e}"
 
-        elif command == "listen":
-            media_path = kwargs.get('mediaPath') or (args[0] if args else None)
-            if not media_path:
-                return "Usage: listen <mediaPath>"
-            
-            if not os.path.exists(media_path):
-                return f"Error: File not found at {media_path}"
-                
-            return {"result": f"Audio attached.", "media": [media_path]}
+
 
         return f"Unknown command: {command}"
 

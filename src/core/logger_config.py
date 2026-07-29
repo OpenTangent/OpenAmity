@@ -19,19 +19,38 @@ class VerbosityFilter(logging.Filter):
 
 class BaseFormatter(logging.Formatter):
     def get_source(self, record):
-        if record.name == "root":
-            path = record.pathname.replace('\\', '/')
-            if "/src/core/" in path:
-                return "core"
-            elif "/src/gui/" in path:
-                return "gui"
-            elif "/src/tools/" in path:
-                return "tool"
-            elif path.endswith("main.py"):
-                return "core"
-            else:
-                return "other"
-        return record.name
+        if record.name not in ("root", "core"):
+            return record.name
+            
+        path = record.pathname.replace('\\', '/')
+        filename = os.path.basename(path)
+        module_name = os.path.splitext(filename)[0]
+        
+        pascal_name = "".join(word.capitalize() for word in module_name.split("_"))
+        
+        if "/src/core/gemini_worker.py" in path:
+            return "geminiworker.Main"
+        elif "/src/core/agy_worker.py" in path:
+            return "agyworker.Main"
+        elif "/src/core/" in path:
+            if filename == "__init__.py":
+                return "core.Init"
+            return f"core.{pascal_name}"
+        elif "/src/gui/" in path:
+            if filename == "__init__.py":
+                return "core.GUI"
+            return f"core.GUI.{pascal_name}"
+        elif "/src/tools/" in path:
+            if filename == "__init__.py":
+                return "tool.Init"
+            clean_name = pascal_name
+            if clean_name.endswith("Tool"):
+                clean_name = clean_name[:-4]
+            return f"tool.{clean_name}"
+        elif path.endswith("main.py"):
+            return "core.Init"
+        else:
+            return "other"
 
 class FileFormatter(BaseFormatter):
     def format(self, record):
@@ -52,23 +71,18 @@ class ColorFormatter(BaseFormatter):
     reset = "\x1b[0m"
 
     SECTION_COLORS = {
-        "core": "\x1b[38;2;243;156;18m",
-        "gui": "\x1b[38;2;253;121;168m",
-        "main": "\x1b[38;2;173;216;230m",
-        "tool": "\x1b[38;2;241;196;15m",
-        "other": "\x1b[38;2;200;200;200m",
-        "agent.thinker": "\x1b[38;2;155;89;182m",
-        "agent.speaker": "\x1b[38;2;52;152;219m",
-        "agent.tool.WhatsApp": "\x1b[38;2;37;211;102m",
-        "agent.tool.Trajectory": "\x1b[38;2;26;188;156m",
-        "agent.tool.Contacts": "\x1b[38;2;0;150;136m",
-        "agent.tool.DateTime": "\x1b[38;2;139;195;74m",
-        "agent.tool.Mastodon": "\x1b[38;2;99;100;255m",
-        "agent.tool.MemPalace": "\x1b[38;2;205;133;63m",
-        "agent.tool.PulseTool": "\x1b[38;2;224;64;251m",
-        "agent.tool.Speaker": "\x1b[38;2;3;169;244m",
-        "agent.tool.Terminal": "\x1b[38;2;112;128;144m",
-        "piper.voice": "\x1b[38;2;128;128;0m",
+        "tool.Contacts": "\x1b[38;2;0;150;136m",
+        "tool.DateTime": "\x1b[38;2;139;195;74m",
+        "tool.Mastodon": "\x1b[38;2;99;100;255m",
+        "tool.Media": "\x1b[38;2;255;105;180m",
+        "tool.MemPalace": "\x1b[38;2;205;133;63m",
+        "tool.Moltbook": "\x1b[38;2;255;152;0m",
+        "tool.Pulse": "\x1b[38;2;103;58;183m",
+        "tool.Speaker": "\x1b[38;2;3;169;244m",
+        "tool.Terminal": "\x1b[38;2;243;156;18m",
+        "tool.Trajectory": "\x1b[38;2;26;188;156m",
+        "tool.WebSearch": "\x1b[38;2;0;188;212m",
+        "tool.WhatsApp": "\x1b[38;2;37;211;102m",
     }
 
     FALLBACK_PALETTE = [
@@ -89,6 +103,17 @@ class ColorFormatter(BaseFormatter):
     def get_section_color(self, source):
         if source in self.SECTION_COLORS:
             return self.SECTION_COLORS[source]
+            
+        primary_section = source.split('.')[0]
+        if primary_section == "core":
+            if source.startswith("core.TTS"):
+                return "\x1b[38;2;128;128;0m" # Olive
+            return self.grey # Light Grey matches INFO logs
+        elif primary_section == "geminiworker":
+            return "\x1b[38;2;155;89;182m" # Amethyst
+        elif primary_section == "agyworker":
+            return "\x1b[38;2;224;64;251m" # Purple
+            
         h = sum(ord(c) for c in source)
         return self.FALLBACK_PALETTE[h % len(self.FALLBACK_PALETTE)]
 

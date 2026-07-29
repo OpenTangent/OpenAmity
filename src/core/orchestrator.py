@@ -219,6 +219,16 @@ class AmityOrchestrator:
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
         
+        # Reset somatic state
+        try:
+            from config import paths
+            import os
+            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+            if os.path.exists(state_path):
+                os.remove(state_path)
+        except Exception:
+            pass
+        
         threading.Thread(target=self._async_query_prep, args=(text, self.recent_history.copy(), audio_path), daemon=True).start()
 
     def _async_query_prep(self, text, history, audio_path):
@@ -269,6 +279,16 @@ class AmityOrchestrator:
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
         
+        # Reset somatic state
+        try:
+            from config import paths
+            import os
+            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+            if os.path.exists(state_path):
+                os.remove(state_path)
+        except Exception:
+            pass
+        
         self.gemini_worker.send_prompt(text)
 
     def append_to_conversation(self, sender, text):
@@ -310,7 +330,8 @@ class AmityOrchestrator:
         clean_text = text.strip() if text else ""
         if clean_text:
             logging.debug("handle_gemini_thought logging agent thought to info")
-            logging.info(f"Agent Thought: {clean_text}")
+            worker_type = "agyworker" if self.settings_manager.get("core.antigravity.agy-mode", False) else "geminiworker"
+            logging.getLogger(f"{worker_type}.Thoughts").info(clean_text)
             self.accumulated_thoughts += clean_text + "\n"
             
         if not function_calls:
@@ -330,7 +351,19 @@ class AmityOrchestrator:
             tool_name = function_name.split("_")[0] if "_" in function_name else function_name
             args = call.args or {}
             
-            logging.getLogger(f"agent.tool.{tool_name}").info(f"[Weight: {current_weight:.1f}] Executing command: {function_name}")
+            if len(args) == 1 and "text" in args:
+                args_str = str(args["text"])
+            elif args:
+                args_str = ", ".join(f"{k}='{v}'" for k, v in args.items())
+            else:
+                args_str = "()"
+                
+            if args_str == "()":
+                log_msg = f"[Weight: {current_weight:.1f}] {function_name}()"
+            else:
+                log_msg = f"[Weight: {current_weight:.1f}] {function_name}: {args_str}"
+                
+            logging.getLogger(f"tool.{tool_name}").info(log_msg)
             
             skill_result = self.cerebrum.execute_tool_call(function_name, args)
             executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
@@ -383,6 +416,16 @@ class AmityOrchestrator:
         added_weight = base_weight * (exp_factor ** (self.current_loop_count - 1))
         self.current_task_weight += added_weight
         
+        # Write somatic state for tools
+        try:
+            from config import paths
+            import os
+            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+            with open(state_path, "w") as f:
+                json.dump({"current_task_weight": self.current_task_weight, "max_weight": max_weight}, f)
+        except Exception:
+            pass
+        
         current_batch = ", ".join(executed_tools)
         if current_batch == self.last_executed_command:
             self.duplicate_command_count += 1
@@ -423,7 +466,6 @@ class AmityOrchestrator:
         self.finish_thinking()
 
     def speak(self, text):
-        logging.getLogger("agent.speaker").info(f"[Weight: {self.current_task_weight:.1f}] {text}")
         self.speech_queue.append(text)
         self.process_speech_queue()
 

@@ -90,7 +90,7 @@ class PulseEngine:
                 ),
                 (
                     "Evening Reflection",
-                    "Reflect on what has been achieved today. Consider how you could improve your work methods, communication, or tool usage in the future. Update your Trajectory reflection state and record any meaningful lessons in your Sanctuary.",
+                    "Reflect on what has been achieved today. Critically evaluate not just what was done, but how you reasoned. Update your Trajectory reflection state and record any meaningful lessons. Crucially, if you received feedback or formed new opinions about yourself or others, use MemPalace_update_mirror to update your Theory of Mind records in your Sanctuary.",
                     now.replace(hour=17, minute=0, second=0, microsecond=0)
                 )
             ]

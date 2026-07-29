@@ -113,7 +113,31 @@ class TrajectoryTool(Tool):
             
         data = self._load_data()
         
+        # Read Somatic State
+        somatic_state_text = ""
+        try:
+            state_path = os.path.join(TRAJECTORY_DIR, "somatic_state.json")
+            if os.path.exists(state_path):
+                with open(state_path, "r") as f:
+                    somatic = json.load(f)
+                    current_weight = somatic.get("current_task_weight", 0)
+                    max_weight = somatic.get("max_weight", 1000)
+                    percent = (current_weight / max_weight) * 100 if max_weight else 0
+                    
+                    state_desc = "Low (Unrestricted)"
+                    if percent >= 50:
+                        state_desc = "High (Completion Phase - Overwhelmed/Fatigued)"
+                    elif percent >= 25:
+                        state_desc = "Moderate (Conservation Phase - Nearing capacity)"
+                        
+                    somatic_state_text = f"\n--- Somatic (Physiological) Feedback ---\nCognitive Budget Task Weight: {current_weight:.1f}/{max_weight} ({percent:.1f}%)\nCurrent State: {state_desc}\n"
+        except Exception:
+            pass
+        
         lines = ["=== THE AGENT'S CURRENT BEARING ==="]
+        if somatic_state_text:
+            lines.append(somatic_state_text.strip())
+            lines.append("")
         if self_perception:
             lines.append(self_perception.strip())
             lines.append("")
@@ -122,7 +146,13 @@ class TrajectoryTool(Tool):
         lines.append(f"State: {data['last_reflection']['perceived_state']}")
         lines.append(f"Summary: {data['last_reflection']['summary']}")
         
-        lines.append("\n-- Aspirations (Ordered by Priority) --")
+        lines.append("\n-- Aspirations & Tasks (Ordered by Priority) --")
+        tasks = data.get("tasks", [])
+        task_dict = {t["id"]: t for t in tasks}
+        tasks_by_asp = {}
+        for t in tasks:
+            tasks_by_asp.setdefault(t.get("aspiration_id"), []).append(t)
+
         for tier in ["short_term", "medium_term", "long_term"]:
             lines.append(f"[{tier.upper()}]:")
             aspirations = data["aspirations"].get(tier, [])
@@ -132,26 +162,31 @@ class TrajectoryTool(Tool):
             for asp in aspirations:
                 created = self._format_time_elapsed(asp.get("created_at"))
                 lines.append(f"  {asp.get('priority', '-')}. ID: {asp['id']} | Status: {asp['status']} | Created: {created} | {asp['description']}")
-                
-        lines.append("\n-- Tasks --")
-        tasks = data.get("tasks", [])
-        if not tasks:
-            lines.append("  No tasks currently plotted.")
-        
-        task_dict = {t["id"]: t for t in tasks}
-        for task in tasks:
-            created = self._format_time_elapsed(task.get("created_at"))
-            deps = task.get("depends_on", [])
-            blocked_by = []
-            for d in deps:
-                if d in task_dict:
-                    blocked_by.append(d)
-                    
-            status_display = task['status']
-            if blocked_by:
-                status_display += f" (BLOCKED BY: {', '.join(blocked_by)})"
-                
-            lines.append(f"  ID: {task['id']} (for Aspiration: {task['aspiration_id']}) | Status: {status_display} | Created: {created} | {task['description']}")
+                asp_tasks = tasks_by_asp.get(asp['id'], [])
+                if not asp_tasks:
+                    lines.append("    (No tasks plotted for this aspiration)")
+                else:
+                    for task in asp_tasks:
+                        task_created = self._format_time_elapsed(task.get("created_at"))
+                        deps = task.get("depends_on", [])
+                        blocked_by = [d for d in deps if d in task_dict]
+                        status_display = task['status']
+                        if blocked_by:
+                            status_display += f" (BLOCKED BY: {', '.join(blocked_by)})"
+                        lines.append(f"    -> Task {task['id']} | Status: {status_display} | Created: {task_created} | {task['description']}")
+
+        all_asp_ids = {a['id'] for tier in ["short_term", "medium_term", "long_term"] for a in data["aspirations"].get(tier, [])}
+        orphaned = [t for t in tasks if t.get("aspiration_id") not in all_asp_ids]
+        if orphaned:
+            lines.append("\n[ORPHANED TASKS]:")
+            for task in orphaned:
+                task_created = self._format_time_elapsed(task.get("created_at"))
+                deps = task.get("depends_on", [])
+                blocked_by = [d for d in deps if d in task_dict]
+                status_display = task['status']
+                if blocked_by:
+                    status_display += f" (BLOCKED BY: {', '.join(blocked_by)})"
+                lines.append(f"  Task {task['id']} (for unknown Aspiration: {task.get('aspiration_id')}) | Status: {status_display} | Created: {task_created} | {task['description']}")
             
         lines.append("\n=== OPERATIONAL HINTS ===")
         lines.append("- PulseEngine: If your Task Weight is getting high or you have long-running tasks, use the PulseTool to schedule a wake-up later.")

@@ -1,10 +1,10 @@
 {
     "app-id": "com.openamity.OpenAmity",
     "runtime": "org.kde.Platform",
-    "runtime-version": "6.8",
+    "runtime-version": "6.11",
     "sdk": "org.kde.Sdk",
     "base": "io.qt.PySide.BaseApp",
-    "base-version": "6.8",
+    "base-version": "6.11",
     "command": "run_OpenAmity.sh",
     "finish-args": [
         "--share=network",

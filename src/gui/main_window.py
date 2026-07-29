@@ -212,7 +212,7 @@ class MainWindow(QMainWindow):
         self.btn_mic = QPushButton("🎤")
         self.btn_mic.setFixedSize(40, 40)
         self.btn_mic.clicked.connect(self.toggle_mic)
-        self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+        self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
         self.footer_layout.addWidget(self.btn_mic)
         
         self.btn_mute = QPushButton()
@@ -223,10 +223,10 @@ class MainWindow(QMainWindow):
         self.btn_mute.setChecked(is_muted)
         if is_muted:
             self.btn_mute.setText("🔇")
-            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
         else:
             self.btn_mute.setText("🔊")
-            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
         self.footer_layout.addWidget(self.btn_mute)
         
         self.main_layout.addWidget(self.footer_widget)
@@ -293,7 +293,7 @@ class MainWindow(QMainWindow):
     def append_to_conversation(self, sender, text):
         name_color = "#00FFC8" if sender == "User" else "#FFA500"
         text_color = "#808080" if sender == "User" else "#FFFFFF"
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = datetime.now().strftime("%H:%M")
         
         if sender == "User":
             safe_text = text.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
@@ -302,10 +302,12 @@ class MainWindow(QMainWindow):
             formatted_text = markdown.markdown(text, extensions=['fenced_code', 'tables'])
 
         html = f"""
-        <div style='margin-bottom: 10px;'>
-            <span style='color: #666; font-size: 12px;'>[{timestamp}]</span>
+        <div style='margin-bottom: 10px; text-align: left;'>
             <span style='color: {name_color}; font-weight: bold;'>{sender}:</span>
-            <div style='margin-top: 5px; color: {text_color};'>{formatted_text}</div>
+            <div style='margin-top: 5px; color: {text_color};'>
+                {formatted_text}
+                <div style='color: #666; font-size: 12px; text-align: right; margin-top: 2px;'>{timestamp}</div>
+            </div>
         </div>
         """
         self.conversation_log.append(html)
@@ -315,7 +317,7 @@ class MainWindow(QMainWindow):
         logging.debug(f"main_window.set_busy_state called with busy={busy}, speaking={speaking}")
         if busy:
             self.btn_mic.setText("🟥")
-            self.btn_mic.setStyleSheet("background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+            self.btn_mic.setStyleSheet("background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
             
             if speaking:
                 self.loading_bar.hide()
@@ -327,7 +329,7 @@ class MainWindow(QMainWindow):
                 self.loading_bar.show()
         else:
             self.btn_mic.setText("🎤")
-            self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+            self.btn_mic.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
@@ -340,10 +342,10 @@ class MainWindow(QMainWindow):
         self.orchestrator.settings_manager.save()
         if checked:
             self.btn_mute.setText("🔇")
-            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+            self.btn_mute.setStyleSheet("background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
         else:
             self.btn_mute.setText("🔊")
-            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu';")
+            self.btn_mute.setStyleSheet("background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
 
     def send_text_prompt(self):
         text = self.text_input.toPlainText().strip()

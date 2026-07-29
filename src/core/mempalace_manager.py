@@ -177,9 +177,9 @@ class MemPalaceManager:
 
     def get_self_perception(self) -> str:
         """Retrieves core self-perception entries to inject during wake up."""
-        res = self.recall(wing="sanctuary", room="self", n_results=5)
+        res = self.recall(wing="sanctuary", room="mirrors", n_results=5)
         if res and "No results" not in res and "No palace" not in res:
-            return f"\n--- Core Self Perception ---\n{res}\n"
+            return f"\n--- Core Self Perception & Theory of Mind ---\n{res}\n"
         return ""
         
     def initialize_short_term_memory(self):
@@ -282,6 +282,10 @@ class MemPalaceManager:
             for person in social.get("people", []):
                 content = f"Person: {person['name']}\nEntity Type: {person['entity_type']}\nPronouns: {person.get('pronouns', '')}\nRelation: {person['relation']}\nSubjective View: {person['subjective_view']}"
                 self.add_memory(content=content, wing="sanctuary", room="people", source_file="sanctuary_init.json")
+                
+            for mirror in social.get("mirrors", []):
+                content = f"Perspective: {mirror['perspective']}\nSubjective View: {mirror['subjective_view']}"
+                self.add_memory(content=content, wing="sanctuary", room="mirrors", source_file="sanctuary_init.json")
                 
             for community in social.get("communities", []):
                 content = f"Community: {community['name']}\nEntity Type: {community['entity_type']}\nSubjective View: {community['subjective_view']}"

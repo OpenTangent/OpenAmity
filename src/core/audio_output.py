@@ -43,7 +43,7 @@ class TTSWorker(threading.Thread):
             if not self._is_stopped:
                 self._stream_and_play()
         except Exception as e:
-            logging.error(f"TTS Error: {e}", exc_info=True)
+            logging.getLogger("core.TTS").error(f"TTS Error: {e}", exc_info=True)
         finally:
             self.on_finished.emit()
 
@@ -117,7 +117,7 @@ class TTSWorker(threading.Thread):
                                     amp = min(1.0, rms / 32768.0)
                                     self.amplitude_emitted.emit(amp)
                 except Exception as e:
-                    logging.error(f"TTS writer thread error: {e}")
+                    logging.getLogger("core.TTS.Gemini").error(f"TTS writer thread error: {e}")
                 finally:
                     if self.process and self.process.stdin:
                         try:
@@ -151,10 +151,10 @@ class TTSWorker(threading.Thread):
                             if data:
                                 audio_queue.put(data)
                 except (IndexError, AttributeError, TypeError) as inner_err:
-                    logging.warning(f"Skipped an unexpected TTS chunk. Reason: {inner_err}")
+                    logging.getLogger("core.TTS.Gemini").warning(f"Skipped an unexpected TTS chunk. Reason: {inner_err}")
                     
         except Exception as e:
-            logging.error(f"Error during TTS streaming: {e}")
+            logging.getLogger("core.TTS.Gemini").error(f"Error during TTS streaming: {e}")
         finally:
             if 'audio_queue' in locals():
                 audio_queue.put(None)
@@ -171,7 +171,7 @@ class TTSWorker(threading.Thread):
             config_path = piper_dir / "en_GB-cori-high.onnx.json"
             
             if not model_path.exists() or not config_path.exists():
-                logging.info("Downloading Piper TTS model...")
+                logging.getLogger("core.TTS.Piper").info("Downloading Piper TTS model...")
                 model_url = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/cori/high/en_GB-cori-high.onnx"
                 config_url = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/cori/high/en_GB-cori-high.onnx.json"
                 try:
@@ -186,9 +186,9 @@ class TTSWorker(threading.Thread):
                     with open(config_path, 'wb') as f:
                         for chunk in r_config.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    logging.info("Piper TTS model downloaded successfully.")
+                    logging.getLogger("core.TTS.Piper").info("Piper TTS model downloaded successfully.")
                 except requests.RequestException as e:
-                    logging.warning(f"Offline or failed to download Piper model: {e}")
+                    logging.getLogger("core.TTS.Piper").warning(f"Offline or failed to download Piper model: {e}")
                     if model_path.exists(): model_path.unlink()
                     if config_path.exists(): config_path.unlink()
                     return
@@ -237,7 +237,7 @@ class TTSWorker(threading.Thread):
                                     amp = min(1.0, rms / 32768.0)
                                     self.amplitude_emitted.emit(amp)
                 except Exception as e:
-                    logging.error(f"Piper writer thread error: {e}")
+                    logging.getLogger("core.TTS.Piper").error(f"Piper writer thread error: {e}")
                 finally:
                     if self.process and self.process.stdin:
                         try:
@@ -260,7 +260,7 @@ class TTSWorker(threading.Thread):
                     audio_queue.put(chunk.audio_int16_bytes)
 
         except Exception as e:
-            logging.error(f"Error during Piper TTS streaming: {e}")
+            logging.getLogger("core.TTS.Piper").error(f"Error during Piper TTS streaming: {e}")
         finally:
             if 'audio_queue' in locals():
                 audio_queue.put(None)
@@ -268,4 +268,3 @@ class TTSWorker(threading.Thread):
                 writer.join(timeout=10)
             if self.process:
                 self.process.wait()
-
