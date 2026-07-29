@@ -306,7 +306,11 @@ class MainWindow(QMainWindow):
             <span style='color: {name_color}; font-weight: bold;'>{sender}:</span>
             <div style='margin-top: 5px; color: {text_color};'>
                 {formatted_text}
-                <div style='color: #666; font-size: 12px; text-align: right; margin-top: 2px;'>{timestamp}</div>
+                <table width="100%" cellpadding="0" cellspacing="0" style="margin-top: 2px;">
+                    <tr><td align="right">
+                        <span style='color: #666; font-size: 12px;'>{timestamp}</span>
+                    </td></tr>
+                </table>
             </div>
         </div>
         """
