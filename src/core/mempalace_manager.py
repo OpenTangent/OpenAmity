@@ -39,7 +39,27 @@ class MemPalaceManager:
         self._sync_identity()
         
         # Initialize the stack
-        self.stack = MemoryStack(palace_path=self.palace_path, identity_path=self.identity_path)
+        try:
+            self.stack = MemoryStack(palace_path=self.palace_path, identity_path=self.identity_path)
+        except Exception as e:
+            logging.error(f"MemPalaceManager: Error initializing MemoryStack (possibly ChromaDB schema mismatch): {e}")
+            import time
+            import shutil
+            
+            timestamp = int(time.time())
+            backup_dir = f"{self.palace_path}_quarantined_{timestamp}"
+            logging.warning(f"MemPalaceManager: Quarantining incompatible MemPalace directory to {backup_dir} and re-initializing.")
+            
+            shutil.move(self.palace_path, backup_dir)
+            os.makedirs(self.palace_path, exist_ok=True)
+            
+            # Restore core Open Amity state files that are safe
+            for safe_file in ["mirrors.json", "short_term_mem.json", "identity.txt", ".sanctuary_initialized"]:
+                src = os.path.join(backup_dir, safe_file)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(self.palace_path, safe_file))
+                    
+            self.stack = MemoryStack(palace_path=self.palace_path, identity_path=self.identity_path)
         
         # Ensure sanctuary is initialized (Layer 2 data)
         self.initialize_sanctuary()
@@ -128,8 +148,10 @@ class MemPalaceManager:
                 else:
                     lines.append(f" - {key}: {val}")
                 
-            with open(self.identity_path, 'w') as f:
+            temp_path = self.identity_path + ".tmp"
+            with open(temp_path, 'w') as f:
                 f.write("\n".join(lines))
+            os.replace(temp_path, self.identity_path)
         except Exception as e:
             logging.error(f"Error syncing identity: {e}", exc_info=True)
 
@@ -175,12 +197,85 @@ class MemPalaceManager:
                 context.append(f"Context for topic '{topic}':\n{res}")
         return "\n\n".join(context)
 
+    def _load_mirrors(self) -> dict:
+        path = os.path.join(self.palace_path, "mirrors.json")
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    mirrors = json.load(f)
+                    
+                    modified = False
+                    for perspective, data in mirrors.items():
+                        if not isinstance(data, dict):
+                            mirrors[perspective] = {"current_view": str(data), "history": [], "provenance": "unknown"}
+                            modified = True
+                            continue
+                            
+                        if "current_view" not in data:
+                            data["current_view"] = ""
+                            modified = True
+                        if "history" not in data:
+                            data["history"] = []
+                            modified = True
+                        if "provenance" not in data:
+                            data["provenance"] = "unknown"
+                            modified = True
+                            
+                    if modified:
+                        self._save_mirrors(mirrors)
+                        
+                    return mirrors
+            except Exception as e:
+                logging.error(f"Error reading mirrors: {e}")
+        return {}
+
+    def _save_mirrors(self, mirrors: dict):
+        path = os.path.join(self.palace_path, "mirrors.json")
+        try:
+            temp_path = path + ".tmp"
+            with open(temp_path, 'w') as f:
+                json.dump(mirrors, f, indent=2)
+            os.replace(temp_path, path)
+        except Exception as e:
+            logging.error(f"Error writing mirrors: {e}")
+
+    def update_mirror(self, perspective: str, subjective_view: str, provenance: str = "inferred"):
+        mirrors = self._load_mirrors()
+        now_str = datetime.datetime.now().isoformat()
+        
+        if perspective not in mirrors:
+            mirrors[perspective] = {
+                "current_view": subjective_view,
+                "history": []
+            }
+        else:
+            old_view = mirrors[perspective]["current_view"]
+            mirrors[perspective]["history"].append({
+                "view": old_view,
+                "date": now_str,
+                "provenance": mirrors[perspective].get("provenance", "unknown")
+            })
+            mirrors[perspective]["current_view"] = subjective_view
+            
+        mirrors[perspective]["provenance"] = provenance
+        mirrors[perspective]["last_updated"] = now_str
+        
+        self._save_mirrors(mirrors)
+        return True
+
     def get_self_perception(self) -> str:
         """Retrieves core self-perception entries to inject during wake up."""
-        res = self.recall(wing="sanctuary", room="mirrors", n_results=5)
-        if res and "No results" not in res and "No palace" not in res:
-            return f"\n--- Core Self Perception & Theory of Mind ---\n{res}\n"
-        return ""
+        mirrors = self._load_mirrors()
+        if not mirrors:
+            return ""
+            
+        lines = ["\n--- Core Self Perception & Theory of Mind ---"]
+        for perspective, data in mirrors.items():
+            lines.append(f"Perspective: {perspective}")
+            lines.append(f"Subjective View: {data.get('current_view', '')}")
+            lines.append(f"Provenance: {data.get('provenance', 'unknown')}\n")
+            
+        return "\n".join(lines)
         
     def initialize_short_term_memory(self):
         """Seed a proactive short-term memory if the file doesn't exist."""
@@ -192,8 +287,10 @@ class MemPalaceManager:
                 "content": "System initialized. My immediate goal is to understand who the user is, what their goals are, and how I play a role. I should populate my trajectory data with tasks and aspirations that move us towards our shared goals."
             }]
             try:
-                with open(path, 'w') as f:
+                temp_path = path + ".tmp"
+                with open(temp_path, 'w') as f:
                     json.dump(seed_memory, f, indent=2)
+                os.replace(temp_path, path)
             except Exception as e:
                 logging.error(f"Error seeding short term memories: {e}")
 
@@ -202,7 +299,24 @@ class MemPalaceManager:
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
-                    return json.load(f)
+                    memories = json.load(f)
+                    
+                    modified = False
+                    for m in memories:
+                        if "id" not in m:
+                            m["id"] = str(uuid.uuid4())[:8]
+                            modified = True
+                        if "date" not in m:
+                            m["date"] = datetime.datetime.now().isoformat()
+                            modified = True
+                        if "content" not in m:
+                            m["content"] = ""
+                            modified = True
+                            
+                    if modified:
+                        self._save_short_term_memories(memories)
+                        
+                    return memories
             except Exception as e:
                 logging.error(f"Error reading short term memories: {e}")
         return []
@@ -210,8 +324,10 @@ class MemPalaceManager:
     def _save_short_term_memories(self, memories: list):
         path = os.path.join(self.palace_path, "short_term_mem.json")
         try:
-            with open(path, 'w') as f:
+            temp_path = path + ".tmp"
+            with open(temp_path, 'w') as f:
                 json.dump(memories, f, indent=2)
+            os.replace(temp_path, path)
         except Exception as e:
             logging.error(f"Error writing short term memories: {e}")
 
@@ -284,8 +400,7 @@ class MemPalaceManager:
                 self.add_memory(content=content, wing="sanctuary", room="people", source_file="sanctuary_init.json")
                 
             for mirror in social.get("mirrors", []):
-                content = f"Perspective: {mirror['perspective']}\nSubjective View: {mirror['subjective_view']}"
-                self.add_memory(content=content, wing="sanctuary", room="mirrors", source_file="sanctuary_init.json")
+                self.update_mirror(mirror['perspective'], mirror['subjective_view'], provenance="stated")
                 
             for community in social.get("communities", []):
                 content = f"Community: {community['name']}\nEntity Type: {community['entity_type']}\nSubjective View: {community['subjective_view']}"
@@ -296,8 +411,10 @@ class MemPalaceManager:
                 self.add_memory(content=memory, wing="sanctuary", room="character_memories", source_file="sanctuary_init.json")
                 
             # Touch the flag file so it's not processed again
-            with open(initialized_flag, 'w') as f:
+            temp_path = initialized_flag + ".tmp"
+            with open(temp_path, 'w') as f:
                 f.write("Initialized")
+            os.replace(temp_path, initialized_flag)
             logging.info("Sanctuary initialized successfully.")
         except Exception as e:
             logging.error(f"Error initializing sanctuary: {e}", exc_info=True)

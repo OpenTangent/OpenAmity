@@ -603,7 +603,9 @@ class SettingsPanelWidget(QWidget):
         if hasattr(self, 'ui_moltbook_api_key'):
             self.ui_moltbook_api_key.setText(self.settings.get_env("MOLTBOOK_API_KEY", ""))
         
-        limit = self.settings.get("core.agentic-orchestration.cognitive-budget", 1000)
+
+        
+        limit = self.settings.get("core.somatic.cognitive-budget", 10000)
         self.ui_agency_limit.setValue(limit)
         self.ui_agency_limit_val.setText(str(limit))
         
@@ -662,7 +664,7 @@ class SettingsPanelWidget(QWidget):
         if hasattr(self, 'ui_moltbook_api_key') and self.ui_moltbook_api_key.text():
             self.settings.set_env("MOLTBOOK_API_KEY", self.ui_moltbook_api_key.text())
             
-        self.settings.set("core.agentic-orchestration.cognitive-budget", self.ui_agency_limit.value())
+        self.settings.set("core.somatic.cognitive-budget", self.ui_agency_limit.value())
         whitelist = [self.ui_whatsapp_whitelist.item(i).text() for i in range(self.ui_whatsapp_whitelist.count())]
         self.settings.set("core.auto-pulse.whitelist", whitelist)
         self.settings.set("core.auto-pulse.buffer-seconds", self.ui_wa_buffer.value())

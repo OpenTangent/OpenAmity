@@ -227,6 +227,25 @@ class GeminiWorker:
                     self.is_processing = False
                     return
 
+        # Intelligent Media Culling: Strip heavy multimodal tokens from older context
+        if self.thinker_chat and hasattr(self.thinker_chat, 'history'):
+            history_len = len(self.thinker_chat.history)
+            if history_len > 2:
+                from google.genai import types
+                for i in range(history_len - 2):
+                    content_msg = self.thinker_chat.history[i]
+                    if getattr(content_msg, 'parts', None):
+                        new_parts = []
+                        modified = False
+                        for part in content_msg.parts:
+                            if getattr(part, 'inline_data', None) or getattr(part, 'file_data', None):
+                                new_parts.append(types.Part.from_text(text="[Media attachment automatically culled to save tokens]"))
+                                modified = True
+                            else:
+                                new_parts.append(part)
+                        if modified:
+                            content_msg.parts = new_parts
+
         start_idx = self.thinking_models.index(self.current_thinker_model) if self.current_thinker_model in self.thinking_models else 0
 
         for idx in range(start_idx, len(self.thinking_models)):
@@ -268,23 +287,6 @@ class GeminiWorker:
                 if getattr(self, '_abort_flag', False):
                     logging.debug("_abort_flag is True after stream, returning")
                     return
-                    
-                # Truncate history to prevent unbounded context growth
-                max_history = self.settings.get("core.gemini.session-context-limit", 40)
-                if is_low_token:
-                    max_history = max_history // 2
-                    
-                if self.thinker_chat and hasattr(self.thinker_chat, 'history') and len(self.thinker_chat.history) > max_history:
-                    new_history = self.thinker_chat.history[-max_history:]
-                    if new_history and getattr(new_history[0], 'role', '') == 'model':
-                        new_history = new_history[1:]
-                    
-                    if new_history:
-                        from google.genai import types
-                        warning_msg = "Context before this point has been automatically trimmed, use your MemPalace tool to ensure that important context is never lost."
-                        warning_part = types.Part.from_text(text=warning_msg)
-                        new_history.insert(0, types.Content(role="user", parts=[warning_part]))
-                        self.thinker_chat.history = new_history
                         
                 logging.debug(f"About to emit thought_received. Callback count: {len(self.thought_received._callbacks)}")
                 self.thought_received.emit(full_text, function_calls)

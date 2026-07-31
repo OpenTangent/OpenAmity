@@ -17,7 +17,23 @@ class MemPalaceTool(Tool):
             n_results = kwargs.get("n_results", 5)
             if not query:
                 return "Error: query is required."
-            return self.manager.search(query, wing=wing, room=room, n_results=int(n_results))
+            res = self.manager.search(query, wing=wing, room=room, n_results=int(n_results))
+            
+            # Phase 4 hook: Intrinsic Curiosity
+            if "No results found" in res or res.strip() == "":
+                try:
+                    from tools.pulse_tool import PulseTool
+                    import datetime
+                    pt = PulseTool()
+                    sched_time = (datetime.datetime.now() + datetime.timedelta(minutes=10)).isoformat()
+                    pulse_title = f"Curiosity: {query}"
+                    pulse_context = f"You recently searched your memory for '{query}' and found nothing. If this topic is important, use your tools (like Web Search) to research it and synthesize the findings into your MemPalace."
+                    pt._add_pulse(title=pulse_title, context=pulse_context, scheduled_time=sched_time, recurrence="none", pulse_type="silent")
+                except Exception as e:
+                    import logging
+                    logging.error(f"Error scheduling curiosity pulse: {e}")
+                    
+            return res
             
         elif command == "recall":
             wing = kwargs.get("wing")
@@ -62,11 +78,42 @@ class MemPalaceTool(Tool):
         elif command == "update_mirror":
             perspective = kwargs.get("perspective") or (args[0] if args else "")
             subjective_view = kwargs.get("subjective_view") or (args[1] if len(args) > 1 else "")
+            provenance = kwargs.get("provenance", "inferred")
             if not perspective or not subjective_view:
                 return "Error: perspective and subjective_view are required."
-            content = f"Perspective: {perspective}\nSubjective View: {subjective_view}"
-            res = self.manager.add_memory(content, wing="sanctuary", room="mirrors", source_file="agent_reflection")
-            return f"Successfully updated mirror for perspective '{perspective}'. Memory ID: {res}"
+            
+            res = self.manager.update_mirror(perspective, subjective_view, provenance)
+            
+            # Phase 4 hook: Cognitive Dissonance
+            try:
+                from tools.trajectory_tool import TrajectoryTool
+                traj_tool = TrajectoryTool()
+                traj_data = traj_tool._load_data()
+                
+                # Leash to an Identity aspiration
+                long_term_asps = traj_data.get("aspirations", {}).get("long_term", [])
+                identity_asp = next((a for a in long_term_asps if "identity" in a.get("description", "").lower()), None)
+                
+                if not identity_asp:
+                    traj_tool._manage_aspirations("long_term", "add", description="Maintain a coherent Self-Identity and resolve cognitive dissonance.")
+                    traj_data = traj_tool._load_data()
+                    long_term_asps = traj_data.get("aspirations", {}).get("long_term", [])
+                    identity_asp = long_term_asps[-1] if long_term_asps else None
+                
+                if identity_asp:
+                    from tools.pulse_tool import PulseTool
+                    import datetime
+                    pt = PulseTool()
+                    sched_time = (datetime.datetime.now() + datetime.timedelta(minutes=5)).isoformat()
+                    pulse_title = f"Dissonance Check: {perspective}"
+                    pulse_context = f"Evaluate your updated Theory of Mind record for '{perspective}' (View: '{subjective_view}'). Compare it against your Core Identity. If there is severe cognitive dissonance, create a task under aspiration {identity_asp['id']} to resolve it."
+                    pt._add_pulse(title=pulse_title, context=pulse_context, scheduled_time=sched_time, recurrence="none", pulse_type="silent")
+                    
+            except Exception as e:
+                import logging
+                logging.error(f"Error scheduling dissonance pulse: {e}")
+            
+            return f"Successfully updated mirror for perspective '{perspective}'."
             
         return f"Unknown command: {command}"
 
@@ -160,7 +207,8 @@ class MemPalaceTool(Tool):
                     "type": "OBJECT",
                     "properties": {
                         "perspective": {"type": "STRING", "description": "The person or entity holding the view (e.g. 'Andrew', 'Self', 'User X')."},
-                        "subjective_view": {"type": "STRING", "description": "The subjective view or opinion held by that perspective about you."}
+                        "subjective_view": {"type": "STRING", "description": "The subjective view or opinion held by that perspective about you."},
+                        "provenance": {"type": "STRING", "description": "Whether this view was 'stated' directly to you or 'inferred' by you. Default is 'inferred'."}
                     },
                     "required": ["perspective", "subjective_view"]
                 }

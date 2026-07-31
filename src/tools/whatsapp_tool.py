@@ -73,10 +73,11 @@ class WhatsAppSkill(Tool):
                     "type": "OBJECT",
                     "properties": {
                         "target": {"type": "STRING", "description": "Name, phone, or ID of the contact/group."},
-                        "message": {"type": "STRING", "description": "The text message to send."},
+                        "message": {"type": "STRING", "description": "The text message to send. If a media_path is provided, this will be used as the caption."},
+                        "media_path": {"type": "STRING", "description": "Optional absolute path to a media file (image, video, document) to attach to the message. Max 16MB."},
                         "reply_to": {"type": "STRING", "description": "Optional MsgID to reply directly to a specific message."}
                     },
-                    "required": ["target", "message"]
+                    "required": ["target"]
                 }
             },
             {
@@ -278,15 +279,17 @@ class WhatsAppSkill(Tool):
 
         elif command == "send":
             target = kwargs.get('target')
-            message = kwargs.get('message')
+            message = kwargs.get('message', "")
+            media_path = kwargs.get('media_path')
             reply_to = kwargs.get('reply_to')
             
-            if not target and len(args) >= 2:
+            if not target and len(args) >= 1:
                 target = args[0]
-                message = " ".join(args[1:])
+                if len(args) >= 2:
+                    message = " ".join(args[1:])
                 
-            if not target or not message:
-                return "Usage: send <target> <message>"
+            if not target or (not message and not media_path):
+                return "Usage: send <target> <message> [media_path]"
             
             try:
                 try:
@@ -305,7 +308,32 @@ class WhatsAppSkill(Tool):
                 if reply_to:
                     payload["reply_to"] = reply_to
                     
-                res = requests.post(f"{self.base_url}/send", json=payload, timeout=15)
+                if media_path:
+                    if not os.path.exists(media_path):
+                        return f"Error: Media file not found at {media_path}"
+                    
+                    file_size = os.path.getsize(media_path)
+                    if file_size > 16 * 1024 * 1024:
+                        return f"Error: File size ({file_size / (1024*1024):.1f}MB) exceeds the 16MB limit."
+                        
+                    import mimetypes
+                    mime_type, _ = mimetypes.guess_type(media_path)
+                    if not mime_type:
+                        mime_type = "application/octet-stream"
+                        
+                    with open(media_path, 'rb') as f:
+                        filename = os.path.basename(media_path)
+                        files = {'media': (filename, f, mime_type)}
+                        data_payload = {"target": target}
+                        if message:
+                            data_payload["text"] = message
+                        if reply_to:
+                            data_payload["reply_to"] = reply_to
+                            
+                        res = requests.post(f"{self.base_url}/send", data=data_payload, files=files, timeout=60)
+                else:
+                    res = requests.post(f"{self.base_url}/send", json=payload, timeout=15)
+                    
                 data = res.json()
                 if "error" in data: return f"Error: {data['error']}"
                 return f"Message sent to {target} successfully."

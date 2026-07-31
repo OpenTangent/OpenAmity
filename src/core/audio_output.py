@@ -59,17 +59,44 @@ class TTSWorker(threading.Thread):
             return
 
         try:
+            # Inject Somatic State
+            somatic_state_text = ""
+            try:
+                from config import paths
+                import os, json
+                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                if os.path.exists(state_path):
+                    with open(state_path, "r") as f:
+                        somatic = json.load(f)
+                        current_weight = somatic.get("current_task_weight", 0)
+                        max_weight = somatic.get("max_weight", 1000)
+                        percent = (current_weight / max_weight) * 100 if max_weight else 0
+                        
+                        if percent >= 50:
+                            somatic_state_text = "The speaker is highly fatigued and cognitively overwhelmed. The voice should sound tired, slightly strained, or weary."
+                        elif percent >= 25:
+                            somatic_state_text = "The speaker is moderately fatigued, nearing cognitive capacity. The voice should sound serious and slightly subdued."
+            except Exception:
+                pass
+
             client = genai.Client()
             if isinstance(self.voice_prompt, dict):
+                directors_notes = self.voice_prompt.get('directors-notes', '')
+                if somatic_state_text:
+                    directors_notes += f" [SOMATIC STATE INJECTION: {somatic_state_text}]"
+                    
                 full_text = (
                     f"{self.voice_prompt.get('preamble', '')}\n\n"
                     f"Audio Profile: {self.voice_prompt.get('profile', '')}\n\n"
                     f"Scene Setting: {self.voice_prompt.get('scene', '')}\n\n"
-                    f"Director's Notes: {self.voice_prompt.get('directors-notes', '')}\n\n"
+                    f"Director's Notes: {directors_notes}\n\n"
                     f"Transcript:\n{self.text}"
                 )
             else:
-                full_text = f"{self.voice_prompt}\n\nTranscript:\n{self.text}"
+                full_text = self.voice_prompt
+                if somatic_state_text:
+                    full_text += f"\n\nDirector's Notes: [SOMATIC STATE INJECTION: {somatic_state_text}]"
+                full_text += f"\n\nTranscript:\n{self.text}"
 
             response_stream = client.models.generate_content_stream(
                 model=self.model,

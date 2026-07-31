@@ -161,6 +161,7 @@ class AmityOrchestrator:
         logging.debug(f"check_cycle_completion evaluated is_speaking: {is_speaking}, is_thinking: {self.is_thinking}")
         if not self.is_thinking and not is_speaking:
             logging.debug("check_cycle_completion calling set_busy_state(False)")
+            
             self.set_busy_state(False)
             if self.prompt_queue:
                 logging.debug("check_cycle_completion popping next prompt from queue")
@@ -191,15 +192,6 @@ class AmityOrchestrator:
             self.set_busy_state(False)
             return
 
-        import time
-        session_timeout_mins = self.settings_manager.get("core.gemini.session-timeout", 60)
-        time_since_last = time.time() - getattr(self, 'last_prompt_time', time.time())
-        if time_since_last > (session_timeout_mins * 60):
-            logging.info(f"System: Session timeout exceeded ({session_timeout_mins} mins). Wiping context to enforce MemPalace usage.")
-            if self.gemini_worker.running:
-                self.gemini_worker.stop_session()
-        self.last_prompt_time = time.time()
-
         if not self.gemini_worker.running:
             logging.info("System: Brain offline. Starting session...")
             tools = self.cerebrum.get_all_tool_declarations()
@@ -213,21 +205,31 @@ class AmityOrchestrator:
         self.current_user_prompt = text
         self.is_silent_pulse = False
         
-        self.current_task_weight = 0
+        try:
+            from config import paths
+            import os, json, time
+            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+            if os.path.exists(state_path):
+                with open(state_path, "r") as f:
+                    somatic = json.load(f)
+                    
+                last_weight = somatic.get("current_task_weight", 0)
+                last_update = somatic.get("last_updated", time.time())
+                
+                # Decay calculation: e.g. 50 weight points per minute of idle time
+                elapsed_mins = (time.time() - last_update) / 60.0
+                decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
+                decay = elapsed_mins * decay_rate
+                self.current_task_weight = max(0, last_weight - decay)
+            else:
+                self.current_task_weight = 0
+        except Exception:
+            self.current_task_weight = 0
+            
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
-        
-        # Reset somatic state
-        try:
-            from config import paths
-            import os
-            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
-            if os.path.exists(state_path):
-                os.remove(state_path)
-        except Exception:
-            pass
         
         threading.Thread(target=self._async_query_prep, args=(text, self.recent_history.copy(), audio_path), daemon=True).start()
 
@@ -254,15 +256,6 @@ class AmityOrchestrator:
             logging.error("System: Pulse aborted. The Gemini Worker failed to initialise (worker is None or unavailable).")
             return
 
-        import time
-        session_timeout_mins = self.settings_manager.get("core.gemini.session-timeout", 60)
-        time_since_last = time.time() - getattr(self, 'last_prompt_time', time.time())
-        if time_since_last > (session_timeout_mins * 60):
-            logging.info(f"System: Session timeout exceeded ({session_timeout_mins} mins). Wiping context to enforce MemPalace usage.")
-            if self.gemini_worker.running:
-                self.gemini_worker.stop_session()
-        self.last_prompt_time = time.time()
-
         if not self.gemini_worker.running:
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
@@ -273,21 +266,31 @@ class AmityOrchestrator:
         self.set_busy_state(True)
         self.current_user_prompt = text
         
-        self.current_task_weight = 0
+        try:
+            from config import paths
+            import os, json, time
+            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+            if os.path.exists(state_path):
+                with open(state_path, "r") as f:
+                    somatic = json.load(f)
+                    
+                last_weight = somatic.get("current_task_weight", 0)
+                last_update = somatic.get("last_updated", time.time())
+                
+                # Decay calculation
+                elapsed_mins = (time.time() - last_update) / 60.0
+                decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
+                decay = elapsed_mins * decay_rate
+                self.current_task_weight = max(0, last_weight - decay)
+            else:
+                self.current_task_weight = 0
+        except Exception:
+            self.current_task_weight = 0
+            
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
-        
-        # Reset somatic state
-        try:
-            from config import paths
-            import os
-            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
-            if os.path.exists(state_path):
-                os.remove(state_path)
-        except Exception:
-            pass
         
         self.gemini_worker.send_prompt(text)
 
@@ -399,10 +402,10 @@ class AmityOrchestrator:
 
         if hasattr(self, 'pulse_engine') and hasattr(self.pulse_engine, 'settings_manager'):
             sm = self.pulse_engine.settings_manager
-            max_weight = sm.get("core.agentic-orchestration.cognitive-budget", 1000)
+            max_weight = sm.get("core.somatic.cognitive-budget", 10000)
             low_token = sm.get("core.low-token-mode", False)
-            base_weight = sm.get("core.agentic-orchestration.tool-cost", 2)
-            exp_factor = sm.get("core.agentic-orchestration.exponential-factor", 1.5)
+            base_weight = sm.get("core.somatic.tool-cost", 2)
+            exp_factor = sm.get("core.somatic.exponential-factor", 1.5)
         else:
             max_weight = 1000
             low_token = False
@@ -419,10 +422,14 @@ class AmityOrchestrator:
         # Write somatic state for tools
         try:
             from config import paths
-            import os
+            import os, time
             state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
             with open(state_path, "w") as f:
-                json.dump({"current_task_weight": self.current_task_weight, "max_weight": max_weight}, f)
+                json.dump({
+                    "current_task_weight": self.current_task_weight, 
+                    "max_weight": max_weight,
+                    "last_updated": time.time()
+                }, f)
         except Exception:
             pass
         

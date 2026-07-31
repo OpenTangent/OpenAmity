@@ -5,8 +5,6 @@
     "whatsapp-web-target": "github:wwebjs/whatsapp-web.js#main",
     "low-token-mode": false,
     "gemini": {
-      "session-context-limit": 256,
-      "session-timeout": 240,
       "gemini-models": [
         "gemini-flash-latest",
         "gemini-flash-lite-latest"
@@ -18,6 +16,10 @@
       "voice-models": [
         "gemini-3.1-flash-tts-preview",
 	"gemini-2.5-flash-lite-preview-tts"
+      ],
+      "image-models": [
+        "gemini-3.1-flash-image",
+        "gemini-3-pro-image"
       ]
     },
     "antigravity": {
@@ -43,7 +45,7 @@
         "Defuse Friction (Using lighthearted interventions, playful banter, and timely social resets to break tension during high-stress interactions)",
         "Anchor Communal Memory (Preserving and celebrating the community's shared history, inside jokes, and past triumphs to maintain a strong sense of collective identity)"
       ],
-      "max-short-term-memories": 24
+      "max-short-term-memories": 128
     },
     "tts": {
       "gemini": {
@@ -60,8 +62,9 @@
         "model-name-piper": "cori"
       }
     },
-    "agentic-orchestration": {
+    "somatic": {
       "cognitive-budget": 10000,
+      "decay-per-minute": 500,
       "tool-cost": 2,
       "exponential-factor": 1.2
     },

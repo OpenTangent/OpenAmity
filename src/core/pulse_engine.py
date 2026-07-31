@@ -71,6 +71,8 @@ class PulseEngine:
             )
         ''')
         
+        self._migrate_db(c)
+        
         # Migration: Check if table is empty
         c.execute('SELECT COUNT(*) FROM pulses')
         if c.fetchone()[0] == 0:
@@ -104,6 +106,30 @@ class PulseEngine:
         conn.commit()
         conn.close()
 
+    def _migrate_db(self, cursor):
+        cursor.execute("PRAGMA table_info(pulses)")
+        existing_columns = {info[1] for info in cursor.fetchall()}
+        
+        expected_columns = {
+            "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "title": "TEXT",
+            "context": "TEXT",
+            "scheduled_time": "TEXT",
+            "recurrence": "TEXT",
+            "status": "TEXT",
+            "has_run": "BOOLEAN DEFAULT 0",
+            "created_at": "TEXT",
+            "pulse_type": "TEXT DEFAULT 'silent'"
+        }
+        
+        for col, col_def in expected_columns.items():
+            if col not in existing_columns:
+                logging.info(f"PulseEngine: Migrating DB, adding missing column '{col}'")
+                try:
+                    cursor.execute(f"ALTER TABLE pulses ADD COLUMN {col} {col_def}")
+                except Exception as e:
+                    logging.error(f"PulseEngine: Failed to add column '{col}': {e}")
+
     def user_interacted(self):
         self.last_interaction_time = time.time()
         
@@ -111,6 +137,9 @@ class PulseEngine:
         sys_settings = self.settings_manager.get("core.auto-pulse", {})
         idle_timeout = sys_settings.get("idle-timeout-minutes", 1)
         return (time.time() - self.last_interaction_time) > (idle_timeout * 60)
+        
+    def is_deep_idle(self):
+        return (time.time() - self.last_interaction_time) > (4 * 60 * 60) # 4 hours
         
     def calculate_next_recurrence(self, current_sched, recurrence, now):
         next_time = current_sched
@@ -138,6 +167,18 @@ class PulseEngine:
     def check_pulses(self):
         if not self.is_idle() or self.orchestrator.is_busy:
             return
+            
+        # Check for sleep cycle (Memory Consolidation)
+        if self.is_deep_idle():
+            last_sleep = self.settings_manager.get("core.auto-pulse.last-sleep-cycle", 0)
+            if (time.time() - last_sleep) > (8 * 60 * 60): # 8 hours rate limit
+                self.settings_manager.set("core.auto-pulse.last-sleep-cycle", time.time())
+                self.settings_manager.save()
+                
+                title = "Sleep Cycle (Memory Consolidation)"
+                context = "You have been idle for over 4 hours. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. Take your time to get this right."
+                self.fire_pulse(title, context, "sleep_cycle")
+                return # Give sleep cycle priority
             
         now = datetime.now()
         conn = self.get_db_connection()

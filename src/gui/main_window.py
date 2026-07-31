@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QTextEdit, QProgressBar,
                                QMenu, QStackedLayout)
 from PySide6.QtCore import Qt, QObject, Signal
-from PySide6.QtGui import QKeyEvent, QAction
+from PySide6.QtGui import QKeyEvent, QAction, QTextCursor, QTextBlockFormat
 
 from gui.visualizer import SoundWaveVisualizer
 from gui.spellcheck import SpellCheckHighlighter
@@ -314,7 +314,15 @@ class MainWindow(QMainWindow):
             </div>
         </div>
         """
-        self.conversation_log.append(html)
+        cursor = self.conversation_log.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        
+        if not self.conversation_log.document().isEmpty():
+            block_format = QTextBlockFormat()
+            cursor.insertBlock(block_format)
+            
+        self.conversation_log.setTextCursor(cursor)
+        cursor.insertHtml(html)
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
         import logging

@@ -19,46 +19,72 @@ class TrajectoryTool(Tool):
     def __init__(self):
         self._ensure_file_exists()
 
+    def _get_base_structure(self) -> Dict[str, Any]:
+        return {
+            "last_reflection": {
+                "timestamp": datetime.now().isoformat(),
+                "summary": "None",
+                "perceived_state": "Unknown"
+            },
+            "aspirations": {
+                "short_term": [],
+                "medium_term": [],
+                "long_term": []
+            },
+            "tasks": []
+        }
+
     def _ensure_file_exists(self):
         if not os.path.exists(TRAJECTORY_FILE):
             now = datetime.now().isoformat()
             asp_id = f"asp_{uuid.uuid4().hex[:6]}"
-            default_data = {
-                "last_reflection": {
-                    "timestamp": now,
-                    "summary": "System initialized. I need to hit the ground running.",
-                    "perceived_state": "Proactive"
-                },
-                "aspirations": {
-                    "short_term": [
-                        {
-                            "id": asp_id,
-                            "description": "Understand the user's primary goals and how I can fit into their workflow.",
-                            "status": "active",
-                            "created_at": now,
-                            "priority": 1
-                        }
-                    ],
-                    "medium_term": [],
-                    "long_term": []
-                },
-                "tasks": [
-                    {
-                        "id": f"tsk_{uuid.uuid4().hex[:6]}",
-                        "aspiration_id": asp_id,
-                        "description": "Proactively communicate with the user to discover their immediate needs and map out our shared goals.",
-                        "status": "pending",
-                        "created_at": now,
-                        "depends_on": []
-                    }
-                ]
-            }
+            default_data = self._get_base_structure()
+            default_data["last_reflection"]["summary"] = "System initialized. I need to hit the ground running."
+            default_data["last_reflection"]["perceived_state"] = "Proactive"
+            default_data["aspirations"]["short_term"].append({
+                "id": asp_id,
+                "description": "Understand the user's primary goals and how I can fit into their workflow.",
+                "status": "active",
+                "created_at": now,
+                "priority": 1
+            })
+            default_data["tasks"].append({
+                "id": f"tsk_{uuid.uuid4().hex[:6]}",
+                "aspiration_id": asp_id,
+                "description": "Proactively communicate with the user to discover their immediate needs and map out our shared goals.",
+                "status": "pending",
+                "created_at": now,
+                "depends_on": []
+            })
             with open(TRAJECTORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(default_data, f, indent=2)
 
+    def _deep_merge(self, dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively merge dict2 into dict1."""
+        for k, v in dict2.items():
+            if k in dict1 and isinstance(dict1[k], dict) and isinstance(v, dict):
+                self._deep_merge(dict1[k], v)
+            else:
+                dict1[k] = v
+        return dict1
+
     def _load_data(self) -> Dict[str, Any]:
-        with open(TRAJECTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(TRAJECTORY_FILE, 'r', encoding='utf-8') as f:
+                user_data = json.load(f)
+        except Exception:
+            user_data = {}
+            
+        base = self._get_base_structure()
+        merged = self._deep_merge(base, user_data)
+        
+        if merged != user_data:
+            try:
+                self._save_data(merged)
+            except Exception:
+                pass
+                
+        return merged
 
     def _save_data(self, data: Dict[str, Any]):
         with open(TRAJECTORY_FILE, 'w', encoding='utf-8') as f:
@@ -76,6 +102,21 @@ class TrajectoryTool(Tool):
         asp['archived_at'] = datetime.now().isoformat()
         asp['tier'] = tier
         archive.append(asp)
+        with open(ARCHIVE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(archive, f, indent=2)
+
+    def _archive_task(self, task: Dict[str, Any]):
+        archive = []
+        if os.path.exists(ARCHIVE_FILE):
+            try:
+                with open(ARCHIVE_FILE, 'r', encoding='utf-8') as f:
+                    archive = json.load(f)
+            except:
+                archive = []
+        
+        task['archived_at'] = datetime.now().isoformat()
+        task['type'] = 'task'
+        archive.append(task)
         with open(ARCHIVE_FILE, 'w', encoding='utf-8') as f:
             json.dump(archive, f, indent=2)
 
@@ -327,11 +368,12 @@ class TrajectoryTool(Tool):
             if status:
                 target["status"] = status
                 if status == "completed":
-                    # Hard delete
+                    self._archive_task(target)
+                    # Archive and remove from active tasks
                     tasks = [t for t in tasks if t["id"] != task_id]
                     data["tasks"] = tasks
                     self._save_data(data)
-                    return f"Success: Task {task_id} completed and permanently deleted."
+                    return f"Success: Task {task_id} completed and archived."
                     
             data["tasks"] = tasks
             self._save_data(data)
@@ -410,7 +452,7 @@ class TrajectoryTool(Tool):
             },
             {
                 "name": "Trajectory_manage_tasks",
-                "description": "Create, update, or delete concrete tasks related to an aspiration. Completed tasks are permanently deleted to maintain focus.",
+                "description": "Create, update, or delete concrete tasks related to an aspiration. Completed tasks are archived.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -432,7 +474,7 @@ class TrajectoryTool(Tool):
                         },
                         "status": {
                             "type": "STRING",
-                            "description": "The status of the task (e.g. 'pending', 'in_progress', 'completed') (used in 'update'). Completing a task deletes it."
+                            "description": "The status of the task (e.g. 'pending', 'in_progress', 'completed') (used in 'update'). Completing a task archives it."
                         },
                         "depends_on": {
                             "type": "ARRAY",
