@@ -6,19 +6,20 @@ This document defines the architectural structure and conceptual model of the Op
 Open Amity strictly decouples headless backend domain logic from the graphical frontend, communicating asynchronously via an event-driven signal architecture.
 - **AmityOrchestrator (`src/core/orchestrator.py`)**: The central backend hub. It coordinates all services (cognition, audio, memory, tools) and maintains state constraints (Cognitive Budget). It runs entirely independent of any UI framework.
 - **MainWindow (`src/gui/main_window.py`)**: The PySide6 frontend. It handles the rendering of multi-stream logs, user input, busy/loading states, and real-time audio amplitude visualization.
-- **State Isolation**: The goal is for all stateful data (memory databases, settings, trajectories, logs) to be strictly isolated in standard XDG directories (e.g., `~/.local/share/OpenAmity/`), ensuring the application source directory remains read-only (which is critical for Flatpak packaging). Note: During development, some tools like `whatsapp_node` may leak state (e.g., `.wwebjs_auth`) into the source tree if not carefully managed.
+- **State Isolation**: The goal is for all stateful data (memory databases, settings, trajectories, logs) to be strictly isolated in standard XDG directories (e.g., `~/.var/app/com.openamity.OpenAmity/`), ensuring the application source directory remains read-only (which is critical for Flatpak packaging).
 - **Versioning**: The Open Amity framework version is centrally defined in `src/core/version.py`. This version is logged on startup and automatically injected into the agent's Layer 0 Memory (Identity), ensuring the agent is inherently aware of its operating framework version without requiring explicit tool calls.
 
 ## 2. Cognitive Engine & Execution
 The agent's cognition relies on a unified single-model architecture managed by `GeminiWorker` (`src/core/gemini_worker.py`).
 - **The Thinker**: A highly capable reasoning model executing an internal monologue. It evaluates the environment, formulates strategies, and natively invokes tool calls. All communication with the user is handled explicitly via tool calls (e.g., the Speaker tool), enabling a fully autonomous feedback loop.
+- **AgyWorker (`src/core/agy_worker.py`)**: Handles alternative agent execution flows when operating in Antigravity mode.
 - **Cognitive Budget**: The Orchestrator enforces execution limits to prevent infinite autonomous loops. Each sequential tool action exponentially increases a "Task Weight." If the maximum absolute weight (defined in `settings.json`) is exceeded, the Orchestrator forces loop termination.
 - **Low Token Mode**: Governed by `settings.json`, this mode halves the cognitive budget, disables heavy media attachments, and aggressively prunes history to sustain cost-effective operations.
 
 ## 3. Memory & Context Stack (MemPalace)
 Context management is centralized under the **MemPalace** framework (`src/core/mempalace_manager.py`), a 4-Layer unified memory stack.
 - **Layer 0 (Identity)**: The immutable foundation. `soul_jar.json` is compiled into a static `identity.txt` plain text prompt, injected at the start of every cognitive cycle to define the agent's core traits, archetype, and values.
-- **Layer 1 (Continuity)**: The short-term memory (`short_term_context.txt`), providing immediate contextual bridging between recent tasks and thoughts.
+- **Layer 1 (Continuity)**: The short-term memory (`short_term_mem.json`), providing immediate contextual bridging between recent tasks and thoughts.
 - **Layer 2 (The Sanctuary)**: Explicitly segmented wings and rooms (e.g., `sanctuary/people`, `sanctuary/mirrors`) storing dynamic identity elements, social records, Theory of Mind, and character-defining subjective experiences. Theory of Mind records (Mirrors) actively filter the static Layer 0 to provide a dynamically evolving, subjective self-perception. Retrieved on-demand to prevent prompt bloat.
 - **Layer 3 (Deep Search)**: A ChromaDB vector database (`chroma.sqlite3`) enabling semantic search across all facts, events, and generalized knowledge.
 

@@ -71,6 +71,8 @@ class PulseEngine:
             )
         ''')
         
+        c.execute('CREATE INDEX IF NOT EXISTS idx_status_time ON pulses (status, scheduled_time)')
+        
         self._migrate_db(c)
         
         # Migration: Check if table is empty
@@ -165,18 +167,28 @@ class PulseEngine:
         return next_time
 
     def check_pulses(self):
-        if not self.is_idle() or self.orchestrator.is_busy:
-            return
+        # Allow pulses to enter the event queue normally regardless of idle/busy state
             
         # Check for sleep cycle (Memory Consolidation)
-        if self.is_deep_idle():
+        session_tokens = getattr(self.orchestrator, 'session_fatigue_tokens', 0)
+        max_tokens = 500000.0
+        fatigue = min(session_tokens / max_tokens, 1.0)
+        gap_minutes = 240.0 * (1.0 - fatigue)
+        
+        is_fatigue_idle = (time.time() - self.last_interaction_time) > (gap_minutes * 60)
+        
+        if is_fatigue_idle:
             last_sleep = self.settings_manager.get("core.auto-pulse.last-sleep-cycle", 0)
-            if (time.time() - last_sleep) > (8 * 60 * 60): # 8 hours rate limit
+            if (time.time() - last_sleep) > (8 * 60 * 60) or fatigue >= 0.95: # 8 hours rate limit, OR critical fatigue
                 self.settings_manager.set("core.auto-pulse.last-sleep-cycle", time.time())
                 self.settings_manager.save()
                 
+                # Reset fatigue since we are consolidating
+                if hasattr(self.orchestrator, 'session_fatigue_tokens'):
+                    self.orchestrator.session_fatigue_tokens = 0
+                
                 title = "Sleep Cycle (Memory Consolidation)"
-                context = "You have been idle for over 4 hours. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. Take your time to get this right."
+                context = f"You have been idle long enough given your current context fatigue ({int(fatigue*100)}%). It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. Take your time to get this right."
                 self.fire_pulse(title, context, "sleep_cycle")
                 return # Give sleep cycle priority
             
@@ -257,14 +269,8 @@ class PulseEngine:
             logging.info("PulseEngine: WhatsApp pulse suppressed due to rate limiting.")
             return
             
-        if not self.is_idle() or self.orchestrator.is_busy:
-            logging.info("PulseEngine: WhatsApp pulse suppressed due to active system state.")
-            return
-
         buffer_seconds = sys_settings.get("buffer-seconds", 30)
         self.pending_whatsapp_sender = sender_name or f"+{clean_sender}"
-        self.pending_whatsapp_sender_id = sender_id
-        self.pending_whatsapp_is_group = sender_id.endswith("@g.us")
         
         if self.whatsapp_timer:
             self.whatsapp_timer.cancel()
@@ -274,12 +280,7 @@ class PulseEngine:
         logging.debug(f"PulseEngine: WhatsApp message from {self.pending_whatsapp_sender} buffered for {buffer_seconds}s.")
 
     def execute_whatsapp_pulse(self, sys_settings):
-        if not self.is_idle() or self.orchestrator.is_busy:
-            logging.info("PulseEngine: WhatsApp pulse aborted, system no longer idle.")
-            return
-            
         self.last_pulse_time = time.time()
         
-        channel = "WHATSAPP_GROUP" if getattr(self, 'pending_whatsapp_is_group', False) else "WHATSAPP_DM"
-        prompt = f"[CHANNEL: {channel}]\n[SOURCE_ID: {getattr(self, 'pending_whatsapp_sender_id', '')}]\n[AGENT_PULSE] {self.pending_whatsapp_sender} has messaged you. Read their message and respond appropriately."
+        prompt = "[AGENT_PULSE] Check your unread WhatsApp messages now."
         self.trigger_pulse.emit(prompt)

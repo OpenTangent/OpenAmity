@@ -17,6 +17,7 @@ class GeminiWorker:
         logging.debug(f"GeminiWorker.__init__ called. Existing thought_received: {hasattr(self, 'thought_received')}")
         self.thought_received = Signal() # text, list of function calls
         self.error_occurred = Signal()
+        self.tokens_consumed = Signal() # int
         
         self.settings = SettingsManager()
         self.api_key = self.settings.get_env("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -173,9 +174,8 @@ class GeminiWorker:
                             response['result'] = f"{response.get('result', '')}\nAttached multimedia file: {file_path}"
                             try:
                                 mime_type, _ = mimetypes.guess_type(file_path)
-                                with open(file_path, 'rb') as f:
-                                    data = f.read()
-                                multimodal_parts.append(types.Part.from_bytes(data=data, mime_type=mime_type or 'application/octet-stream'))
+                                uploaded_file = self.client.files.upload(file=file_path, mime_type=mime_type)
+                                multimodal_parts.append(uploaded_file)
                             except Exception as e:
                                 logging.error(f"Failed to attach multimodal file {file_path}: {e}")
                     
@@ -204,8 +204,10 @@ class GeminiWorker:
                 content.append("[Image attachment skipped: Low Token Mode is active]")
             else:
                 try:
-                    img = Image.open(image_path)
-                    content.append(img)
+                    import mimetypes
+                    mime_type, _ = mimetypes.guess_type(image_path)
+                    uploaded_img = self.client.files.upload(file=image_path, mime_type=mime_type or 'image/jpeg')
+                    content.append(uploaded_img)
                 except Exception as e:
                     self.error_occurred.emit(f"Image load error: {e}")
                     self.is_processing = False
@@ -217,11 +219,9 @@ class GeminiWorker:
             else:
                 try:
                     import mimetypes
-                    from google.genai import types
                     mime_type, _ = mimetypes.guess_type(audio_path)
-                    with open(audio_path, 'rb') as f:
-                        audio_data = f.read()
-                    content.append(types.Part.from_bytes(data=audio_data, mime_type=mime_type or 'audio/wav'))
+                    uploaded_audio = self.client.files.upload(file=audio_path, mime_type=mime_type or 'audio/wav')
+                    content.append(uploaded_audio)
                 except Exception as e:
                     self.error_occurred.emit(f"Audio load error: {e}")
                     self.is_processing = False
@@ -239,7 +239,14 @@ class GeminiWorker:
                         modified = False
                         for part in content_msg.parts:
                             if getattr(part, 'inline_data', None) or getattr(part, 'file_data', None):
-                                new_parts.append(types.Part.from_text(text="[Media attachment automatically culled to save tokens]"))
+                                if getattr(part, 'file_data', None) and getattr(part.file_data, 'file_uri', None):
+                                    try:
+                                        file_name = part.file_data.file_uri.split('/')[-1]
+                                        self.client.files.delete(name=f"files/{file_name}")
+                                        logging.debug(f"Automatically deleted pruned file from API: files/{file_name}")
+                                    except Exception as e:
+                                        logging.debug(f"Could not delete pruned file {part.file_data.file_uri}: {e}")
+                                new_parts.append(types.Part.from_text(text="[Media attachment automatically culled to save tokens/memory]"))
                                 modified = True
                             else:
                                 new_parts.append(part)
@@ -288,6 +295,18 @@ class GeminiWorker:
                     logging.debug("_abort_flag is True after stream, returning")
                     return
                         
+                # Token tracking
+                tokens = 0
+                if 'chunk' in locals() and hasattr(chunk, 'usage_metadata') and chunk.usage_metadata and hasattr(chunk.usage_metadata, 'total_token_count') and chunk.usage_metadata.total_token_count:
+                    tokens = chunk.usage_metadata.total_token_count
+                else:
+                    # Fallback estimate
+                    est_content_chars = sum(len(str(p)) for p in content)
+                    tokens = int((est_content_chars + len(full_text)) / 4)
+                
+                if tokens > 0 and hasattr(self, 'tokens_consumed'):
+                    self.tokens_consumed.emit(tokens)
+
                 logging.debug(f"About to emit thought_received. Callback count: {len(self.thought_received._callbacks)}")
                 self.thought_received.emit(full_text, function_calls)
                 self.is_processing = False

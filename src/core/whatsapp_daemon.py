@@ -23,6 +23,7 @@ class WhatsAppDaemon:
         self.lock_file = os.path.join(self.bridge_dir, "daemon.pid")
         self.node_process = None
         self.message_callback = None
+        self._stopping = False
 
     def start(self, force_update: bool = False):
         os.makedirs(self.bridge_dir, exist_ok=True)
@@ -105,6 +106,17 @@ class WhatsAppDaemon:
         threading.Thread(target=read_output, args=(self.node_process.stdout, "WhatsApp-JS"), daemon=True).start()
         threading.Thread(target=read_output, args=(self.node_process.stderr, "WhatsApp-JS-ERR"), daemon=True).start()
 
+        self._stopping = False
+        def monitor_process(proc):
+            proc.wait()
+            if not self._stopping and self.node_process == proc:
+                logging.error(f"WhatsApp Node process crashed with return code {proc.returncode}. Restarting in 5s...")
+                time.sleep(5)
+                if not self._stopping:
+                    self.restart()
+                    
+        threading.Thread(target=monitor_process, args=(self.node_process,), daemon=True).start()
+
         # Wait for server to be ready
         for _ in range(30):
             try:
@@ -125,6 +137,13 @@ class WhatsAppDaemon:
                     process = psutil.Process(pid)
                     if "node" in process.name().lower():
                         logging.info(f"Killing orphaned WhatsApp daemon (PID: {pid})...")
+                        
+                        children = []
+                        try:
+                            children = process.children(recursive=True)
+                        except psutil.NoSuchProcess:
+                            pass
+                            
                         # Try graceful shutdown
                         try:
                             requests.post(f"{self.base_url}/shutdown", timeout=2)
@@ -133,10 +152,24 @@ class WhatsAppDaemon:
                             pass
                         
                         if process.is_running():
-                            process.terminate()
-                            process.wait(timeout=3)
+                            try:
+                                process.terminate()
+                                process.wait(timeout=3)
+                            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                                pass
+                                
                         if process.is_running():
-                            process.kill()
+                            try:
+                                process.kill()
+                            except psutil.NoSuchProcess:
+                                pass
+                                
+                        for child in children:
+                            try:
+                                if child.is_running():
+                                    child.kill()
+                            except psutil.NoSuchProcess:
+                                pass
             except Exception as e:
                 logging.warning(f"Failed to kill orphaned daemon via PID: {e}")
             finally:
@@ -162,6 +195,7 @@ class WhatsAppDaemon:
         self.start(force_update=True)
 
     def stop(self):
+        self._stopping = True
         if self.node_process:
             logging.info("Sending shutdown signal to WhatsApp node daemon...")
             try:
@@ -172,9 +206,30 @@ class WhatsAppDaemon:
                 logging.debug(f"Error shutting down WhatsApp daemon gracefully: {e}")
             
             try:
-                self.node_process.terminate()
+                if self.node_process.poll() is None:
+                    children = []
+                    try:
+                        parent = psutil.Process(self.node_process.pid)
+                        children = parent.children(recursive=True)
+                    except Exception:
+                        pass
+                        
+                    self.node_process.terminate()
+                    
+                    try:
+                        self.node_process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self.node_process.kill()
+                        
+                    for child in children:
+                        try:
+                            if child.is_running():
+                                child.kill()
+                        except Exception:
+                            pass
             except Exception:
                 pass
+            
             self.node_process = None
             
             if os.path.exists(self.lock_file):

@@ -20,6 +20,8 @@ class MemPalaceManager:
         
         self.palace_path = palace_path
         self.soul_jar_path = soul_jar_path
+        self._mirrors_cache = None
+        self._short_term_cache = None
         
         # Ensure directory exists
         os.makedirs(self.palace_path, exist_ok=True)
@@ -181,23 +183,46 @@ class MemPalaceManager:
         if not entities:
             return ""
         context = []
-        for entity in entities:
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def fetch(entity):
             res = self.search(entity, wing="sanctuary", room="people", n_results=3)
             if res and "No results" not in res and "No palace" not in res:
-                context.append(f"Context for {entity}:\n{res}")
+                return f"Context for {entity}:\n{res}"
+            return None
+            
+        with ThreadPoolExecutor(max_workers=min(5, len(entities))) as executor:
+            results = executor.map(fetch, entities)
+            
+        for res in results:
+            if res:
+                context.append(res)
         return "\n\n".join(context)
         
     def get_topic_context(self, topics: list) -> str:
         if not topics:
             return ""
         context = []
-        for topic in topics:
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def fetch(topic):
             res = self.search(topic, n_results=2)
             if res and "No results" not in res and "No palace" not in res:
-                context.append(f"Context for topic '{topic}':\n{res}")
+                return f"Context for topic '{topic}':\n{res}"
+            return None
+            
+        with ThreadPoolExecutor(max_workers=min(5, len(topics))) as executor:
+            results = executor.map(fetch, topics)
+            
+        for res in results:
+            if res:
+                context.append(res)
         return "\n\n".join(context)
 
     def _load_mirrors(self) -> dict:
+        if getattr(self, '_mirrors_cache', None) is not None:
+            return self._mirrors_cache
+            
         path = os.path.join(self.palace_path, "mirrors.json")
         if os.path.exists(path):
             try:
@@ -223,6 +248,8 @@ class MemPalaceManager:
                             
                     if modified:
                         self._save_mirrors(mirrors)
+                    else:
+                        self._mirrors_cache = mirrors
                         
                     return mirrors
             except Exception as e:
@@ -230,6 +257,7 @@ class MemPalaceManager:
         return {}
 
     def _save_mirrors(self, mirrors: dict):
+        self._mirrors_cache = mirrors
         path = os.path.join(self.palace_path, "mirrors.json")
         try:
             temp_path = path + ".tmp"
@@ -295,6 +323,9 @@ class MemPalaceManager:
                 logging.error(f"Error seeding short term memories: {e}")
 
     def _load_short_term_memories(self) -> list:
+        if getattr(self, '_short_term_cache', None) is not None:
+            return self._short_term_cache
+            
         path = os.path.join(self.palace_path, "short_term_mem.json")
         if os.path.exists(path):
             try:
@@ -315,6 +346,8 @@ class MemPalaceManager:
                             
                     if modified:
                         self._save_short_term_memories(memories)
+                    else:
+                        self._short_term_cache = memories
                         
                     return memories
             except Exception as e:
@@ -322,6 +355,7 @@ class MemPalaceManager:
         return []
 
     def _save_short_term_memories(self, memories: list):
+        self._short_term_cache = memories
         path = os.path.join(self.palace_path, "short_term_mem.json")
         try:
             temp_path = path + ".tmp"

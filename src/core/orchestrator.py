@@ -30,7 +30,7 @@ class AmityOrchestrator:
 
         self.settings_manager = SettingsManager()
         self.mempalace_manager = MemPalaceManager()
-        self.cerebrum = Cerebrum(settings_manager=self.settings_manager)
+        self.cerebrum = Cerebrum(orchestrator=self, settings_manager=self.settings_manager)
         
         # State
         self.is_busy = False
@@ -40,14 +40,18 @@ class AmityOrchestrator:
         self.recent_history = []
         self.is_silent_pulse = False
         
+        self.on_shutdown_complete = Signal()
+        self.session_fatigue_tokens = 0
+        
         # Budget
+        self.budget_lock = threading.Lock()
         self.current_task_weight = 0
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
         self.speech_queue = []
-        self.prompt_queue = []
+        self.event_queue = []
         
         self.build_system_prompt()
         
@@ -60,6 +64,7 @@ class AmityOrchestrator:
             
         self.gemini_worker = None
         self.audio_service = None
+            
         is_first_run = self.settings_manager.get("core.first-run", True)
         if not is_first_run:
             self.init_worker()
@@ -84,6 +89,8 @@ class AmityOrchestrator:
             self.gemini_worker = GeminiWorker()
             
         self.gemini_worker.thought_received.connect(self.handle_gemini_thought)
+        if hasattr(self.gemini_worker, 'tokens_consumed'):
+            self.gemini_worker.tokens_consumed.connect(self.add_fatigue)
         if hasattr(self.gemini_worker, 'speech_received'):
             self.gemini_worker.speech_received.connect(self.handle_gemini_speech)
         self.gemini_worker.error_occurred.connect(self.handle_gemini_error)
@@ -120,6 +127,9 @@ class AmityOrchestrator:
         self.is_busy = busy
         self.on_busy_state_changed.emit(busy, speaking)
 
+    def add_fatigue(self, tokens: int):
+        self.session_fatigue_tokens += tokens
+
     def user_interacted(self):
         self.pulse_engine.user_interacted()
 
@@ -139,7 +149,7 @@ class AmityOrchestrator:
             self.tts_worker.stop()
             
         self.speech_queue.clear()
-        self.prompt_queue.clear()
+        self.event_queue.clear()
         self.is_thinking = False
         logging.info("System: Processing aborted by user.")
         self.set_busy_state(False)
@@ -147,7 +157,7 @@ class AmityOrchestrator:
     def process_text_input(self, text):
         if not text: return
         if self.is_busy:
-            self.prompt_queue.append(text)
+            self.event_queue.append({"type": "input", "text": text})
         else:
             self.process_input(text)
 
@@ -163,10 +173,13 @@ class AmityOrchestrator:
             logging.debug("check_cycle_completion calling set_busy_state(False)")
             
             self.set_busy_state(False)
-            if self.prompt_queue:
-                logging.debug("check_cycle_completion popping next prompt from queue")
-                next_prompt = self.prompt_queue.pop(0)
-                self.process_input(next_prompt)
+            if self.event_queue:
+                logging.debug("check_cycle_completion popping next event from queue")
+                next_event = self.event_queue.pop(0)
+                if next_event["type"] == "input":
+                    self.process_input(next_event["text"])
+                elif next_event["type"] == "pulse":
+                    self.process_pulse(next_event["text"])
         else:
             logging.debug("check_cycle_completion calling set_busy_state(True)")
             self.set_busy_state(True, speaking=is_speaking)
@@ -205,26 +218,27 @@ class AmityOrchestrator:
         self.current_user_prompt = text
         self.is_silent_pulse = False
         
-        try:
-            from config import paths
-            import os, json, time
-            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
-            if os.path.exists(state_path):
-                with open(state_path, "r") as f:
-                    somatic = json.load(f)
+        with self.budget_lock:
+            try:
+                from config import paths
+                import os, json, time
+                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                if os.path.exists(state_path):
+                    with open(state_path, "r") as f:
+                        somatic = json.load(f)
+                        
+                    last_weight = somatic.get("current_task_weight", 0)
+                    last_update = somatic.get("last_updated", time.time())
                     
-                last_weight = somatic.get("current_task_weight", 0)
-                last_update = somatic.get("last_updated", time.time())
-                
-                # Decay calculation: e.g. 50 weight points per minute of idle time
-                elapsed_mins = (time.time() - last_update) / 60.0
-                decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
-                decay = elapsed_mins * decay_rate
-                self.current_task_weight = max(0, last_weight - decay)
-            else:
+                    # Decay calculation: e.g. 50 weight points per minute of idle time
+                    elapsed_mins = (time.time() - last_update) / 60.0
+                    decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
+                    decay = elapsed_mins * decay_rate
+                    self.current_task_weight = max(0, last_weight - decay)
+                else:
+                    self.current_task_weight = 0
+            except Exception:
                 self.current_task_weight = 0
-        except Exception:
-            self.current_task_weight = 0
             
         self.current_loop_count = 0
         self.last_executed_command = None
@@ -252,6 +266,10 @@ class AmityOrchestrator:
         logging.debug("gemini_worker.send_prompt returned.")
 
     def process_pulse(self, text="Autonomy Pulse"):
+        if self.is_busy:
+            self.event_queue.append({"type": "pulse", "text": text})
+            return
+            
         if not self.gemini_worker or not getattr(self.gemini_worker, 'available', False):
             logging.error("System: Pulse aborted. The Gemini Worker failed to initialise (worker is None or unavailable).")
             return
@@ -266,26 +284,27 @@ class AmityOrchestrator:
         self.set_busy_state(True)
         self.current_user_prompt = text
         
-        try:
-            from config import paths
-            import os, json, time
-            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
-            if os.path.exists(state_path):
-                with open(state_path, "r") as f:
-                    somatic = json.load(f)
+        with self.budget_lock:
+            try:
+                from config import paths
+                import os, json, time
+                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                if os.path.exists(state_path):
+                    with open(state_path, "r") as f:
+                        somatic = json.load(f)
+                        
+                    last_weight = somatic.get("current_task_weight", 0)
+                    last_update = somatic.get("last_updated", time.time())
                     
-                last_weight = somatic.get("current_task_weight", 0)
-                last_update = somatic.get("last_updated", time.time())
-                
-                # Decay calculation
-                elapsed_mins = (time.time() - last_update) / 60.0
-                decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
-                decay = elapsed_mins * decay_rate
-                self.current_task_weight = max(0, last_weight - decay)
-            else:
+                    # Decay calculation
+                    elapsed_mins = (time.time() - last_update) / 60.0
+                    decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
+                    decay = elapsed_mins * decay_rate
+                    self.current_task_weight = max(0, last_weight - decay)
+                else:
+                    self.current_task_weight = 0
+            except Exception:
                 self.current_task_weight = 0
-        except Exception:
-            self.current_task_weight = 0
             
         self.current_loop_count = 0
         self.last_executed_command = None
@@ -415,23 +434,26 @@ class AmityOrchestrator:
         if low_token:
             max_weight = max_weight / 2
         
-        self.current_loop_count += 1
-        added_weight = base_weight * (exp_factor ** (self.current_loop_count - 1))
-        self.current_task_weight += added_weight
-        
-        # Write somatic state for tools
-        try:
-            from config import paths
-            import os, time
-            state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
-            with open(state_path, "w") as f:
-                json.dump({
-                    "current_task_weight": self.current_task_weight, 
-                    "max_weight": max_weight,
-                    "last_updated": time.time()
-                }, f)
-        except Exception:
-            pass
+        with self.budget_lock:
+            self.current_loop_count += 1
+            added_weight = base_weight * (exp_factor ** (self.current_loop_count - 1))
+            self.current_task_weight += added_weight
+            
+            # Write somatic state for tools (Atomic)
+            try:
+                from config import paths
+                import os, time
+                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                temp_path = state_path + ".tmp"
+                with open(temp_path, "w") as f:
+                    json.dump({
+                        "current_task_weight": self.current_task_weight, 
+                        "max_weight": max_weight,
+                        "last_updated": time.time()
+                    }, f)
+                os.replace(temp_path, state_path)
+            except Exception:
+                pass
         
         current_batch = ", ".join(executed_tools)
         if current_batch == self.last_executed_command:
@@ -503,7 +525,25 @@ class AmityOrchestrator:
     def _on_started_playback(self):
         self.set_busy_state(self.is_busy, speaking=True)
 
-    def shutdown(self):
+    def shutdown(self, force_sleep=False):
+        if force_sleep and self.session_fatigue_tokens > 10000:
+            logging.info("System: Initiating graceful shutdown sleep cycle...")
+            title = "Sleep Cycle (Memory Consolidation)"
+            context = "You are shutting down. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived."
+            self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
+            
+            def check_busy():
+                if not self.is_busy and not self.is_thinking:
+                    self._finalize_shutdown()
+                else:
+                    threading.Timer(1.0, check_busy).start()
+            
+            threading.Timer(2.0, check_busy).start()
+            return
+            
+        self._finalize_shutdown()
+
+    def _finalize_shutdown(self):
         logging.info("System: Shutting down orchestrator...")
         if self.pulse_engine:
             self.pulse_engine.stop()
@@ -512,3 +552,5 @@ class AmityOrchestrator:
             self.gemini_worker.stop_session()
         if self.cerebrum:
             self.cerebrum.shutdown()
+        if hasattr(self, 'on_shutdown_complete'):
+            self.on_shutdown_complete.emit()

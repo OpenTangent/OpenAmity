@@ -126,7 +126,7 @@ async function startClient() {
             console.error('Failed to resolve chat for MSG_RECEIVED:', e);
         }
         
-        let resolvedChatId = msg.from;
+        let resolvedChatId = await resolveLidToCus(client, msg.from);
         console.log(`[MSG_RECEIVED] ${resolvedChatId} ${senderName}`);
         
         if(msg.hasMedia && msg.type === 'ptt') {
@@ -155,16 +155,23 @@ app.post('/eval', async (req, res) => {
     }
 });
 
-app.post('/shutdown', async (req, res) => {
-    console.log('Shutdown requested via API');
+async function forceShutdown() {
+    console.log('Initiating shutdown...');
     isShuttingDown = true;
-    res.json({ success: true });
     try {
-        await client.destroy();
+        if (client) {
+            await client.destroy();
+        }
     } catch (e) {
         console.error('Error during client destroy:', e);
     }
     process.exit(0);
+}
+
+app.post('/shutdown', async (req, res) => {
+    console.log('Shutdown requested via API');
+    res.json({ success: true });
+    setTimeout(forceShutdown, 100);
 });
 
 app.get('/unread', async (req, res) => {
@@ -536,7 +543,7 @@ async function serializeMessage(msg, chat) {
                 // Some mimetypes are like application/pdf, which gives extension 'pdf'
                 // Some are like image/jpeg, which gives 'jpeg'
                 const filename = `${msg.id.id}.${extension}`;
-                mediaPath = path.join(__dirname, 'uploads', filename);
+                mediaPath = path.join(uploadDir, filename);
                 fs.writeFileSync(mediaPath, media.data, 'base64');
             }
         } catch (e) {
@@ -577,10 +584,6 @@ const server = app.listen(port, () => {
 });
 
 process.on('SIGTERM', () => {
-    console.log('SIGTERM signal received: closing HTTP server');
-    isShuttingDown = true;
-    server.close(() => {
-        client.destroy();
-        process.exit(0);
-    });
+    console.log('SIGTERM signal received');
+    forceShutdown();
 });

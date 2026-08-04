@@ -142,7 +142,7 @@ class AudioService:
             is_agy_mode = self.settings.get("core.antigravity.agy-mode", False)
 
             if is_low_token or is_agy_mode:
-                from src.core.local_stt import LocalSTT
+                from .local_stt import LocalSTT
                 text = LocalSTT().transcribe(temp_wav)
                 if not text or "Failed" in text:
                     raise Exception(f"Local STT error: {text}")

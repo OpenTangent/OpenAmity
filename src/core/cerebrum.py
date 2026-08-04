@@ -26,7 +26,8 @@ class Tool:
 
 class Cerebrum:
     """The brain center that manages tools and their execution."""
-    def __init__(self, settings_manager=None, skills_dir="src/tools", manual_path="src/memory/agent_manual.md"):
+    def __init__(self, orchestrator=None, settings_manager=None, skills_dir="src/tools", manual_path="src/memory/agent_manual.md"):
+        self.orchestrator = orchestrator
         self.settings_manager = settings_manager
         self.tools: Dict[str, Tool] = {}
         self.skills_dir = skills_dir
@@ -57,6 +58,7 @@ class Cerebrum:
                                     
                                 if is_enabled:
                                     skill_instance = obj()
+                                    skill_instance.orchestrator = self.orchestrator
                                     self.register_skill(skill_instance)
                                     logging.info(f"Loaded tool: {skill_instance.name}")
                                 else:
@@ -136,6 +138,7 @@ class Cerebrum:
                     
                 if is_enabled and skill_name not in self.tools:
                     skill_instance = obj()
+                    skill_instance.orchestrator = self.orchestrator
                     self.register_skill(skill_instance)
                     logging.info(f"Dynamically enabled tool: {skill_name}")
                 elif not is_enabled and skill_name in self.tools:

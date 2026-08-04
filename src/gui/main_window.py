@@ -56,8 +56,9 @@ class MainWindow(QMainWindow):
     ui_append_conversation = Signal(str, str)
     ui_set_busy = Signal(bool, bool)
     ui_set_amplitude = Signal(float)
+    ui_shutdown_complete = Signal()
 
-    def __init__(self):
+    def __init__(self, orchestrator=None):
         super().__init__()
         self.setWindowTitle("Open Amity")
         self.resize(1000, 600)
@@ -78,8 +79,6 @@ class MainWindow(QMainWindow):
         else:
             self.qt_logger.setLevel(logging.INFO)
             
-        self.qt_logger.signals.new_message.connect(self.append_to_console)
-        logging.getLogger().addHandler(self.qt_logger)
 
         # Early log flushing moved down after console_log creation
 
@@ -183,10 +182,14 @@ class MainWindow(QMainWindow):
         self.console_log.hide()
         self.split_layout.addWidget(self.console_log, 1)
 
+        self.qt_logger.signals.new_message.connect(self.append_to_console)
+        logging.getLogger().addHandler(self.qt_logger)
+        
         # Flush early logs into the now-existing console
         from core.logger_config import EARLY_LOG_BUFFER, early_buffer_handler
         for record in EARLY_LOG_BUFFER:
-            self.qt_logger.emit(record)
+            if record.levelno >= self.qt_logger.level:
+                self.qt_logger.handle(record)
         
         logging.getLogger().removeHandler(early_buffer_handler)
         EARLY_LOG_BUFFER.clear()
@@ -232,16 +235,18 @@ class MainWindow(QMainWindow):
         self.main_layout.addWidget(self.footer_widget)
 
         # Core Systems Setup
-        self.orchestrator = AmityOrchestrator()
+        self.orchestrator = orchestrator if orchestrator else AmityOrchestrator()
         
         # Connect orchestrator events to UI threads via signals
         self.orchestrator.on_message_appended.connect(lambda sender, text: self.ui_append_conversation.emit(sender, text))
         self.orchestrator.on_busy_state_changed.connect(lambda busy, speaking: self.ui_set_busy.emit(busy, speaking))
         self.orchestrator.on_amplitude_emitted.connect(lambda amp: self.ui_set_amplitude.emit(amp))
+        self.orchestrator.on_shutdown_complete.connect(lambda: self.ui_shutdown_complete.emit())
 
         self.ui_append_conversation.connect(self.append_to_conversation)
         self.ui_set_busy.connect(self.set_busy_state)
         self.ui_set_amplitude.connect(self.visualizer.set_amplitude)
+        self.ui_shutdown_complete.connect(self.close)
         
         self.text_input.textChanged.connect(self.orchestrator.user_interacted)
         self.settings_panel.wizard_finished.connect(self.orchestrator.init_worker)
@@ -269,9 +274,20 @@ class MainWindow(QMainWindow):
         self.stacked_layout.setCurrentIndex(0)
 
     def closeEvent(self, event):
-        logging.info("System: Shutting down gracefully...")
-        self.orchestrator.shutdown()
-        event.accept()
+        if hasattr(self, '_shutting_down') and self._shutting_down:
+            event.accept()
+            return
+
+        if getattr(self.orchestrator, 'session_fatigue_tokens', 0) > 10000:
+            logging.info("System: High fatigue detected, running sleep cycle before exit.")
+            event.ignore()
+            self._shutting_down = True
+            self.append_to_conversation("System", "Consolidating memories for graceful shutdown... please wait.")
+            self.orchestrator.shutdown(force_sleep=True)
+        else:
+            logging.info("System: Shutting down gracefully...")
+            self.orchestrator.shutdown()
+            event.accept()
 
     def keyPressEvent(self, event: QKeyEvent):
         self.orchestrator.user_interacted()
@@ -292,7 +308,7 @@ class MainWindow(QMainWindow):
 
     def append_to_conversation(self, sender, text):
         name_color = "#00FFC8" if sender == "User" else "#FFA500"
-        text_color = "#808080" if sender == "User" else "#FFFFFF"
+        text_color = "#FFFFFF" if sender == "Agent" else "#808080"
         timestamp = datetime.now().strftime("%H:%M")
         
         if sender == "User":

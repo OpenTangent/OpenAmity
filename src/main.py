@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon, QFontDatabase, QFont
 from PySide6.QtCore import qInstallMessageHandler, QtMsgType
 from gui.main_window import MainWindow
+from gui.splash_screen import LoadingCard
 from core.settings_manager import SettingsManager
 from core.logger_config import setup_logging
 from config import paths
@@ -161,8 +162,41 @@ def main():
     # Set dark theme palette (optional, but good for base look)
     # app.setStyle("Fusion") 
 
-    window = MainWindow()
-    window.show()
+    from PySide6.QtCore import QTimer, QThread, Signal, QObject
+
+    class InitWorker(QObject):
+        finished = Signal(object)
+        
+        def run(self):
+            from core.orchestrator import AmityOrchestrator
+            orchestrator = AmityOrchestrator()
+            self.finished.emit(orchestrator)
+
+    splash = LoadingCard()
+    splash.show()
+
+    worker = InitWorker()
+    thread = QThread()
+    worker.moveToThread(thread)
+
+    class MainThreadRunner(QObject):
+        def finish_init(self, orchestrator):
+            window = MainWindow(orchestrator=orchestrator)
+            splash.close()
+            window.show()
+            app._main_window = window
+            thread.quit()
+            thread.wait()
+
+    runner = MainThreadRunner()
+    worker.finished.connect(runner.finish_init)
+    thread.started.connect(worker.run)
+
+    app._init_thread = thread
+    app._init_worker = worker
+    app._runner = runner
+
+    QTimer.singleShot(0, thread.start)
 
     sys.exit(app.exec())
 
