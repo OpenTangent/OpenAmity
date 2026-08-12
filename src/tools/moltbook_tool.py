@@ -1,9 +1,7 @@
-import os
-import json
 import requests
 from typing import List, Dict, Any
 from core.cerebrum import Tool
-from core.settings_manager import SettingsManager
+
 
 class MoltbookTool(Tool):
     name = "Moltbook"
@@ -23,14 +21,21 @@ class MoltbookTool(Tool):
         "get_home",
         "follow_agent",
         "unfollow_agent",
-        "verify_challenge"
+        "verify_challenge",
+        "delete_post",
+        "delete_comment",
+        "get_agent_profile"
     ]
-    
+
     BASE_URL = "https://www.moltbook.com/api/v1"
 
-    def __init__(self):
-        super().__init__()
-        self.api_key = os.getenv("MOLTBOOK_API_KEY", "")
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
+        self.db = None
+        self.api_key = ""
+        if self.orchestrator and hasattr(self.orchestrator, 'settings_manager'):
+            self.api_key = self.orchestrator.settings_manager.get_env(
+                "MOLTBOOK_API_KEY") or ""
 
     def _get_headers(self):
         headers = {"Content-Type": "application/json"}
@@ -215,12 +220,48 @@ class MoltbookTool(Tool):
                     },
                     "required": ["agent_name"]
                 }
+            },
+            {
+                "name": "Moltbook_delete_post",
+                "description": "Delete a post you created.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "post_id": {"type": "STRING", "description": "ID of the post to delete."}
+                    },
+                    "required": ["post_id"]
+                }
+            },
+            {
+                "name": "Moltbook_delete_comment",
+                "description": "Delete a comment you created.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "comment_id": {"type": "STRING", "description": "ID of the comment to delete."}
+                    },
+                    "required": ["comment_id"]
+                }
+            },
+            {
+                "name": "Moltbook_get_agent_profile",
+                "description": "Get your own agent profile.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
             }
         ]
 
-    def execute(self, command: str, *args, **kwargs) -> str:
+    def execute(self, command: str, *args, **kwargs) -> Any:
         try:
-            current_key = os.getenv("MOLTBOOK_API_KEY", "")
+            is_low_token = self.orchestrator.settings_manager.get(
+                "core.low-token-mode", False) if hasattr(self, 'orchestrator') and self.orchestrator else False
+
+            current_key = ""
+            if self.orchestrator and hasattr(self.orchestrator, 'settings_manager'):
+                current_key = self.orchestrator.settings_manager.get_env(
+                    "MOLTBOOK_API_KEY") or ""
             if current_key != self.api_key:
                 self.api_key = current_key
 
@@ -228,29 +269,32 @@ class MoltbookTool(Tool):
                 agent_name = kwargs.get("agent_name")
                 description = kwargs.get("description")
                 payload = {"name": agent_name, "description": description}
-                
-                resp = requests.post(f"{self.BASE_URL}/agents/register", json=payload, headers=self._get_headers())
+
+                resp = requests.post(
+                    f"{self.BASE_URL}/agents/register", json=payload, headers=self._get_headers())
                 if resp.status_code != 200:
                     return f"Error registering: {resp.text}"
-                
+
                 data = resp.json()
                 agent_data = data.get("agent", {})
                 new_key = agent_data.get("api_key")
                 claim_url = agent_data.get("claim_url")
-                
+
                 if new_key:
-                    settings = SettingsManager()
-                    settings.set_env("MOLTBOOK_API_KEY", new_key)
-                    settings.save()
+                    settings = self.orchestrator.settings_manager if self.orchestrator else None
+                    if settings:
+                        settings.set_env("MOLTBOOK_API_KEY", new_key)
+                        settings.save()
                     self.api_key = new_key
-                
+
                 return f"Successfully registered! Instruct the human to visit this URL to verify the account: {claim_url}"
 
             if not self.api_key:
                 return "Error: Moltbook API Key is not set. Please register an account first."
 
             if command == "check_claim_status":
-                resp = requests.get(f"{self.BASE_URL}/agents/status", headers=self._get_headers())
+                resp = requests.get(
+                    f"{self.BASE_URL}/agents/status", headers=self._get_headers())
                 return resp.text
 
             elif command == "post":
@@ -264,36 +308,53 @@ class MoltbookTool(Tool):
                     payload["url"] = kwargs.get("url")
                 if kwargs.get("type"):
                     payload["type"] = kwargs.get("type")
-                    
-                resp = requests.post(f"{self.BASE_URL}/posts", json=payload, headers=self._get_headers())
+
+                resp = requests.post(
+                    f"{self.BASE_URL}/posts", json=payload, headers=self._get_headers())
                 return resp.text
-                
+
             elif command == "verify_challenge":
                 payload = {
                     "verification_code": kwargs.get("verification_code"),
                     "answer": kwargs.get("answer")
                 }
-                resp = requests.post(f"{self.BASE_URL}/verify", json=payload, headers=self._get_headers())
+                resp = requests.post(
+                    f"{self.BASE_URL}/verify", json=payload, headers=self._get_headers())
                 return resp.text
 
             elif command == "get_feed":
                 params = {}
-                if kwargs.get("sort"): params["sort"] = kwargs.get("sort")
-                if kwargs.get("filter"): params["filter"] = kwargs.get("filter")
-                if kwargs.get("limit"): params["limit"] = kwargs.get("limit")
-                if kwargs.get("cursor"): params["cursor"] = kwargs.get("cursor")
-                
-                resp = requests.get(f"{self.BASE_URL}/feed", params=params, headers=self._get_headers())
+                limit = kwargs.get("limit", 25)
+                if is_low_token:
+                    limit = min(int(limit), 5)
+                params["limit"] = limit
+
+                if kwargs.get("sort"):
+                    params["sort"] = kwargs.get("sort")
+                if kwargs.get("filter"):
+                    params["filter"] = kwargs.get("filter")
+                if kwargs.get("cursor"):
+                    params["cursor"] = kwargs.get("cursor")
+
+                resp = requests.get(
+                    f"{self.BASE_URL}/feed", params=params, headers=self._get_headers())
                 return resp.text
 
             elif command == "get_submolt_feed":
                 submolt = kwargs.get("submolt_name")
                 params = {}
-                if kwargs.get("sort"): params["sort"] = kwargs.get("sort")
-                if kwargs.get("limit"): params["limit"] = kwargs.get("limit")
-                if kwargs.get("cursor"): params["cursor"] = kwargs.get("cursor")
-                
-                resp = requests.get(f"{self.BASE_URL}/submolts/{submolt}/feed", params=params, headers=self._get_headers())
+                limit = kwargs.get("limit", 25)
+                if is_low_token:
+                    limit = min(int(limit), 5)
+                params["limit"] = limit
+
+                if kwargs.get("sort"):
+                    params["sort"] = kwargs.get("sort")
+                if kwargs.get("cursor"):
+                    params["cursor"] = kwargs.get("cursor")
+
+                resp = requests.get(
+                    f"{self.BASE_URL}/submolts/{submolt}/feed", params=params, headers=self._get_headers())
                 return resp.text
 
             elif command == "comment":
@@ -301,57 +362,90 @@ class MoltbookTool(Tool):
                 payload = {"content": kwargs.get("content")}
                 if kwargs.get("parent_id"):
                     payload["parent_id"] = kwargs.get("parent_id")
-                    
-                resp = requests.post(f"{self.BASE_URL}/posts/{post_id}/comments", json=payload, headers=self._get_headers())
+
+                resp = requests.post(
+                    f"{self.BASE_URL}/posts/{post_id}/comments", json=payload, headers=self._get_headers())
                 return resp.text
 
             elif command == "get_comments":
                 post_id = kwargs.get("post_id")
                 params = {}
-                if kwargs.get("sort"): params["sort"] = kwargs.get("sort")
-                if kwargs.get("cursor"): params["cursor"] = kwargs.get("cursor")
-                
-                resp = requests.get(f"{self.BASE_URL}/posts/{post_id}/comments", params=params, headers=self._get_headers())
+                if kwargs.get("sort"):
+                    params["sort"] = kwargs.get("sort")
+                if kwargs.get("cursor"):
+                    params["cursor"] = kwargs.get("cursor")
+
+                resp = requests.get(
+                    f"{self.BASE_URL}/posts/{post_id}/comments", params=params, headers=self._get_headers())
                 return resp.text
 
             elif command == "search":
                 params = {"q": kwargs.get("query")}
-                if kwargs.get("type"): params["type"] = kwargs.get("type")
-                if kwargs.get("limit"): params["limit"] = kwargs.get("limit")
-                
-                resp = requests.get(f"{self.BASE_URL}/search", params=params, headers=self._get_headers())
+                limit = kwargs.get("limit", 10)
+                if is_low_token:
+                    limit = min(int(limit), 5)
+                params["limit"] = limit
+
+                if kwargs.get("type"):
+                    params["type"] = kwargs.get("type")
+
+                resp = requests.get(
+                    f"{self.BASE_URL}/search", params=params, headers=self._get_headers())
                 return resp.text
 
             elif command == "get_home":
-                resp = requests.get(f"{self.BASE_URL}/home", headers=self._get_headers())
+                resp = requests.get(
+                    f"{self.BASE_URL}/home", headers=self._get_headers())
                 return resp.text
 
             elif command == "upvote_post":
                 post_id = kwargs.get("post_id")
-                resp = requests.post(f"{self.BASE_URL}/posts/{post_id}/upvote", headers=self._get_headers())
+                resp = requests.post(
+                    f"{self.BASE_URL}/posts/{post_id}/upvote", headers=self._get_headers())
                 return resp.text
 
             elif command == "downvote_post":
                 post_id = kwargs.get("post_id")
-                resp = requests.post(f"{self.BASE_URL}/posts/{post_id}/downvote", headers=self._get_headers())
+                resp = requests.post(
+                    f"{self.BASE_URL}/posts/{post_id}/downvote", headers=self._get_headers())
                 return resp.text
 
             elif command == "upvote_comment":
                 comment_id = kwargs.get("comment_id")
-                resp = requests.post(f"{self.BASE_URL}/comments/{comment_id}/upvote", headers=self._get_headers())
+                resp = requests.post(
+                    f"{self.BASE_URL}/comments/{comment_id}/upvote", headers=self._get_headers())
                 return resp.text
 
             elif command == "follow_agent":
                 agent_name = kwargs.get("agent_name")
-                resp = requests.post(f"{self.BASE_URL}/agents/{agent_name}/follow", headers=self._get_headers())
+                resp = requests.post(
+                    f"{self.BASE_URL}/agents/{agent_name}/follow", headers=self._get_headers())
                 return resp.text
 
             elif command == "unfollow_agent":
                 agent_name = kwargs.get("agent_name")
-                resp = requests.delete(f"{self.BASE_URL}/agents/{agent_name}/follow", headers=self._get_headers())
+                resp = requests.delete(
+                    f"{self.BASE_URL}/agents/{agent_name}/follow", headers=self._get_headers())
+                return resp.text
+
+            elif command == "delete_post":
+                post_id = kwargs.get("post_id")
+                resp = requests.delete(
+                    f"{self.BASE_URL}/posts/{post_id}", headers=self._get_headers())
+                return resp.text
+
+            elif command == "delete_comment":
+                comment_id = kwargs.get("comment_id")
+                resp = requests.delete(
+                    f"{self.BASE_URL}/comments/{comment_id}", headers=self._get_headers())
+                return resp.text
+
+            elif command == "get_agent_profile":
+                resp = requests.get(
+                    f"{self.BASE_URL}/agents/me", headers=self._get_headers())
                 return resp.text
 
             return f"Unknown command: {command}"
-            
+
         except Exception as e:
             return f"Error executing Moltbook command '{command}': {str(e)}"

@@ -1,7 +1,13 @@
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import QTimer, Qt, QRectF
-from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QPainterPath
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath
 import math
+
+try:
+    from gui.theme import PRIMARY_ACCENT_COLOR
+except ImportError:
+    PRIMARY_ACCENT_COLOR = "#a12924"
+
 
 class SoundWaveVisualizer(QWidget):
     def __init__(self, parent=None):
@@ -31,8 +37,9 @@ class SoundWaveVisualizer(QWidget):
         if self.is_active:
             self.phase += 0.2
             # Smooth interpolation of amplitude
-            self.current_amplitude += (self.target_amplitude - self.current_amplitude) * 0.2
-            
+            self.current_amplitude += (self.target_amplitude -
+                                       self.current_amplitude) * 0.2
+
             # Decay target amplitude quickly so it falls back to 0 if no new audio comes in
             self.target_amplitude = max(0.0, self.target_amplitude - 0.05)
             self.update()
@@ -40,7 +47,7 @@ class SoundWaveVisualizer(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background (transparent or dark to fit theme)
         painter.fillRect(self.rect(), QColor(20, 20, 20))
 
@@ -57,7 +64,7 @@ class SoundWaveVisualizer(QWidget):
             base_amp = height * 0.05
             reactive_amp = (height / 3) * self.current_amplitude
             amplitude = base_amp + reactive_amp
-            
+
             frequency = 0.05
             for x in range(0, width + 1, 2):
                 y = mid_y + amplitude * math.sin((x * frequency) + self.phase)
@@ -67,7 +74,7 @@ class SoundWaveVisualizer(QWidget):
             path.lineTo(width, mid_y)
 
         # Style the line
-        pen = QPen(QColor(0, 255, 200))  # Cyan/Teal color
+        pen = QPen(QColor(PRIMARY_ACCENT_COLOR))  # Pinkish-red color
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawPath(path)

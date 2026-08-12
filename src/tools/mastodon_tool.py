@@ -1,9 +1,8 @@
-import os
 import json
 from typing import List, Dict, Any
 from core.cerebrum import Tool
 from mastodon import Mastodon
-from core.settings_manager import SettingsManager
+
 
 class MastodonTool(Tool):
     name = "Mastodon"
@@ -19,14 +18,25 @@ class MastodonTool(Tool):
         "get_timeline"
     ]
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
+        self._mastodon_client = None
         # Initialize mastodon client
-        client_key = os.getenv("MASTODON_CLIENT_KEY")
-        client_secret = os.getenv("MASTODON_CLIENT_SECRET")
-        access_token = os.getenv("MASTODON_ACCESS_TOKEN")
-        api_base_url = os.getenv("MASTODON_API_BASE_URL", "https://mastodon.social")
-        
+        client_key = ""
+        client_secret = ""
+        access_token = ""
+        api_base_url = "https://mastodon.social"
+
+        if self.orchestrator and hasattr(self.orchestrator, 'settings_manager'):
+            client_key = self.orchestrator.settings_manager.get_env(
+                "MASTODON_CLIENT_KEY") or ""
+            client_secret = self.orchestrator.settings_manager.get_env(
+                "MASTODON_CLIENT_SECRET") or ""
+            access_token = self.orchestrator.settings_manager.get_env(
+                "MASTODON_ACCESS_TOKEN") or ""
+            api_base_url = self.orchestrator.settings_manager.get_env(
+                "MASTODON_API_BASE_URL") or "https://mastodon.social"
+
         if access_token and client_key and client_secret:
             self.client = Mastodon(
                 client_id=client_key,
@@ -138,32 +148,35 @@ class MastodonTool(Tool):
     def execute(self, command: str, *args, **kwargs) -> str:
         if not self.client:
             return "Error: Mastodon credentials not found in environment."
-            
+
         try:
-            is_low_token = SettingsManager().get("core.low-token-mode", False)
-            
+            is_low_token = self.orchestrator.settings_manager.get(
+                "core.low-token-mode", False) if self.orchestrator else False
+
             if command == "post_status":
                 text = kwargs.get("text")
                 if not text:
                     return "Error: 'text' parameter is required."
                 result = self.client.status_post(status=text)
                 return f"Successfully posted status. ID: {result.get('id')}, URL: {result.get('url')}"
-                
+
             elif command == "get_notifications":
                 limit = kwargs.get("limit", 10)
                 if is_low_token:
                     limit = min(int(limit), 5)
-                
+
                 # Retrieve the last read marker
                 try:
                     markers = self.client.markers_get(["notifications"])
-                    last_read_id = markers.get("notifications", {}).get("last_read_id")
+                    last_read_id = markers.get(
+                        "notifications", {}).get("last_read_id")
                 except Exception:
                     last_read_id = None
-                
+
                 # Fetch notifications since the last read id
-                notifications = self.client.notifications(limit=limit, since_id=last_read_id)
-                
+                notifications = self.client.notifications(
+                    limit=limit, since_id=last_read_id)
+
                 # Update the marker if there are new notifications
                 if notifications:
                     max_id = max(n.get("id") for n in notifications)
@@ -171,7 +184,7 @@ class MastodonTool(Tool):
                         self.client.markers_set("notifications", max_id)
                     except Exception:
                         pass
-                
+
                 res = []
                 for n in notifications:
                     item = {
@@ -185,13 +198,13 @@ class MastodonTool(Tool):
                         item["content"] = n["status"].get("content")
                     res.append(item)
                 return json.dumps(res, indent=2)
-                
+
             elif command == "get_status_context":
                 status_id = kwargs.get("status_id")
                 if not status_id:
                     return "Error: 'status_id' parameter is required."
                 context = self.client.status_context(status_id)
-                
+
                 def format_status(s):
                     return {
                         "id": s.get("id"),
@@ -199,28 +212,29 @@ class MastodonTool(Tool):
                         "content": s.get("content"),
                         "created_at": str(s.get("created_at"))
                     }
-                
+
                 res = {
                     "ancestors": [format_status(s) for s in context.get("ancestors", [])],
                     "descendants": [format_status(s) for s in context.get("descendants", [])]
                 }
                 return json.dumps(res, indent=2)
-                
+
             elif command == "reply_to_status":
                 status_id = kwargs.get("status_id")
                 text = kwargs.get("text")
                 if not status_id or not text:
                     return "Error: 'status_id' and 'text' parameters are required."
-                result = self.client.status_post(status=text, in_reply_to_id=status_id)
+                result = self.client.status_post(
+                    status=text, in_reply_to_id=status_id)
                 return f"Successfully replied. ID: {result.get('id')}, URL: {result.get('url')}"
-                
+
             elif command == "search":
                 query = kwargs.get("query")
                 result_type = kwargs.get("result_type", "statuses")
                 if not query:
                     return "Error: 'query' parameter is required."
                 results = self.client.search(q=query)
-                
+
                 items = results.get(result_type, [])
                 res = []
                 max_items = 5 if is_low_token else 10
@@ -241,21 +255,21 @@ class MastodonTool(Tool):
                     elif result_type == "hashtags":
                         res.append(item.get("name"))
                 return json.dumps(res, indent=2)
-                
+
             elif command == "favorite_status":
                 status_id = kwargs.get("status_id")
                 if not status_id:
                     return "Error: 'status_id' parameter is required."
                 self.client.status_favorite(status_id)
                 return f"Successfully favorited status {status_id}."
-                
+
             elif command == "boost_status":
                 status_id = kwargs.get("status_id")
                 if not status_id:
                     return "Error: 'status_id' parameter is required."
                 self.client.status_reblog(status_id)
                 return f"Successfully boosted status {status_id}."
-                
+
             elif command == "get_timeline":
                 timeline_type = kwargs.get("timeline_type", "home")
                 limit = kwargs.get("limit", 10)
@@ -269,7 +283,7 @@ class MastodonTool(Tool):
                     statuses = self.client.timeline_public(limit=limit)
                 else:
                     return "Error: Invalid timeline_type. Choose from 'home', 'local', 'public'."
-                
+
                 res = []
                 for s in statuses:
                     res.append({
@@ -279,8 +293,8 @@ class MastodonTool(Tool):
                         "created_at": str(s.get("created_at"))
                     })
                 return json.dumps(res, indent=2)
-                
+
             return f"Unknown command: {command}"
-            
+
         except Exception as e:
             return f"Error executing Mastodon command '{command}': {str(e)}"

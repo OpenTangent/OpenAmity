@@ -2,6 +2,7 @@ from typing import List, Dict, Any
 from core.cerebrum import Tool
 import json
 
+
 class SpeakerTool(Tool):
     name = "Speaker"
     description = "Use this tool to speak aloud to the user or output text. YOU ARE FULLY AUTONOMOUS regarding your speech. If you do not use this tool, you will remain completely silent. You must explicitly use this tool to communicate your thoughts or findings to the user. Speak from a first-person perspective ('I'). Use audio tags like [whisper], [sigh], [laugh], [excitedly] autonomously where appropriate to add emotion to your speech."
@@ -59,5 +60,5 @@ class SpeakerTool(Tool):
             if not text:
                 return "Error: text parameter is required for output_text."
             return json.dumps({"action": "trigger_output_text", "text": text})
-        
+
         return f"Unknown command: {command}"

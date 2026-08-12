@@ -1,11 +1,14 @@
 import os
 import json
 
+
 class AddressBookManager:
-    def __init__(self, filepath=None):
+    def __init__(self, agent_id=None, filepath=None):
+        self.agent_id = agent_id
         if not filepath:
             from config import paths
-            filepath = os.path.join(paths.get_app_data_dir(), "address_book.json")
+            filepath = os.path.join(paths.get_base_dir_for(
+                self.agent_id), "address_book.json")
         self.filepath = filepath
         self.ensure_file()
 
@@ -31,15 +34,15 @@ class AddressBookManager:
 
     def add_contact(self, phone_number, name, relationship=""):
         data = self.load_data()
-        
+
         # Clean phone number (strip whitespace, ensure starts with + if needed, etc)
         phone_number = phone_number.replace(" ", "").strip()
-        
+
         # Check if exists
         for c in data["contacts"]:
             if c["phone_number"] == phone_number:
                 return False, f"Contact with number {phone_number} already exists."
-                
+
         contact = {
             "phone_number": phone_number,
             "name": name,
@@ -52,7 +55,7 @@ class AddressBookManager:
     def update_contact(self, phone_number, name=None, relationship=None):
         data = self.load_data()
         phone_number = phone_number.replace(" ", "").strip()
-        
+
         for c in data["contacts"]:
             if c["phone_number"] == phone_number:
                 if name is not None:
@@ -61,16 +64,17 @@ class AddressBookManager:
                     c["relationship"] = relationship
                 self.save_data(data)
                 return True, f"Contact {phone_number} updated."
-                
+
         return False, f"Contact with number {phone_number} not found."
 
     def delete_contact(self, phone_number):
         data = self.load_data()
         phone_number = phone_number.replace(" ", "").strip()
-        
+
         initial_count = len(data["contacts"])
-        data["contacts"] = [c for c in data["contacts"] if c["phone_number"] != phone_number]
-        
+        data["contacts"] = [c for c in data["contacts"]
+                            if c["phone_number"] != phone_number]
+
         if len(data["contacts"]) < initial_count:
             self.save_data(data)
             return True, f"Contact {phone_number} deleted."
@@ -78,15 +82,15 @@ class AddressBookManager:
 
     def lookup_by_number(self, phone_number):
         data = self.load_data()
-        
+
         # Remove common characters, WhatsApp suffixes, and leading zeros
         def clean_num(n):
             n = n.replace(" ", "").replace("+", "").replace("-", "")
             n = n.replace("@c.us", "").replace("@g.us", "").replace("@lid", "")
             return n.lstrip('0')
-            
+
         p_clean = clean_num(phone_number)
-        
+
         for c in data["contacts"]:
             c_clean = clean_num(c["phone_number"])
             if c_clean == p_clean or p_clean.endswith(c_clean) or c_clean.endswith(p_clean):

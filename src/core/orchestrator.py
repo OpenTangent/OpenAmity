@@ -1,6 +1,7 @@
 import logging
 import threading
 import json
+import time
 from .events import Signal
 
 try:
@@ -12,6 +13,7 @@ try:
     from core.cerebrum import Cerebrum
     from core.pulse_engine import PulseEngine
     from core.settings_manager import SettingsManager
+    from core.subagent_worker import SubagentWorker
 except ImportError:
     from .gemini_worker import GeminiWorker
     from .agy_worker import AgyWorker
@@ -21,17 +23,33 @@ except ImportError:
     from .cerebrum import Cerebrum
     from .pulse_engine import PulseEngine
     from .settings_manager import SettingsManager
+    from .subagent_worker import SubagentWorker
+
+
+def with_agent_context(func):
+    def wrapper(self, *args, **kwargs):
+        from core.logger_config import agent_id_var
+        if hasattr(self, 'agent_id'):
+            agent_id_var.set(self.agent_id)
+        return func(self, *args, **kwargs)
+    return wrapper
+
 
 class AmityOrchestrator:
-    def __init__(self):
-        self.on_message_appended = Signal() # sender, text
-        self.on_busy_state_changed = Signal() # is_busy, is_speaking
-        self.on_amplitude_emitted = Signal() # float
+    def __init__(self, agent_id=None):
+        self.agent_id = agent_id
+        from core.logger_config import agent_id_var
+        agent_id_var.set(self.agent_id)
 
-        self.settings_manager = SettingsManager()
-        self.mempalace_manager = MemPalaceManager()
-        self.cerebrum = Cerebrum(orchestrator=self, settings_manager=self.settings_manager)
-        
+        self.on_message_appended = Signal()  # sender, text
+        self.on_busy_state_changed = Signal()  # is_busy, is_speaking
+        self.on_amplitude_emitted = Signal()  # float
+
+        self.settings_manager = SettingsManager(agent_id=self.agent_id)
+        self.mempalace_manager = MemPalaceManager(agent_id=self.agent_id)
+        self.cerebrum = Cerebrum(
+            orchestrator=self, settings_manager=self.settings_manager)
+
         # State
         self.is_busy = False
         self.is_thinking = False
@@ -39,10 +57,10 @@ class AmityOrchestrator:
         self.current_user_prompt = ""
         self.recent_history = []
         self.is_silent_pulse = False
-        
+
         self.on_shutdown_complete = Signal()
         self.session_fatigue_tokens = 0
-        
+
         # Budget
         self.budget_lock = threading.Lock()
         self.current_task_weight = 0
@@ -52,30 +70,35 @@ class AmityOrchestrator:
         self.accumulated_thoughts = ""
         self.speech_queue = []
         self.event_queue = []
-        
+        self.active_subagents = {}
+        self.subagent_last_activity = {}
+        self._shutdown_flag = False
+        self._start_subagent_gc()
+
         self.build_system_prompt()
-        
+
         self.pulse_engine = PulseEngine(self)
         self.pulse_engine.trigger_pulse.connect(self.process_pulse)
-        
+
         wa_skill = self.cerebrum.tools.get("WhatsApp")
         if wa_skill:
             wa_skill.message_received_callback = self.pulse_engine.handle_whatsapp_message
-            
+
         self.gemini_worker = None
         self.audio_service = None
-            
+
         is_first_run = self.settings_manager.get("core.first-run", True)
         if not is_first_run:
             self.init_worker()
 
-        self.audio_service = AudioService()
+        self.audio_service = AudioService(agent_id=self.agent_id)
         self.audio_service.initialized.connect(self.on_audio_initialized)
         self.audio_service.listening_started.connect(self.on_listening_start)
         self.audio_service.listening_stopped.connect(self.on_listening_stop)
-        self.audio_service.audio_prompt_ready.connect(self.on_audio_prompt_ready)
+        self.audio_service.audio_prompt_ready.connect(
+            self.on_audio_prompt_ready)
         self.audio_service.error_occurred.connect(self.on_audio_error)
-        
+
         self.tts_worker = None
         self.audio_service.start_initialization()
 
@@ -83,16 +106,21 @@ class AmityOrchestrator:
         if self.gemini_worker is not None:
             return
 
+        provider = self.settings_manager.get("core.api-provider", "gemini")
         if self.settings_manager.get("core.antigravity.agy-mode", False):
-            self.gemini_worker = AgyWorker()
+            self.gemini_worker = AgyWorker(agent_id=self.agent_id)
+        elif provider == "claude":
+            from .claude_worker import ClaudeWorker
+            self.gemini_worker = ClaudeWorker(agent_id=self.agent_id)
         else:
-            self.gemini_worker = GeminiWorker()
-            
+            self.gemini_worker = GeminiWorker(agent_id=self.agent_id)
+
         self.gemini_worker.thought_received.connect(self.handle_gemini_thought)
         if hasattr(self.gemini_worker, 'tokens_consumed'):
             self.gemini_worker.tokens_consumed.connect(self.add_fatigue)
         if hasattr(self.gemini_worker, 'speech_received'):
-            self.gemini_worker.speech_received.connect(self.handle_gemini_speech)
+            self.gemini_worker.speech_received.connect(
+                self.handle_gemini_speech)
         self.gemini_worker.error_occurred.connect(self.handle_gemini_error)
 
         if self.audio_service and hasattr(self.audio_service, 'running') and getattr(self.gemini_worker, 'available', False):
@@ -105,21 +133,28 @@ class AmityOrchestrator:
         if self.settings_manager.get("core.low-token-mode", False):
             self.system_prompt += "\n\n[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]"
 
+    def restart_worker(self):
+        if self.gemini_worker:
+            if hasattr(self.gemini_worker, 'stop_session'):
+                self.gemini_worker.stop_session()
+            self.gemini_worker = None
+        self.reload_settings()
+
     def reload_settings(self):
         self.mempalace_manager.reload_settings()
         self.build_system_prompt()
         self.cerebrum.reload_skills()
-        
+
         if not self.gemini_worker:
             self.init_worker()
         elif not getattr(self.gemini_worker, 'available', False):
             self.gemini_worker = None
             self.init_worker()
-            
+
         if self.gemini_worker and getattr(self.gemini_worker, 'available', False):
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
-            
+
         if hasattr(self, 'agy_worker') and self.agy_worker and not getattr(self.agy_worker, 'available', False):
             self.agy_worker = None
 
@@ -140,6 +175,7 @@ class AmityOrchestrator:
         else:
             self.audio_service.start_listening()
 
+    @with_agent_context
     def stop_all_processing(self):
         if self.audio_service.running:
             self.audio_service.stop_listening()
@@ -147,7 +183,7 @@ class AmityOrchestrator:
             self.gemini_worker.abort()
         if self.tts_worker:
             self.tts_worker.stop()
-            
+
         self.speech_queue.clear()
         self.event_queue.clear()
         self.is_thinking = False
@@ -155,53 +191,91 @@ class AmityOrchestrator:
         self.set_busy_state(False)
 
     def process_text_input(self, text):
-        if not text: return
+        if not text:
+            return
         if self.is_busy:
             self.event_queue.append({"type": "input", "text": text})
         else:
             self.process_input(text)
 
+    @with_agent_context
     def finish_thinking(self):
         logging.debug("finish_thinking called")
         self.is_thinking = False
         self.check_cycle_completion()
 
+    @with_agent_context
     def check_cycle_completion(self):
-        is_speaking = (self.tts_worker and self.tts_worker.is_alive()) or len(self.speech_queue) > 0
-        logging.debug(f"check_cycle_completion evaluated is_speaking: {is_speaking}, is_thinking: {self.is_thinking}")
+        is_speaking = (self.tts_worker and self.tts_worker.is_alive()) or len(
+            self.speech_queue) > 0
+        logging.debug(
+            f"check_cycle_completion evaluated is_speaking: {is_speaking}, is_thinking: {self.is_thinking}")
         if not self.is_thinking and not is_speaking:
-            logging.debug("check_cycle_completion calling set_busy_state(False)")
-            
+            logging.debug(
+                "check_cycle_completion calling set_busy_state(False)")
+
             self.set_busy_state(False)
             if self.event_queue:
-                logging.debug("check_cycle_completion popping next event from queue")
+                logging.debug(
+                    "check_cycle_completion popping next event from queue")
                 next_event = self.event_queue.pop(0)
                 if next_event["type"] == "input":
                     self.process_input(next_event["text"])
                 elif next_event["type"] == "pulse":
                     self.process_pulse(next_event["text"])
         else:
-            logging.debug("check_cycle_completion calling set_busy_state(True)")
+            logging.debug(
+                "check_cycle_completion calling set_busy_state(True)")
             self.set_busy_state(True, speaking=is_speaking)
 
+    @with_agent_context
     def process_input(self, text, audio_path=None):
         import os
-        current_env_key = self.settings_manager.get_env("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if self.gemini_worker and hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
-            logging.info("System: API Key mismatch detected. Hot-reloading Gemini Worker...")
+        provider = self.settings_manager.get("core.api-provider", "gemini")
+        needs_reload = False
+
+        if self.settings_manager.get("core.antigravity.agy-mode", False):
+            if type(self.gemini_worker).__name__ != "AgyWorker":
+                needs_reload = True
+        elif provider == "claude":
+            if type(self.gemini_worker).__name__ != "ClaudeWorker":
+                needs_reload = True
+            else:
+                current_env_key = self.settings_manager.get_env(
+                    "CLAUDE_API_KEY")
+                if hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
+                    needs_reload = True
+        else:
+            if type(self.gemini_worker).__name__ != "GeminiWorker":
+                needs_reload = True
+            else:
+                current_env_key = self.settings_manager.get_env(
+                    "GEMINI_API_KEY")
+                if hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
+                    needs_reload = True
+
+        if needs_reload:
+            logging.info(
+                "System: Settings or API Key change detected. Hot-reloading Worker...")
             try:
-                self.gemini_worker.thought_received.disconnect(self.handle_gemini_thought)
+                self.gemini_worker.thought_received.disconnect(
+                    self.handle_gemini_thought)
                 if hasattr(self.gemini_worker, 'speech_received'):
-                    self.gemini_worker.speech_received.disconnect(self.handle_gemini_speech)
-                self.gemini_worker.error_occurred.disconnect(self.handle_gemini_error)
+                    self.gemini_worker.speech_received.disconnect(
+                        self.handle_gemini_speech)
+                self.gemini_worker.error_occurred.disconnect(
+                    self.handle_gemini_error)
             except Exception as e:
-                logging.debug(f"Failed to disconnect signals during hot-reload: {e}")
+                logging.debug(
+                    f"Failed to disconnect signals during hot-reload: {e}")
             self.gemini_worker = None
             self.init_worker()
 
         if not self.gemini_worker or not getattr(self.gemini_worker, 'available', False):
-            logging.error("System: The Gemini Worker failed to initialise (worker is None or unavailable).")
-            self.append_to_conversation("System", "The Gemini Worker failed to initialise")
+            logging.error(
+                "System: The Cognitive Worker failed to initialise (worker is None or unavailable).")
+            self.append_to_conversation(
+                "System", "The Cognitive Worker failed to initialise")
             self.set_busy_state(False)
             return
 
@@ -211,67 +285,81 @@ class AmityOrchestrator:
             logging.debug("Calling self.gemini_worker.start_session...")
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
             logging.debug("start_session returned.")
-            
+
         self.append_to_conversation("User", text)
         self.is_thinking = True
         self.set_busy_state(True)
         self.current_user_prompt = text
         self.is_silent_pulse = False
-        
+
         with self.budget_lock:
             try:
                 from config import paths
-                import os, json, time
-                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                import os
+                import json
+                import time
+                state_path = os.path.join(paths.get_base_dir_for(
+                    self.agent_id), "somatic_state.json")
                 if os.path.exists(state_path):
                     with open(state_path, "r") as f:
                         somatic = json.load(f)
-                        
+
                     last_weight = somatic.get("current_task_weight", 0)
                     last_update = somatic.get("last_updated", time.time())
-                    
+
                     # Decay calculation: e.g. 50 weight points per minute of idle time
                     elapsed_mins = (time.time() - last_update) / 60.0
-                    decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
+                    decay_rate = self.settings_manager.get(
+                        "core.somatic.decay-per-minute", 50)
                     decay = elapsed_mins * decay_rate
                     self.current_task_weight = max(0, last_weight - decay)
                 else:
                     self.current_task_weight = 0
             except Exception:
                 self.current_task_weight = 0
-            
+
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
-        
-        threading.Thread(target=self._async_query_prep, args=(text, self.recent_history.copy(), audio_path), daemon=True).start()
+
+        threading.Thread(target=self._async_query_prep, args=(
+            text, self.recent_history.copy(), audio_path), daemon=True).start()
 
     def _async_query_prep(self, text, history, audio_path):
+        from core.logger_config import agent_id_var
+        agent_id_var.set(self.agent_id)
         logging.debug("_async_query_prep started.")
         logging.debug("Calling reformulate_query...")
         reformulated = self.gemini_worker.reformulate_query(text, history)
         logging.debug(f"reformulate_query returned: {reformulated}")
         if reformulated != text:
             logging.debug(f"System: Reformulated query -> {reformulated}")
-        
+
         prompt = "[CHANNEL: LOCAL_GUI]\n"
         if self.last_action_result:
             prompt += f"[System Feedback from previous turn]: {self.last_action_result}\n\n"
             self.last_action_result = None
-            
+
         prompt += f"[User]: {self.current_user_prompt}"
-        logging.debug(f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
+        logging.debug(
+            f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
         self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
         logging.debug("gemini_worker.send_prompt returned.")
 
+    @with_agent_context
     def process_pulse(self, text="Autonomy Pulse"):
         if self.is_busy:
             self.event_queue.append({"type": "pulse", "text": text})
             return
-            
+
         if not self.gemini_worker or not getattr(self.gemini_worker, 'available', False):
-            logging.error("System: Pulse aborted. The Gemini Worker failed to initialise (worker is None or unavailable).")
+            if self.settings_manager.get("core.first-run", True):
+                logging.debug(
+                    "System: Pulse aborted. Agent is still in first-run setup.")
+            else:
+                logging.error(
+                    "System: Pulse aborted. The Gemini Worker failed to initialise (worker is None or unavailable).")
             return
 
         if not self.gemini_worker.running:
@@ -279,43 +367,49 @@ class AmityOrchestrator:
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
         self.is_silent_pulse = False
-        self.append_to_conversation("System", "[Autonomy Pulse Triggered]")
+        if "You are shutting down." not in text:
+            self.append_to_conversation("System", "[Autonomy Pulse Triggered]")
         self.is_thinking = True
         self.set_busy_state(True)
         self.current_user_prompt = text
-        
+
         with self.budget_lock:
             try:
                 from config import paths
-                import os, json, time
-                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                import os
+                import json
+                import time
+                state_path = os.path.join(paths.get_base_dir_for(
+                    self.agent_id), "somatic_state.json")
                 if os.path.exists(state_path):
                     with open(state_path, "r") as f:
                         somatic = json.load(f)
-                        
+
                     last_weight = somatic.get("current_task_weight", 0)
                     last_update = somatic.get("last_updated", time.time())
-                    
+
                     # Decay calculation
                     elapsed_mins = (time.time() - last_update) / 60.0
-                    decay_rate = self.settings_manager.get("core.somatic.decay-per-minute", 50)
+                    decay_rate = self.settings_manager.get(
+                        "core.somatic.decay-per-minute", 50)
                     decay = elapsed_mins * decay_rate
                     self.current_task_weight = max(0, last_weight - decay)
                 else:
                     self.current_task_weight = 0
             except Exception:
                 self.current_task_weight = 0
-            
+
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
-        
+
         self.gemini_worker.send_prompt(text)
 
     def append_to_conversation(self, sender, text):
         self.recent_history.append((sender, text))
-        max_history = 6 if self.settings_manager.get("core.low-token-mode", False) else 10
+        max_history = 6 if self.settings_manager.get(
+            "core.low-token-mode", False) else 10
         while len(self.recent_history) > max_history:
             self.recent_history.pop(0)
         self.on_message_appended.emit(sender, text)
@@ -343,58 +437,75 @@ class AmityOrchestrator:
         logging.error(f"Audio Error: {error}")
         self.finish_thinking()
 
+    @with_agent_context
     def handle_gemini_thought(self, text: str, function_calls: list):
-        logging.debug(f"handle_gemini_thought called with text length: {len(text)}, function_calls count: {len(function_calls) if function_calls else 0}")
+        logging.debug(
+            f"handle_gemini_thought called with text length: {len(text)}, function_calls count: {len(function_calls) if function_calls else 0}")
         if getattr(self, 'is_silent_pulse', False):
-            logging.debug("handle_gemini_thought returning early due to is_silent_pulse")
+            logging.debug(
+                "handle_gemini_thought returning early due to is_silent_pulse")
             return
-            
+
         clean_text = text.strip() if text else ""
         if clean_text:
-            logging.debug("handle_gemini_thought logging agent thought to info")
-            worker_type = "agyworker" if self.settings_manager.get("core.antigravity.agy-mode", False) else "geminiworker"
+            logging.debug(
+                "handle_gemini_thought logging agent thought to info")
+            provider = self.settings_manager.get("core.api-provider", "gemini")
+            if self.settings_manager.get("core.antigravity.agy-mode", False):
+                worker_type = "agyworker"
+            elif provider == "claude":
+                worker_type = "claudeworker"
+            else:
+                worker_type = "geminiworker"
             logging.getLogger(f"{worker_type}.Thoughts").info(clean_text)
             self.accumulated_thoughts += clean_text + "\n"
-            
+
         if not function_calls:
-            logging.debug("handle_gemini_thought found no function calls, calling finish_thinking")
+            logging.debug(
+                "handle_gemini_thought found no function calls, calling finish_thinking")
             self.finish_thinking()
             return
 
-        logging.debug("handle_gemini_thought starting _async_tool_execution thread")
-        threading.Thread(target=self._async_tool_execution, args=(function_calls, self.current_task_weight), daemon=True).start()
+        logging.debug(
+            "handle_gemini_thought starting _async_tool_execution thread")
+        threading.Thread(target=self._async_tool_execution, args=(
+            function_calls, self.current_task_weight), daemon=True).start()
 
     def _async_tool_execution(self, function_calls, current_weight):
+        from core.logger_config import agent_id_var
+        agent_id_var.set(self.agent_id)
         function_responses = []
         executed_tools = []
-        
+
         for call in function_calls:
             function_name = call.name
-            tool_name = function_name.split("_")[0] if "_" in function_name else function_name
+            tool_name = function_name.split(
+                "_")[0] if "_" in function_name else function_name
             args = call.args or {}
-            
+
             if len(args) == 1 and "text" in args:
                 args_str = str(args["text"])
             elif args:
                 args_str = ", ".join(f"{k}='{v}'" for k, v in args.items())
             else:
                 args_str = "()"
-                
+
             if args_str == "()":
                 log_msg = f"[Weight: {current_weight:.1f}] {function_name}()"
             else:
                 log_msg = f"[Weight: {current_weight:.1f}] {function_name}: {args_str}"
-                
+
             logging.getLogger(f"tool.{tool_name}").info(log_msg)
-            
+
             skill_result = self.cerebrum.execute_tool_call(function_name, args)
             executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
             executed_tools.append(executed_tool_sig)
             if isinstance(skill_result, dict):
                 function_responses.append((function_name, skill_result))
             else:
-                function_responses.append((function_name, {"result": str(skill_result)}))
-                
+                function_responses.append(
+                    (function_name, {"result": str(skill_result)}))
+
         self.on_tool_execution_finished(function_responses, executed_tools)
 
     def on_tool_execution_finished(self, function_responses, executed_tools):
@@ -416,7 +527,8 @@ class AmityOrchestrator:
                         self.append_to_conversation("Agent", text)
                         resp["result"] = "Text output to GUI."
                 except Exception as e:
-                    logging.debug(f"Expected valid JSON from Speaker tool but failed to parse: {e}")
+                    logging.debug(
+                        f"Expected valid JSON from Speaker tool but failed to parse: {e}")
                 function_responses[i] = (name, resp)
 
         if hasattr(self, 'pulse_engine') and hasattr(self.pulse_engine, 'settings_manager'):
@@ -430,57 +542,65 @@ class AmityOrchestrator:
             low_token = False
             base_weight = 2
             exp_factor = 1.5
-            
+
         if low_token:
             max_weight = max_weight / 2
-        
+
         with self.budget_lock:
             self.current_loop_count += 1
-            added_weight = base_weight * (exp_factor ** (self.current_loop_count - 1))
+            added_weight = base_weight * \
+                (exp_factor ** (self.current_loop_count - 1))
             self.current_task_weight += added_weight
-            
+
             # Write somatic state for tools (Atomic)
             try:
                 from config import paths
-                import os, time
-                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                import os
+                import time
+                state_path = os.path.join(paths.get_base_dir_for(
+                    self.agent_id), "somatic_state.json")
                 temp_path = state_path + ".tmp"
                 with open(temp_path, "w") as f:
                     json.dump({
-                        "current_task_weight": self.current_task_weight, 
+                        "current_task_weight": self.current_task_weight,
                         "max_weight": max_weight,
                         "last_updated": time.time()
                     }, f)
                 os.replace(temp_path, state_path)
             except Exception:
                 pass
-        
+
         current_batch = ", ".join(executed_tools)
         if current_batch == self.last_executed_command:
             self.duplicate_command_count += 1
             if self.duplicate_command_count >= 3:
-                logging.warning("System: Duplicate Action Detected. Breaking loop.")
-                self.handle_gemini_speech("I'm sorry, I seem to be stuck in a loop trying to figure this out. I'll stop here.")
+                logging.warning(
+                    "System: Duplicate Action Detected. Breaking loop.")
+                self.handle_gemini_speech(
+                    "I'm sorry, I seem to be stuck in a loop trying to figure this out. I'll stop here.")
                 self.finish_thinking()
                 return
         else:
             self.duplicate_command_count = 0
 
         if self.current_task_weight >= max_weight:
-            logging.warning("System: Maximum operational capacity exceeded. Breaking loop.")
-            self.handle_gemini_speech("I'm sorry, this task is taking too much of my cognitive capacity. I'll need to stop here and re-evaluate.")
+            logging.warning(
+                "System: Maximum operational capacity exceeded. Breaking loop.")
+            self.handle_gemini_speech(
+                "I'm sorry, this task is taking too much of my cognitive capacity. I'll need to stop here and re-evaluate.")
             self.finish_thinking()
             return
-            
+
         self.last_executed_command = current_batch
         budget_alert = f"\n[SYSTEM ALERT: Current Task Weight is {self.current_task_weight:.1f} out of {max_weight}. Evaluate necessity of further action.]"
-        
+
         if function_responses:
             last_name, last_resp = function_responses[-1]
             last_resp["result"] = f"{last_resp['result']}{budget_alert}"
             function_responses[-1] = (last_name, last_resp)
             self.gemini_worker.send_function_responses(function_responses)
 
+    @with_agent_context
     def handle_gemini_speech(self, text: str):
         clean_text = text.strip()
         self.append_to_conversation("Agent", clean_text)
@@ -489,6 +609,7 @@ class AmityOrchestrator:
         else:
             self.finish_thinking()
 
+    @with_agent_context
     def handle_gemini_error(self, text):
         logging.warning(f"Gemini API Event: {text}")
         self.append_to_conversation("System Warning", text)
@@ -501,20 +622,21 @@ class AmityOrchestrator:
     def process_speech_queue(self):
         if self.tts_worker and self.tts_worker.is_alive():
             return
-            
+
         if not self.speech_queue:
             self.check_cycle_completion()
             return
-            
+
         next_text = self.speech_queue.pop(0)
-        
+
         if self.settings_manager.get("core.mute", False):
             self.process_speech_queue()
             return
-            
-        self.tts_worker = TTSWorker(next_text)
+
+        self.tts_worker = TTSWorker(next_text, agent_id=self.agent_id)
         self.tts_worker.started_playback.connect(self._on_started_playback)
-        self.tts_worker.amplitude_emitted.connect(self.on_amplitude_emitted.emit)
+        self.tts_worker.amplitude_emitted.connect(
+            self.on_amplitude_emitted.emit)
         self.tts_worker.on_finished.connect(self.on_tts_finished)
         self.tts_worker.start()
 
@@ -531,20 +653,24 @@ class AmityOrchestrator:
             title = "Sleep Cycle (Memory Consolidation)"
             context = "You are shutting down. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived."
             self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
-            
+            self.pulse_engine.settings_manager.set(
+                "core.auto-pulse.last-sleep-cycle", time.time())
+            self.pulse_engine.settings_manager.save()
+
             def check_busy():
                 if not self.is_busy and not self.is_thinking:
                     self._finalize_shutdown()
                 else:
                     threading.Timer(1.0, check_busy).start()
-            
+
             threading.Timer(2.0, check_busy).start()
             return
-            
+
         self._finalize_shutdown()
 
     def _finalize_shutdown(self):
         logging.info("System: Shutting down orchestrator...")
+        self._shutdown_flag = True
         if self.pulse_engine:
             self.pulse_engine.stop()
         self.stop_all_processing()
@@ -554,3 +680,106 @@ class AmityOrchestrator:
             self.cerebrum.shutdown()
         if hasattr(self, 'on_shutdown_complete'):
             self.on_shutdown_complete.emit()
+
+    def _start_subagent_gc(self):
+        def gc_loop():
+            while not getattr(self, '_shutdown_flag', False):
+                time.sleep(60)
+                if getattr(self, '_shutdown_flag', False):
+                    break
+                now = time.time()
+                to_dispose = []
+                for sid, last_active in list(self.subagent_last_activity.items()):
+                    if now - last_active > 300:
+                        to_dispose.append(sid)
+                for sid in to_dispose:
+                    logging.info(f"System: Auto-disposing idle subagent {sid}")
+                    self.dispose_subagent(sid)
+        threading.Thread(target=gc_loop, daemon=True).start()
+
+    def spawn_subagent(self, task_description, model_tier="light"):
+        if len(self.active_subagents) >= 6:
+            return "Error: Maximum concurrent subagents (6) reached."
+
+        import uuid
+        sid = str(uuid.uuid4())[:8]
+        worker = SubagentWorker(sid, self, model_tier)
+
+        worker.thought_received.connect(
+            lambda text, funcs, s=sid: self.handle_subagent_thought(s, text, funcs))
+        worker.error_occurred.connect(
+            lambda err, s=sid: self.handle_subagent_error(s, err))
+
+        self.active_subagents[sid] = worker
+        self.subagent_last_activity[sid] = time.time()
+
+        worker.send_prompt(task_description)
+        return f"Subagent {sid} spawned."
+
+    def message_subagent(self, sid, message):
+        if sid not in self.active_subagents:
+            return f"Error: Subagent {sid} not found."
+
+        self.subagent_last_activity[sid] = time.time()
+        self.active_subagents[sid].send_prompt(message)
+        return f"Message sent to Subagent {sid}."
+
+    def dispose_subagent(self, sid):
+        if sid in self.active_subagents:
+            self.active_subagents[sid].abort()
+            del self.active_subagents[sid]
+            if sid in self.subagent_last_activity:
+                del self.subagent_last_activity[sid]
+            return f"Subagent {sid} disposed."
+        return f"Error: Subagent {sid} not found."
+
+    def list_subagents(self):
+        if not self.active_subagents:
+            return "No active subagents."
+        return "Active subagents: " + ", ".join(self.active_subagents.keys())
+
+    @with_agent_context
+    def handle_subagent_thought(self, sid, text, function_calls):
+        self.subagent_last_activity[sid] = time.time()
+
+        if function_calls:
+            threading.Thread(target=self._async_subagent_tool_execution, args=(
+                sid, function_calls), daemon=True).start()
+            return
+
+        if text:
+            self.event_queue.append(
+                {"type": "pulse", "text": f"[System Feedback: Subagent {sid} finished - {text}]"})
+            self.check_cycle_completion()
+
+    def _async_subagent_tool_execution(self, sid, function_calls):
+        from core.logger_config import agent_id_var
+        if hasattr(self, 'agent_id'):
+            agent_id_var.set(self.agent_id)
+
+        if sid not in self.active_subagents:
+            return
+
+        function_responses = []
+        for call in function_calls:
+            function_name = call.name
+            args = call.args or {}
+            try:
+                skill_result = self.cerebrum.execute_tool_call(
+                    function_name, args)
+                if isinstance(skill_result, dict):
+                    function_responses.append((function_name, skill_result))
+                else:
+                    function_responses.append(
+                        (function_name, {"result": str(skill_result)}))
+            except Exception as e:
+                function_responses.append((function_name, {"error": str(e)}))
+
+        for name, resp in function_responses:
+            self.active_subagents[sid].send_function_response(name, resp)
+
+    @with_agent_context
+    def handle_subagent_error(self, sid, error):
+        self.event_queue.append(
+            {"type": "pulse", "text": f"[System Warning: Subagent {sid} encountered an error: {error}]"})
+        self.check_cycle_completion()

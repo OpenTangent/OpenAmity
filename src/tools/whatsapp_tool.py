@@ -1,15 +1,10 @@
 import os
-import time
 import subprocess
 import requests
-import json
-import logging
 from typing import List, Dict, Any
 from core.cerebrum import Tool
-from core.settings_manager import SettingsManager
-from core.whatsapp_daemon import WhatsAppDaemon
 from core.cache_manager import CacheManager
-from config import paths
+
 
 class WhatsAppSkill(Tool):
     name = "WhatsApp"
@@ -25,9 +20,11 @@ class WhatsAppSkill(Tool):
         "reset_connection (Clears WhatsApp cache and restarts the server if stuck in a QR loop)"
     ]
 
-    def __init__(self):
-        super().__init__()
-        self.daemon = WhatsAppDaemon(port=3000)
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
+        from core.whatsapp_daemon import WhatsAppDaemon
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        self.daemon = WhatsAppDaemon(port=3000, agent_id=agent_id)
         self.daemon.message_callback = self._on_message_received
         self.base_url = self.daemon.base_url
         self.data_dir = self.daemon.data_dir
@@ -124,8 +121,6 @@ class WhatsAppSkill(Tool):
             },
         ]
 
-
-
     def get_auth_status(self) -> Dict[str, Any]:
         try:
             res = requests.get(f"{self.base_url}/status", timeout=10)
@@ -137,7 +132,8 @@ class WhatsAppSkill(Tool):
 
     def execute(self, command: str, *args, **kwargs) -> Any:
         if command in ["unread", "recent", "recent_chat"]:
-            CacheManager.clear_expired(os.path.join(self.data_dir, 'uploads'), max_age_days=1.0)
+            CacheManager.clear_expired(os.path.join(
+                self.data_dir, 'uploads'), max_age_days=1.0)
 
         if command == "reset_connection":
             try:
@@ -157,17 +153,23 @@ class WhatsAppSkill(Tool):
             try:
                 res = requests.get(f"{self.base_url}/unread", timeout=15)
                 data = res.json()
-                if "error" in data: return f"Error: {data['error']}"
-                
+                if "error" in data:
+                    return f"Error: {data['error']}"
+
                 unread = data.get("unread", [])
-                
-                is_low_token = SettingsManager().get("core.low-token-mode", False)
+
+                if hasattr(self, 'orchestrator') and self.orchestrator:
+                    is_low_token = self.orchestrator.settings_manager.get(
+                        "core.low-token-mode", False)
+                else:
+                    is_low_token = False
+
                 if is_low_token and len(unread) > 5:
                     unread = unread[:5]
 
                 if not unread:
                     return "No unread messages."
-                
+
                 output = "Unread Messages:\n"
                 for msg in unread:
                     content = msg.get('content', '')
@@ -180,11 +182,13 @@ class WhatsAppSkill(Tool):
                             content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
                     elif msg.get('hasMedia'):
                         content = f"[Media: {msg['type']}] {content}"
-                        
-                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith("@g.us") else "WHATSAPP_DM"
-                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get('senderNumber') else msg['senderName']
+
+                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
+                        "@g.us") else "WHATSAPP_DM"
+                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
+                        'senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
-                
+
                 output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
                 return output
             except Exception as e:
@@ -192,18 +196,24 @@ class WhatsAppSkill(Tool):
 
         elif command == "recent":
             n = kwargs.get('n') or (args[0] if len(args) > 0 else 30)
-            is_low_token = SettingsManager().get("core.low-token-mode", False)
+            if hasattr(self, 'orchestrator') and self.orchestrator:
+                is_low_token = self.orchestrator.settings_manager.get(
+                    "core.low-token-mode", False)
+            else:
+                is_low_token = False
             if is_low_token:
                 n = min(int(n), 5)
-            
+
             try:
                 res = requests.get(f"{self.base_url}/recent?n={n}", timeout=15)
                 data = res.json()
-                if "error" in data: return f"Error: {data['error']}"
-                
+                if "error" in data:
+                    return f"Error: {data['error']}"
+
                 messages = data.get("messages", [])
-                if not messages: return "No recent messages."
-                
+                if not messages:
+                    return "No recent messages."
+
                 output = f"Recent Messages (Last {len(messages)}):\n"
                 for msg in messages:
                     content = msg.get('content', '')
@@ -217,23 +227,30 @@ class WhatsAppSkill(Tool):
                     elif msg.get('hasMedia'):
                         content = f"[Media: {msg['type']}] {content}"
 
-                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith("@g.us") else "WHATSAPP_DM"
-                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get('senderNumber') else msg['senderName']
+                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
+                        "@g.us") else "WHATSAPP_DM"
+                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
+                        'senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
-                
+
                 output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
                 return output
             except Exception as e:
                 return f"Failed to fetch recent messages: {e}"
-                
+
         elif command == "recent_chat":
             target = kwargs.get('target') or (args[0] if args else None)
-            if not target: return "Usage: recent_chat <target> [n]"
+            if not target:
+                return "Usage: recent_chat <target> [n]"
             n = kwargs.get('n') or (args[1] if len(args) > 1 else 30)
-            is_low_token = SettingsManager().get("core.low-token-mode", False)
+            if hasattr(self, 'orchestrator') and self.orchestrator:
+                is_low_token = self.orchestrator.settings_manager.get(
+                    "core.low-token-mode", False)
+            else:
+                is_low_token = False
             if is_low_token:
                 n = min(int(n), 5)
-                
+
             try:
                 try:
                     # 1. Attempt to resolve via internal Rolodex first
@@ -249,13 +266,16 @@ class WhatsAppSkill(Tool):
 
                 import urllib.parse
                 safe_target = urllib.parse.quote(target)
-                res = requests.get(f"{self.base_url}/recent?n={n}&target={safe_target}", timeout=15)
+                res = requests.get(
+                    f"{self.base_url}/recent?n={n}&target={safe_target}", timeout=15)
                 data = res.json()
-                if "error" in data: return f"Error: {data['error']}"
-                
+                if "error" in data:
+                    return f"Error: {data['error']}"
+
                 messages = data.get("messages", [])
-                if not messages: return f"No recent messages for {target}."
-                
+                if not messages:
+                    return f"No recent messages for {target}."
+
                 output = f"Recent Messages for {target} (Last {len(messages)}):\n"
                 for msg in messages:
                     content = msg.get('content', '')
@@ -269,10 +289,12 @@ class WhatsAppSkill(Tool):
                     elif msg.get('hasMedia'):
                         content = f"[Media: {msg['type']}] {content}"
 
-                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith("@g.us") else "WHATSAPP_DM"
-                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get('senderNumber') else msg['senderName']
+                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
+                        "@g.us") else "WHATSAPP_DM"
+                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
+                        'senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
-                
+
                 output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
                 return output
             except Exception as e:
@@ -283,15 +305,15 @@ class WhatsAppSkill(Tool):
             message = kwargs.get('message', "")
             media_path = kwargs.get('media_path')
             reply_to = kwargs.get('reply_to')
-            
+
             if not target and len(args) >= 1:
                 target = args[0]
                 if len(args) >= 2:
                     message = " ".join(args[1:])
-                
+
             if not target or (not message and not media_path):
                 return "Usage: send <target> <message> [media_path]"
-            
+
             try:
                 try:
                     # 1. Attempt to resolve via internal Rolodex first
@@ -308,20 +330,20 @@ class WhatsAppSkill(Tool):
                 payload = {"target": target, "text": message}
                 if reply_to:
                     payload["reply_to"] = reply_to
-                    
+
                 if media_path:
                     if not os.path.exists(media_path):
                         return f"Error: Media file not found at {media_path}"
-                    
+
                     file_size = os.path.getsize(media_path)
                     if file_size > 16 * 1024 * 1024:
                         return f"Error: File size ({file_size / (1024*1024):.1f}MB) exceeds the 16MB limit."
-                        
+
                     import mimetypes
                     mime_type, _ = mimetypes.guess_type(media_path)
                     if not mime_type:
                         mime_type = "application/octet-stream"
-                        
+
                     with open(media_path, 'rb') as f:
                         filename = os.path.basename(media_path)
                         files = {'media': (filename, f, mime_type)}
@@ -330,13 +352,16 @@ class WhatsAppSkill(Tool):
                             data_payload["text"] = message
                         if reply_to:
                             data_payload["reply_to"] = reply_to
-                            
-                        res = requests.post(f"{self.base_url}/send", data=data_payload, files=files, timeout=60)
+
+                        res = requests.post(
+                            f"{self.base_url}/send", data=data_payload, files=files, timeout=60)
                 else:
-                    res = requests.post(f"{self.base_url}/send", json=payload, timeout=15)
-                    
+                    res = requests.post(
+                        f"{self.base_url}/send", json=payload, timeout=15)
+
                 data = res.json()
-                if "error" in data: return f"Error: {data['error']}"
+                if "error" in data:
+                    return f"Error: {data['error']}"
                 return f"Message sent to {target} successfully."
             except Exception as e:
                 return f"Failed to send message: {e}"
@@ -345,17 +370,17 @@ class WhatsAppSkill(Tool):
             target = kwargs.get('target')
             message = kwargs.get('message')
             reply_to = kwargs.get('reply_to')
-            
+
             if not target and len(args) >= 2:
                 target = args[0]
                 message = " ".join(args[1:])
-                
+
             if not target or not message:
                 return "Usage: send_voice <target> <message text to speak>"
-            
-            if SettingsManager().get("core.antigravity.agy-mode", False):
+
+            if hasattr(self, 'orchestrator') and self.orchestrator and self.orchestrator.settings_manager.get("core.antigravity.agy-mode", False):
                 return "Error: Voice notes are currently unavailable when agy-mode is active. Please use WhatsApp_send instead."
-            
+
             try:
                 try:
                     # 1. Attempt to resolve via internal Rolodex first
@@ -373,18 +398,27 @@ class WhatsAppSkill(Tool):
                 from google import genai
                 from google.genai import types
 
-                settings = SettingsManager()
-                voice = settings.get("core.tts.gemini.model-name", "Achernar")
-                voice_prompt = settings.get("core.tts.gemini.prompt.profile", "")
-                
-                gemini_settings = settings.get("core.gemini", {})
-                voice_models = gemini_settings.get("voice-models", ["gemini-3.1-flash-tts-preview"])
+                settings = self.orchestrator.settings_manager if hasattr(
+                    self, 'orchestrator') and self.orchestrator else None
+                if settings:
+                    voice = settings.get(
+                        "core.tts.gemini.model-name", "Achernar")
+                    voice_prompt = settings.get(
+                        "core.tts.gemini.prompt.profile", "")
+                else:
+                    voice = "Achernar"
+                    voice_prompt = ""
+
+                gemini_settings = settings.get(
+                    "core.gemini", {}) if settings else {}
+                voice_models = gemini_settings.get(
+                    "voice-models", ["gemini-3.1-flash-tts-preview"])
                 model_name = voice_models[0] if voice_models else "gemini-3.1-flash-tts-preview"
 
                 temp_fd, temp_wav = tempfile.mkstemp(suffix=".wav")
                 os.close(temp_fd)
                 temp_ogg = temp_wav.replace(".wav", ".ogg")
-                
+
                 try:
                     client = genai.Client()
                     full_text = f"{voice_prompt}{message}"
@@ -402,27 +436,29 @@ class WhatsAppSkill(Tool):
                             ),
                         )
                     )
-                    
+
                     audio_data = response.candidates[0].content.parts[0].inline_data.data
                     with open(temp_wav, "wb") as f:
                         f.write(audio_data)
-                        
+
                     subprocess.run(
-                        ["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", temp_wav, "-c:a", "libopus", temp_ogg],
+                        ["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac",
+                            "1", "-i", temp_wav, "-c:a", "libopus", temp_ogg],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
-                    
+
                     if os.path.exists(temp_ogg):
                         with open(temp_ogg, 'rb') as f:
                             files = {'media': ('voice.ogg', f, 'audio/ogg')}
                             data = {'target': target, 'isVoice': 'true'}
                             if reply_to:
                                 data['reply_to'] = reply_to
-                                
-                            res = requests.post(f"{self.base_url}/send", data=data, files=files, timeout=30)
+
+                            res = requests.post(
+                                f"{self.base_url}/send", data=data, files=files, timeout=30)
                             res_data = res.json()
-                        
+
                         if "error" in res_data:
                             return f"Error: {res_data['error']}"
                         return f"Voice message sent to {target} successfully."
@@ -435,25 +471,27 @@ class WhatsAppSkill(Tool):
                         os.remove(temp_wav)
                     if os.path.exists(temp_ogg):
                         os.remove(temp_ogg)
-                    
+
             except Exception as e:
                 return f"Failed to send voice message: {e}"
 
         elif command == "react":
             msg_id = kwargs.get('msgId')
             reaction = kwargs.get('reaction')
-            
+
             if not msg_id and len(args) >= 2:
                 msg_id = args[0]
                 reaction = args[1]
-                
+
             if not msg_id or not reaction:
                 return "Usage: react <msgId> <reaction>"
-            
+
             try:
-                res = requests.post(f"{self.base_url}/react", json={"msgId": msg_id, "reaction": reaction}, timeout=10)
+                res = requests.post(
+                    f"{self.base_url}/react", json={"msgId": msg_id, "reaction": reaction}, timeout=10)
                 data = res.json()
-                if "error" in data: return f"Error: {data['error']}"
+                if "error" in data:
+                    return f"Error: {data['error']}"
                 return f"Reacted with {reaction} successfully."
             except Exception as e:
                 return f"Failed to react: {e}"
@@ -463,14 +501,14 @@ class WhatsAppSkill(Tool):
             if not chat_id:
                 return "Usage: mark_read <chatId>"
             try:
-                res = requests.post(f"{self.base_url}/mark_read", json={"chatId": chat_id}, timeout=10)
+                res = requests.post(
+                    f"{self.base_url}/mark_read", json={"chatId": chat_id}, timeout=10)
                 data = res.json()
-                if "error" in data: return f"Error: {data['error']}"
+                if "error" in data:
+                    return f"Error: {data['error']}"
                 return f"Chat {chat_id} marked as read."
             except Exception as e:
                 return f"Failed to mark as read: {e}"
-
-
 
         return f"Unknown command: {command}"
 

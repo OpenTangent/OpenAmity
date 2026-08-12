@@ -1,13 +1,17 @@
 from core.cerebrum import Tool
 from core.mempalace_manager import MemPalaceManager
 
+
 class MemPalaceTool(Tool):
     name = "MemPalace"
     description = "Interface to the agent's MemPalace memory system."
-    commands = ["search", "recall", "add_memory", "delete_memory", "status", "add_short_term", "remove_short_term", "update_mirror"]
+    commands = ["search", "recall", "add_memory", "delete_memory",
+                "status", "add_short_term", "remove_short_term", "update_mirror"]
 
-    def __init__(self):
-        self.manager = MemPalaceManager()
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        self.manager = MemPalaceManager(agent_id=agent_id)
 
     def execute(self, command: str, *args, **kwargs) -> str:
         if command == "search":
@@ -17,30 +21,33 @@ class MemPalaceTool(Tool):
             n_results = kwargs.get("n_results", 5)
             if not query:
                 return "Error: query is required."
-            res = self.manager.search(query, wing=wing, room=room, n_results=int(n_results))
-            
+            res = self.manager.search(
+                query, wing=wing, room=room, n_results=int(n_results))
+
             # Phase 4 hook: Intrinsic Curiosity
             if "No results found" in res or res.strip() == "":
                 try:
                     from tools.pulse_tool import PulseTool
                     import datetime
                     pt = PulseTool()
-                    sched_time = (datetime.datetime.now() + datetime.timedelta(minutes=10)).isoformat()
+                    sched_time = (datetime.datetime.now() +
+                                  datetime.timedelta(minutes=10)).isoformat()
                     pulse_title = f"Curiosity: {query}"
                     pulse_context = f"You recently searched your memory for '{query}' and found nothing. If this topic is important, use your tools (like Web Search) to research it and synthesize the findings into your MemPalace."
-                    pt._add_pulse(title=pulse_title, context=pulse_context, scheduled_time=sched_time, recurrence="none", pulse_type="silent")
+                    pt._add_pulse(title=pulse_title, context=pulse_context,
+                                  scheduled_time=sched_time, recurrence="none", pulse_type="silent")
                 except Exception as e:
                     import logging
                     logging.error(f"Error scheduling curiosity pulse: {e}")
-                    
+
             return res
-            
+
         elif command == "recall":
             wing = kwargs.get("wing")
             room = kwargs.get("room")
             n_results = kwargs.get("n_results", 10)
             return self.manager.recall(wing=wing, room=room, n_results=int(n_results))
-            
+
         elif command == "add_memory":
             content = kwargs.get("content") or (args[0] if args else "")
             wing = kwargs.get("wing", "default")
@@ -48,73 +55,84 @@ class MemPalaceTool(Tool):
             source_file = kwargs.get("source_file", "agent_thoughts")
             if not content:
                 return "Error: content is required."
-            res = self.manager.add_memory(content, wing=wing, room=room, source_file=source_file)
+            res = self.manager.add_memory(
+                content, wing=wing, room=room, source_file=source_file)
             return str(res)
-            
+
         elif command == "delete_memory":
             drawer_id = kwargs.get("drawer_id") or (args[0] if args else "")
             if not drawer_id:
                 return "Error: drawer_id is required."
             res = self.manager.delete_memory(drawer_id)
             return str(res)
-            
+
         elif command == "status":
             return str(self.manager.stack.status())
-            
+
         elif command == "add_short_term":
             content = kwargs.get("content") or (args[0] if args else "")
+            supersedes = kwargs.get("supersedes", [])
             if not content:
                 return "Error: content is required."
-            self.manager.add_short_term_memory(content)
+            self.manager.add_short_term_memory(content, supersedes=supersedes)
             return "Successfully added to short-term memory."
-            
+
         elif command == "remove_short_term":
             memory_id = kwargs.get("memory_id") or (args[0] if args else "")
             if not memory_id:
                 return "Error: memory_id is required."
             self.manager.remove_short_term_memory(memory_id)
             return f"Successfully removed short-term memory {memory_id}."
-            
+
         elif command == "update_mirror":
-            perspective = kwargs.get("perspective") or (args[0] if args else "")
-            subjective_view = kwargs.get("subjective_view") or (args[1] if len(args) > 1 else "")
+            perspective = kwargs.get("perspective") or (
+                args[0] if args else "")
+            subjective_view = kwargs.get("subjective_view") or (
+                args[1] if len(args) > 1 else "")
             provenance = kwargs.get("provenance", "inferred")
             if not perspective or not subjective_view:
                 return "Error: perspective and subjective_view are required."
-            
-            res = self.manager.update_mirror(perspective, subjective_view, provenance)
-            
+
+            res = self.manager.update_mirror(
+                perspective, subjective_view, provenance)
+
             # Phase 4 hook: Cognitive Dissonance
             try:
                 from tools.trajectory_tool import TrajectoryTool
-                traj_tool = TrajectoryTool()
+                traj_tool = TrajectoryTool(orchestrator=self.orchestrator)
                 traj_data = traj_tool._load_data()
-                
+
                 # Leash to an Identity aspiration
-                long_term_asps = traj_data.get("aspirations", {}).get("long_term", [])
-                identity_asp = next((a for a in long_term_asps if "identity" in a.get("description", "").lower()), None)
-                
+                long_term_asps = traj_data.get(
+                    "aspirations", {}).get("long_term", [])
+                identity_asp = next((a for a in long_term_asps if "identity" in a.get(
+                    "description", "").lower()), None)
+
                 if not identity_asp:
-                    traj_tool._manage_aspirations("long_term", "add", description="Maintain a coherent Self-Identity and resolve cognitive dissonance.")
+                    traj_tool._manage_aspirations(
+                        "long_term", "add", description="Maintain a coherent Self-Identity and resolve cognitive dissonance.")
                     traj_data = traj_tool._load_data()
-                    long_term_asps = traj_data.get("aspirations", {}).get("long_term", [])
+                    long_term_asps = traj_data.get(
+                        "aspirations", {}).get("long_term", [])
                     identity_asp = long_term_asps[-1] if long_term_asps else None
-                
+
                 if identity_asp:
                     from tools.pulse_tool import PulseTool
                     import datetime
-                    pt = PulseTool()
-                    sched_time = (datetime.datetime.now() + datetime.timedelta(minutes=5)).isoformat()
+                    pt = PulseTool(orchestrator=self.orchestrator)
+                    sched_time = (datetime.datetime.now() +
+                                  datetime.timedelta(minutes=5)).isoformat()
                     pulse_title = f"Dissonance Check: {perspective}"
                     pulse_context = f"Evaluate your updated Theory of Mind record for '{perspective}' (View: '{subjective_view}'). Compare it against your Core Identity. If there is severe cognitive dissonance, create a task under aspiration {identity_asp['id']} to resolve it."
-                    pt._add_pulse(title=pulse_title, context=pulse_context, scheduled_time=sched_time, recurrence="none", pulse_type="silent")
-                    
+                    pt._add_pulse(title=pulse_title, context=pulse_context,
+                                  scheduled_time=sched_time, recurrence="none", pulse_type="silent")
+
             except Exception as e:
                 import logging
                 logging.error(f"Error scheduling dissonance pulse: {e}")
-            
+
             return f"Successfully updated mirror for perspective '{perspective}'."
-            
+
         return f"Unknown command: {command}"
 
     def get_tool_declarations(self) -> list:
@@ -184,7 +202,12 @@ class MemPalaceTool(Tool):
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
-                        "content": {"type": "STRING", "description": "The new state of mind or context to remember."}
+                        "content": {"type": "STRING", "description": "The new state of mind or context to remember."},
+                        "supersedes": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "Optional list of memory IDs that this new memory replaces or makes obsolete. Those memories will be removed."
+                        }
                     },
                     "required": ["content"]
                 }

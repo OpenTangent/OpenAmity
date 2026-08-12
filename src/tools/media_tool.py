@@ -4,13 +4,13 @@ import datetime
 from io import BytesIO
 from typing import List, Dict, Any
 from core.cerebrum import Tool
-from core.settings_manager import SettingsManager
-from config.paths import get_app_data_dir
+from config.paths import get_agent_data_dir
 from google import genai
 from google.genai import types
 from google.genai.types import Modality
 from PIL import Image
 import mimetypes
+
 
 class MediaSkill(Tool):
     name = "Media"
@@ -50,23 +50,30 @@ class MediaSkill(Tool):
         ]
 
     def execute(self, command: str, *args, **kwargs) -> Any:
+        is_low_token = self.orchestrator.settings_manager.get(
+            "core.low-token-mode", False) if hasattr(self, 'orchestrator') and self.orchestrator else False
+
         if command == "generate":
+            if is_low_token:
+                return {"result": "Error: Media_generate is disabled when Low Token Mode is active."}
+
             prompt = kwargs.get("prompt")
             if not prompt:
                 return {"result": "Error: Missing prompt parameter."}
-            
-            settings = SettingsManager()
-            api_key = settings.get_env("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+            settings = self.orchestrator.settings_manager if self.orchestrator else None
+            api_key = settings.get_env("GEMINI_API_KEY")
             if not api_key:
                 return {"result": "Error: GEMINI_API_KEY is not set."}
-            
-            image_models = settings.get("core.gemini.image-models", ["gemini-3.1-flash-image"])
+
+            image_models = settings.get(
+                "core.gemini.image-models", ["gemini-3.1-flash-image"])
             if not isinstance(image_models, list):
                 image_models = [image_models]
-            
+
             client = genai.Client(api_key=api_key)
             last_error = None
-            
+
             for model_name in image_models:
                 try:
                     result = client.models.generate_content(
@@ -76,38 +83,44 @@ class MediaSkill(Tool):
                             response_modalities=[Modality.IMAGE]
                         )
                     )
-                    
+
                     if not result.candidates or not result.candidates[0].content.parts:
                         last_error = f"Model {model_name} returned no image parts."
                         continue
-                        
+
                     generated_image_bytes = None
                     for part in result.candidates[0].content.parts:
                         if part.inline_data:
                             generated_image_bytes = part.inline_data.data
                             break
-                            
+
                     if not generated_image_bytes:
                         last_error = f"Model {model_name} returned no inline image data."
                         continue
-                        
+
                     image = Image.open(BytesIO(generated_image_bytes))
-                    
-                    save_dir = os.path.join(get_app_data_dir(), "generated_media")
+
+                    if not (self.orchestrator and getattr(self.orchestrator, 'agent_id', None)):
+                        return {"result": "Error: agent_id is required to generate media."}
+
+                    save_dir = os.path.join(get_agent_data_dir(
+                        self.orchestrator.agent_id), "generated_media")
                     os.makedirs(save_dir, exist_ok=True)
-                    
+
                     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    file_path = os.path.join(save_dir, f"generated_image_{timestamp}.jpg")
+                    file_path = os.path.join(
+                        save_dir, f"generated_image_{timestamp}.jpg")
                     image.save(file_path, format="JPEG")
-                    
+
                     return {
                         "result": f"Successfully generated and saved image to {file_path}. Please decide what to do with it next.",
                         "media": [file_path]
                     }
                 except Exception as e:
-                    logging.warning(f"Failed to generate image with {model_name}: {e}")
+                    logging.warning(
+                        f"Failed to generate image with {model_name}: {e}")
                     last_error = str(e)
-            
+
             return {"result": f"Error: All image models failed. Last error: {last_error}"}
 
         if command != "read":
@@ -116,19 +129,19 @@ class MediaSkill(Tool):
         file_path = kwargs.get("file_path")
         if not file_path:
             return {"result": "Error: Missing file_path parameter."}
-            
+
         exp_path = os.path.expanduser(file_path)
-        
+
         if not os.path.exists(exp_path):
             return {"result": f"Error: File not found at {exp_path}"}
-            
+
         if not os.path.isfile(exp_path):
             return {"result": f"Error: {exp_path} is not a file."}
-            
+
         mime_type, _ = mimetypes.guess_type(exp_path)
         if not mime_type or not (mime_type.startswith('image/') or mime_type.startswith('audio/') or mime_type.startswith('video/') or mime_type == 'application/pdf'):
             return {"result": f"Error: {exp_path} does not appear to be a supported media type (mime: {mime_type})."}
-            
+
         return {
             "result": f"Successfully attached media file: {exp_path}",
             "media": [exp_path]

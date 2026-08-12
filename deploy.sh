@@ -14,7 +14,7 @@ echo ""
 echo -e "${BLUE}[1/5] Checking Python requirements...${NC}"
 if [ requirements.txt -nt compile/python3-requirements.json ]; then
     echo -e "${YELLOW}requirements.txt has changed. Regenerating Flatpak dependencies...${NC}"
-    python3 compile/sync_requirements.py
+    (cd compile && python3 sync_requirements.py)
     echo -e "${GREEN}Dependencies regenerated successfully.${NC}"
 else
     echo -e "${GREEN}requirements.txt has not changed. Skipping dependency regeneration.${NC}"

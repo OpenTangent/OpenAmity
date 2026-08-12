@@ -5,19 +5,22 @@ from datetime import datetime
 from typing import List, Dict, Any
 from core.cerebrum import Tool
 
-from config import paths
-TRAJECTORY_DIR = paths.get_app_data_dir()
-os.makedirs(TRAJECTORY_DIR, exist_ok=True)
-TRAJECTORY_FILE = os.path.join(TRAJECTORY_DIR, "trajectory.json")
-ARCHIVE_FILE = os.path.join(TRAJECTORY_DIR, "completed_trajectory_archive.json")
 
 class TrajectoryTool(Tool):
     name = "Trajectory"
     description = "Manage the agent's self-reflection, hierarchical aspirations (using short-term goals as milestones for long-term ones), and tasks."
-    commands = ["get_bearings", "reflect_and_update_state", "manage_aspirations", "manage_tasks"]
+    commands = ["get_bearings", "reflect_and_update_state",
+                "manage_aspirations", "manage_tasks"]
 
-    def __init__(self):
-        self._ensure_file_exists()
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
+
+    def _get_trajectory_paths(self):
+        from config import paths
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        d = paths.get_base_dir_for(agent_id)
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "trajectory.json"), os.path.join(d, "completed_trajectory_archive.json")
 
     def _get_base_structure(self) -> Dict[str, Any]:
         return {
@@ -35,7 +38,8 @@ class TrajectoryTool(Tool):
         }
 
     def _ensure_file_exists(self):
-        if not os.path.exists(TRAJECTORY_FILE):
+        traj_file, _ = self._get_trajectory_paths()
+        if not os.path.exists(traj_file):
             now = datetime.now().isoformat()
             asp_id = f"asp_{uuid.uuid4().hex[:6]}"
             default_data = self._get_base_structure()
@@ -56,7 +60,7 @@ class TrajectoryTool(Tool):
                 "created_at": now,
                 "depends_on": []
             })
-            with open(TRAJECTORY_FILE, 'w', encoding='utf-8') as f:
+            with open(traj_file, 'w', encoding='utf-8') as f:
                 json.dump(default_data, f, indent=2)
 
     def _deep_merge(self, dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
@@ -69,55 +73,59 @@ class TrajectoryTool(Tool):
         return dict1
 
     def _load_data(self) -> Dict[str, Any]:
+        traj_file, _ = self._get_trajectory_paths()
         try:
-            with open(TRAJECTORY_FILE, 'r', encoding='utf-8') as f:
+            with open(traj_file, 'r', encoding='utf-8') as f:
                 user_data = json.load(f)
         except Exception:
             user_data = {}
-            
+
         base = self._get_base_structure()
         merged = self._deep_merge(base, user_data)
-        
+
         if merged != user_data:
             try:
                 self._save_data(merged)
             except Exception:
                 pass
-                
+
         return merged
 
     def _save_data(self, data: Dict[str, Any]):
-        with open(TRAJECTORY_FILE, 'w', encoding='utf-8') as f:
+        traj_file, _ = self._get_trajectory_paths()
+        with open(traj_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
 
     def _archive_aspiration(self, asp: Dict[str, Any], tier: str):
+        _, arch_file = self._get_trajectory_paths()
         archive = []
-        if os.path.exists(ARCHIVE_FILE):
+        if os.path.exists(arch_file):
             try:
-                with open(ARCHIVE_FILE, 'r', encoding='utf-8') as f:
+                with open(arch_file, 'r', encoding='utf-8') as f:
                     archive = json.load(f)
             except:
                 archive = []
-        
+
         asp['archived_at'] = datetime.now().isoformat()
         asp['tier'] = tier
         archive.append(asp)
-        with open(ARCHIVE_FILE, 'w', encoding='utf-8') as f:
+        with open(arch_file, 'w', encoding='utf-8') as f:
             json.dump(archive, f, indent=2)
 
     def _archive_task(self, task: Dict[str, Any]):
+        _, arch_file = self._get_trajectory_paths()
         archive = []
-        if os.path.exists(ARCHIVE_FILE):
+        if os.path.exists(arch_file):
             try:
-                with open(ARCHIVE_FILE, 'r', encoding='utf-8') as f:
+                with open(arch_file, 'r', encoding='utf-8') as f:
                     archive = json.load(f)
             except:
                 archive = []
-        
+
         task['archived_at'] = datetime.now().isoformat()
         task['type'] = 'task'
         archive.append(task)
-        with open(ARCHIVE_FILE, 'w', encoding='utf-8') as f:
+        with open(arch_file, 'w', encoding='utf-8') as f:
             json.dump(archive, f, indent=2)
 
     def execute(self, command: str, *args, **kwargs) -> str:
@@ -132,7 +140,8 @@ class TrajectoryTool(Tool):
         return f"Unknown command: {command}"
 
     def _format_time_elapsed(self, iso_str: str) -> str:
-        if not iso_str: return "Unknown"
+        if not iso_str:
+            return "Unknown"
         try:
             dt = datetime.fromisoformat(iso_str)
             days = (datetime.now() - dt).days
@@ -147,34 +156,49 @@ class TrajectoryTool(Tool):
     def _get_bearings(self) -> str:
         try:
             from core.mempalace_manager import MemPalaceManager
-            mp = MemPalaceManager()
+            agent_id = self.orchestrator.agent_id if self.orchestrator else None
+            mp = MemPalaceManager(agent_id=agent_id)
             self_perception = mp.get_self_perception()
         except Exception as e:
             self_perception = f"(Could not load Self Perception: {e})"
-            
+
         data = self._load_data()
-        
+
+        # Track deferrals
+        tasks = data.get("tasks", [])
+        modified_data = False
+        for t in tasks:
+            if t.get("status") == "pending":
+                t["deferral_count"] = t.get("deferral_count", 0) + 1
+                modified_data = True
+
+        if modified_data:
+            self._save_data(data)
+
         # Read Somatic State
         somatic_state_text = ""
         try:
-            state_path = os.path.join(TRAJECTORY_DIR, "somatic_state.json")
+            traj_file, _ = self._get_trajectory_paths()
+            state_path = os.path.join(os.path.dirname(
+                traj_file), "somatic_state.json")
             if os.path.exists(state_path):
                 with open(state_path, "r") as f:
                     somatic = json.load(f)
                     current_weight = somatic.get("current_task_weight", 0)
                     max_weight = somatic.get("max_weight", 1000)
-                    percent = (current_weight / max_weight) * 100 if max_weight else 0
-                    
+                    percent = (current_weight / max_weight) * \
+                        100 if max_weight else 0
+
                     state_desc = "Low (Unrestricted)"
                     if percent >= 50:
                         state_desc = "High (Completion Phase - Overwhelmed/Fatigued)"
                     elif percent >= 25:
                         state_desc = "Moderate (Conservation Phase - Nearing capacity)"
-                        
+
                     somatic_state_text = f"\n--- Somatic (Physiological) Feedback ---\nCognitive Budget Task Weight: {current_weight:.1f}/{max_weight} ({percent:.1f}%)\nCurrent State: {state_desc}\n"
         except Exception:
             pass
-        
+
         lines = ["=== THE AGENT'S CURRENT BEARING ==="]
         if somatic_state_text:
             lines.append(somatic_state_text.strip())
@@ -182,11 +206,12 @@ class TrajectoryTool(Tool):
         if self_perception:
             lines.append(self_perception.strip())
             lines.append("")
-            
-        lines.append(f"Last Reflection: {data['last_reflection']['timestamp']}")
+
+        lines.append(
+            f"Last Reflection: {data['last_reflection']['timestamp']}")
         lines.append(f"State: {data['last_reflection']['perceived_state']}")
         lines.append(f"Summary: {data['last_reflection']['summary']}")
-        
+
         lines.append("\n-- Aspirations & Tasks (Ordered by Priority) --")
         tasks = data.get("tasks", [])
         task_dict = {t["id"]: t for t in tasks}
@@ -202,38 +227,54 @@ class TrajectoryTool(Tool):
                 lines.append("  None.")
             for asp in aspirations:
                 created = self._format_time_elapsed(asp.get("created_at"))
-                lines.append(f"  {asp.get('priority', '-')}. ID: {asp['id']} | Status: {asp['status']} | Created: {created} | {asp['description']}")
                 asp_tasks = tasks_by_asp.get(asp['id'], [])
+                active_asp_tasks = [
+                    t for t in asp_tasks if t.get("status") != "completed"]
+                orphan_warning = " (WARNING: Orphaned Aspiration. No active tasks exist to advance this. Add tasks or delete it.)" if not active_asp_tasks else ""
+
+                lines.append(
+                    f"  {asp.get('priority', '-')}. ID: {asp['id']} | Status: {asp['status']} | Created: {created}{orphan_warning} | {asp['description']}")
                 if not asp_tasks:
                     lines.append("    (No tasks plotted for this aspiration)")
                 else:
                     for task in asp_tasks:
-                        task_created = self._format_time_elapsed(task.get("created_at"))
+                        task_created = self._format_time_elapsed(
+                            task.get("created_at"))
                         deps = task.get("depends_on", [])
                         blocked_by = [d for d in deps if d in task_dict]
                         status_display = task['status']
                         if blocked_by:
                             status_display += f" (BLOCKED BY: {', '.join(blocked_by)})"
-                        lines.append(f"    -> Task {task['id']} | Status: {status_display} | Created: {task_created} | {task['description']}")
 
-        all_asp_ids = {a['id'] for tier in ["short_term", "medium_term", "long_term"] for a in data["aspirations"].get(tier, [])}
-        orphaned = [t for t in tasks if t.get("aspiration_id") not in all_asp_ids]
+                        deferral_count = task.get("deferral_count", 0)
+                        deferral_warning = " (WARNING: Repeatedly deferred. Consider breaking this down or removing it.)" if deferral_count >= 3 else ""
+                        lines.append(
+                            f"    -> Task {task['id']} | Status: {status_display} | Created: {task_created}{deferral_warning} | {task['description']}")
+
+        all_asp_ids = {a['id'] for tier in ["short_term", "medium_term",
+                                            "long_term"] for a in data["aspirations"].get(tier, [])}
+        orphaned = [t for t in tasks if t.get(
+            "aspiration_id") not in all_asp_ids]
         if orphaned:
             lines.append("\n[ORPHANED TASKS]:")
             for task in orphaned:
-                task_created = self._format_time_elapsed(task.get("created_at"))
+                task_created = self._format_time_elapsed(
+                    task.get("created_at"))
                 deps = task.get("depends_on", [])
                 blocked_by = [d for d in deps if d in task_dict]
                 status_display = task['status']
                 if blocked_by:
                     status_display += f" (BLOCKED BY: {', '.join(blocked_by)})"
-                lines.append(f"  Task {task['id']} (for unknown Aspiration: {task.get('aspiration_id')}) | Status: {status_display} | Created: {task_created} | {task['description']}")
-            
+                lines.append(
+                    f"  Task {task['id']} (for unknown Aspiration: {task.get('aspiration_id')}) | Status: {status_display} | Created: {task_created} | {task['description']}")
+
         lines.append("\n=== OPERATIONAL HINTS ===")
-        lines.append("- PulseEngine: If your Task Weight is getting high or you have long-running tasks, use the PulseTool to schedule a wake-up later.")
+        lines.append(
+            "- PulseEngine: If your Task Weight is getting high or you have long-running tasks, use the PulseTool to schedule a wake-up later.")
         lines.append("- Trajectory Milestones: When you complete a significant aspiration, use the MemPalace tool to store a memory in the 'office' wing to document your growth.")
-        lines.append("- Hierarchies: Use short-term aspirations as concrete milestones to achieve medium/long-term aspirations.")
-        
+        lines.append(
+            "- Hierarchies: Use short-term aspirations as concrete milestones to achieve medium/long-term aspirations.")
+
         return "\n".join(lines)
 
     def _reflect_and_update_state(self, summary: str, perceived_state: str) -> str:
@@ -249,58 +290,62 @@ class TrajectoryTool(Tool):
     def _update_priorities(self, aspirations: List[Dict[str, Any]], updated_asp: Dict[str, Any], new_priority: int) -> List[Dict[str, Any]]:
         remaining = [a for a in aspirations if a['id'] != updated_asp['id']]
         remaining.sort(key=lambda x: x.get('priority', 999))
-        
+
         pos = max(0, new_priority - 1)
         remaining.insert(pos, updated_asp)
-        
+
         for i, asp in enumerate(remaining):
             asp['priority'] = i + 1
-            
+
         return remaining
 
     def _manage_aspirations(self, tier: str, action: str, description: str = None, aspiration_id: str = None, priority: int = None) -> str:
         if tier not in ["short_term", "medium_term", "long_term"]:
             return "Error: tier must be 'short_term', 'medium_term', or 'long_term'."
-        
+
         data = self._load_data()
         aspirations = data["aspirations"].get(tier, [])
-        
+
         if action == "add":
             if not description:
                 return "Error: description is required to add an aspiration."
             new_id = f"asp_{uuid.uuid4().hex[:6]}"
             new_asp = {
-                "id": new_id, 
-                "description": description, 
+                "id": new_id,
+                "description": description,
                 "status": "active",
                 "created_at": datetime.now().isoformat()
             }
             if priority is not None:
-                aspirations = self._update_priorities(aspirations, new_asp, priority)
+                aspirations = self._update_priorities(
+                    aspirations, new_asp, priority)
             else:
                 new_asp["priority"] = len(aspirations) + 1
                 aspirations.append(new_asp)
-                
+
             data["aspirations"][tier] = aspirations
             self._save_data(data)
             return f"Success: Aspiration added with ID {new_id}."
-            
+
         elif action == "update":
             if not aspiration_id:
                 return "Error: aspiration_id is required to update."
-            target_asp = next((a for a in aspirations if a["id"] == aspiration_id), None)
-            if not target_asp: return f"Error: Aspiration {aspiration_id} not found in {tier}."
-            
+            target_asp = next(
+                (a for a in aspirations if a["id"] == aspiration_id), None)
+            if not target_asp:
+                return f"Error: Aspiration {aspiration_id} not found in {tier}."
+
             if description:
                 target_asp["description"] = description
-                
+
             if priority is not None:
-                aspirations = self._update_priorities(aspirations, target_asp, priority)
-                
+                aspirations = self._update_priorities(
+                    aspirations, target_asp, priority)
+
             data["aspirations"][tier] = aspirations
             self._save_data(data)
             return f"Success: Aspiration {aspiration_id} updated."
-            
+
         elif action == "delete":
             if not aspiration_id:
                 return "Error: aspiration_id is required to delete."
@@ -308,36 +353,38 @@ class TrajectoryTool(Tool):
             aspirations = [a for a in aspirations if a["id"] != aspiration_id]
             if len(aspirations) == original_len:
                 return f"Error: Aspiration {aspiration_id} not found in {tier}."
-                
+
             # Reshuffle
             for i, a in enumerate(aspirations):
                 a['priority'] = i + 1
             data["aspirations"][tier] = aspirations
             self._save_data(data)
             return f"Success: Aspiration {aspiration_id} deleted."
-            
+
         elif action == "complete":
             if not aspiration_id:
                 return "Error: aspiration_id is required to complete."
-            target_asp = next((a for a in aspirations if a["id"] == aspiration_id), None)
-            if not target_asp: return f"Error: Aspiration {aspiration_id} not found in {tier}."
-            
+            target_asp = next(
+                (a for a in aspirations if a["id"] == aspiration_id), None)
+            if not target_asp:
+                return f"Error: Aspiration {aspiration_id} not found in {tier}."
+
             target_asp["status"] = "completed"
             self._archive_aspiration(target_asp, tier)
-            
+
             aspirations = [a for a in aspirations if a["id"] != aspiration_id]
             for i, a in enumerate(aspirations):
                 a['priority'] = i + 1
             data["aspirations"][tier] = aspirations
             self._save_data(data)
             return f"Success: Aspiration {aspiration_id} marked as completed and archived."
-            
+
         return f"Error: Unknown action '{action}' for aspirations."
 
     def _manage_tasks(self, action: str, aspiration_id: str = None, task_id: str = None, description: str = None, status: str = None, depends_on: List[str] = None) -> str:
         data = self._load_data()
         tasks = data.get("tasks", [])
-        
+
         if action == "add":
             if not aspiration_id or not description:
                 return "Error: aspiration_id and description are required to add a task."
@@ -354,13 +401,14 @@ class TrajectoryTool(Tool):
             data["tasks"] = tasks
             self._save_data(data)
             return f"Success: Task added with ID {new_id}."
-            
+
         elif action == "update":
             if not task_id:
                 return "Error: task_id is required to update."
             target = next((t for t in tasks if t["id"] == task_id), None)
-            if not target: return f"Error: Task {task_id} not found."
-            
+            if not target:
+                return f"Error: Task {task_id} not found."
+
             if description:
                 target["description"] = description
             if depends_on is not None:
@@ -374,11 +422,11 @@ class TrajectoryTool(Tool):
                     data["tasks"] = tasks
                     self._save_data(data)
                     return f"Success: Task {task_id} completed and archived."
-                    
+
             data["tasks"] = tasks
             self._save_data(data)
             return f"Success: Task {task_id} updated."
-            
+
         elif action == "delete":
             if not task_id:
                 return "Error: task_id is required to delete."
@@ -389,7 +437,7 @@ class TrajectoryTool(Tool):
             data["tasks"] = tasks
             self._save_data(data)
             return f"Success: Task {task_id} deleted."
-            
+
         return f"Error: Unknown action '{action}' for tasks."
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:

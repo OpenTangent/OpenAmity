@@ -4,14 +4,14 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from core.cerebrum import Tool
 
-from config import paths
-DB_DIR = paths.get_app_data_dir()
-os.makedirs(DB_DIR, exist_ok=True)
-DB_PATH = os.path.join(DB_DIR, "pulses.db")
+
 class PulseTool(Tool):
     name = "PulseTool"
     description = "Allows you to manage your own Autonomy Pulses (your scheduled tasks and routines)."
     commands = ["add_pulse", "update_pulse", "view_agenda"]
+
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -83,7 +83,12 @@ class PulseTool(Tool):
         ]
 
     def _get_db(self):
-        return sqlite3.connect(DB_PATH)
+        from config import paths
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        db_dir = paths.get_base_dir_for(agent_id)
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "pulses.db")
+        return sqlite3.connect(db_path)
 
     def execute(self, command: str, *args, **kwargs) -> str:
         if command == "add_pulse":
@@ -99,10 +104,10 @@ class PulseTool(Tool):
             datetime.fromisoformat(scheduled_time)
         except ValueError:
             return "Error: scheduled_time must be a valid ISO format string."
-            
+
         if recurrence not in ['none', 'daily', 'weekly', 'monthly']:
             return "Error: recurrence must be one of 'none', 'daily', 'weekly', 'monthly'."
-            
+
         if pulse_type not in ['silent', 'standard']:
             return "Error: pulse_type must be either 'silent' or 'standard'."
 
@@ -115,30 +120,31 @@ class PulseTool(Tool):
         conn.commit()
         pulse_id = c.lastrowid
         conn.close()
-        
+
         return f"Success: Pulse '{title}' scheduled with ID {pulse_id}."
 
     def _update_pulse(self, pulse_id: int, action: str, new_time: str = None) -> str:
         if action not in ['complete', 'cancel', 'snooze', 'delete']:
             return "Error: action must be 'complete', 'cancel', 'snooze', or 'delete'."
-            
+
         if action == 'snooze' and not new_time:
             return "Error: new_time is required when snoozing."
 
         conn = self._get_db()
         c = conn.cursor()
-        
+
         c.execute('SELECT recurrence FROM pulses WHERE id = ?', (pulse_id,))
         row = c.fetchone()
         if not row:
             conn.close()
             return f"Error: Pulse ID {pulse_id} not found."
-            
+
         recurrence = row[0]
 
         if action == 'delete':
             if recurrence == 'none':
-                c.execute('UPDATE pulses SET status="deleted" WHERE id=?', (pulse_id,))
+                c.execute(
+                    'UPDATE pulses SET status="deleted" WHERE id=?', (pulse_id,))
                 msg = f"Success: Once-off Pulse ID {pulse_id} flagged as deleted."
             else:
                 c.execute('DELETE FROM pulses WHERE id=?', (pulse_id,))
@@ -149,11 +155,13 @@ class PulseTool(Tool):
             except ValueError:
                 conn.close()
                 return "Error: new_time must be a valid ISO format string."
-            c.execute('UPDATE pulses SET scheduled_time=?, status="pending", has_run=0 WHERE id=?', (new_time, pulse_id))
+            c.execute(
+                'UPDATE pulses SET scheduled_time=?, status="pending", has_run=0 WHERE id=?', (new_time, pulse_id))
             msg = f"Success: Pulse ID {pulse_id} snoozed to {new_time}."
         else:
             # complete or cancel
-            c.execute('UPDATE pulses SET status=? WHERE id=?', (action, pulse_id))
+            c.execute('UPDATE pulses SET status=? WHERE id=?',
+                      (action, pulse_id))
             msg = f"Success: Pulse ID {pulse_id} marked as {action}."
 
         conn.commit()
@@ -163,23 +171,23 @@ class PulseTool(Tool):
     def _view_agenda(self, days_ahead: int = 7) -> str:
         now = datetime.now()
         end_date = now + timedelta(days=days_ahead)
-        
+
         conn = self._get_db()
         c = conn.cursor()
-        
+
         c.execute('''
             SELECT id, title, scheduled_time, recurrence, status, pulse_type
             FROM pulses 
             WHERE status != 'deleted' AND scheduled_time <= ?
             ORDER BY scheduled_time ASC
         ''', (end_date.isoformat(),))
-        
+
         rows = c.fetchall()
         conn.close()
-        
+
         if not rows:
             return f"Your agenda is clear for the next {days_ahead} days."
-            
+
         agenda = [f"Upcoming Agenda (Next {days_ahead} days):"]
         for row in rows:
             p_id, title, sched, rec, status, p_type = row
@@ -189,8 +197,9 @@ class PulseTool(Tool):
                 sched_display = dt.strftime("%Y-%m-%d %H:%M")
             except:
                 sched_display = sched
-                
+
             rec_str = f" (Repeats: {rec})" if rec != 'none' else ""
-            agenda.append(f"[{p_id}] {sched_display} | {title} | Type: {p_type} | Status: {status}{rec_str}")
-            
+            agenda.append(
+                f"[{p_id}] {sched_display} | {title} | Type: {p_type} | Status: {status}{rec_str}")
+
         return "\n".join(agenda)

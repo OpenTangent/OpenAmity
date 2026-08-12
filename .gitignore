@@ -2,12 +2,13 @@ __pycache__/
 *.pyc
 .env
 .venv
-GEMINI.md
 dist/
 build/
 *.egg-info/
 .idea/
 .vscode/
+GEMINI.md
+deploy.sh
 
 # Large binaries and releases
 *.flatpak

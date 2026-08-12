@@ -5,8 +5,10 @@ from PySide6.QtCore import QObject, Signal
 
 from core.logger_config import ColorFormatter
 
+
 class LogSignals(QObject):
-    new_message = Signal(str)
+    new_message = Signal(str, str)
+
 
 class QtLoggingHandler(logging.Handler):
     def __init__(self):
@@ -17,18 +19,18 @@ class QtLoggingHandler(logging.Handler):
     def emit(self, record):
         msg = self.format(record)
         escaped_msg = html.escape(msg)
-        
+
         parts = re.split(r'(\x1b\[[0-9;]*m)', escaped_msg)
-        
+
         html_out = ""
         span_open = False
-        
+
         for part in parts:
             if part.startswith('\x1b['):
                 if span_open:
                     html_out += "</span>"
                     span_open = False
-                    
+
                 if part == '\x1b[0m':
                     pass
                 elif part == '\x1b[90m':
@@ -49,20 +51,26 @@ class QtLoggingHandler(logging.Handler):
                 else:
                     m = re.match(r'\x1b\[38;2;(\d+);(\d+);(\d+)m', part)
                     if m:
-                        r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                        r, g, b = int(m.group(1)), int(
+                            m.group(2)), int(m.group(3))
                         html_out += f'<span style="color: #{r:02x}{g:02x}{b:02x};">'
                         span_open = True
             else:
                 html_out += part
-                
+
         if span_open:
             html_out += "</span>"
-            
+
         html_out = html_out.replace('\n', '<br>')
-        self.signals.new_message.emit(html_out)
+
+        from core.logger_config import agent_id_var
+        agent_id = agent_id_var.get() or "global"
+
+        self.signals.new_message.emit(agent_id, html_out)
+
 
 class StreamLogger(QObject):
-    new_message = Signal(str)
+    new_message = Signal(str, str)
 
     def __init__(self, stream):
         super().__init__()
@@ -71,7 +79,9 @@ class StreamLogger(QObject):
     def write(self, text):
         if text.strip():
             clean_text = re.sub(r'\x1b\[[0-9;]*m', '', text.strip())
-            self.new_message.emit(clean_text)
+            from core.logger_config import agent_id_var
+            agent_id = agent_id_var.get() or "global"
+            self.new_message.emit(agent_id, clean_text)
         if self.stream:
             self.stream.write(text)
 

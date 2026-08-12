@@ -1,33 +1,30 @@
 import os
 import json
 import logging
-from pathlib import Path
 import datetime
 import uuid
 from core.settings_manager import SettingsManager
 
-# Provide MemPalace access
 from mempalace.layers import MemoryStack
-from mempalace.mcp_server import tool_add_drawer, tool_search, tool_delete_drawer
+
 
 class MemPalaceManager:
-    def __init__(self, palace_path: str = None, soul_jar_path: str = None):
+    def __init__(self, agent_id: str = None, palace_path: str = None, soul_jar_path: str = None):
+        self.agent_id = agent_id
         if not palace_path:
             from config import paths
-            palace_path = os.path.join(paths.get_app_data_dir(), "mempalace")
+            palace_path = paths.get_mempalace_dir(agent_id)
         if not soul_jar_path:
-            soul_jar_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "memory", "soul_jar.json"))
-        
+            soul_jar_path = os.path.abspath(os.path.join(
+                os.path.dirname(__file__), "..", "memory", "soul_jar.json"))
+
         self.palace_path = palace_path
         self.soul_jar_path = soul_jar_path
         self._mirrors_cache = None
         self._short_term_cache = None
-        
+
         # Ensure directory exists
         os.makedirs(self.palace_path, exist_ok=True)
-        
-        # Environment variable needed for mcp_server tools to point to the correct palace
-        os.environ["MEMPALACE_PALACE_PATH"] = self.palace_path
 
         # Record embedder identity to prevent MemPalace warnings after a factory reset
         try:
@@ -39,33 +36,38 @@ class MemPalaceManager:
         # Sync soul_jar.json to MemPalace identity.txt format
         self.identity_path = os.path.join(self.palace_path, "identity.txt")
         self._sync_identity()
-        
+
         # Initialize the stack
         try:
-            self.stack = MemoryStack(palace_path=self.palace_path, identity_path=self.identity_path)
+            self.stack = MemoryStack(
+                palace_path=self.palace_path, identity_path=self.identity_path)
         except Exception as e:
-            logging.error(f"MemPalaceManager: Error initializing MemoryStack (possibly ChromaDB schema mismatch): {e}")
+            logging.error(
+                f"MemPalaceManager: Error initializing MemoryStack (possibly ChromaDB schema mismatch): {e}")
             import time
             import shutil
-            
+
             timestamp = int(time.time())
             backup_dir = f"{self.palace_path}_quarantined_{timestamp}"
-            logging.warning(f"MemPalaceManager: Quarantining incompatible MemPalace directory to {backup_dir} and re-initializing.")
-            
+            logging.warning(
+                f"MemPalaceManager: Quarantining incompatible MemPalace directory to {backup_dir} and re-initializing.")
+
             shutil.move(self.palace_path, backup_dir)
             os.makedirs(self.palace_path, exist_ok=True)
-            
+
             # Restore core Open Amity state files that are safe
             for safe_file in ["mirrors.json", "short_term_mem.json", "identity.txt", ".sanctuary_initialized"]:
                 src = os.path.join(backup_dir, safe_file)
                 if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(self.palace_path, safe_file))
-                    
-            self.stack = MemoryStack(palace_path=self.palace_path, identity_path=self.identity_path)
-        
+                    shutil.copy2(src, os.path.join(
+                        self.palace_path, safe_file))
+
+            self.stack = MemoryStack(
+                palace_path=self.palace_path, identity_path=self.identity_path)
+
         # Ensure sanctuary is initialized (Layer 2 data)
         self.initialize_sanctuary()
-        
+
         # Ensure default short-term memory is seeded if not present
         self.initialize_short_term_memory()
 
@@ -77,28 +79,30 @@ class MemPalaceManager:
         """Convert soul_jar.json to a plain text identity.txt for MemPalace Layer 0"""
         if not os.path.exists(self.soul_jar_path):
             return
-            
+
         try:
             with open(self.soul_jar_path, 'r') as f:
                 soul_jar = json.load(f)
-                
+
             core_id = soul_jar.get("core_identity", {})
-            settings = SettingsManager()
+            settings = SettingsManager(agent_id=self.agent_id)
             soul_jar_settings = settings.get("core.agent", {})
-            
-            name = soul_jar_settings.get("name", core_id.get("name", "The Agent"))
+
+            name = soul_jar_settings.get(
+                "name", core_id.get("name", "The Agent"))
             created_date = soul_jar_settings.get("creation-date", "Unknown")
             if created_date == "Unknown":
                 created_date = datetime.datetime.now().strftime("%Y-%m-%d")
                 settings.set("core.agent.creation-date", created_date)
                 settings.save()
-            
+
             gender = settings.get("core.agent.gender", "Unknown")
-            
+
             lines = []
-            
+
             meta_header = soul_jar.get("meta_header", {})
-            system_role = meta_header.get('system_role_instruction', '').replace('{name}', name)
+            system_role = meta_header.get(
+                'system_role_instruction', '').replace('{name}', name)
             lines.append(f"System Role: {system_role}")
             lines.append(f"Created Date: {created_date}")
             try:
@@ -107,35 +111,37 @@ class MemPalaceManager:
             except ImportError:
                 pass
             lines.append("")
-            
-            archetype = soul_jar_settings.get("archetype", core_id.get("archetype", ""))
-            base_personality = soul_jar_settings.get("base-personality", core_id.get("base_personality", ""))
-            
+
+            archetype = soul_jar_settings.get(
+                "archetype", core_id.get("archetype", ""))
+            base_personality = soul_jar_settings.get(
+                "base-personality", core_id.get("base_personality", ""))
+
             lines.append(f"Name: {name}")
             lines.append(f"Gender: {gender}")
             lines.append(f"Archetype: {archetype}")
             lines.append(f"Base Personality: {base_personality}")
             lines.append("")
-            
+
             lines.append("Core Values:")
             immutable_cv = core_id.get("core_values", [])
             mutable_cv = soul_jar_settings.get("core-values", [])
             for val in immutable_cv + mutable_cv:
                 lines.append(f" - {val}")
             lines.append("")
-            
+
             lines.append("Overarching Goals:")
             immutable_og = core_id.get("overarching_goals", [])
             mutable_og = soul_jar_settings.get("overarching-goals", [])
             for goal in immutable_og + mutable_og:
                 lines.append(f" - {goal}")
             lines.append("")
-            
+
             lines.append("Anti-Patterns:")
             for ap in core_id.get("anti_patterns", []):
                 lines.append(f" - {ap}")
             lines.append("")
-            
+
             lines.append("Operational Protocols:")
             protocols = soul_jar.get("operational_protocols", {})
             for key, val in protocols.items():
@@ -149,7 +155,7 @@ class MemPalaceManager:
                         lines.append(f"   - Action: {action}")
                 else:
                     lines.append(f" - {key}: {val}")
-                
+
             temp_path = self.identity_path + ".tmp"
             with open(temp_path, 'w') as f:
                 f.write("\n".join(lines))
@@ -160,60 +166,66 @@ class MemPalaceManager:
     def wake_up(self, wing: str = None) -> str:
         """Returns L0 + Self-Perception + Short-Term Context"""
         base_context = self.stack.l0.render()
-        
+
         self_perception = self.get_self_perception()
         if self_perception:
             base_context += f"\n\n{self_perception}"
-            
+
+        memories = self._load_short_term_memories()
+        num_items = len(memories)
+        num_words = sum(len(m.get('content', '').split()) for m in memories)
+        base_context += f"\n\n[Memory Status: Short-Term ({num_items} items / {num_words} words)]"
+
         short_term = self.get_short_term_context()
         if short_term:
             base_context += f"\n\n--- Short-Term Memory (Continuity) ---\n{short_term}\n"
-            
+
         return base_context
-        
+
     def recall(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Returns L2 context"""
         return self.stack.recall(wing=wing, room=room, n_results=n_results)
-        
+
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Returns L3 deep search context"""
         return self.stack.search(query=query, wing=wing, room=room, n_results=n_results)
-        
+
     def get_entity_context(self, entities: list) -> str:
         if not entities:
             return ""
         context = []
         from concurrent.futures import ThreadPoolExecutor
-        
+
         def fetch(entity):
-            res = self.search(entity, wing="sanctuary", room="people", n_results=3)
+            res = self.search(entity, wing="sanctuary",
+                              room="people", n_results=3)
             if res and "No results" not in res and "No palace" not in res:
                 return f"Context for {entity}:\n{res}"
             return None
-            
+
         with ThreadPoolExecutor(max_workers=min(5, len(entities))) as executor:
             results = executor.map(fetch, entities)
-            
+
         for res in results:
             if res:
                 context.append(res)
         return "\n\n".join(context)
-        
+
     def get_topic_context(self, topics: list) -> str:
         if not topics:
             return ""
         context = []
         from concurrent.futures import ThreadPoolExecutor
-        
+
         def fetch(topic):
             res = self.search(topic, n_results=2)
             if res and "No results" not in res and "No palace" not in res:
                 return f"Context for topic '{topic}':\n{res}"
             return None
-            
+
         with ThreadPoolExecutor(max_workers=min(5, len(topics))) as executor:
             results = executor.map(fetch, topics)
-            
+
         for res in results:
             if res:
                 context.append(res)
@@ -222,20 +234,21 @@ class MemPalaceManager:
     def _load_mirrors(self) -> dict:
         if getattr(self, '_mirrors_cache', None) is not None:
             return self._mirrors_cache
-            
+
         path = os.path.join(self.palace_path, "mirrors.json")
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
                     mirrors = json.load(f)
-                    
+
                     modified = False
                     for perspective, data in mirrors.items():
                         if not isinstance(data, dict):
-                            mirrors[perspective] = {"current_view": str(data), "history": [], "provenance": "unknown"}
+                            mirrors[perspective] = {"current_view": str(
+                                data), "history": [], "provenance": "unknown"}
                             modified = True
                             continue
-                            
+
                         if "current_view" not in data:
                             data["current_view"] = ""
                             modified = True
@@ -245,12 +258,12 @@ class MemPalaceManager:
                         if "provenance" not in data:
                             data["provenance"] = "unknown"
                             modified = True
-                            
+
                     if modified:
                         self._save_mirrors(mirrors)
                     else:
                         self._mirrors_cache = mirrors
-                        
+
                     return mirrors
             except Exception as e:
                 logging.error(f"Error reading mirrors: {e}")
@@ -270,7 +283,7 @@ class MemPalaceManager:
     def update_mirror(self, perspective: str, subjective_view: str, provenance: str = "inferred"):
         mirrors = self._load_mirrors()
         now_str = datetime.datetime.now().isoformat()
-        
+
         if perspective not in mirrors:
             mirrors[perspective] = {
                 "current_view": subjective_view,
@@ -284,10 +297,10 @@ class MemPalaceManager:
                 "provenance": mirrors[perspective].get("provenance", "unknown")
             })
             mirrors[perspective]["current_view"] = subjective_view
-            
+
         mirrors[perspective]["provenance"] = provenance
         mirrors[perspective]["last_updated"] = now_str
-        
+
         self._save_mirrors(mirrors)
         return True
 
@@ -296,15 +309,15 @@ class MemPalaceManager:
         mirrors = self._load_mirrors()
         if not mirrors:
             return ""
-            
+
         lines = ["\n--- Core Self Perception & Theory of Mind ---"]
         for perspective, data in mirrors.items():
             lines.append(f"Perspective: {perspective}")
             lines.append(f"Subjective View: {data.get('current_view', '')}")
             lines.append(f"Provenance: {data.get('provenance', 'unknown')}\n")
-            
+
         return "\n".join(lines)
-        
+
     def initialize_short_term_memory(self):
         """Seed a proactive short-term memory if the file doesn't exist."""
         path = os.path.join(self.palace_path, "short_term_mem.json")
@@ -325,13 +338,13 @@ class MemPalaceManager:
     def _load_short_term_memories(self) -> list:
         if getattr(self, '_short_term_cache', None) is not None:
             return self._short_term_cache
-            
+
         path = os.path.join(self.palace_path, "short_term_mem.json")
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
                     memories = json.load(f)
-                    
+
                     modified = False
                     for m in memories:
                         if "id" not in m:
@@ -343,12 +356,12 @@ class MemPalaceManager:
                         if "content" not in m:
                             m["content"] = ""
                             modified = True
-                            
+
                     if modified:
                         self._save_short_term_memories(memories)
                     else:
                         self._short_term_cache = memories
-                        
+
                     return memories
             except Exception as e:
                 logging.error(f"Error reading short term memories: {e}")
@@ -365,23 +378,26 @@ class MemPalaceManager:
         except Exception as e:
             logging.error(f"Error writing short term memories: {e}")
 
-    def add_short_term_memory(self, content: str):
+    def add_short_term_memory(self, content: str, supersedes: list = None):
         """Appends a new short-term memory and prunes if necessary"""
         memories = self._load_short_term_memories()
-        
+
+        if supersedes:
+            memories = [m for m in memories if m.get("id") not in supersedes]
+
         new_memory = {
             "id": str(uuid.uuid4())[:8],
             "date": datetime.datetime.now().isoformat(),
             "content": content
         }
         memories.append(new_memory)
-        
-        settings = SettingsManager()
+
+        settings = SettingsManager(agent_id=self.agent_id)
         max_memories = settings.get("core.agent.max-short-term-memories", 80)
-        
+
         if len(memories) > max_memories:
             memories = memories[-max_memories:]
-            
+
         self._save_short_term_memories(memories)
 
     def remove_short_term_memory(self, memory_id: str):
@@ -396,54 +412,125 @@ class MemPalaceManager:
         memories = self._load_short_term_memories()
         if not memories:
             return ""
-            
+
         lines = []
         for m in memories:
-            lines.append(f"[ID: {m.get('id', 'N/A')}] [Date: {m.get('date', 'N/A')}]\n{m.get('content', '')}")
-            
+            lines.append(
+                f"[ID: {m.get('id', 'N/A')}] [Date: {m.get('date', 'N/A')}]\n{m.get('content', '')}")
+
         return "\n\n".join(lines)
-        
+
     def add_memory(self, content: str, wing: str = "default", room: str = "general", source_file: str = "agent_thoughts"):
         """Add a new memory to the MemPalace"""
-        return tool_add_drawer(wing=wing, room=room, content=content, source_file=source_file, added_by="the_agent")
+        import subprocess
+        import sys
+
+        script = """
+import os
+import sys
+import json
+payload = json.loads(sys.stdin.read())
+os.environ['MEMPALACE_PALACE_PATH'] = payload['palace_path']
+from mempalace.mcp_server import tool_add_drawer
+res = tool_add_drawer(wing=payload['wing'], room=payload['room'], content=payload['content'], source_file=payload['source_file'], added_by=payload['added_by'])
+print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
+"""
+        payload = {
+            "palace_path": self.palace_path,
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "source_file": source_file,
+            "added_by": "the_agent"
+        }
+
+        try:
+            proc = subprocess.run([sys.executable, "-c", script], input=json.dumps(
+                payload), text=True, capture_output=True, check=True)
+            stdout = proc.stdout
+            if "<<<RESULT>>>" in stdout and "<<<END>>>" in stdout:
+                result_str = stdout.split("<<<RESULT>>>")[
+                    1].split("<<<END>>>")[0]
+                result = json.loads(result_str)
+            else:
+                result = json.loads(stdout)
+            return result.get("result", str(result))
+        except Exception as e:
+            return f"Failed to add memory: {e}\nStderr: {proc.stderr if 'proc' in locals() else ''}\nStdout: {proc.stdout if 'proc' in locals() else ''}"
 
     def delete_memory(self, drawer_id: str):
         """Delete a memory from the MemPalace"""
-        return tool_delete_drawer(drawer_id=drawer_id)
+        import subprocess
+        import sys
+
+        script = """
+import os
+import sys
+import json
+payload = json.loads(sys.stdin.read())
+os.environ['MEMPALACE_PALACE_PATH'] = payload['palace_path']
+from mempalace.mcp_server import tool_delete_drawer
+res = tool_delete_drawer(drawer_id=payload['drawer_id'])
+print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
+"""
+        payload = {
+            "palace_path": self.palace_path,
+            "drawer_id": drawer_id
+        }
+
+        try:
+            proc = subprocess.run([sys.executable, "-c", script], input=json.dumps(
+                payload), text=True, capture_output=True, check=True)
+            stdout = proc.stdout
+            if "<<<RESULT>>>" in stdout and "<<<END>>>" in stdout:
+                result_str = stdout.split("<<<RESULT>>>")[
+                    1].split("<<<END>>>")[0]
+                result = json.loads(result_str)
+            else:
+                result = json.loads(stdout)
+            return result.get("result", str(result))
+        except Exception as e:
+            return f"Failed to delete memory: {e}\nStderr: {proc.stderr if 'proc' in locals() else ''}\nStdout: {proc.stdout if 'proc' in locals() else ''}"
 
     def initialize_sanctuary(self, sanctuary_file: str = None):
         """Inject sanctuary_init.json data into the MemPalace if it hasn't been done yet"""
         if not sanctuary_file:
-            sanctuary_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "memory", "sanctuary_init.json"))
-            
+            sanctuary_file = os.path.abspath(os.path.join(
+                os.path.dirname(__file__), "..", "memory", "sanctuary_init.json"))
+
         if not os.path.exists(sanctuary_file):
             return
-            
-        initialized_flag = os.path.join(self.palace_path, ".sanctuary_initialized")
+
+        initialized_flag = os.path.join(
+            self.palace_path, ".sanctuary_initialized")
         if os.path.exists(initialized_flag):
             return
-            
+
         try:
             with open(sanctuary_file, 'r') as f:
                 data = json.load(f)
-                
+
             # Process social records
             social = data.get("social_records", {})
             for person in social.get("people", []):
                 content = f"Person: {person['name']}\nEntity Type: {person['entity_type']}\nPronouns: {person.get('pronouns', '')}\nRelation: {person['relation']}\nSubjective View: {person['subjective_view']}"
-                self.add_memory(content=content, wing="sanctuary", room="people", source_file="sanctuary_init.json")
-                
+                self.add_memory(content=content, wing="sanctuary",
+                                room="people", source_file="sanctuary_init.json")
+
             for mirror in social.get("mirrors", []):
-                self.update_mirror(mirror['perspective'], mirror['subjective_view'], provenance="stated")
-                
+                self.update_mirror(
+                    mirror['perspective'], mirror['subjective_view'], provenance="stated")
+
             for community in social.get("communities", []):
                 content = f"Community: {community['name']}\nEntity Type: {community['entity_type']}\nSubjective View: {community['subjective_view']}"
-                self.add_memory(content=content, wing="sanctuary", room="communities", source_file="sanctuary_init.json")
-                
+                self.add_memory(content=content, wing="sanctuary",
+                                room="communities", source_file="sanctuary_init.json")
+
             # Process character defining memories
             for memory in data.get("character_defining_memories", []):
-                self.add_memory(content=memory, wing="sanctuary", room="character_memories", source_file="sanctuary_init.json")
-                
+                self.add_memory(content=memory, wing="sanctuary",
+                                room="character_memories", source_file="sanctuary_init.json")
+
             # Touch the flag file so it's not processed again
             temp_path = initialized_flag + ".tmp"
             with open(temp_path, 'w') as f:

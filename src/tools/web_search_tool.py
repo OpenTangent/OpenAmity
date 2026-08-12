@@ -10,15 +10,18 @@ try:
 except ImportError:
     DDGS = None
 
+
 class WebSearchSkill(Tool):
     name = "WebSearch"
     description = "Allows you to search the web, read webpages, and download images for viewing. Use this to find up-to-date information or answer questions you don't know the answer to."
     commands = ["search", "view_page", "download_image"]
 
-    def __init__(self):
-        super().__init__()
-        # Ensure the web cache directory exists
-        self.cache_dir = os.path.join(paths.get_app_data_dir(), "web_cache")
+    def __init__(self, orchestrator=None):
+        super().__init__(orchestrator)
+        # Ensure the web cache directory exists based on agent_id
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        self.cache_dir = os.path.join(
+            paths.get_base_dir_for(agent_id), "web_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
@@ -78,24 +81,24 @@ class WebSearchSkill(Tool):
         if command == "search":
             if DDGS is None:
                 return "Error: The 'ddgs' package is not installed. Please run 'pip install ddgs'."
-                
+
             query = kwargs.get('query') or (args[0] if args else None)
             max_results = kwargs.get('max_results', 5)
-            
+
             if not query:
                 return "Error: Missing search query."
-                
+
             try:
                 # Cap max_results to 10 to avoid too much context usage
                 max_results = min(int(max_results), 10)
-                
+
                 with DDGS() as ddgs:
                     # Note: we need to coerce DDGS generator to list since we iterate
                     results = list(ddgs.text(query, max_results=max_results))
-                    
+
                 if not results:
                     return f"No results found for query: {query}"
-                    
+
                 output = f"Search Results for '{query}':\n\n"
                 for i, r in enumerate(results, 1):
                     output += f"{i}. {r.get('title', 'No Title')}\n"
@@ -110,7 +113,7 @@ class WebSearchSkill(Tool):
             url = kwargs.get('url') or (args[0] if args else None)
             if not url:
                 return "Error: Missing URL."
-                
+
             try:
                 headers = {'User-Agent': 'Open Amity Web Search Tool'}
                 # Use Jina Reader API
@@ -119,44 +122,48 @@ class WebSearchSkill(Tool):
                 response.raise_for_status()
                 return response.text
             except Exception as e:
-                logging.error(f"WebSearch (view_page) error: {e}", exc_info=True)
+                logging.error(
+                    f"WebSearch (view_page) error: {e}", exc_info=True)
                 return f"Failed to fetch page {url}: {e}"
 
         elif command == "download_image":
             url = kwargs.get('url') or (args[0] if args else None)
             if not url:
                 return "Error: Missing image URL."
-                
+
             try:
                 headers = {'User-Agent': 'Open Amity Web Search Tool'}
-                response = requests.get(url, headers=headers, stream=True, timeout=15)
+                response = requests.get(
+                    url, headers=headers, stream=True, timeout=15)
                 response.raise_for_status()
-                
+
                 # Determine a filename. Use a hash or the last part of the URL.
                 import hashlib
                 import time
                 # Create a unique but readable filename
-                hash_str = hashlib.md5(f"{url}{time.time()}".encode('utf-8')).hexdigest()[:8]
+                hash_str = hashlib.md5(
+                    f"{url}{time.time()}".encode('utf-8')).hexdigest()[:8]
                 filename = url.split('/')[-1]
                 if not filename or '?' in filename:
                     filename = "image.jpg"
                 else:
                     # Clean filename if it has query params
                     filename = filename.split('?')[0]
-                
+
                 safe_filename = f"{hash_str}_{filename}"
                 filepath = os.path.join(self.cache_dir, safe_filename)
-                
+
                 with open(filepath, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                        
+
                 return {
                     "result": f"Image downloaded successfully from {url}.",
                     "media": [filepath]
                 }
             except Exception as e:
-                logging.error(f"WebSearch (download_image) error: {e}", exc_info=True)
+                logging.error(
+                    f"WebSearch (download_image) error: {e}", exc_info=True)
                 return f"Failed to download image {url}: {e}"
 
         return f"Unknown command: {command}"

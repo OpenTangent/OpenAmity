@@ -22,6 +22,16 @@
         "gemini-3-pro-image"
       ]
     },
+    "claude": {
+      "claude-models": [
+        "claude-sonnet-5",
+        "claude-opus-5"
+      ],
+      "light-models": [
+        "claude-haiku-4-5",
+        "claude-sonnet-5"
+      ]
+    },
     "antigravity": {
       "agy-mode": false,
       "agy-models": [
@@ -59,8 +69,12 @@
       },
       "piper": {
         "prefer-piper": false,
-        "model-name-piper": "cori"
+        "model-name-piper": "en_GB-cori-high"
       }
+    },
+    "audio": {
+      "max-recording-time": 60,
+      "silence-timeout": 3.0
     },
     "somatic": {
       "cognitive-budget": 10000,
@@ -88,7 +102,11 @@
       "terminal": true,
       "whatsapp": false,
       "moltbook": false,
-      "mastodon": false
+      "mastodon": false,
+      "subagent": true,
+      "system": true,
+      "websearch": true,
+      "media": true
     }
   }
 }

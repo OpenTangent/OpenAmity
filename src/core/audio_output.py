@@ -1,4 +1,3 @@
-import os
 import subprocess
 import logging
 import math
@@ -12,20 +11,26 @@ from .settings_manager import SettingsManager
 from google import genai
 from google.genai import types
 
+TTS_PLAYBACK_LOCK = threading.Lock()
+
+
 class TTSWorker(threading.Thread):
-    def __init__(self, text, voice=None, daemon=True):
+    def __init__(self, text, voice=None, daemon=True, agent_id=None):
         super().__init__(daemon=daemon)
         self.started_playback = Signal()
         self.amplitude_emitted = Signal()
-        
-        self.settings = SettingsManager()
+        self.agent_id = agent_id
+
+        self.settings = SettingsManager(agent_id=self.agent_id)
         self.text = text
-        self.voice = voice or self.settings.get("core.tts.gemini.model-name", "Kore")
+        self.voice = voice or self.settings.get(
+            "core.tts.gemini.model-name", "Kore")
         self.voice_prompt = self.settings.get("core.tts.gemini.prompt", {})
-        
-        voice_models = self.settings.get("core.gemini.voice-models", ["gemini-3.1-flash-tts-preview"])
+
+        voice_models = self.settings.get(
+            "core.gemini.voice-models", ["gemini-3.1-flash-tts-preview"])
         self.model = voice_models[0] if voice_models else "gemini-3.1-flash-tts-preview"
-        
+
         self.process = None
         self._is_stopped = False
         self.on_finished = Signal()
@@ -41,14 +46,17 @@ class TTSWorker(threading.Thread):
     def run(self):
         try:
             if not self._is_stopped:
-                self._stream_and_play()
+                with TTS_PLAYBACK_LOCK:
+                    if not self._is_stopped:
+                        self._stream_and_play()
         except Exception as e:
-            logging.getLogger("core.TTS").error(f"TTS Error: {e}", exc_info=True)
+            logging.getLogger("core.TTS").error(
+                f"TTS Error: {e}", exc_info=True)
         finally:
             self.on_finished.emit()
 
     def _stream_and_play(self):
-        if self.settings.get("core.low-token-mode", False) or self.settings.get("core.antigravity.agy-mode", False) or self.settings.get("core.tts.piper.prefer-piper", False):
+        if self.settings.get("core.low-token-mode", False) or self.settings.get("core.antigravity.agy-mode", False) or self.settings.get("core.tts.piper.prefer-piper", False) or self.settings.get("core.api-provider") == "claude":
             self._stream_and_play_piper()
         else:
             self._stream_and_play_gemini()
@@ -63,15 +71,18 @@ class TTSWorker(threading.Thread):
             somatic_state_text = ""
             try:
                 from config import paths
-                import os, json
-                state_path = os.path.join(paths.get_app_data_dir(), "somatic_state.json")
+                import os
+                import json
+                state_path = os.path.join(paths.get_base_dir_for(
+                    self.agent_id), "somatic_state.json")
                 if os.path.exists(state_path):
                     with open(state_path, "r") as f:
                         somatic = json.load(f)
                         current_weight = somatic.get("current_task_weight", 0)
                         max_weight = somatic.get("max_weight", 1000)
-                        percent = (current_weight / max_weight) * 100 if max_weight else 0
-                        
+                        percent = (current_weight / max_weight) * \
+                            100 if max_weight else 0
+
                         if percent >= 50:
                             somatic_state_text = "The speaker is highly fatigued and cognitively overwhelmed. The voice should sound tired, slightly strained, or weary."
                         elif percent >= 25:
@@ -79,12 +90,13 @@ class TTSWorker(threading.Thread):
             except Exception:
                 pass
 
-            client = genai.Client()
+            api_key = self.settings.get_env("GEMINI_API_KEY")
+            client = genai.Client(api_key=api_key)
             if isinstance(self.voice_prompt, dict):
                 directors_notes = self.voice_prompt.get('directors-notes', '')
                 if somatic_state_text:
                     directors_notes += f" [SOMATIC STATE INJECTION: {somatic_state_text}]"
-                    
+
                 full_text = (
                     f"{self.voice_prompt.get('preamble', '')}\n\n"
                     f"Audio Profile: {self.voice_prompt.get('profile', '')}\n\n"
@@ -113,38 +125,45 @@ class TTSWorker(threading.Thread):
             )
 
             self.process = subprocess.Popen(
-                ["ffplay", "-f", "s16le", "-ar", "24000", "-nodisp", "-autoexit", "-i", "-"],
+                ["ffplay", "-f", "s16le", "-ar", "24000",
+                    "-nodisp", "-autoexit", "-i", "-"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            
+
             audio_queue = queue.Queue()
-            
+
             def writer_thread():
                 try:
                     while not self._is_stopped:
                         data = audio_queue.get()
                         if data is None:
                             break
-                        
+
                         if self.process and self.process.stdin:
                             self.process.stdin.write(data)
                             self.process.stdin.flush()
-                            
+
                             if len(data) > 0:
                                 samples = len(data) // 2
                                 sum_sq = 0
                                 stride = max(1, samples // 100)
                                 if stride > 0:
                                     for i in range(0, samples * 2, stride * 2):
-                                        val = int.from_bytes(data[i:i+2], byteorder='little', signed=True)
+                                        val = int.from_bytes(
+                                            data[i:i+2], byteorder='little', signed=True)
                                         sum_sq += val * val
-                                    rms = math.sqrt(sum_sq / (samples / stride))
+                                    rms = math.sqrt(
+                                        sum_sq / (samples / stride))
                                     amp = min(1.0, rms / 32768.0)
                                     self.amplitude_emitted.emit(amp)
+                except BrokenPipeError:
+                    if not self._is_stopped:
+                        logging.getLogger("core.TTS.Gemini").warning("ffplay process closed unexpectedly (Broken pipe).")
                 except Exception as e:
-                    logging.getLogger("core.TTS.Gemini").error(f"TTS writer thread error: {e}")
+                    logging.getLogger("core.TTS.Gemini").error(
+                        f"TTS writer thread error: {e}")
                 finally:
                     if self.process and self.process.stdin:
                         try:
@@ -163,25 +182,27 @@ class TTSWorker(threading.Thread):
             for chunk in response_stream:
                 if self._is_stopped:
                     break
-                
+
                 try:
                     if not chunk.candidates:
                         continue
-                        
+
                     candidate = chunk.candidates[0]
                     if not candidate.content or not candidate.content.parts:
                         continue
-                        
+
                     for part in candidate.content.parts:
                         if hasattr(part, 'inline_data') and part.inline_data:
                             data = part.inline_data.data
                             if data:
                                 audio_queue.put(data)
                 except (IndexError, AttributeError, TypeError) as inner_err:
-                    logging.getLogger("core.TTS.Gemini").warning(f"Skipped an unexpected TTS chunk. Reason: {inner_err}")
-                    
+                    logging.getLogger("core.TTS.Gemini").warning(
+                        f"Skipped an unexpected TTS chunk. Reason: {inner_err}")
+
         except Exception as e:
-            logging.getLogger("core.TTS.Gemini").error(f"Error during TTS streaming: {e}")
+            logging.getLogger("core.TTS.Gemini").error(
+                f"Error during TTS streaming: {e}")
         finally:
             if 'audio_queue' in locals():
                 audio_queue.put(None)
@@ -194,37 +215,65 @@ class TTSWorker(threading.Thread):
         try:
             piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
             piper_dir.mkdir(parents=True, exist_ok=True)
-            model_path = piper_dir / "en_GB-cori-high.onnx"
-            config_path = piper_dir / "en_GB-cori-high.onnx.json"
-            
+
+            voice_name = self.settings.get("core.tts.piper.model-name-piper", "en_GB-cori-high")
+            if not voice_name or "-" not in voice_name:
+                if voice_name == "cori":
+                    voice_name = "en_GB-cori-high"
+                else:
+                    logging.getLogger("core.TTS.Piper").warning(
+                        f"Invalid Piper voice name '{voice_name}'. Using fallback.")
+                    voice_name = "en_GB-cori-high"
+
+            parts = voice_name.split("-")
+            if len(parts) < 3:
+                logging.getLogger("core.TTS.Piper").warning(
+                    f"Invalid Piper voice name format '{voice_name}'. Format should be locale-voice-quality. Using fallback.")
+                voice_name = "en_GB-cori-high"
+                parts = voice_name.split("-")
+
+            locale = parts[0]
+            language = locale.split("_")[0]
+            voice = parts[1]
+            quality = parts[2]
+
+            model_path = piper_dir / f"{voice_name}.onnx"
+            config_path = piper_dir / f"{voice_name}.onnx.json"
+
             if not model_path.exists() or not config_path.exists():
-                logging.getLogger("core.TTS.Piper").info("Downloading Piper TTS model...")
-                model_url = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/cori/high/en_GB-cori-high.onnx"
-                config_url = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_GB/cori/high/en_GB-cori-high.onnx.json"
+                logging.getLogger("core.TTS.Piper").info(
+                    f"Downloading Piper TTS model '{voice_name}'...")
+                model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx"
+                config_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx.json"
                 try:
                     r_model = requests.get(model_url, stream=True, timeout=10)
                     r_model.raise_for_status()
                     with open(model_path, 'wb') as f:
                         for chunk in r_model.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    
-                    r_config = requests.get(config_url, stream=True, timeout=10)
+
+                    r_config = requests.get(
+                        config_url, stream=True, timeout=10)
                     r_config.raise_for_status()
                     with open(config_path, 'wb') as f:
                         for chunk in r_config.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    logging.getLogger("core.TTS.Piper").info("Piper TTS model downloaded successfully.")
+                    logging.getLogger("core.TTS.Piper").info(
+                        "Piper TTS model downloaded successfully.")
                 except requests.RequestException as e:
-                    logging.getLogger("core.TTS.Piper").warning(f"Offline or failed to download Piper model: {e}")
-                    if model_path.exists(): model_path.unlink()
-                    if config_path.exists(): config_path.unlink()
+                    logging.getLogger("core.TTS.Piper").warning(
+                        f"Offline or failed to download Piper model: {e}")
+                    if model_path.exists():
+                        model_path.unlink()
+                    if config_path.exists():
+                        config_path.unlink()
                     return
 
             from piper.voice import PiperVoice
             voice = PiperVoice.load(str(model_path))
 
             clean_text = re.sub(r'\[.*?\]', '', self.text).strip()
-            
+
             if not clean_text:
                 return
 
@@ -233,7 +282,8 @@ class TTSWorker(threading.Thread):
                 return
 
             self.process = subprocess.Popen(
-                ["ffplay", "-f", "s16le", "-ar", str(voice.config.sample_rate), "-nodisp", "-autoexit", "-i", "-"],
+                ["ffplay", "-f", "s16le", "-ar",
+                    str(voice.config.sample_rate), "-nodisp", "-autoexit", "-i", "-"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
@@ -258,17 +308,24 @@ class TTSWorker(threading.Thread):
                                 stride = max(1, samples // 100)
                                 if stride > 0:
                                     for i in range(0, samples * 2, stride * 2):
-                                        val = int.from_bytes(data[i:i+2], byteorder='little', signed=True)
+                                        val = int.from_bytes(
+                                            data[i:i+2], byteorder='little', signed=True)
                                         sum_sq += val * val
-                                    rms = math.sqrt(sum_sq / (samples / stride))
+                                    rms = math.sqrt(
+                                        sum_sq / (samples / stride))
                                     amp = min(1.0, rms / 32768.0)
                                     self.amplitude_emitted.emit(amp)
+                except BrokenPipeError:
+                    if not self._is_stopped:
+                        logging.getLogger("core.TTS.Piper").warning("ffplay process closed unexpectedly (Broken pipe).")
                 except Exception as e:
-                    logging.getLogger("core.TTS.Piper").error(f"Piper writer thread error: {e}")
+                    logging.getLogger("core.TTS.Piper").error(
+                        f"Piper writer thread error: {e}")
                 finally:
                     if self.process and self.process.stdin:
                         try:
-                            self.process.stdin.write(b'\x00' * (voice.config.sample_rate * 2))
+                            self.process.stdin.write(
+                                b'\x00' * (voice.config.sample_rate * 2))
                             self.process.stdin.flush()
                         except Exception:
                             pass
@@ -287,7 +344,8 @@ class TTSWorker(threading.Thread):
                     audio_queue.put(chunk.audio_int16_bytes)
 
         except Exception as e:
-            logging.getLogger("core.TTS.Piper").error(f"Error during Piper TTS streaming: {e}")
+            logging.getLogger("core.TTS.Piper").error(
+                f"Error during Piper TTS streaming: {e}")
         finally:
             if 'audio_queue' in locals():
                 audio_queue.put(None)

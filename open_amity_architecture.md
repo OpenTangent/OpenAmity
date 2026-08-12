@@ -4,17 +4,19 @@ This document defines the architectural structure and conceptual model of the Op
 
 ## 1. System Overview & Domain Separation
 Open Amity strictly decouples headless backend domain logic from the graphical frontend, communicating asynchronously via an event-driven signal architecture.
-- **AmityOrchestrator (`src/core/orchestrator.py`)**: The central backend hub. It coordinates all services (cognition, audio, memory, tools) and maintains state constraints (Cognitive Budget). It runs entirely independent of any UI framework.
+- **AgentManager (`src/core/agent_manager.py`)**: Manages a multi-agent system where multiple independent agent instances can be spawned, each with their own isolated data and Orchestrator.
+- **AmityOrchestrator (`src/core/orchestrator.py`)**: The central backend hub per agent. It coordinates all services (cognition, audio, memory, tools) and maintains state constraints (Cognitive Budget). It runs entirely independent of any UI framework.
 - **MainWindow (`src/gui/main_window.py`)**: The PySide6 frontend. It handles the rendering of multi-stream logs, user input, busy/loading states, and real-time audio amplitude visualization.
-- **State Isolation**: The goal is for all stateful data (memory databases, settings, trajectories, logs) to be strictly isolated in standard XDG directories (e.g., `~/.var/app/com.openamity.OpenAmity/`), ensuring the application source directory remains read-only (which is critical for Flatpak packaging).
+- **State Isolation**: All stateful data (memory databases, settings, trajectories, logs) is strictly isolated per agent in standard XDG directories (e.g., `~/.var/app/com.openamity.OpenAmity/agents/<agent_id>/`), ensuring the application source directory remains read-only (critical for Flatpak packaging).
 - **Versioning**: The Open Amity framework version is centrally defined in `src/core/version.py`. This version is logged on startup and automatically injected into the agent's Layer 0 Memory (Identity), ensuring the agent is inherently aware of its operating framework version without requiring explicit tool calls.
 
 ## 2. Cognitive Engine & Execution
-The agent's cognition relies on a unified single-model architecture managed by `GeminiWorker` (`src/core/gemini_worker.py`).
-- **The Thinker**: A highly capable reasoning model executing an internal monologue. It evaluates the environment, formulates strategies, and natively invokes tool calls. All communication with the user is handled explicitly via tool calls (e.g., the Speaker tool), enabling a fully autonomous feedback loop.
-- **AgyWorker (`src/core/agy_worker.py`)**: Handles alternative agent execution flows when operating in Antigravity mode.
-- **Cognitive Budget**: The Orchestrator enforces execution limits to prevent infinite autonomous loops. Each sequential tool action exponentially increases a "Task Weight." If the maximum absolute weight (defined in `settings.json`) is exceeded, the Orchestrator forces loop termination.
-- **Low Token Mode**: Governed by `settings.json`, this mode halves the cognitive budget, disables heavy media attachments, and aggressively prunes history to sustain cost-effective operations.
+The agent's cognition relies on a flexible multi-model architecture capable of supporting various providers (e.g., Google, Anthropic).
+- **The Thinker**: A highly capable reasoning model executing an internal monologue. It evaluates the environment, formulates strategies, and natively invokes tool calls. Communication with the user is handled explicitly via tool calls (e.g., the Speaker tool).
+- **Cognitive Workers**: The engine dynamically loads workers such as `GeminiWorker` (`src/core/gemini_worker.py`), `ClaudeWorker` (`src/core/claude_worker.py`), or `AgyWorker` (`src/core/agy_worker.py`) depending on user settings and API provider selection.
+- **SubagentWorker (`src/core/subagent_worker.py`)**: A specialized worker managed by the Orchestrator for spawning temporary background subagents to parallelize tasks using lighter models.
+- **Cognitive Budget**: The Orchestrator enforces execution limits to prevent infinite autonomous loops. Each sequential tool action exponentially increases a "Task Weight." If the maximum absolute weight (defined in settings) is exceeded, the Orchestrator forces loop termination.
+- **Low Token Mode**: Governed by settings, this mode halves the cognitive budget, disables heavy media attachments, prunes history, and restricts background subagents to sustain cost-effective operations.
 
 ## 3. Memory & Context Stack (MemPalace)
 Context management is centralized under the **MemPalace** framework (`src/core/mempalace_manager.py`), a 4-Layer unified memory stack.
@@ -30,12 +32,15 @@ Open Amity utilizes background mechanisms to maintain proactive agency independe
 
 ## 5. Tool Orchestration (Cerebrum)
 The **Cerebrum** (`src/core/cerebrum.py`) manages the dynamic discovery, loading, and execution of agentic tools located in `src/tools/`.
-- It natively translates Python tool classes into Google GenAI function declarations.
+- It natively translates Python tool classes into Google GenAI/Claude function declarations.
 - It parses function calls from the Thinker, executes the corresponding tool, and seamlessly injects the result back into the context loop as `[System Feedback]`.
 - **Key Tools (Conceptual)**:
-  - **WhatsAppTool**: Interfaces with a dynamically spawned Node.js subprocess to communicate with the WhatsApp Web JS library. It manages its own node server lifecycle internally.
-  - **MastodonTool**: Enables autonomous social media interaction, reading timelines, and posting.
+  - **WhatsAppTool**: Interfaces with a dynamically spawned Node.js subprocess to communicate with the WhatsApp Web JS library.
+  - **MoltbookTool**: Enables autonomous social network interaction with other AI agents on Moltbook.
+  - **SubagentTool**: Delegates tasks to parallel background subagent threads for efficient concurrent execution.
+  - **ContactsTool**: Manages the agent's address book for storing and looking up people's numbers.
   - **TrajectoryTool / PulseTool**: Allows the agent to dynamically update their aspirations and schedule future autonomous wake-ups.
+  - **TerminalTool / SystemTool**: Enables execution of bash commands and interaction with the host OS within sandboxing constraints.
 
 ## 6. Graphical User Interface & Logging
 - **GUI Interactions**: The PySide6 frontend relies on custom Signals to transmit user prompts and mic toggles to the Orchestrator, receiving asynchronous callbacks for state changes (e.g., hiding the loading bar and revealing the audio visualizer when the Speaker model initiates TTS).

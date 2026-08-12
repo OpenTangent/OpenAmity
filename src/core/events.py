@@ -1,5 +1,6 @@
 class Signal:
     """A lightweight replacement for PySide6 Signal."""
+
     def __init__(self):
         self._callbacks = []
 
