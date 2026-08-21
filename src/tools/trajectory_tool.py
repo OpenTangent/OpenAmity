@@ -155,10 +155,22 @@ class TrajectoryTool(Tool):
 
     def _get_bearings(self) -> str:
         try:
+            from core.config_manager import ConfigManager
+            cfg = getattr(self.orchestrator, 'config_manager', None) if self.orchestrator else None
+            if not cfg:
+                cfg = ConfigManager()
+            user_name = cfg.get("user-full-name", "") or "System Administrator"
+            user_phone = cfg.get("user-phone-number", "") or "Not configured"
+            user_email = cfg.get("user-email", "") or "Not configured"
+            user_details_text = f"--- User Details ---\nName: {user_name}\nPhone: {user_phone}\nEmail: {user_email}\n"
+        except Exception as e:
+            user_details_text = f"--- User Details ---\n(Could not load User Details: {e})\n"
+
+        try:
             from core.mempalace_manager import MemPalaceManager
             agent_id = self.orchestrator.agent_id if self.orchestrator else None
             mp = MemPalaceManager(agent_id=agent_id)
-            self_perception = mp.get_self_perception()
+            self_perception = mp.get_self_perception(limit=24)
         except Exception as e:
             self_perception = f"(Could not load Self Perception: {e})"
 
@@ -200,6 +212,9 @@ class TrajectoryTool(Tool):
             pass
 
         lines = ["=== THE AGENT'S CURRENT BEARING ==="]
+        if user_details_text:
+            lines.append(user_details_text.strip())
+            lines.append("")
         if somatic_state_text:
             lines.append(somatic_state_text.strip())
             lines.append("")
@@ -269,6 +284,8 @@ class TrajectoryTool(Tool):
                     f"  Task {task['id']} (for unknown Aspiration: {task.get('aspiration_id')}) | Status: {status_display} | Created: {task_created} | {task['description']}")
 
         lines.append("\n=== OPERATIONAL HINTS ===")
+        lines.append(
+            "- Operational Protocols: Strictly follow your Operational Protocols (defined in your Soul Jar / Layer 0 Identity) across all actions, memory consolidation, theory of mind tracking, and proactive task generation.")
         lines.append(
             "- PulseEngine: If your Task Weight is getting high or you have long-running tasks, use the PulseTool to schedule a wake-up later.")
         lines.append("- Trajectory Milestones: When you complete a significant aspiration, use the MemPalace tool to store a memory in the 'office' wing to document your growth.")

@@ -71,9 +71,15 @@ def main():
         run_cmd(["chmod", "+x", GENERATOR_SCRIPT])
         
         # Patch the generator to mount host filesystem and set PYTHONPATH
-        venv_site = os.path.abspath("../.venv/lib/python3.14/site-packages")
+        import glob
+        venv_sites = glob.glob(os.path.abspath("../.venv/lib/python3.*/site-packages"))
+        venv_site = venv_sites[0] if venv_sites else os.path.abspath("../.venv/lib/python3.14/site-packages")
         patch_cmd = f"sed -i 's|\"run\",|\"run\", \"--filesystem=host\", \"--env=PYTHONPATH={venv_site}\",|' {GENERATOR_SCRIPT}"
         subprocess.run(patch_cmd, shell=True, check=True)
+        
+        # Patch socket timeout to avoid hanging indefinitely on stalled connections
+        timeout_patch = f"sed -i 's|import urllib.request|import urllib.request\\nimport socket\\nsocket.setdefaulttimeout(15)|' {GENERATOR_SCRIPT}"
+        subprocess.run(timeout_patch, shell=True, check=True)
         
     # Ensure requirements-parser and toml are installed locally
     run_cmd([pip_exe, "install", "-q", "requirements-parser", "toml"])

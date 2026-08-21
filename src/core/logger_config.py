@@ -82,6 +82,7 @@ class ColorFormatter(BaseFormatter):
     SECTION_COLORS = {
         "tool.Contacts": "\x1b[38;2;0;150;136m",
         "tool.DateTime": "\x1b[38;2;139;195;74m",
+        "tool.Email": "\x1b[38;2;65;105;225m",
         "tool.Mastodon": "\x1b[38;2;99;100;255m",
         "tool.Media": "\x1b[38;2;255;105;180m",
         "tool.MemPalace": "\x1b[38;2;205;133;63m",

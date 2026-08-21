@@ -1,24 +1,31 @@
 const express = require('express');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const puppeteer = require('puppeteer');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 
 const app = express();
-const port = 3000;
+const port = parseInt(process.env.WHATSAPP_PORT || process.env.PORT, 10) || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 const dataDir = process.env.WHATSAPP_DATA_DIR || __dirname;
-
+const sessionDir = path.join(dataDir, '.wpp_session');
 const uploadDir = path.join(dataDir, 'uploads');
+const customWaJsPath = path.join(dataDir, 'wppconnect-wa.js');
+
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
 }
+if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+}
+
 const upload = multer({ dest: uploadDir });
 
-let client;
+let browser = null;
+let page = null;
 let isReady = false;
 let currentQR = null;
 let isShuttingDown = false;
@@ -27,7 +34,7 @@ process.on('uncaughtException', (err) => {
     const errStr = err ? err.toString() : '';
     if (isShuttingDown) {
         console.log('Ignored uncaught error during shutdown:', err.message);
-    } else if (errStr.includes('Execution context was destroyed') || errStr.includes('Target closed')) {
+    } else if (errStr.includes('Execution context was destroyed') || errStr.includes('Target closed') || errStr.includes('Session closed')) {
         console.log('Ignored benign Puppeteer exception:', errStr);
     } else {
         console.error('Uncaught Exception:', err);
@@ -39,105 +46,504 @@ process.on('unhandledRejection', (reason, promise) => {
     const reasonStr = reason ? reason.toString() : '';
     if (isShuttingDown) {
         console.log('Ignored unhandled rejection during shutdown');
-    } else if (reasonStr.includes('Execution context was destroyed') || reasonStr.includes('Target closed')) {
+    } else if (reasonStr.includes('Execution context was destroyed') || reasonStr.includes('Target closed') || reasonStr.includes('Session closed')) {
         console.log('Ignored benign Puppeteer rejection:', reasonStr);
     } else {
         console.error('Unhandled Rejection at:', promise, 'reason:', reason);
     }
 });
 
-async function startClient() {
-    let options = {
-        authStrategy: new LocalAuth({
-            dataPath: path.join(dataDir, '.wwebjs_auth')
-        }),
-        webVersionCache: {
-            type: 'local',
-            path: path.join(dataDir, '.wwebjs_cache')
-        },
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu'
-            ]
-        }
-    };
-
-    console.log('Starting client with strict local whatsapp-web.js...');
-    client = new Client(options);
-
-    client.on('authenticated', () => {
-        console.log('WhatsApp Client is authenticated!');
-    });
-
-    client.on('qr', (qr) => {
-        console.log('QR Code received. Scan with your phone:');
-        currentQR = qr;
-        qrcode.generate(qr, { small: true });
-    });
-
-    client.on('ready', async () => {
-        console.log('WhatsApp Client is ready! Running health check...');
+function getWaJsSource() {
+    if (fs.existsSync(customWaJsPath)) {
         try {
-            await client.getState();
-            
-            // Explicitly validate internal store structures to catch protocol mismatches 
-            // that getState() misses when the protocol changes silently.
-            await client.pupPage.evaluate(() => {
-                const WAWebCollections = window.require("WAWebCollections");
-                if (!WAWebCollections || !WAWebCollections.Chat) {
-                    throw new Error("WAWebCollections.Chat is missing");
-                }
-                const models = WAWebCollections.Chat.getModelsArray();
-                if (models.length === 0) {
-                    throw new Error("Protocol mismatch: 0 chats found (likely structural change)");
-                }
-            });
-
-            console.log('Health check passed. Bridge is fully active.');
-            currentQR = null;
-            isReady = true;
-        } catch (err) {
-            console.error('Health check failed. Protocol mismatch detected:', err.message);
-            console.error('Waiting for whatsapp-web.js patch update.');
-            isReady = true; // Stay "ready" so the API endpoints can return the 500 protocol mismatch error explicitly
+            console.log(`Using custom hot-patched WA-JS from ${customWaJsPath}`);
+            return fs.readFileSync(customWaJsPath, 'utf8');
+        } catch (e) {
+            console.error(`Failed to read custom WA-JS at ${customWaJsPath}, falling back to bundled:`, e);
         }
-    });
+    }
 
-    client.on('message', async msg => {
-        let senderName = msg._data?.notifyName || msg.author || 'Unknown';
+    try {
+        const pkgPath = require.resolve('@wppconnect/wa-js/package.json');
+        const distFile = path.join(path.dirname(pkgPath), 'dist', 'wppconnect-wa.js');
+        if (fs.existsSync(distFile)) {
+            return fs.readFileSync(distFile, 'utf8');
+        }
+    } catch (e) {}
+
+    try {
+        const mainPath = require.resolve('@wppconnect/wa-js');
+        const distFile = path.join(path.dirname(mainPath), 'wppconnect-wa.js');
+        if (fs.existsSync(distFile)) {
+            return fs.readFileSync(distFile, 'utf8');
+        }
+    } catch (e) {}
+
+    const localFallback = path.join(__dirname, 'node_modules', '@wppconnect', 'wa-js', 'dist', 'wppconnect-wa.js');
+    if (fs.existsSync(localFallback)) {
+        return fs.readFileSync(localFallback, 'utf8');
+    }
+
+    throw new Error('Could not locate wppconnect-wa.js distribution bundle.');
+}
+
+async function injectWaJs() {
+    if (!page) return false;
+    try {
+        const waJsCode = getWaJsSource();
+        await page.evaluate(waJsCode);
+        await page.waitForFunction(() => typeof window.WPP !== 'undefined' && window.WPP.isReady, { timeout: 15000 });
+        console.log('WA-JS successfully injected and ready.');
+        return true;
+    } catch (e) {
+        console.error('WA-JS injection waiting/failed:', e.message);
+        return false;
+    }
+}
+
+function findChromeExecutable() {
+    const candidateDirs = [
+        process.env.PUPPETEER_CACHE_DIR,
+        path.join(process.env.HOME || '', '.cache', 'puppeteer'),
+        '/app/share/puppeteer',
+        '/usr/bin',
+        '/usr/local/bin'
+    ].filter(Boolean);
+
+    let candidates = [];
+    const searchDir = (current, depth = 0) => {
+        if (depth > 6) return;
         try {
-            const chat = await msg.getChat();
-            if (chat && !chat.isGroup) {
-                senderName = chat.name || senderName;
-            } else if (chat && chat.isGroup && msg.author) {
-                const contact = await client.getContactById(msg.author);
-                if (contact) {
-                    senderName = contact.name || contact.pushname || senderName;
+            const entries = fs.readdirSync(current, { withFileTypes: true });
+            for (const entry of entries) {
+                const full = path.join(current, entry.name);
+                if (entry.isDirectory()) {
+                    searchDir(full, depth + 1);
+                } else if (entry.isFile() && (entry.name === 'chrome' || entry.name === 'chromium' || entry.name === 'google-chrome' || entry.name === 'google-chrome-stable')) {
+                    try {
+                        fs.accessSync(full, fs.constants.X_OK);
+                        candidates.push(full);
+                    } catch (e) {}
                 }
             }
-        } catch (e) {
-            console.error('Failed to resolve chat for MSG_RECEIVED:', e);
-        }
-        
-        let resolvedChatId = await resolveLidToCus(client, msg.from);
-        console.log(`[MSG_RECEIVED] ${resolvedChatId} ${senderName}`);
-        
-        if(msg.hasMedia && msg.type === 'ptt') {
-            // It's a voice message
-        }
-    });
+        } catch (e) {}
+    };
 
-    client.initialize();
+    for (const dir of candidateDirs) {
+        if (fs.existsSync(dir)) searchDir(dir);
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort().reverse();
+    return candidates[0];
+}
+
+async function startClient() {
+    console.log('Starting WhatsApp Client with WPPConnect (WA-JS)...');
+
+    const puppeteerArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--aggressive-cache-discard',
+        '--disable-features=IsolateOrigins,site-per-process'
+    ];
+
+    const exe = findChromeExecutable();
+    if (exe) {
+        console.log(`Using discovered Chrome executable: ${exe}`);
+    }
+
+    // Clean any orphaned Chromium profile locks from previous runs
+    for (const lockFileName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+        const lockPath = path.join(sessionDir, lockFileName);
+        if (fs.existsSync(lockPath)) {
+            try {
+                fs.unlinkSync(lockPath);
+            } catch (e) {}
+        }
+    }
+
+    try {
+        browser = await puppeteer.launch({
+            executablePath: exe || undefined,
+            headless: true,
+            userDataDir: sessionDir,
+            args: puppeteerArgs
+        });
+
+        const pages = await browser.pages();
+        page = pages.length > 0 ? pages[0] : await browser.newPage();
+
+        await page.setUserAgent('Mozilla/5.0 (X-UA-Compatible; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+        await page.setBypassCSP(true);
+
+        // Expose Node bridge callbacks to the browser context
+        await page.exposeFunction('nodeOnQrCode', (qr) => {
+            if (qr && qr !== currentQR) {
+                currentQR = qr;
+                console.log('QR Code received. Scan with your phone:');
+                qrcode.generate(qr, { small: true });
+            }
+        });
+
+        await page.exposeFunction('nodeOnAuthenticated', () => {
+            console.log('WhatsApp Client is authenticated!');
+        });
+
+        await page.exposeFunction('nodeOnReady', () => {
+            console.log('WhatsApp Client is ready! Bridge is fully active.');
+            currentQR = null;
+            isReady = true;
+        });
+
+        await page.exposeFunction('nodeOnMsgReceived', (chatId, senderName) => {
+            console.log(`[MSG_RECEIVED] ${chatId} ${senderName}`);
+        });
+
+        // Pre-evaluate WA-JS on every page reload
+        const initialWaJsCode = getWaJsSource();
+        await page.evaluateOnNewDocument(initialWaJsCode);
+
+        console.log('Navigating to https://web.whatsapp.com ...');
+        await page.goto('https://web.whatsapp.com', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        });
+
+        // Continuous QR code and authentication polling interval
+        const checkInterval = setInterval(async () => {
+            if (isShuttingDown || isReady || !page) {
+                if (isReady) clearInterval(checkInterval);
+                return;
+            }
+            try {
+                const state = await page.evaluate(async () => {
+                    // 1. Check if WPP ready / authenticated
+                    if (typeof window.WPP !== 'undefined' && window.WPP.conn) {
+                        const isAuthed = await window.WPP.conn.isAuthenticated();
+                        if (isAuthed) {
+                            return { ready: true, qr: null };
+                        }
+                        const code = await window.WPP.conn.getAuthCode();
+                        if (code && code.fullCode) {
+                            return { ready: false, qr: code.fullCode };
+                        }
+                    }
+
+                    // 2. Check DOM data-ref fallback
+                    const domEl = document.querySelector('div[data-ref]') || document.querySelector('[data-ref]');
+                    if (domEl) {
+                        const ref = domEl.getAttribute('data-ref');
+                        if (ref) return { ready: false, qr: ref };
+                    }
+
+                    return { ready: false, qr: null };
+                });
+
+                if (state) {
+                    if (state.ready) {
+                        isReady = true;
+                        currentQR = null;
+                        clearInterval(checkInterval);
+                        console.log('WhatsApp Client is ready! Bridge is fully active.');
+                    } else if (state.qr && state.qr !== currentQR) {
+                        currentQR = state.qr;
+                        isReady = false;
+                        console.log('QR Code received. Scan with your phone:');
+                        qrcode.generate(state.qr, { small: true });
+                    }
+                }
+            } catch (e) {}
+        }, 2000);
+
+        // Loop to ensure WA-JS is injected and event listeners are active
+        let injected = false;
+        for (let i = 0; i < 30; i++) {
+            if (isShuttingDown) break;
+            try {
+                injected = await page.evaluate(async () => {
+                    if (typeof window.WPP === 'undefined' || !window.WPP.isReady) {
+                        return false;
+                    }
+
+                    if (!window.__wpp_listeners_attached) {
+                        window.__wpp_listeners_attached = true;
+
+                        window.WPP.on('conn.auth_code_change', (authCode) => {
+                            if (authCode && authCode.fullCode) {
+                                window.nodeOnQrCode(authCode.fullCode);
+                            }
+                        });
+
+                        window.WPP.on('conn.authenticated', () => {
+                            window.nodeOnAuthenticated();
+                            window.nodeOnReady();
+                        });
+
+                        window.WPP.on('conn.main_ready', async () => {
+                            try {
+                                if (await window.WPP.conn.isAuthenticated()) {
+                                    window.nodeOnReady();
+                                }
+                            } catch (e) {}
+                        });
+
+                        window.WPP.on('chat.new_message', async (msg) => {
+                            try {
+                                if (!msg) return;
+                                let senderName = msg.notifyName || (msg.author && (msg.author._serialized || msg.author)) || (msg.from && (msg.from._serialized || msg.from)) || 'Unknown';
+                                let chatId = (msg.chatId && (msg.chatId._serialized || msg.chatId)) || (msg.from && (msg.from._serialized || msg.from)) || '';
+                                
+                                if (msg.chat && !msg.chat.isGroup) {
+                                    senderName = msg.chat.name || senderName;
+                                } else if (msg.author) {
+                                    try {
+                                        const contact = await window.WPP.contact.get(msg.author);
+                                        if (contact) {
+                                            senderName = contact.name || contact.pushname || senderName;
+                                        }
+                                    } catch (e) {}
+                                }
+                                window.nodeOnMsgReceived(chatId, senderName);
+                            } catch (e) {
+                                console.error('Error handling incoming message event:', e);
+                            }
+                        });
+                    }
+
+                    const isAuthed = await window.WPP.conn.isAuthenticated();
+                    if (isAuthed) {
+                        window.nodeOnReady();
+                    } else {
+                        const authCode = await window.WPP.conn.getAuthCode();
+                        if (authCode && authCode.fullCode) {
+                            window.nodeOnQrCode(authCode.fullCode);
+                        } else {
+                            const domEl = document.querySelector('div[data-ref]') || document.querySelector('[data-ref]');
+                            if (domEl) {
+                                const ref = domEl.getAttribute('data-ref');
+                                if (ref) window.nodeOnQrCode(ref);
+                            }
+                        }
+                    }
+
+                    return true;
+                });
+
+                if (injected) {
+                    break;
+                }
+            } catch (e) {
+                // Page might still be loading Webpack scripts
+            }
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
+        if (!injected) {
+            console.log('Attempting direct WA-JS evaluation injection...');
+            await injectWaJs();
+        }
+
+    } catch (err) {
+        console.error('Failed to initialize WhatsApp browser client:', err);
+    }
 }
 
 startClient();
+
+// --- Helper Functions in Node ---
+
+async function forceShutdown() {
+    console.log('Initiating shutdown...');
+    isShuttingDown = true;
+    try {
+        if (browser) {
+            await browser.close();
+        }
+    } catch (e) {
+        console.error('Error during browser close:', e);
+    }
+    process.exit(0);
+}
+
+// In-browser target resolution helper stringified
+const browserResolveTarget = `
+async function resolveTargetInBrowser(target) {
+    if (!target) return null;
+    if (target.includes('@c.us') || target.includes('@g.us') || target.includes('@newsletter')) return target;
+
+    // 1. Clean number matching
+    let cleanInput = target.replace(/[^\\d+]/g, '');
+    if (cleanInput.startsWith('0') && cleanInput.length === 10) {
+        cleanInput = '27' + cleanInput.substring(1);
+    }
+    cleanInput = cleanInput.replace('+', '');
+
+    // 2. Query contact list
+    const contacts = await window.WPP.contact.list();
+    
+    // Direct phone matching
+    if (cleanInput.length >= 7) {
+        const byPhone = contacts.find(c => {
+            const user = (c.id && c.id.user) || '';
+            const pn = (c.phoneNumber && c.phoneNumber.user) || '';
+            return user === cleanInput || pn === cleanInput || user.endsWith(cleanInput) || cleanInput.endsWith(user);
+        });
+        if (byPhone && byPhone.id) {
+            return byPhone.id._serialized || byPhone.id;
+        }
+        
+        try {
+            const exists = await window.WPP.contact.queryExists(cleanInput + '@c.us');
+            if (exists && exists.wid) {
+                return exists.wid._serialized || exists.wid;
+            }
+        } catch (e) {}
+    }
+
+    // Exact name / pushname
+    let match = contacts.find(c => c.name === target || c.pushname === target);
+    if (!match) {
+        const lower = target.toLowerCase();
+        match = contacts.find(c => (c.name && c.name.toLowerCase() === lower) || (c.pushname && c.pushname.toLowerCase() === lower));
+    }
+    // Partial name
+    if (!match) {
+        const lower = target.toLowerCase();
+        const matches = contacts.filter(c => (c.name && c.name.toLowerCase().includes(lower)) || (c.pushname && c.pushname.toLowerCase().includes(lower)));
+        if (matches.length > 0) {
+            match = matches.find(m => ((m.id && m.id._serialized) || m.id || '').includes('@c.us')) || matches[0];
+        }
+    }
+
+    if (match && match.id) {
+        return match.id._serialized || match.id;
+    }
+
+    // Check chat list
+    const chats = await window.WPP.chat.list();
+    let chatMatch = chats.find(c => c.name === target);
+    if (!chatMatch) {
+        const lower = target.toLowerCase();
+        chatMatch = chats.find(c => c.name && c.name.toLowerCase() === lower);
+    }
+    if (!chatMatch) {
+        const lower = target.toLowerCase();
+        chatMatch = chats.find(c => c.name && c.name.toLowerCase().includes(lower));
+    }
+    if (chatMatch && chatMatch.id) {
+        return chatMatch.id._serialized || chatMatch.id;
+    }
+
+    if (cleanInput.length >= 7) {
+        return cleanInput + '@c.us';
+    }
+
+    return null;
+}
+`;
+
+// Helper to serialize messages in browser context
+const browserSerializeMessage = `
+async function serializeMsgInBrowser(msg, chat) {
+    let senderName = 'Unknown';
+    if (msg.notifyName) {
+        senderName = msg.notifyName;
+    } else if (msg.author) {
+        try {
+            const contact = await window.WPP.contact.get(msg.author);
+            senderName = contact.name || contact.pushname || (msg.author._serialized || msg.author);
+        } catch (e) {
+            senderName = msg.author._serialized || msg.author;
+        }
+    } else if (msg.from) {
+        try {
+            const contact = await window.WPP.contact.get(msg.from);
+            senderName = contact.name || contact.pushname || (msg.from._serialized || msg.from);
+        } catch (e) {
+            senderName = msg.from._serialized || msg.from;
+        }
+    }
+
+    const chatIdStr = (chat && chat.id && (chat.id._serialized || chat.id)) || (msg.chatId && (msg.chatId._serialized || msg.chatId)) || '';
+    const fromStr = (msg.from && (msg.from._serialized || msg.from)) || '';
+    const authorStr = (msg.author && (msg.author._serialized || msg.author)) || fromStr;
+    const isGroup = chatIdStr.endsWith('@g.us');
+
+    let senderNumber = null;
+    let authorToUse = isGroup ? authorStr : fromStr;
+    if (authorToUse && authorToUse.includes('@c.us')) {
+        senderNumber = authorToUse.split('@')[0];
+    } else if (authorToUse && authorToUse.includes('@lid')) {
+        try {
+            const entry = await window.WPP.contact.getPnLidEntry(authorToUse);
+            if (entry && entry.phoneNumber && entry.phoneNumber.id) {
+                senderNumber = entry.phoneNumber.id;
+            }
+        } catch (e) {}
+    }
+
+    const msgIdStr = (msg.id && (msg.id._serialized || msg.id)) || '';
+    let msgType = msg.type || 'chat';
+    if (msg.isMedia) {
+        if (!msgType || msgType === 'chat') msgType = 'document';
+    }
+
+    return {
+        id: msgIdStr,
+        chatId: chatIdStr,
+        chatName: (chat && (chat.name || (chat.id && chat.id.user))) || '',
+        timestamp: msg.t || msg.timestamp || Math.floor(Date.now() / 1000),
+        sender: fromStr,
+        author: authorStr,
+        senderName: senderName,
+        senderNumber: senderNumber,
+        content: msg.body || msg.caption || '',
+        fromMe: Boolean(msg.fromMe || msg.id && msg.id.fromMe),
+        isGroup: isGroup,
+        hasMedia: Boolean(msg.hasMedia || msg.isMedia || msgType === 'ptt' || msgType === 'audio' || msgType === 'image' || msgType === 'video' || msgType === 'document'),
+        type: msgType
+    };
+}
+`;
+
+async function downloadAndSaveMedia(msgId, msgType) {
+    if (!page || !msgId) return null;
+    try {
+        const base64Data = await page.evaluate(async (id) => {
+            const blob = await window.WPP.chat.downloadMedia(id);
+            if (!blob) return null;
+            return await window.WPP.util.blobToBase64(blob);
+        }, msgId);
+
+        if (!base64Data) return null;
+
+        const matches = base64Data.match(/^data:([^;]+);base64,(.+)$/);
+        const mimeType = matches ? matches[1] : 'application/octet-stream';
+        const rawBase64 = matches ? matches[2] : base64Data;
+
+        let extension = 'bin';
+        if (mimeType.includes('/')) {
+            extension = mimeType.split('/')[1].split(';')[0];
+        }
+        if (msgType === 'ptt') extension = 'ogg';
+
+        const safeId = msgId.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const filename = `${safeId}.${extension}`;
+        const filePath = path.join(uploadDir, filename);
+
+        fs.writeFileSync(filePath, rawBase64, 'base64');
+        return filePath;
+    } catch (e) {
+        console.error(`Failed to download media for message ${msgId}:`, e.message);
+        return null;
+    }
+}
 
 // --- Endpoints ---
 
@@ -146,27 +552,24 @@ app.get('/status', (req, res) => {
 });
 
 app.post('/eval', async (req, res) => {
+    if (!page) return res.status(503).json({ error: 'Browser not initialized' });
     try {
         const code = req.body.code;
-        const result = await client.pupPage.evaluate(code);
+        const result = await page.evaluate(code);
         res.json({ result });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-async function forceShutdown() {
-    console.log('Initiating shutdown...');
-    isShuttingDown = true;
+app.post('/update_engine', async (req, res) => {
     try {
-        if (client) {
-            await client.destroy();
-        }
+        const success = await injectWaJs();
+        res.json({ success });
     } catch (e) {
-        console.error('Error during client destroy:', e);
+        res.status(500).json({ error: e.message });
     }
-    process.exit(0);
-}
+});
 
 app.post('/shutdown', async (req, res) => {
     console.log('Shutdown requested via API');
@@ -175,39 +578,46 @@ app.post('/shutdown', async (req, res) => {
 });
 
 app.get('/unread', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     try {
-        console.log('[DEBUG] /unread endpoint called - fetching natively');
-        const chats = await client.getChats();
-        
-        let unreadMessages = [];
-        for (const chat of chats) {
-            if (chat.unreadCount > 0) {
-                try {
-                    const msgs = await chat.fetchMessages({ limit: chat.unreadCount });
-                    for (const msg of msgs) {
-                        unreadMessages.push(await serializeMessage(msg, chat));
-                    }
-                } catch (err) {
-                    console.error(`Failed to fetch unread for chat ${chat.id._serialized}:`, err);
-                    throw err; // Re-throw to trigger protocol mismatch error
+        console.log('[DEBUG] /unread endpoint called via WA-JS');
+        const unreadData = await page.evaluate(async (resolveHelper, serializeHelper) => {
+            eval(resolveHelper);
+            eval(serializeHelper);
+
+            const unreadChats = await window.WPP.chat.list({ onlyWithUnreadMessage: true });
+            let unreadList = [];
+
+            for (const chat of unreadChats) {
+                const count = chat.unreadCount || 1;
+                const msgs = await window.WPP.chat.getMessages(chat.id, { count: count, onlyUnread: true });
+                for (const msg of msgs) {
+                    unreadList.push(await serializeMsgInBrowser(msg, chat));
                 }
             }
+            return unreadList;
+        }, browserResolveTarget, browserSerializeMessage);
+
+        for (const msg of unreadData) {
+            if (msg.hasMedia) {
+                msg.mediaPath = await downloadAndSaveMedia(msg.id, msg.type);
+            }
         }
-        
-        res.json({ unread: unreadMessages });
+
+        res.json({ unread: unreadData });
     } catch (e) {
-        console.error("Unread extraction failed natively. Protocol mismatch detected:", e);
-        res.status(500).json({ error: "Protocol mismatch: Waiting for whatsapp-web.js patch update.", details: e.message });
+        console.error('Unread extraction failed via WA-JS:', e);
+        res.status(500).json({ error: 'Protocol mismatch: Waiting for WA-JS update.', details: e.message });
     }
 });
 
 app.post('/mark_read', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
-    const { chatId } = req.body; 
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const { chatId } = req.body;
     try {
-        const chat = await client.getChatById(chatId);
-        await chat.sendSeen();
+        await page.evaluate(async (cid) => {
+            await window.WPP.chat.markIsRead(cid);
+        }, chatId);
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -215,28 +625,29 @@ app.post('/mark_read', async (req, res) => {
 });
 
 app.post('/react', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     const { msgId, reaction } = req.body;
     try {
-        const msg = await client.getMessageById(msgId);
-        if (msg) {
-            await msg.react(reaction);
-            res.json({ success: true });
-        } else {
-            res.status(404).json({ error: 'Message not found' });
-        }
+        await page.evaluate(async (mid, rx) => {
+            await window.WPP.chat.sendReactionToMessage(mid, rx);
+        }, msgId, reaction);
+        res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
 app.get('/resolve', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     const target = req.query.target;
     if (!target) return res.status(400).json({ error: 'No target provided' });
-    
+
     try {
-        const chatId = await resolveTarget(target);
+        const chatId = await page.evaluate(async (t, resolveHelper) => {
+            eval(resolveHelper);
+            return await resolveTargetInBrowser(t);
+        }, target, browserResolveTarget);
+
         if (chatId) {
             res.json({ target: chatId });
         } else {
@@ -248,339 +659,183 @@ app.get('/resolve', async (req, res) => {
 });
 
 app.get('/recent', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
-    const n = parseInt(req.query.n) || 30;
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const n = parseInt(req.query.n, 10) || 30;
     const target = req.query.target;
-    
+
     try {
-        console.log(`[DEBUG] /recent endpoint called. target=${target}`);
-        let targetChat = null;
-        if (target) {
-            const chatId = await resolveTarget(target);
-            if (!chatId) return res.status(404).json({ error: `Target not found: ${target}` });
-            targetChat = await client.getChatById(chatId);
-        }
-        
-        let msgsToSerialize = [];
-        
-        if (targetChat) {
-            const msgs = await targetChat.fetchMessages({ limit: n });
-            for (const msg of msgs) {
-                msgsToSerialize.push({ msg, chat: targetChat });
-            }
-        } else {
-            const chats = await client.getChats();
-            const topChats = chats.slice(0, 15);
-            for (const chat of topChats) {
-                const msgs = await chat.fetchMessages({ limit: 5 });
+        console.log(`[DEBUG] /recent endpoint called. target=${target} n=${n}`);
+        const messagesData = await page.evaluate(async (t, count, resolveHelper, serializeHelper) => {
+            eval(resolveHelper);
+            eval(serializeHelper);
+
+            let allMsgs = [];
+            if (t) {
+                const chatId = await resolveTargetInBrowser(t);
+                if (!chatId) return { error: `Target not found: ${t}` };
+                const chat = await window.WPP.chat.get(chatId);
+                const msgs = await window.WPP.chat.getMessages(chatId, { count: count });
                 for (const msg of msgs) {
-                    msgsToSerialize.push({ msg, chat });
+                    allMsgs.push(await serializeMsgInBrowser(msg, chat));
+                }
+            } else {
+                const chats = await window.WPP.chat.list({ count: 15 });
+                for (const chat of chats) {
+                    const msgs = await window.WPP.chat.getMessages(chat.id, { count: 5 });
+                    for (const msg of msgs) {
+                        allMsgs.push(await serializeMsgInBrowser(msg, chat));
+                    }
                 }
             }
+
+            allMsgs.sort((a, b) => b.timestamp - a.timestamp);
+            return { messages: allMsgs.slice(0, count) };
+        }, target, n, browserResolveTarget, browserSerializeMessage);
+
+        if (messagesData.error) {
+            return res.status(404).json({ error: messagesData.error });
         }
-        
-        let allMsgs = [];
-        for (const pair of msgsToSerialize) {
-            allMsgs.push(await serializeMessage(pair.msg, pair.chat));
+
+        const msgs = messagesData.messages || [];
+        for (const msg of msgs) {
+            if (msg.hasMedia) {
+                msg.mediaPath = await downloadAndSaveMedia(msg.id, msg.type);
+            }
         }
-        
-        allMsgs.sort((a, b) => b.timestamp - a.timestamp);
-        res.json({ messages: allMsgs.slice(0, n) });
+
+        res.json({ messages: msgs });
     } catch (e) {
-        console.error("Recent extraction failed natively. Protocol mismatch detected:", e);
-        res.status(500).json({ error: "Protocol mismatch: Waiting for whatsapp-web.js patch update.", details: e.message });
+        console.error('Recent extraction failed via WA-JS:', e);
+        res.status(500).json({ error: 'Protocol mismatch: Waiting for WA-JS update.', details: e.message });
     }
 });
 
 app.get('/recent/:chatId', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
-    const n = parseInt(req.query.n) || 30;
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const n = parseInt(req.query.n, 10) || 30;
+    const targetChatId = req.params.chatId;
+
     try {
-        const chat = await client.getChatById(req.params.chatId);
-        const msgs = await chat.fetchMessages({ limit: n });
-        let allMsgs = [];
-        for (const msg of msgs) {
-            allMsgs.push(await serializeMessage(msg, chat));
+        const messagesData = await page.evaluate(async (cid, count, serializeHelper) => {
+            eval(serializeHelper);
+            const chat = await window.WPP.chat.get(cid);
+            const msgs = await window.WPP.chat.getMessages(cid, { count: count });
+            let allMsgs = [];
+            for (const msg of msgs) {
+                allMsgs.push(await serializeMsgInBrowser(msg, chat));
+            }
+            allMsgs.sort((a, b) => b.timestamp - a.timestamp);
+            return allMsgs;
+        }, targetChatId, n, browserSerializeMessage);
+
+        for (const msg of messagesData) {
+            if (msg.hasMedia) {
+                msg.mediaPath = await downloadAndSaveMedia(msg.id, msg.type);
+            }
         }
-        allMsgs.sort((a, b) => b.timestamp - a.timestamp);
-        res.json({ messages: allMsgs });
+
+        res.json({ messages: messagesData });
     } catch (e) {
-        console.error("Recent chatId extraction failed natively:", e);
-        res.status(500).json({ error: "Protocol mismatch: Waiting for whatsapp-web.js patch update.", details: e.message });
+        console.error('Recent chatId extraction failed via WA-JS:', e);
+        res.status(500).json({ error: 'Protocol mismatch: Waiting for WA-JS update.', details: e.message });
     }
 });
 
 app.post('/send', upload.single('media'), async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
-    const { target, text, reply_to } = req.body;
-    
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const { target, text, reply_to, isVoice } = req.body;
+
     try {
-        // Resolve target
-        const chatId = await resolveTarget(target);
-        if (!chatId) {
+        const resolvedChatId = await page.evaluate(async (t, resolveHelper) => {
+            eval(resolveHelper);
+            return await resolveTargetInBrowser(t);
+        }, target, browserResolveTarget);
+
+        if (!resolvedChatId) {
+            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(404).json({ error: `Could not resolve target: ${target}` });
         }
 
-        let contentToSend = text || '';
-        const options = {
-            linkPreview: true
-        };
+        let sendOptions = {};
+        if (reply_to) {
+            sendOptions.quotedMsg = reply_to;
+        }
 
-        // Automatically parse mentions from text
+        // Parse mentions
         if (text) {
             const mentionMatches = text.match(/@(\d+)/g);
             if (mentionMatches) {
-                const mentionIds = mentionMatches.map(m => m.substring(1) + '@c.us');
-                options.mentions = mentionIds;
+                sendOptions.mentionedList = mentionMatches.map(m => m.substring(1) + '@c.us');
             }
         }
 
         if (req.file) {
-            // Check if it's an audio file for voice message
-            const isVoice = req.body.isVoice === 'true';
-            
-            // To ensure WhatsApp knows what it is, we need to supply the mime type and a proper filename 
-            // if the multer file lacks an extension.
-            const mimeType = req.file.mimetype || 'audio/mp3';
-            const filename = req.file.originalname || 'voice.mp3';
-            const mediaData = fs.readFileSync(req.file.path, { encoding: 'base64' });
-            
-            contentToSend = new MessageMedia(mimeType, mediaData, filename);
+            const mimeType = req.file.mimetype || 'application/octet-stream';
+            const filename = req.file.originalname || 'file';
+            const fileDataB64 = fs.readFileSync(req.file.path, { encoding: 'base64' });
+            const dataUrl = `data:${mimeType};base64,${fileDataB64}`;
+            const isVoiceNote = isVoice === 'true' || isVoice === true;
 
-            if (isVoice) {
-                options.sendAudioAsVoice = true;
-            } else if (text) {
-                options.caption = text;
-            }
-        }
-
-        let sent = false;
-        if (reply_to) {
-            try {
-                const quotedMsg = await client.getMessageById(reply_to);
-                if (quotedMsg) {
-                    await quotedMsg.reply(contentToSend, chatId, options);
-                    sent = true;
+            await page.evaluate(async (cid, dUrl, isV, txt, fname, opts) => {
+                if (isV) {
+                    await window.WPP.chat.sendFileMessage(cid, dUrl, {
+                        type: 'audio',
+                        isPtt: true,
+                        ...opts
+                    });
+                } else {
+                    await window.WPP.chat.sendFileMessage(cid, dUrl, {
+                        type: 'auto-detect',
+                        filename: fname,
+                        caption: txt || undefined,
+                        ...opts
+                    });
                 }
-            } catch (e) {
-                console.error("Could not fetch quoted message for reply:", e);
-                options.quotedMessageId = reply_to;
-            }
+            }, resolvedChatId, dataUrl, isVoiceNote, text, filename, sendOptions);
+
+            fs.unlinkSync(req.file.path);
+        } else {
+            await page.evaluate(async (cid, txt, opts) => {
+                await window.WPP.chat.sendTextMessage(cid, txt, opts);
+            }, resolvedChatId, text || '', sendOptions);
         }
 
-        if (!sent) {
-            await client.sendMessage(chatId, contentToSend, options);
-        }
-        
-        res.json({ success: true, target: chatId });
-        
-        if (req.file) {
-            fs.unlinkSync(req.file.path); // cleanup
-        }
+        res.json({ success: true, target: resolvedChatId });
     } catch (e) {
-        res.status(500).json({ error: e.message });
-        if (req.file) {
+        if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
         }
+        res.status(500).json({ error: e.message });
     }
 });
 
 app.get('/media/:msgId', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'Client not ready' });
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     try {
-        const msg = await client.getMessageById(req.params.msgId);
-        if (msg.hasMedia) {
-            const media = await msg.downloadMedia();
-            const buffer = Buffer.from(media.data, 'base64');
-            res.set('Content-Type', media.mimetype);
-            res.send(buffer);
-        } else {
-            res.status(404).json({ error: 'No media' });
+        const base64Data = await page.evaluate(async (id) => {
+            const blob = await window.WPP.chat.downloadMedia(id);
+            if (!blob) return null;
+            return await window.WPP.util.blobToBase64(blob);
+        }, req.params.msgId);
+
+        if (!base64Data) {
+            return res.status(404).json({ error: 'No media found or download failed' });
         }
+
+        const matches = base64Data.match(/^data:([^;]+);base64,(.+)$/);
+        const mimeType = matches ? matches[1] : 'application/octet-stream';
+        const rawBase64 = matches ? matches[2] : base64Data;
+        const buffer = Buffer.from(rawBase64, 'base64');
+
+        res.set('Content-Type', mimeType);
+        res.send(buffer);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-async function resolveTarget(target) {
-    if (target.includes('@c.us') || target.includes('@g.us')) return target;
-    
-    // First check existing contacts instead of chats (since getChats is broken)
-    const chats = await client.getContacts();
-    // 1. Exact Name
-    let chat = chats.find(c => c.name === target);
-    // 2. Case Insensitive
-    if (!chat) chat = chats.find(c => c.name && c.name.toLowerCase() === target.toLowerCase());
-    // 3. Partial Match
-    if (!chat) {
-        const matches = chats.filter(c => c.name && c.name.toLowerCase().includes(target.toLowerCase()));
-        if (matches.length > 0) chat = matches.sort((a, b) => a.name.length - b.name.length)[0];
-    }
-    // 4. Robust Phone Number Matching
-    if (!chat) {
-        // Strip everything except digits and plus
-        let cleanInput = target.replace(/[^\d+]/g, '');
-        
-        // Handle South African number formatting (assuming local numbers starting with 0 belong to +27)
-        // If it starts with 0 and is 10 digits long, convert to 27
-        if (cleanInput.startsWith('0') && cleanInput.length === 10) {
-            cleanInput = '27' + cleanInput.substring(1);
-        }
-        
-        // Strip any remaining leading '+'
-        cleanInput = cleanInput.replace('+', '');
-        
-        // Only try to match if we have a reasonable length number to avoid false positives
-        if (cleanInput.length >= 7) {
-            chat = chats.find(c => {
-                const chatIdUser = c.id.user;
-                // Direct match on ID
-                if (chatIdUser === cleanInput) return true;
-                
-                // Sometimes the chat ID has the country code and the input doesn't (e.g. chat is 2783... input is 83...)
-                if (chatIdUser.endsWith(cleanInput)) return true;
-                
-                // Sometimes the input has the country code and the chat ID doesn't (rare, but just in case)
-                if (cleanInput.endsWith(chatIdUser) && chatIdUser.length >= 7) return true;
-                
-                // For LID (Linked Device) accounts, the ID is random numbers, but the name holds the formatted phone number
-                if (c.name) {
-                    const cleanName = c.name.replace(/[^\d+]/g, '').replace('+', '');
-                    if (cleanName === cleanInput) return true;
-                    if (cleanName.endsWith(cleanInput) && cleanInput.length >= 9) return true;
-                }
-                
-                return false;
-            });
-        }
-    }
-    
-    if (chat) return chat.id._serialized;
-
-    // If no chat found, check all contacts (pushnames)
-    const contacts = await client.getContacts();
-    
-    // 5. Exact Pushname Match
-    let contact = contacts.find(c => c.pushname === target || c.name === target);
-    
-    // 6. Case Insensitive Pushname
-    if (!contact) contact = contacts.find(c => (c.pushname && c.pushname.toLowerCase() === target.toLowerCase()) || (c.name && c.name.toLowerCase() === target.toLowerCase()));
-    
-    // 7. Partial Pushname Match (Target is part of pushname, or pushname is part of target)
-    if (!contact) {
-        const matches = contacts.filter(c => {
-            const pname = (c.pushname || '').toLowerCase();
-            const cname = (c.name || '').toLowerCase();
-            const t = target.toLowerCase();
-            return (pname && (pname.includes(t) || t.includes(pname))) || (cname && (cname.includes(t) || t.includes(cname)));
-        });
-        
-        if (matches.length > 0) {
-            // Prefer regular c.us accounts over lid accounts if there's a duplicate
-            const nonLid = matches.find(m => m.id._serialized.includes('@c.us'));
-            contact = nonLid || matches[0];
-        }
-    }
-    
-    // 8. Robust Phone Number Matching against contacts
-    if (!contact) {
-        let cleanInput = target.replace(/[^\d+]/g, '');
-        if (cleanInput.startsWith('0') && cleanInput.length === 10) {
-            cleanInput = '27' + cleanInput.substring(1);
-        }
-        cleanInput = cleanInput.replace('+', '');
-        
-        if (cleanInput.length >= 7) {
-            contact = contacts.find(c => {
-                const contactIdUser = c.id.user;
-                if (contactIdUser === cleanInput) return true;
-                if (contactIdUser.endsWith(cleanInput)) return true;
-                if (cleanInput.endsWith(contactIdUser) && contactIdUser.length >= 7) return true;
-                return false;
-            });
-        }
-    }
-    
-    return contact ? contact.id._serialized : null;
-}
-
-async function resolveLidToCus(client, lidOrOther) {
-    if (!lidOrOther || !lidOrOther.includes('@lid')) return lidOrOther;
-    try {
-        const lidContact = await client.getContactById(lidOrOther);
-        const contactName = lidContact.name || lidContact.pushname;
-        if (contactName) {
-            const contacts = await client.getContacts();
-            const realContact = contacts.find(c => (c.name === contactName || c.pushname === contactName) && c.id._serialized.includes('@c.us'));
-            if (realContact) {
-                return realContact.id._serialized;
-            }
-        }
-    } catch(e) {
-        console.error("LID resolution failed", e);
-    }
-    return lidOrOther;
-}
-
-async function serializeMessage(msg, chat) {
-    let senderName = 'Unknown';
-    if (msg._data && msg._data.notifyName) {
-        senderName = msg._data.notifyName;
-    } else if (msg.author) {
-        const contact = await client.getContactById(msg.author);
-        senderName = contact.name || contact.pushname || msg.author;
-    } else {
-        const contact = await msg.getContact();
-        senderName = contact.name || contact.pushname || msg.from;
-    }
-
-    let mediaPath = null;
-    if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio' || msg.type === 'image' || msg.type === 'document')) {
-        try {
-            const media = await msg.downloadMedia();
-            if (media) {
-                let extension = media.mimetype.split('/')[1].split(';')[0] || 'bin';
-                // Some mimetypes are like application/pdf, which gives extension 'pdf'
-                // Some are like image/jpeg, which gives 'jpeg'
-                const filename = `${msg.id.id}.${extension}`;
-                mediaPath = path.join(uploadDir, filename);
-                fs.writeFileSync(mediaPath, media.data, 'base64');
-            }
-        } catch (e) {
-            console.error('Failed to download media:', e);
-        }
-    }
-
-    const resolvedChatId = await resolveLidToCus(client, chat.id._serialized);
-    const resolvedSenderId = await resolveLidToCus(client, msg.from);
-    const resolvedAuthor = await resolveLidToCus(client, msg.author);
-
-    let authorIdToUse = chat.isGroup ? resolvedAuthor : resolvedSenderId;
-    let senderNumber = null;
-    if (authorIdToUse && authorIdToUse.includes('@c.us')) {
-        senderNumber = authorIdToUse.split('@')[0];
-    }
-
-    return {
-        id: msg.id._serialized,
-        chatId: resolvedChatId,
-        chatName: chat.name || chat.id.user,
-        timestamp: msg.timestamp,
-        sender: resolvedSenderId,
-        author: resolvedAuthor,
-        senderName: senderName,
-        senderNumber: senderNumber,
-        content: msg.body,
-        fromMe: msg.fromMe,
-        isGroup: chat.isGroup,
-        hasMedia: msg.hasMedia,
-        type: msg.type, // 'ptt' for voice messages
-        mediaPath: mediaPath
-    };
-}
-
 const server = app.listen(port, () => {
-    console.log(`WhatsApp Bridge running on port ${port}`);
+    console.log(`WhatsApp WA-JS Bridge running on port ${port}`);
 });
 
 process.on('SIGTERM', () => {

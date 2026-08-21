@@ -7,11 +7,13 @@ from PySide6.QtGui import QTextCursor, QTextBlockFormat
 
 from gui.visualizer import SoundWaveVisualizer
 from core.orchestrator import AmityOrchestrator
+from core.config_manager import ConfigManager
 
 try:
-    from gui.theme import PRIMARY_ACCENT_COLOR
+    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
+    SECONDARY_ACCENT_COLOR = "#f7e3a5"
 
 
 class AgentView(QWidget):
@@ -170,22 +172,29 @@ class AgentView(QWidget):
         scroll_bar.setValue(scroll_bar.maximum())
 
     def append_to_conversation(self, sender, text):
-        if sender == "User":
-            display_name = "User"
+        user_name = "User"
+        try:
+            config = ConfigManager()
+            user_name = config.get("user-full-name", "").strip() or "User"
+        except Exception:
+            pass
+
+        if sender in ["User", user_name]:
+            display_name = user_name
             name_color = PRIMARY_ACCENT_COLOR
             text_color = "#808080"
-        elif sender == "System":
-            display_name = "System"
+        elif sender.startswith("System"):
+            display_name = sender
             name_color = "#808080"
             text_color = "#808080"
         else:
             display_name = self.settings_manager.get(
                 "core.agent.name", "Agent")
-            name_color = "#f7e3a5"
+            name_color = SECONDARY_ACCENT_COLOR
             text_color = "#FFFFFF"
         timestamp = datetime.now().strftime("%H:%M")
 
-        if sender == "User":
+        if sender in ["User", user_name]:
             safe_text = text.replace("<", "&lt;").replace(
                 ">", "&gt;").replace("\n", "<br>")
             formatted_text = safe_text

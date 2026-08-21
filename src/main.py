@@ -7,6 +7,7 @@ from PySide6.QtGui import QIcon, QFontDatabase, QFont
 from PySide6.QtCore import qInstallMessageHandler, QtMsgType
 from gui.main_window import MainWindow
 from gui.splash_screen import LoadingCard
+from gui.theme import setup_app_theme
 from core.logger_config import setup_logging
 from config import paths
 from core.version import __version__ as amity_version
@@ -81,36 +82,8 @@ def main():
     icon_path = paths.get_icon_path()
     app.setWindowIcon(QIcon(icon_path))
 
-    # Set modern global scrollbar style
-    app.setStyleSheet("""
-        QScrollBar:vertical {
-            border: none;
-            background: transparent;
-            width: 14px;
-            margin: 0px 0px 0px 0px;
-        }
-        QScrollBar::handle:vertical {
-            background-color: rgba(100, 100, 100, 150);
-            min-height: 30px;
-            border-radius: 7px;
-            margin: 2px;
-        }
-        QScrollBar::handle:vertical:hover {
-            background-color: rgba(150, 150, 150, 200);
-            margin: 0px;
-        }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-            border: none;
-            background: none;
-            height: 0px;
-        }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-            background: none;
-        }
-    """)
-
-    # Set dark theme palette (optional, but good for base look)
-    # app.setStyle("Fusion")
+    # Set centralized application theme, dark palette, and modern scrollbars
+    setup_app_theme(app)
 
     from PySide6.QtCore import QTimer, QThread, Signal, QObject
 

@@ -8,7 +8,7 @@ from core.cache_manager import CacheManager
 
 class WhatsAppSkill(Tool):
     name = "WhatsApp"
-    description = "Allows you to read and send WhatsApp messages. Note: If you encounter a '500 Protocol mismatch' error, it means WhatsApp Web has updated and whatsapp-web.js now requires an update. Try WhatsApp_reset_connection but if you still get the protocol mismatch error just inform the user that the Whatsapp tool is down until an upstream patch is released."
+    description = "Allows you to read and send WhatsApp messages. Note: If you encounter a protocol mismatch error, try WhatsApp_reset_connection to download the latest WPPConnect engine patch and restart the server."
     commands = [
         "unread (Fetch all unread messages)",
         "recent [n] (Fetch n most recent messages, default 30)",
@@ -17,14 +17,14 @@ class WhatsAppSkill(Tool):
         "send_voice <target> <message> (Send a text message that gets converted to voice/TTS and sent)",
         "react <msgId> <reaction> (React to a specific message with an emoji)",
         "mark_read <chatId> (Mark a chat as read)",
-        "reset_connection (Clears WhatsApp cache and restarts the server if stuck in a QR loop)"
+        "reset_connection (Clears WhatsApp cache, checks for engine updates, and restarts the server if stuck in a QR loop)"
     ]
 
     def __init__(self, orchestrator=None):
         super().__init__(orchestrator)
         from core.whatsapp_daemon import WhatsAppDaemon
         agent_id = self.orchestrator.agent_id if self.orchestrator else None
-        self.daemon = WhatsAppDaemon(port=3000, agent_id=agent_id)
+        self.daemon = WhatsAppDaemon(agent_id=agent_id)
         self.daemon.message_callback = self._on_message_received
         self.base_url = self.daemon.base_url
         self.data_dir = self.daemon.data_dir
@@ -116,7 +116,7 @@ class WhatsAppSkill(Tool):
             },
             {
                 "name": "WhatsApp_reset_connection",
-                "description": "Restarts the WhatsApp server, clears caches, and updates the underlying whatsapp-web.js library to the latest commit to fix protocol mismatch errors (e.g., 'Failed to resolve chat', 'r: r'). Use this tool if the WhatsApp client is stuck initializing or throws internal evaluation errors. Note: You can temporarily change the 'core.whatsapp-web-target' setting in settings.json to a specific fork (e.g., a PR branch) to fix protocol mismatch errors, but this should only be used as a temporary solution and must always be reverted back to 'github:wwebjs/whatsapp-web.js#main' once an official patch is released.",
+                "description": "Restarts the WhatsApp server, clears caches, and updates the underlying WPPConnect WA-JS engine to the latest release to fix protocol mismatch errors. Use this tool if the WhatsApp client is stuck initializing or throws internal evaluation errors.",
                 "parameters": {"type": "OBJECT", "properties": {}}
             },
         ]

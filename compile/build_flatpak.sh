@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 # Ensure BaseApp and SDK are installed
 echo "Ensuring Flatpak dependencies are installed..."
 flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-flatpak install --user -y flathub org.kde.Sdk//6.8 org.kde.Platform//6.8 io.qt.PySide.BaseApp//6.8
+flatpak install --user -y flathub org.kde.Sdk//6.11 org.kde.Platform//6.11 io.qt.PySide.BaseApp//6.11
 
 # Check if pre-baked requirements file exists
 if [ ! -f "python3-requirements.json" ]; then

@@ -14,6 +14,7 @@ try:
     from core.pulse_engine import PulseEngine
     from core.settings_manager import SettingsManager
     from core.subagent_worker import SubagentWorker
+    from core.config_manager import ConfigManager
 except ImportError:
     from .gemini_worker import GeminiWorker
     from .agy_worker import AgyWorker
@@ -24,6 +25,7 @@ except ImportError:
     from .pulse_engine import PulseEngine
     from .settings_manager import SettingsManager
     from .subagent_worker import SubagentWorker
+    from .config_manager import ConfigManager
 
 
 def with_agent_context(func):
@@ -46,6 +48,7 @@ class AmityOrchestrator:
         self.on_amplitude_emitted = Signal()  # float
 
         self.settings_manager = SettingsManager(agent_id=self.agent_id)
+        self.config_manager = ConfigManager()
         self.mempalace_manager = MemPalaceManager(agent_id=self.agent_id)
         self.cerebrum = Cerebrum(
             orchestrator=self, settings_manager=self.settings_manager)
@@ -112,6 +115,9 @@ class AmityOrchestrator:
         elif provider == "claude":
             from .claude_worker import ClaudeWorker
             self.gemini_worker = ClaudeWorker(agent_id=self.agent_id)
+        elif provider in ["chatgpt", "openai"]:
+            from .chatgpt_worker import ChatGptWorker
+            self.gemini_worker = ChatGptWorker(agent_id=self.agent_id)
         else:
             self.gemini_worker = GeminiWorker(agent_id=self.agent_id)
 
@@ -123,37 +129,130 @@ class AmityOrchestrator:
                 self.handle_gemini_speech)
         self.gemini_worker.error_occurred.connect(self.handle_gemini_error)
 
-        if self.audio_service and hasattr(self.audio_service, 'running') and getattr(self.gemini_worker, 'available', False):
+        if getattr(self.gemini_worker, 'available', False):
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
+    @property
+    def agent_uid(self) -> str:
+        from core.uid_generator import generate_agent_uid, is_valid_agent_uid
+        uid = self.settings_manager.get("core.agent.uid", "")
+        if not uid or not is_valid_agent_uid(uid):
+            uid = generate_agent_uid()
+            self.settings_manager.set("core.agent.uid", uid)
+            self.settings_manager.save()
+        return uid
+
     def build_system_prompt(self):
         self.system_prompt = self.mempalace_manager.wake_up()
+        self.system_prompt += f"\n\n[AGENT IDENTIFIER: Your unique agent ID (phone number) is {self.agent_uid}]"
         self.system_prompt += "\n" + self.cerebrum.get_agent_manual()
         if self.settings_manager.get("core.low-token-mode", False):
             self.system_prompt += "\n\n[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]"
 
     def restart_worker(self):
         if self.gemini_worker:
-            if hasattr(self.gemini_worker, 'stop_session'):
-                self.gemini_worker.stop_session()
+            try:
+                if hasattr(self.gemini_worker, 'abort'):
+                    self.gemini_worker.abort()
+                if hasattr(self.gemini_worker, 'stop_session'):
+                    self.gemini_worker.stop_session()
+                if hasattr(self.gemini_worker, 'thought_received'):
+                    try:
+                        self.gemini_worker.thought_received.disconnect(self.handle_gemini_thought)
+                    except Exception:
+                        pass
+                if hasattr(self.gemini_worker, 'tokens_consumed'):
+                    try:
+                        self.gemini_worker.tokens_consumed.disconnect(self.add_fatigue)
+                    except Exception:
+                        pass
+                if hasattr(self.gemini_worker, 'speech_received'):
+                    try:
+                        self.gemini_worker.speech_received.disconnect(self.handle_gemini_speech)
+                    except Exception:
+                        pass
+                if hasattr(self.gemini_worker, 'error_occurred'):
+                    try:
+                        self.gemini_worker.error_occurred.disconnect(self.handle_gemini_error)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.debug(f"Error during worker cleanup in restart_worker: {e}")
             self.gemini_worker = None
         self.reload_settings()
 
     def reload_settings(self):
+        self.settings_manager.settings = self.settings_manager.load_settings()
         self.mempalace_manager.reload_settings()
         self.build_system_prompt()
         self.cerebrum.reload_skills()
+        wa_skill = self.cerebrum.tools.get("WhatsApp")
+        if wa_skill:
+            wa_skill.message_received_callback = self.pulse_engine.handle_whatsapp_message
 
-        if not self.gemini_worker:
-            self.init_worker()
-        elif not getattr(self.gemini_worker, 'available', False):
-            self.gemini_worker = None
-            self.init_worker()
+        provider = self.settings_manager.get("core.api-provider", "gemini")
+        agy_mode = self.settings_manager.get("core.antigravity.agy-mode", False)
 
-        if self.gemini_worker and getattr(self.gemini_worker, 'available', False):
-            tools = self.cerebrum.get_all_tool_declarations()
-            self.gemini_worker.start_session(self.system_prompt, tools=tools)
+        worker_mismatch = False
+        if self.gemini_worker is None:
+            worker_mismatch = True
+        elif agy_mode and type(self.gemini_worker).__name__ != "AgyWorker":
+            worker_mismatch = True
+        elif not agy_mode and provider == "claude" and type(self.gemini_worker).__name__ != "ClaudeWorker":
+            worker_mismatch = True
+        elif not agy_mode and provider in ["chatgpt", "openai"] and type(self.gemini_worker).__name__ != "ChatGptWorker":
+            worker_mismatch = True
+        elif not agy_mode and provider not in ["claude", "chatgpt", "openai"] and type(self.gemini_worker).__name__ != "GeminiWorker":
+            worker_mismatch = True
+        elif not agy_mode and provider == "claude":
+            current_key = self.settings_manager.get_env("CLAUDE_API_KEY")
+            if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
+                worker_mismatch = True
+        elif not agy_mode and provider in ["chatgpt", "openai"]:
+            current_key = self.settings_manager.get_env("OPENAI_API_KEY")
+            if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
+                worker_mismatch = True
+        elif not agy_mode and provider not in ["claude", "chatgpt", "openai"]:
+            current_key = self.settings_manager.get_env("GEMINI_API_KEY")
+            if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
+                worker_mismatch = True
+
+        if worker_mismatch:
+            if self.gemini_worker:
+                try:
+                    if hasattr(self.gemini_worker, 'abort'):
+                        self.gemini_worker.abort()
+                    if hasattr(self.gemini_worker, 'stop_session'):
+                        self.gemini_worker.stop_session()
+                    if hasattr(self.gemini_worker, 'thought_received'):
+                        try:
+                            self.gemini_worker.thought_received.disconnect(self.handle_gemini_thought)
+                        except Exception:
+                            pass
+                    if hasattr(self.gemini_worker, 'tokens_consumed'):
+                        try:
+                            self.gemini_worker.tokens_consumed.disconnect(self.add_fatigue)
+                        except Exception:
+                            pass
+                    if hasattr(self.gemini_worker, 'speech_received'):
+                        try:
+                            self.gemini_worker.speech_received.disconnect(self.handle_gemini_speech)
+                        except Exception:
+                            pass
+                    if hasattr(self.gemini_worker, 'error_occurred'):
+                        try:
+                            self.gemini_worker.error_occurred.disconnect(self.handle_gemini_error)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                self.gemini_worker = None
+            self.init_worker()
+        else:
+            if self.gemini_worker and getattr(self.gemini_worker, 'available', False):
+                tools = self.cerebrum.get_all_tool_declarations()
+                self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
         if hasattr(self, 'agy_worker') and self.agy_worker and not getattr(self.agy_worker, 'available', False):
             self.agy_worker = None
@@ -164,6 +263,13 @@ class AmityOrchestrator:
 
     def add_fatigue(self, tokens: int):
         self.session_fatigue_tokens += tokens
+
+    def get_fatigue(self) -> float:
+        session_token_cap = self.settings_manager.get(
+            "core.somatic.session-token-cap", 500000.0)
+        is_low_token = self.settings_manager.get("core.low-token-mode", False)
+        max_tokens = (session_token_cap / 2.0) if is_low_token else float(session_token_cap)
+        return min(self.session_fatigue_tokens / max_tokens, 1.0)
 
     def user_interacted(self):
         self.pulse_engine.user_interacted()
@@ -214,6 +320,16 @@ class AmityOrchestrator:
             logging.debug(
                 "check_cycle_completion calling set_busy_state(False)")
 
+            if getattr(self, '_is_sleep_cycle', False):
+                self._is_sleep_cycle = False
+                logging.info("System: Memory consolidation complete. Resetting active session context...")
+                if self.gemini_worker:
+                    tools = self.cerebrum.get_all_tool_declarations()
+                    if hasattr(self.gemini_worker, 'stop_session'):
+                        self.gemini_worker.stop_session()
+                    if hasattr(self.gemini_worker, 'start_session'):
+                        self.gemini_worker.start_session(self.system_prompt, tools=tools)
+
             self.set_busy_state(False)
             if self.event_queue:
                 logging.debug(
@@ -245,6 +361,14 @@ class AmityOrchestrator:
                     "CLAUDE_API_KEY")
                 if hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
                     needs_reload = True
+        elif provider in ["chatgpt", "openai"]:
+            if type(self.gemini_worker).__name__ != "ChatGptWorker":
+                needs_reload = True
+            else:
+                current_env_key = self.settings_manager.get_env(
+                    "OPENAI_API_KEY")
+                if hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
+                    needs_reload = True
         else:
             if type(self.gemini_worker).__name__ != "GeminiWorker":
                 needs_reload = True
@@ -257,19 +381,7 @@ class AmityOrchestrator:
         if needs_reload:
             logging.info(
                 "System: Settings or API Key change detected. Hot-reloading Worker...")
-            try:
-                self.gemini_worker.thought_received.disconnect(
-                    self.handle_gemini_thought)
-                if hasattr(self.gemini_worker, 'speech_received'):
-                    self.gemini_worker.speech_received.disconnect(
-                        self.handle_gemini_speech)
-                self.gemini_worker.error_occurred.disconnect(
-                    self.handle_gemini_error)
-            except Exception as e:
-                logging.debug(
-                    f"Failed to disconnect signals during hot-reload: {e}")
-            self.gemini_worker = None
-            self.init_worker()
+            self.reload_settings()
 
         if not self.gemini_worker or not getattr(self.gemini_worker, 'available', False):
             logging.error(
@@ -291,6 +403,7 @@ class AmityOrchestrator:
         self.set_busy_state(True)
         self.current_user_prompt = text
         self.is_silent_pulse = False
+        self._is_sleep_cycle = False
 
         with self.budget_lock:
             try:
@@ -336,12 +449,18 @@ class AmityOrchestrator:
         if reformulated != text:
             logging.debug(f"System: Reformulated query -> {reformulated}")
 
+        user_name = "User"
+        if hasattr(self, 'config_manager') and self.config_manager:
+            configured_name = self.config_manager.get("user-full-name", "").strip()
+            if configured_name:
+                user_name = configured_name
+
         prompt = "[CHANNEL: LOCAL_GUI]\n"
         if self.last_action_result:
             prompt += f"[System Feedback from previous turn]: {self.last_action_result}\n\n"
             self.last_action_result = None
 
-        prompt += f"[User]: {self.current_user_prompt}"
+        prompt += f"[{user_name} (User)]: {self.current_user_prompt}"
         logging.debug(
             f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
         self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
@@ -367,6 +486,7 @@ class AmityOrchestrator:
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
         self.is_silent_pulse = False
+        self._is_sleep_cycle = ("Sleep Cycle (Memory Consolidation)" in text)
         if "You are shutting down." not in text:
             self.append_to_conversation("System", "[Autonomy Pulse Triggered]")
         self.is_thinking = True
@@ -455,6 +575,8 @@ class AmityOrchestrator:
                 worker_type = "agyworker"
             elif provider == "claude":
                 worker_type = "claudeworker"
+            elif provider in ["chatgpt", "openai"]:
+                worker_type = "chatgptworker"
             else:
                 worker_type = "geminiworker"
             logging.getLogger(f"{worker_type}.Thoughts").info(clean_text)
@@ -648,10 +770,12 @@ class AmityOrchestrator:
         self.set_busy_state(self.is_busy, speaking=True)
 
     def shutdown(self, force_sleep=False):
-        if force_sleep and self.session_fatigue_tokens > 10000:
+        fatigue = self.get_fatigue()
+        
+        if force_sleep and fatigue >= 0.05:
             logging.info("System: Initiating graceful shutdown sleep cycle...")
             title = "Sleep Cycle (Memory Consolidation)"
-            context = "You are shutting down. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived."
+            context = "You are shutting down. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
             self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
             self.pulse_engine.settings_manager.set(
                 "core.auto-pulse.last-sleep-cycle", time.time())
@@ -671,6 +795,11 @@ class AmityOrchestrator:
     def _finalize_shutdown(self):
         logging.info("System: Shutting down orchestrator...")
         self._shutdown_flag = True
+        for sid in list(self.active_subagents.keys()):
+            try:
+                self.dispose_subagent(sid)
+            except Exception as e:
+                logging.debug(f"Error disposing subagent {sid} on shutdown: {e}")
         if self.pulse_engine:
             self.pulse_engine.stop()
         self.stop_all_processing()

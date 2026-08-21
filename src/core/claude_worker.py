@@ -1,11 +1,15 @@
 import time
 import threading
 import logging
-import anthropic
 import json
 from dotenv import load_dotenv
 from .events import Signal
 from .settings_manager import SettingsManager
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
 # Load environment variables
 load_dotenv()
@@ -49,7 +53,12 @@ class ClaudeWorker:
         self.api_key = self.settings.get_env("CLAUDE_API_KEY")
         self.available = False
         self.last_error = None
-        if not self.api_key:
+        if anthropic is None:
+            self.last_error = "anthropic package is not installed"
+            if not self.settings.get("core.first-run", False):
+                logging.error(self.last_error)
+                self.error_occurred.emit("Anthropic package not installed.")
+        elif not self.api_key:
             self.last_error = "CLAUDE_API_KEY not found in .env"
             if self.settings.get("core.first-run", False):
                 logging.info(
@@ -334,11 +343,16 @@ class ClaudeWorker:
                         function_calls.append(
                             FunctionCallObject(block.name, block.input))
 
-            # Token tracking
+            # Token tracking (excluding static system instruction and tool declarations)
             tokens = 0
-            if hasattr(message, 'usage'):
-                tokens = getattr(message.usage, 'input_tokens', 0) + \
-                    getattr(message.usage, 'output_tokens', 0)
+            if hasattr(message, 'usage') and message.usage:
+                output_tokens = getattr(message.usage, 'output_tokens', 0) or 0
+                est_input_chars = sum(len(str(p)) for p in content) if ('content' in locals() and content) else 0
+                input_tokens = int(est_input_chars / 4)
+                tokens = output_tokens + input_tokens
+            else:
+                est_content_chars = sum(len(str(p)) for p in content) if ('content' in locals() and content) else 0
+                tokens = int((est_content_chars + len(full_text)) / 4)
 
             if tokens > 0 and hasattr(self, 'tokens_consumed'):
                 self.tokens_consumed.emit(tokens)

@@ -1,6 +1,7 @@
 import os
 import shutil
 import uuid
+import logging
 from config import paths
 
 
@@ -103,6 +104,7 @@ class AgentManager:
         if not os.path.exists(env_path):
             with open(env_path, "w") as f:
                 f.write("")
+        self.get_agent_uid(agent_id)
         return agent_id
 
     def create_new_agent(self) -> str:
@@ -112,15 +114,33 @@ class AgentManager:
     def delete_agent(self, agent_id: str):
         if agent_id in self.orchestrators:
             orchestrator = self.orchestrators[agent_id]
-            if hasattr(orchestrator, 'shutdown'):
-                orchestrator.shutdown(force_sleep=False)
-            del self.orchestrators[agent_id]
+            try:
+                if hasattr(orchestrator, 'shutdown'):
+                    orchestrator.shutdown(force_sleep=False)
+            except Exception as e:
+                logging.error(
+                    f"AgentManager: Error during shutdown while deleting agent {agent_id}: {e}", exc_info=True)
+            self.orchestrators.pop(agent_id, None)
         agent_dir = os.path.join(self.agents_dir, agent_id)
         if os.path.exists(agent_dir):
-            shutil.rmtree(agent_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(agent_dir, ignore_errors=True)
+            except Exception as e:
+                logging.error(
+                    f"AgentManager: Error deleting agent directory {agent_dir}: {e}", exc_info=True)
 
     def get_orchestrator(self, agent_id: str):
         return self.orchestrators.get(agent_id)
+
+    def stop_agent(self, agent_id: str):
+        if agent_id in self.orchestrators:
+            orchestrator = self.orchestrators.pop(agent_id)
+            try:
+                if hasattr(orchestrator, 'shutdown'):
+                    orchestrator.shutdown(force_sleep=False)
+            except Exception as e:
+                logging.error(
+                    f"AgentManager: Error stopping agent {agent_id}: {e}", exc_info=True)
 
     def start_agent(self, agent_id: str):
         if agent_id in self.orchestrators:
@@ -138,3 +158,27 @@ class AgentManager:
         if name:
             return name
         return agent_id
+
+    def get_agent_uid(self, agent_id: str) -> str:
+        from core.settings_manager import SettingsManager
+        from core.uid_generator import generate_agent_uid, is_valid_agent_uid
+        settings = SettingsManager(agent_id=agent_id)
+        uid = settings.get("core.agent.uid", "")
+        if not uid or not is_valid_agent_uid(uid):
+            uid = generate_agent_uid()
+            settings.set("core.agent.uid", uid)
+            settings.save()
+            logging.info(f"Assigned new agent UID {uid} to agent {agent_id}")
+        return uid
+
+    def get_agent_id_by_uid(self, uid: str):
+        if not uid:
+            return None
+        clean_uid = uid.strip().upper()
+        for aid in self.get_all_agents():
+            agent_uid = self.get_agent_uid(aid)
+            if agent_uid and agent_uid.strip().upper() == clean_uid:
+                return aid
+        return None
+
+

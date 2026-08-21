@@ -50,14 +50,24 @@ class PulseEngine:
         from core.logger_config import agent_id_var
         agent_id_var.set(self.agent_id)
         # Do an immediate check on boot (with a slight delay to let UI load)
-        time.sleep(5)
-        self.check_pulses()
+        for _ in range(5):
+            time.sleep(1)
+            if not self.is_running:
+                return
+        try:
+            self.check_pulses()
+        except Exception:
+            pass
+
         while self.is_running:
             for _ in range(60):
                 time.sleep(1)
                 if not self.is_running:
                     return
-            self.check_pulses()
+            try:
+                self.check_pulses()
+            except Exception:
+                pass
 
     def get_db_connection(self):
         return sqlite3.connect(self.db_path)
@@ -187,13 +197,7 @@ class PulseEngine:
         # Allow pulses to enter the event queue normally regardless of idle/busy state
 
         # Check for sleep cycle (Memory Consolidation)
-        session_tokens = getattr(
-            self.orchestrator, 'session_fatigue_tokens', 0)
-
-        is_low_token = self.settings_manager.get("core.low-token-mode", False)
-        max_tokens = 250000.0 if is_low_token else 500000.0
-
-        fatigue = min(session_tokens / max_tokens, 1.0)
+        fatigue = self.orchestrator.get_fatigue() if hasattr(self.orchestrator, 'get_fatigue') else 0.0
         gap_minutes = 240.0 * (1.0 - fatigue)
 
         is_fatigue_idle = (
@@ -203,9 +207,10 @@ class PulseEngine:
             last_sleep = self.settings_manager.get(
                 "core.auto-pulse.last-sleep-cycle", 0)
             time_since_sleep = time.time() - last_sleep
-            if time_since_sleep >= (30 * 60):  # 30 minutes absolute rate limit
-                # 8 hours rate limit, OR critical fatigue
-                if time_since_sleep > (8 * 60 * 60) or fatigue >= 0.95:
+            if time_since_sleep >= (15 * 60):  # 15 minutes absolute rate limit
+                # Either critical fatigue (>= 0.95) OR long interval (8 hours) with sufficient fatigue (>= 0.25)
+                should_sleep = (fatigue >= 0.95) or (time_since_sleep > (8 * 60 * 60) and fatigue >= 0.25)
+                if should_sleep:
                     self.settings_manager.set(
                         "core.auto-pulse.last-sleep-cycle", time.time())
                     self.settings_manager.save()
@@ -215,7 +220,7 @@ class PulseEngine:
                         self.orchestrator.session_fatigue_tokens = 0
 
                     title = "Sleep Cycle (Memory Consolidation)"
-                    context = f"You have been idle long enough given your current context fatigue ({int(fatigue*100)}%). It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. Keep your summary under 500 words. Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle."
+                    context = f"You have been idle long enough given your current context fatigue ({int(fatigue*100)}%). It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. Keep your summary under 500 words. Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
                     self.fire_pulse(title, context, "sleep_cycle")
                     return  # Give sleep cycle priority
 
@@ -262,7 +267,9 @@ class PulseEngine:
         conn.close()
 
     def fire_pulse(self, title, context, pulse_type="standard"):
-        if pulse_type == "silent":
+        if pulse_type == "sleep_cycle":
+            prompt = f"[CHANNEL: SYSTEM_CONTEMPLATION]\n[AGENT_PULSE] Event: {title}\nContext:\n{context}\n[Directive]: This is a silent Memory Consolidation (Sleep Cycle). You MUST NOT speak or invoke the Speaker tool. Perform all memory synthesis, updates, and reflections completely silently."
+        elif pulse_type == "silent":
             prompt = f"[CHANNEL: SYSTEM_CONTEMPLATION]\n[AGENT_PULSE] Event: {title}\nContext:\n{context}\n[Directive]: This is a silent contemplation cycle. The system will not automatically vocalize your internal monologue. You do not need to use the Speaker tool to summarize, but you may still explicitly use your voice (via Speaker or WhatsApp voice notes) if you have an urgent realization or deem it necessary to speak."
         else:
             prompt = f"[CHANNEL: SYSTEM_SCHEDULE]\n[AGENT_PULSE] Event: {title}\nContext:\n{context}"

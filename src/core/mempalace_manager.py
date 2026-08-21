@@ -74,6 +74,10 @@ class MemPalaceManager:
     def reload_settings(self):
         """Reload settings and sync identity"""
         self._sync_identity()
+        self._mirrors_cache = None
+        self._short_term_cache = None
+        if hasattr(self, 'stack') and hasattr(self.stack, 'l0'):
+            self.stack.l0._text = None
 
     def _sync_identity(self):
         """Convert soul_jar.json to a plain text identity.txt for MemPalace Layer 0"""
@@ -160,6 +164,10 @@ class MemPalaceManager:
             with open(temp_path, 'w') as f:
                 f.write("\n".join(lines))
             os.replace(temp_path, self.identity_path)
+
+            # Invalidate cached Layer0 text so future render() calls re-read from disk
+            if hasattr(self, 'stack') and hasattr(self.stack, 'l0'):
+                self.stack.l0._text = None
         except Exception as e:
             logging.error(f"Error syncing identity: {e}", exc_info=True)
 
@@ -174,7 +182,11 @@ class MemPalaceManager:
         memories = self._load_short_term_memories()
         num_items = len(memories)
         num_words = sum(len(m.get('content', '').split()) for m in memories)
-        base_context += f"\n\n[Memory Status: Short-Term ({num_items} items / {num_words} words)]"
+        try:
+            num_drawers = self.stack.status().get('total_drawers', 0)
+        except Exception:
+            num_drawers = 0
+        base_context += f"\n\n[Memory Status: Short-Term ({num_items} items / {num_words} words), Palace ({num_drawers} drawers)]"
 
         short_term = self.get_short_term_context()
         if short_term:
@@ -304,17 +316,35 @@ class MemPalaceManager:
         self._save_mirrors(mirrors)
         return True
 
-    def get_self_perception(self) -> str:
-        """Retrieves core self-perception entries to inject during wake up."""
+    def get_self_perception(self, limit: int = 24) -> str:
+        """Retrieves core self-perception entries (up to `limit` most recently updated) to inject during wake up or bearings."""
         mirrors = self._load_mirrors()
         if not mirrors:
             return ""
 
+        sorted_mirrors = sorted(
+            mirrors.items(),
+            key=lambda item: (
+                item[1].get("last_updated") or
+                (item[1].get("history", [])[-1].get("date") if isinstance(item[1].get("history"), list) and item[1].get("history") and isinstance(item[1]["history"][-1], dict) else "") or
+                ""
+            ) if isinstance(item[1], dict) else "",
+            reverse=True
+        )
+
+        if limit is not None and limit > 0:
+            sorted_mirrors = sorted_mirrors[:limit]
+
         lines = ["\n--- Core Self Perception & Theory of Mind ---"]
-        for perspective, data in mirrors.items():
-            lines.append(f"Perspective: {perspective}")
-            lines.append(f"Subjective View: {data.get('current_view', '')}")
-            lines.append(f"Provenance: {data.get('provenance', 'unknown')}\n")
+        for perspective, data in sorted_mirrors:
+            if isinstance(data, dict):
+                lines.append(f"Perspective: {perspective}")
+                lines.append(f"Subjective View: {data.get('current_view', '')}")
+                lines.append(f"Provenance: {data.get('provenance', 'unknown')}\n")
+            else:
+                lines.append(f"Perspective: {perspective}")
+                lines.append(f"Subjective View: {str(data)}")
+                lines.append("Provenance: unknown\n")
 
         return "\n".join(lines)
 
@@ -452,9 +482,13 @@ print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
                 result_str = stdout.split("<<<RESULT>>>")[
                     1].split("<<<END>>>")[0]
                 result = json.loads(result_str)
+                return result.get("result", str(result))
             else:
-                result = json.loads(stdout)
-            return result.get("result", str(result))
+                try:
+                    result = json.loads(stdout)
+                    return result.get("result", str(result))
+                except json.JSONDecodeError:
+                    return stdout.strip() if stdout.strip() else "Success (response parse failed but write committed)"
         except Exception as e:
             return f"Failed to add memory: {e}\nStderr: {proc.stderr if 'proc' in locals() else ''}\nStdout: {proc.stdout if 'proc' in locals() else ''}"
 
@@ -486,9 +520,13 @@ print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
                 result_str = stdout.split("<<<RESULT>>>")[
                     1].split("<<<END>>>")[0]
                 result = json.loads(result_str)
+                return result.get("result", str(result))
             else:
-                result = json.loads(stdout)
-            return result.get("result", str(result))
+                try:
+                    result = json.loads(stdout)
+                    return result.get("result", str(result))
+                except json.JSONDecodeError:
+                    return stdout.strip() if stdout.strip() else "Success (response parse failed but delete committed)"
         except Exception as e:
             return f"Failed to delete memory: {e}\nStderr: {proc.stderr if 'proc' in locals() else ''}\nStdout: {proc.stdout if 'proc' in locals() else ''}"
 

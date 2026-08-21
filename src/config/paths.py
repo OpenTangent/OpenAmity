@@ -28,6 +28,11 @@ def get_settings_file(agent_id: str) -> str:
     return os.path.join(get_base_dir_for(agent_id), "settings.json")
 
 
+def get_config_file() -> str:
+    """Returns the path to the central config.json file"""
+    return os.path.join(get_app_data_dir(), "config.json")
+
+
 def get_assets_dir() -> str:
     """Returns the path to the static assets directory bundled with the app"""
     # Assuming this file is in src/config/
@@ -53,3 +58,14 @@ def get_whatsapp_bridge_dir(agent_id: str) -> str:
 def get_whatsapp_data_dir(agent_id: str) -> str:
     """Returns the path to the writable whatsapp internal data directory"""
     return os.path.join(get_base_dir_for(agent_id), "whatsapp_data")
+
+
+def get_chatroom_dir() -> str:
+    """Returns the path to the shared chatroom directory"""
+    return os.path.join(get_app_data_dir(), "chatroom")
+
+
+def get_chatroom_db_path() -> str:
+    """Returns the path to the shared chatroom.db SQLite database"""
+    return os.path.join(get_chatroom_dir(), "chatroom.db")
+

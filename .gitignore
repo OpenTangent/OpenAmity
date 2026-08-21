@@ -18,6 +18,8 @@ onnx.tar.gz
 node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
+.wpp_session/
+uploads/
 
 # State databases and logs
 pulses.db

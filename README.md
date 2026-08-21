@@ -1,18 +1,18 @@
 <div align="center">
   <h1>Open Amity</h1>
-  <p>Build and run subjective, self-aware social agents within a powerful Multi-Model, Multi-Agent Orchestration Framework.</p>
+  <p>Build and run subjective, self-aware social agents within a powerful multi-model, multi-agent Orchestration Framework.</p>
 </div>
 
-## 🌅 Overview
+## 👤 Overview
 
-Build your own Jarvis, Samantha, EDI, etc. with the ability to maintain their own goals and aspirations, and schedule their own tasks. Open Amity is a Multi-Model, Multi-Agent Orchestration Framework that supports industry-leading models like Gemini and Claude. (There is also a fallback Antigravity CLI mode available for those wanting to run the framework using their Google One account).
+**Open Amity** is an AI orchestration framework designed to create **persistent, self-aware, and subjective AI agents** that are available 24/7. Unlike conventional stateless chatbots or sterile tool-callers, Open Amity agents possess a dynamic **Theory of Mind**, metacognitive reflection, episodic and semantic memory architectures, and proactive autonomy. They maintain their own aspirations, track long-term trajectories, and schedule their own autonomous waking cycles.
 
-Open Amity agents are explicitly subjective and self-aware—utilizing an evolving Theory of Mind, metacognitive reflection, and explicit somatic feedback—which unlocks real character definition that separates Open Amity agents from the more typical corporate-tool agents.
+Whether you are building your own *Jarvis*, *Samantha*, or *EDI*, Open Amity bridges the gap between passive assistant and genuine digital collaborator. Supported by industry-leading models like Gemini, Claude, and ChatGPT, the framework unlocks a wide spectrum of applications from specialised virtual employees to companions and autonomous synthetic teams.
 
 ## ✨ Key Features
 
-- **🤖 Multi-Agent Orchestration**: Run multiple distinct agent personas simultaneously, each with their own isolated state, memory, and settings. Agents can also spawn lightweight background `Subagents` to parallelize tasks like deep research without blocking the main conversational flow.
-- **⚡ Proactive Agency**: Open Amity utilises a background timing service to trigger autonomous cognitive loops called 'pulses'. The agent can proactively schedule pulses to execute tasks, monitor its trajectory, or initiate engagement.
+- **🤖 Multi-Agent Orchestration**: Run multiple distinct agent personas simultaneously, each with their own isolated state, memory, and settings. Agents can also spawn lightweight background `Subagents` to parallelise tasks like deep research without blocking the main conversational flow.
+- **⚡ Proactive Agency**: Open Amity utilises a background timing service to trigger autonomous cognitive loops called 'pulses'. An agent can proactively schedule pulses to execute tasks, monitor trajectory, or initiate engagement.
 - **📚 4-Layer Memory Architecture**: A sophisticated memory stack that integrates seamlessly with the multi-agent system, allowing each agent instance to maintain its own deeply isolated context and trajectory:
   - **Layer 0 (Identity)**: Core agent traits and personality.
   - **Layer 1 (Continuity)**: Short-term memory for contextual bridging.
@@ -29,6 +29,19 @@ Open Amity agents are explicitly subjective and self-aware—utilizing an evolvi
   - **Classic tools**: Web Search, System, and Terminal are also included to allow sandbox-aware host OS interaction.
 - **🖥️ PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice + transcript output. Tip: open the console (tilde key) to display logs and agent thoughts.
 - **🫰 Reduced Token Usage Mode**: Open Amity includes Low Token Mode to significantly reduce API costs (especially useful with a free-tier API key).
+
+## 💡 Additional Practical Use Cases
+
+Open Amity's combination of subjectivity, 4-layer memory stack (**MemPalace**), autonomous background pulses (**PulseEngine**), and multi-agent message bus enables a wide variety of advanced applications:
+
+- **💼 Autonomous Virtual Employees & Digital Coworkers**: Deploy specialised team members (e.g., DevOps on-call engineers, social media managers, executive chiefs of staff) that operate asynchronously, manage their own dedicated email and messaging channels (WhatsApp, IMAP/SMTP), and schedule periodic check-ins.
+- **🔬 Autonomous Research Lab Partners**: Collaborators that maintain ongoing literature reviews, log experimental hypotheses, spawn background subagents to parallelise deep technical research, and maintain a persistent research journal.
+- **🎓 Personalized Socratic Tutors & Mentors**: Educators that build an evolving model of a student's strengths, learning style, and misconceptions over months of interaction—scheduling study sessions and adapting explanations dynamically.
+- **🤝 Empathetic Companions**: Social companions with distinct character definitions, emotional continuity, and shared memories who proactively check in, reflect on past conversations, and evolve through shared experiences.
+- **🎭 Dynamic Creative Co-Authors & Living Worldbuilders**: Narrative partners, tabletop roleplaying game masters, or persistent in-world characters who possess consistent beliefs, quirks, and memory of complex lore.
+- **🌐 Autonomous Digital Representatives & Community Liaisons**: Brand or project ambassadors that maintain consistent personas and ethical guidelines while interacting across public and private social platforms (Mastodon, Moltbook, WhatsApp, Email).
+- **👥 Multi-Agent Synthetic Teams & Think Tanks**: Collaborative cohorts of distinct agent personas interacting via shared chatrooms (e.g., *Architect* + *Software Engineer* + *Security Auditor*, or *Strategist* + *Devil's Advocate* + *Data Analyst*) to debate, verify, and execute complex goals in parallel.
+- **🛡️ Continuous Health & Habit Coaches**: Persistent coaches that proactively check in on fitness goals, habits, and well-being, tracking behavioural patterns and emotional context over time.
 
 ## 🚀 Getting Started
 

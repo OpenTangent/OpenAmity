@@ -341,13 +341,16 @@ class GeminiWorker:
                         "_abort_flag is True after stream, returning")
                     return
 
-                # Token tracking
+                # Token tracking (excluding static system instruction and tool declarations)
                 tokens = 0
-                if 'chunk' in locals() and hasattr(chunk, 'usage_metadata') and chunk.usage_metadata and hasattr(chunk.usage_metadata, 'total_token_count') and chunk.usage_metadata.total_token_count:
-                    tokens = chunk.usage_metadata.total_token_count
+                if 'chunk' in locals() and hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                    output_tokens = getattr(chunk.usage_metadata, 'candidates_token_count', 0) or 0
+                    est_input_chars = sum(len(str(p)) for p in content) if ('content' in locals() and content) else 0
+                    input_tokens = int(est_input_chars / 4)
+                    tokens = output_tokens + input_tokens
                 else:
                     # Fallback estimate
-                    est_content_chars = sum(len(str(p)) for p in content)
+                    est_content_chars = sum(len(str(p)) for p in content) if ('content' in locals() and content) else 0
                     tokens = int((est_content_chars + len(full_text)) / 4)
 
                 if tokens > 0 and hasattr(self, 'tokens_consumed'):

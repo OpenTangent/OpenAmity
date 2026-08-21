@@ -145,8 +145,33 @@ Available Tools:
 
                     full_prompt += "\n[SYSTEM REMINDER: Output ONLY raw JSON matching the schema. No markdown, no preambles, no conversational text outside the JSON object.]\nAssistant (JSON): "
 
-                    cmd = ["agy", "--dangerously-skip-permissions",
-                           "--model", self.current_model, "-p", full_prompt]
+                    schema = {
+                        "type": "object",
+                        "properties": {
+                            "thought": {"type": "string"},
+                            "tool_calls": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "args": {"type": "object"}
+                                    },
+                                    "required": ["name"]
+                                }
+                            }
+                        },
+                        "required": ["thought", "tool_calls"]
+                    }
+                    schema_str = json.dumps(schema)
+
+                    cmd = [
+                        "agy", "--dangerously-skip-permissions",
+                        "--model", self.current_model,
+                        "--output-format", "json",
+                        "--json-schema", schema_str,
+                        "-p", full_prompt
+                    ]
                     from config import paths
                     cwd = os.path.join(paths.get_base_dir_for(
                         self.agent_id), "terminal")
@@ -165,16 +190,34 @@ Available Tools:
                         break  # Break retry loop to try next model
 
                     out = result.stdout.strip()
-                    if out.startswith("```json"):
-                        out = out[7:]
-                    if out.startswith("```"):
-                        out = out[3:]
-                    if out.endswith("```"):
-                        out = out[:-3]
-                    out = out.strip()
-
                     try:
-                        data = json.loads(out)
+                        try:
+                            outer_data = json.loads(out)
+                            data = outer_data.get("structured_output")
+                            if not data:
+                                response_str = outer_data.get("response", "").strip()
+                                if response_str.startswith("```json"):
+                                    response_str = response_str[7:]
+                                if response_str.startswith("```"):
+                                    response_str = response_str[3:]
+                                if response_str.endswith("```"):
+                                    response_str = response_str[:-3]
+                                response_str = response_str.strip()
+                                data = json.loads(response_str)
+                        except json.JSONDecodeError as outer_e:
+                            raw_out = out
+                            if raw_out.startswith("```json"):
+                                raw_out = raw_out[7:]
+                            if raw_out.startswith("```"):
+                                raw_out = raw_out[3:]
+                            if raw_out.endswith("```"):
+                                raw_out = raw_out[:-3]
+                            raw_out = raw_out.strip()
+                            try:
+                                data = json.loads(raw_out)
+                            except json.JSONDecodeError:
+                                raise outer_e
+
                         thought = data.get("thought", "")
                         tool_calls_raw = data.get("tool_calls", [])
 

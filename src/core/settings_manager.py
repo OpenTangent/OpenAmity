@@ -139,9 +139,10 @@ class SettingsManager:
         val = get_key(self.env_file, key)
 
         dotenv_logger.setLevel(original_level)
-        return val if val is not None else default
+        if val is not None:
+            return val
+        return default
 
     def set_env(self, key, value):
         if set_key is not None:
-            set_key(self.env_file, key, value)
-        os.environ[key] = value
+            set_key(self.env_file, key, str(value) if value is not None else "")

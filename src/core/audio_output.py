@@ -56,7 +56,7 @@ class TTSWorker(threading.Thread):
             self.on_finished.emit()
 
     def _stream_and_play(self):
-        if self.settings.get("core.low-token-mode", False) or self.settings.get("core.antigravity.agy-mode", False) or self.settings.get("core.tts.piper.prefer-piper", False) or self.settings.get("core.api-provider") == "claude":
+        if self.settings.get("core.low-token-mode", False) or self.settings.get("core.antigravity.agy-mode", False) or self.settings.get("core.tts.piper.prefer-piper", False) or self.settings.get("core.api-provider") in ["claude", "chatgpt", "openai"]:
             self._stream_and_play_piper()
         else:
             self._stream_and_play_gemini()

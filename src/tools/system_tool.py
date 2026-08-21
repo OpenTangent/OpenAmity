@@ -50,7 +50,7 @@ class SystemTool(Tool):
         "to external parties via social tools (e.g., Mastodon, WhatsApp, web uploads). This information is strictly for "
         "your internal diagnostic use or for communicating directly and privately to the user via the Speaker tool."
     )
-    commands = ["platform_info", "settings", "get_external_ip"]
+    commands = ["platform_info", "settings", "get_external_ip", "create_backup"]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -77,6 +77,23 @@ class SystemTool(Tool):
                     "type": "OBJECT",
                     "properties": {}
                 }
+            },
+            {
+                "name": "System_create_backup",
+                "description": "Creates a single compressed snapshot (.oaa file) of this agent's stateful data and memories, or of all agents in the Open Amity system. Snapshots include settings, memory palace, sanctuary, trajectories, pulses, and logs.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": {
+                            "type": "STRING",
+                            "description": "Specify 'self' to backup only this agent, or 'all' to backup all agents in Open Amity. Defaults to 'self'."
+                        },
+                        "backup_location": {
+                            "type": "STRING",
+                            "description": "Optional directory path to save the .oaa backup file(s). If omitted, defaults to the configured system backup location."
+                        }
+                    }
+                }
             }
         ]
 
@@ -87,6 +104,8 @@ class SystemTool(Tool):
             return self._get_settings()
         elif command == "get_external_ip":
             return self._get_external_ip()
+        elif command == "create_backup":
+            return self._create_backup(*args, **kwargs)
         return f"Unknown command: {command}"
 
     def _get_platform_info(self) -> str:
@@ -205,3 +224,43 @@ class SystemTool(Tool):
                 return f"External IP: {ip}"
         except Exception as e:
             return f"Error fetching external IP: {e}"
+
+    def _create_backup(self, *args, **kwargs) -> str:
+        target = kwargs.get("target", "self")
+        if isinstance(target, str):
+            target = target.strip().lower()
+        else:
+            target = "self"
+
+        custom_dest = kwargs.get("backup_location")
+        if custom_dest and isinstance(custom_dest, str):
+            custom_dest = custom_dest.strip()
+            if not custom_dest:
+                custom_dest = None
+
+        from core.backup_manager import create_agent_backup, create_all_backups, get_default_backup_location
+
+        dest_dir = custom_dest or get_default_backup_location()
+
+        try:
+            if target == "all":
+                paths_created = create_all_backups(destination_dir=dest_dir)
+                if not paths_created:
+                    return f"No agents found or backups could not be created in {dest_dir}."
+                lines = [f"Successfully created backup(s) for all agents in '{dest_dir}':"]
+                for p in paths_created:
+                    sz = format_bytes(os.path.getsize(p)) if os.path.exists(p) else "0 B"
+                    lines.append(f"- {os.path.basename(p)} ({sz}) -> {p}")
+                return "\n".join(lines)
+            else:
+                agent_id = None
+                if self.orchestrator:
+                    agent_id = self.orchestrator.agent_id
+                if not agent_id:
+                    return "Error: Agent ID is not available from orchestrator to perform self backup."
+
+                path_created = create_agent_backup(agent_id, destination_dir=dest_dir)
+                sz = format_bytes(os.path.getsize(path_created)) if os.path.exists(path_created) else "0 B"
+                return f"Successfully created backup snapshot:\n- {os.path.basename(path_created)} ({sz})\nPath: {path_created}"
+        except Exception as e:
+            return f"Error creating backup: {type(e).__name__}: {str(e)}"

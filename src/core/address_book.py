@@ -32,7 +32,7 @@ class AddressBookManager:
         except Exception as e:
             print(f"Error saving address book: {e}")
 
-    def add_contact(self, phone_number, name, relationship=""):
+    def add_contact(self, phone_number, name, relationship="", custom_fields=None):
         data = self.load_data()
 
         # Clean phone number (strip whitespace, ensure starts with + if needed, etc)
@@ -46,13 +46,15 @@ class AddressBookManager:
         contact = {
             "phone_number": phone_number,
             "name": name,
-            "relationship": relationship
+            "relationship": relationship,
+            "custom_fields": custom_fields or {}
         }
         data["contacts"].append(contact)
         self.save_data(data)
         return True, f"Contact {name} ({phone_number}) added successfully."
 
-    def update_contact(self, phone_number, name=None, relationship=None):
+
+    def update_contact(self, phone_number, name=None, relationship=None, custom_fields=None):
         data = self.load_data()
         phone_number = phone_number.replace(" ", "").strip()
 
@@ -62,6 +64,15 @@ class AddressBookManager:
                     c["name"] = name
                 if relationship is not None:
                     c["relationship"] = relationship
+                
+                if custom_fields is not None:
+                    c.setdefault("custom_fields", {})
+                    for k, v in custom_fields.items():
+                        if v is None:
+                            c["custom_fields"].pop(k, None)
+                        else:
+                            c["custom_fields"][k] = v
+                            
                 self.save_data(data)
                 return True, f"Contact {phone_number} updated."
 
@@ -108,3 +119,29 @@ class AddressBookManager:
 
     def list_all(self):
         return self.load_data().get("contacts", [])
+
+    def search(self, query):
+        data = self.load_data()
+        results = []
+        query_lower = query.lower()
+        for c in data.get("contacts", []):
+            match = False
+            # Check basic fields
+            if query_lower in c.get("name", "").lower():
+                match = True
+            elif query_lower in c.get("phone_number", "").lower():
+                match = True
+            elif query_lower in c.get("relationship", "").lower():
+                match = True
+            else:
+                # Check custom fields
+                custom_fields = c.get("custom_fields", {})
+                for k, v in custom_fields.items():
+                    if query_lower in str(k).lower() or query_lower in str(v).lower():
+                        match = True
+                        break
+            
+            if match:
+                results.append(c)
+                
+        return results

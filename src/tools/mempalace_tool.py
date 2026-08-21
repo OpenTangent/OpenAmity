@@ -29,7 +29,7 @@ class MemPalaceTool(Tool):
                 try:
                     from tools.pulse_tool import PulseTool
                     import datetime
-                    pt = PulseTool()
+                    pt = PulseTool(orchestrator=self.orchestrator)
                     sched_time = (datetime.datetime.now() +
                                   datetime.timedelta(minutes=10)).isoformat()
                     pulse_title = f"Curiosity: {query}"

@@ -16,3 +16,4 @@ faster-whisper
 psutil
 ddgs
 anthropic
+openai

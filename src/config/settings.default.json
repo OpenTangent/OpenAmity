@@ -2,7 +2,7 @@
   "core": {
     "mute": false,
     "first-run": true,
-    "whatsapp-web-target": "github:wwebjs/whatsapp-web.js#main",
+    "whatsapp-auto-update-engine": true,
     "low-token-mode": false,
     "gemini": {
       "gemini-models": [
@@ -32,6 +32,15 @@
         "claude-sonnet-5"
       ]
     },
+    "chatgpt": {
+      "chatgpt-models": [
+        "gpt-5.6-terra",
+        "gpt-5.6-sol"
+      ],
+      "light-models": [
+        "gpt-5.6-luna"
+      ]
+    },
     "antigravity": {
       "agy-mode": false,
       "agy-models": [
@@ -41,6 +50,7 @@
     },
     "agent": {
       "creation-date": "",
+      "uid": "",
       "name": "Amy",
       "gender": "Female",
       "archetype": "Community Catalyst",
@@ -80,7 +90,8 @@
       "cognitive-budget": 10000,
       "decay-per-minute": 500,
       "tool-cost": 2,
-      "exponential-factor": 1.2
+      "exponential-factor": 1.2,
+      "session-token-cap": 500000
     },
     "auto-pulse": {
       "whitelist": [],
@@ -95,6 +106,8 @@
     "tools": {
       "datetime": true,
       "contacts": true,
+      "chatroom": true,
+      "email": false,
       "mempalace": true,
       "pulsetool": true,
       "speaker": true,
