@@ -83,14 +83,23 @@ def create_agent_backup(
     logging.info(f"BackupManager: Creating backup for agent '{agent_name}' ({agent_id}) at {backup_path}...")
 
     # Discover candidate files first for accurate progress reporting
+    # Directories and files to exclude from backups (transient caches, lock files, bulky node_modules and browser binaries)
+    EXCLUDED_DIR_NAMES = {"node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__"}
+    EXCLUDED_FILE_NAMES = {
+        "SingletonLock", "SingletonCookie", "SingletonSocket",
+        "daemon.pid", "daemon.port", ".last_engine_update"
+    }
+
     eligible_files = []
     for root, dirs, files in os.walk(agent_dir):
-        for file in files:
-            full_file_path = os.path.join(root, file)
+        # Prune excluded directories in-place so os.walk does not traverse them
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
 
-            # Skip known ephemeral browser lock files and sockets (e.g. from whatsapp_data/.wpp_session/)
-            if file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        for file in files:
+            if file in EXCLUDED_FILE_NAMES:
                 continue
+
+            full_file_path = os.path.join(root, file)
 
             # Check for broken symlink
             if os.path.islink(full_file_path) and not os.path.exists(full_file_path):
@@ -318,6 +327,14 @@ def restore_agent_backup(
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 with zip_file.open(member) as src, open(out_path, "wb") as dst:
                     shutil.copyfileobj(src, dst)
+
+                # Restore POSIX file permissions if available in member external_attr
+                attr = (member.external_attr >> 16) & 0xFFFF
+                if attr:
+                    try:
+                        os.chmod(out_path, attr)
+                    except Exception as chmod_err:
+                        logging.debug(f"BackupManager: Could not set permissions on {out_path}: {chmod_err}")
 
         # Ensure .env exists
         env_path = os.path.join(target_dir, ".env")

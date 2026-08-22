@@ -50,6 +50,21 @@
             ]
         },
         {
+            "name": "puppeteer-chromium",
+            "buildsystem": "simple",
+            "build-commands": [
+                "mkdir -p /app/share/puppeteer",
+                "cp -r chrome-linux64 /app/share/puppeteer/"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://storage.googleapis.com/chrome-for-testing-public/127.0.6533.88/linux64/chrome-linux64.zip",
+                    "sha256": "20e2000334f8cefa115ad3e2c55d6ad0e3e254be33a5fd0b9178c3d1a9c78ba9"
+                }
+            ]
+        },
+        {
             "name": "chroma-onnx-model",
             "buildsystem": "simple",
             "build-commands": [
@@ -71,6 +86,7 @@
                 "install -D compile/com.openamity.OpenAmity.desktop /app/share/applications/com.openamity.OpenAmity.desktop",
                 "install -D compile/com.openamity.OpenAmity.metainfo.xml /app/share/metainfo/com.openamity.OpenAmity.metainfo.xml",
                 "install -D src/assets/com.openamity.OpenAmity.png /app/share/icons/hicolor/512x512/apps/com.openamity.OpenAmity.png",
+                "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true PUPPETEER_SKIP_DOWNLOAD=true npm --prefix src/tools/whatsapp_node --cache flatpak-node/npm-cache --prefer-offline --no-audit --no-fund ci",
                 "cp -r src /app/src",
                 "cp run_OpenAmity.sh /app/bin/run_OpenAmity.sh",
                 "chmod +x /app/bin/run_OpenAmity.sh"
@@ -79,7 +95,8 @@
                 {
                     "type": "dir",
                     "path": ".."
-                }
+                },
+                "node-sources.json"
             ]
         }
     ]

@@ -421,3 +421,109 @@ def test_restore_preserves_sqlite_and_subdirs(temp_backup_env):
         assert len(rows) == 1
         assert rows[0][0] == "pulse_entry_1"
 
+
+def test_backup_excludes_node_modules_and_caches(temp_backup_env):
+    am = AgentManager()
+    aid = am.create_new_agent()
+    settings = SettingsManager(agent_id=aid)
+    settings.set("core.agent.name", "CacheAgent")
+    settings.save()
+
+    agent_dir = paths.get_agent_data_dir(aid)
+
+    # 1. Stateful WhatsApp session and uploads (MUST be included)
+    session_dir = os.path.join(agent_dir, "whatsapp_data", ".wpp_session")
+    os.makedirs(session_dir, exist_ok=True)
+    with open(os.path.join(session_dir, "session_state.json"), "w") as f:
+        f.write('{"auth": "token"}')
+
+    uploads_dir = os.path.join(agent_dir, "whatsapp_data", "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+    with open(os.path.join(uploads_dir, "received_photo.jpg"), "w") as f:
+        f.write('photo_data')
+
+    # 2. Transient directories (MUST be excluded)
+    node_modules_dir = os.path.join(agent_dir, "whatsapp_bridge", "node_modules", "express")
+    os.makedirs(node_modules_dir, exist_ok=True)
+    with open(os.path.join(node_modules_dir, "index.js"), "w") as f:
+        f.write('console.log("express");')
+
+    puppeteer_cache_dir = os.path.join(agent_dir, "whatsapp_data", "puppeteer_cache", "chrome")
+    os.makedirs(puppeteer_cache_dir, exist_ok=True)
+    with open(os.path.join(puppeteer_cache_dir, "chrome"), "w") as f:
+        f.write('binary')
+
+    wwebjs_cache_dir = os.path.join(agent_dir, "whatsapp_data", ".wwebjs_cache")
+    os.makedirs(wwebjs_cache_dir, exist_ok=True)
+    with open(os.path.join(wwebjs_cache_dir, "temp.bin"), "w") as f:
+        f.write('cache')
+
+    # 3. Ephemeral daemon runtime files (MUST be excluded)
+    bridge_dir = os.path.join(agent_dir, "whatsapp_bridge")
+    os.makedirs(bridge_dir, exist_ok=True)
+    with open(os.path.join(bridge_dir, "daemon.pid"), "w") as f:
+        f.write('12345')
+    with open(os.path.join(bridge_dir, "daemon.port"), "w") as f:
+        f.write('3000')
+    with open(os.path.join(agent_dir, "whatsapp_data", ".last_engine_update"), "w") as f:
+        f.write('123456789.0')
+
+    # Create backup
+    backup_path = create_agent_backup(
+        aid,
+        destination_dir=temp_backup_env["backup_dest_dir"],
+        agent_manager=am
+    )
+
+    assert os.path.exists(backup_path)
+
+    with zipfile.ZipFile(backup_path, "r") as zf:
+        namelist = zf.namelist()
+
+        # Check preserved items
+        assert any("whatsapp_data/.wpp_session/session_state.json" in n.replace("\\", "/") for n in namelist)
+        assert any("whatsapp_data/uploads/received_photo.jpg" in n.replace("\\", "/") for n in namelist)
+
+        # Check excluded items
+        assert not any("node_modules" in n for n in namelist)
+        assert not any("puppeteer_cache" in n for n in namelist)
+        assert not any(".wwebjs_cache" in n for n in namelist)
+        assert not any("daemon.pid" in n for n in namelist)
+        assert not any("daemon.port" in n for n in namelist)
+        assert not any(".last_engine_update" in n for n in namelist)
+
+
+def test_restore_preserves_executable_permissions(temp_backup_env):
+    import stat
+    am = AgentManager()
+    aid = am.create_new_agent()
+    uid = am.get_agent_uid(aid)
+    settings = SettingsManager(agent_id=aid)
+    settings.set("core.agent.name", "ExecAgent")
+    settings.save()
+
+    agent_dir = paths.get_agent_data_dir(aid)
+    script_path = os.path.join(agent_dir, "custom_executable.sh")
+    with open(script_path, "w") as f:
+        f.write("#!/bin/sh\necho 'hello'\n")
+    os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)  # 0755
+
+    backup_path = create_agent_backup(
+        aid,
+        destination_dir=temp_backup_env["backup_dest_dir"],
+        agent_manager=am
+    )
+
+    # Delete agent to restore as new instance
+    am.delete_agent(aid)
+
+    success, msg, details = restore_agent_backup(backup_path, agent_manager=am)
+    assert success is True
+    new_aid = details["agent_id"]
+    new_dir = paths.get_agent_data_dir(new_aid)
+    restored_script = os.path.join(new_dir, "custom_executable.sh")
+
+    assert os.path.exists(restored_script)
+    assert os.access(restored_script, os.X_OK)
+
+

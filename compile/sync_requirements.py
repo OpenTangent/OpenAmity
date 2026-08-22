@@ -127,8 +127,24 @@ def main():
         os.remove(FLATPAK_REQS_FILE)
     if os.path.exists(GENERATOR_SCRIPT):
         os.remove(GENERATOR_SCRIPT)
+
+    # 4. Generate the node-sources.json for WhatsApp bridge
+    print("\n=== Generating Flatpak Node Dependencies ===")
+    lock_file = "../src/tools/whatsapp_node/package-lock.json"
+    if os.path.exists(lock_file):
+        print(f"Generating node-sources.json from {lock_file}...")
+        try:
+            import flatpak_node_generator
+        except ImportError:
+            print("Installing flatpak-node-generator in venv...")
+            run_cmd([pip_exe, "install", "-q", "git+https://github.com/flatpak/flatpak-builder-tools.git#subdirectory=node"])
+
+        node_gen_exe = "../.venv/bin/flatpak-node-generator"
+        run_cmd([node_gen_exe, "npm", lock_file, "-o", "node-sources.json"])
+        print("node-sources.json generated successfully.")
+
     print("\n=== Done! ===")
-    print("python3-requirements.json has been generated successfully.")
+    print("python3-requirements.json and node-sources.json have been generated successfully.")
 
 if __name__ == "__main__":
     main()

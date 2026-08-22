@@ -201,11 +201,15 @@ class WhatsAppDaemon:
         env["PUPPETEER_CACHE_DIR"] = os.path.join(
             self.data_dir, "puppeteer_cache")
 
-        # Configure NODE_PATH so node can resolve modules from source and bridge dirs
+        # Configure NODE_PATH so node can resolve modules from source, bridge, and Flatpak app dirs
         source_modules = os.path.join(self.source_bridge_dir, "node_modules")
         bridge_modules = os.path.join(self.bridge_dir, "node_modules")
+        flatpak_source_modules = "/app/src/tools/whatsapp_node/node_modules"
+        flatpak_lib_modules = "/app/lib/node_modules"
         existing_node_path = env.get("NODE_PATH", "")
-        paths_to_add = [p for p in [source_modules, bridge_modules, existing_node_path] if p]
+        paths_to_add = [p for p in [source_modules, bridge_modules, flatpak_source_modules, flatpak_lib_modules, existing_node_path] if p and os.path.exists(p)]
+        if not paths_to_add:
+            paths_to_add = [source_modules, bridge_modules]
         env["NODE_PATH"] = ":".join(paths_to_add)
 
         self.node_process = subprocess.Popen(

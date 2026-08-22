@@ -121,6 +121,9 @@ function findChromeExecutable() {
                     searchDir(full, depth + 1);
                 } else if (entry.isFile() && (entry.name === 'chrome' || entry.name === 'chromium' || entry.name === 'google-chrome' || entry.name === 'google-chrome-stable')) {
                     try {
+                        try {
+                            fs.chmodSync(full, 0o755);
+                        } catch (e) {}
                         fs.accessSync(full, fs.constants.X_OK);
                         candidates.push(full);
                     } catch (e) {}

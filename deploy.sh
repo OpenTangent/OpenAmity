@@ -10,14 +10,24 @@ NC='\033[0m' # No Color
 echo -e "${BLUE}=== Open Amity Deployment Script ===${NC}"
 echo ""
 
-# 1. Update python3-requirements.json if needed
-echo -e "${BLUE}[1/5] Checking Python requirements...${NC}"
+# 1. Update python3-requirements.json and node-sources.json if needed
+echo -e "${BLUE}[1/5] Checking Python and Node requirements...${NC}"
+REGEN_DEPS=false
 if [ requirements.txt -nt compile/python3-requirements.json ]; then
-    echo -e "${YELLOW}requirements.txt has changed. Regenerating Flatpak dependencies...${NC}"
+    echo -e "${YELLOW}requirements.txt has changed.${NC}"
+    REGEN_DEPS=true
+fi
+if [ src/tools/whatsapp_node/package-lock.json -nt compile/node-sources.json ] || [ ! -f compile/node-sources.json ]; then
+    echo -e "${YELLOW}src/tools/whatsapp_node/package-lock.json has changed or node-sources.json missing.${NC}"
+    REGEN_DEPS=true
+fi
+
+if [ "$REGEN_DEPS" = true ]; then
+    echo -e "${YELLOW}Regenerating Flatpak dependencies...${NC}"
     (cd compile && python3 sync_requirements.py)
     echo -e "${GREEN}Dependencies regenerated successfully.${NC}"
 else
-    echo -e "${GREEN}requirements.txt has not changed. Skipping dependency regeneration.${NC}"
+    echo -e "${GREEN}Requirements have not changed. Skipping dependency regeneration.${NC}"
 fi
 echo ""
 
