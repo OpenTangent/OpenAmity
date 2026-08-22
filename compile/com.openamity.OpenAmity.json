@@ -53,8 +53,8 @@
             "name": "puppeteer-chromium",
             "buildsystem": "simple",
             "build-commands": [
-                "mkdir -p /app/share/puppeteer",
-                "cp -r chrome-linux64 /app/share/puppeteer/"
+                "mkdir -p /app/share/puppeteer/chrome-linux64",
+                "cp -a * /app/share/puppeteer/chrome-linux64/"
             ],
             "sources": [
                 {

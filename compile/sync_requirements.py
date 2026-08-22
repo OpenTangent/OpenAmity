@@ -130,8 +130,15 @@ def main():
 
     # 4. Generate the node-sources.json for WhatsApp bridge
     print("\n=== Generating Flatpak Node Dependencies ===")
-    lock_file = "../src/tools/whatsapp_node/package-lock.json"
+    node_dir = "../src/tools/whatsapp_node"
+    lock_file = os.path.join(node_dir, "package-lock.json")
     if os.path.exists(lock_file):
+        print(f"Ensuring complete dependency tree in {lock_file}...")
+        try:
+            subprocess.run(["npm", "i", "--package-lock-only", "--lockfile-version", "2"], cwd=node_dir, check=True)
+        except Exception as e:
+            print(f"Warning: npm command failed: {e}")
+
         print(f"Generating node-sources.json from {lock_file}...")
         try:
             import flatpak_node_generator
