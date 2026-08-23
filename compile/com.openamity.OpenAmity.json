@@ -54,7 +54,8 @@
             "buildsystem": "simple",
             "build-commands": [
                 "mkdir -p /app/share/puppeteer/chrome-linux64",
-                "cp -a * /app/share/puppeteer/chrome-linux64/"
+                "cp -a * /app/share/puppeteer/chrome-linux64/",
+                "chmod -R 755 /app/share/puppeteer/chrome-linux64"
             ],
             "sources": [
                 {

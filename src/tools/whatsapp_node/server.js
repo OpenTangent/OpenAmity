@@ -101,6 +101,43 @@ async function injectWaJs() {
     }
 }
 
+function ensureExecutablePermissions(targetDir) {
+    if (!targetDir || !fs.existsSync(targetDir)) return;
+    const helperNames = new Set([
+        'chrome',
+        'chrome_crashpad_handler',
+        'crashpad_handler',
+        'chrome_sandbox',
+        'chrome-wrapper',
+        'chromedriver',
+        'chrome_management_service',
+        'interactive_ui_tests',
+        'xdg-mime',
+        'xdg-settings'
+    ]);
+
+    const fixDir = (dir, depth = 0) => {
+        if (depth > 5) return;
+        try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    fixDir(full, depth + 1);
+                } else if (entry.isFile()) {
+                    if (helperNames.has(entry.name) || entry.name.startsWith('chrome') || entry.name.toLowerCase().includes('crashpad')) {
+                        try {
+                            fs.chmodSync(full, 0o755);
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (e) {}
+    };
+
+    fixDir(targetDir);
+}
+
 function findChromeExecutable() {
     const candidateDirs = [
         process.env.PUPPETEER_CACHE_DIR,
@@ -119,14 +156,20 @@ function findChromeExecutable() {
                 const full = path.join(current, entry.name);
                 if (entry.isDirectory()) {
                     searchDir(full, depth + 1);
-                } else if (entry.isFile() && (entry.name === 'chrome' || entry.name === 'chromium' || entry.name === 'google-chrome' || entry.name === 'google-chrome-stable')) {
-                    try {
+                } else if (entry.isFile()) {
+                    if (entry.name === 'chrome' || entry.name === 'chromium' || entry.name === 'google-chrome' || entry.name === 'google-chrome-stable') {
+                        try {
+                            try {
+                                fs.chmodSync(full, 0o755);
+                            } catch (e) {}
+                            fs.accessSync(full, fs.constants.X_OK);
+                            candidates.push(full);
+                        } catch (e) {}
+                    } else if (entry.name === 'chrome_crashpad_handler' || entry.name.toLowerCase().includes('crashpad') || entry.name === 'chrome_sandbox' || entry.name === 'chrome-wrapper') {
                         try {
                             fs.chmodSync(full, 0o755);
                         } catch (e) {}
-                        fs.accessSync(full, fs.constants.X_OK);
-                        candidates.push(full);
-                    } catch (e) {}
+                    }
                 }
             }
         } catch (e) {}
@@ -137,7 +180,163 @@ function findChromeExecutable() {
     }
     if (candidates.length === 0) return null;
     candidates.sort().reverse();
-    return candidates[0];
+    const chosen = candidates[0];
+    ensureExecutablePermissions(path.dirname(chosen));
+    return chosen;
+}
+
+async function ensureListenersAttached() {
+    if (!page) return false;
+    try {
+        return await page.evaluate(async () => {
+            if (typeof window.WPP === 'undefined' || !window.WPP.isReady) {
+                return false;
+            }
+
+            if (!window.__wpp_listeners_attached) {
+                window.__wpp_listeners_attached = true;
+
+                window.WPP.on('conn.auth_code_change', (authCode) => {
+                    if (authCode && authCode.fullCode) {
+                        window.nodeOnQrCode(authCode.fullCode);
+                    }
+                });
+
+                window.WPP.on('conn.authenticated', () => {
+                    window.nodeOnAuthenticated();
+                    window.nodeOnReady();
+                });
+
+                window.WPP.on('conn.main_ready', async () => {
+                    try {
+                        if (await window.WPP.conn.isAuthenticated()) {
+                            window.nodeOnReady();
+                        }
+                    } catch (e) {}
+                });
+
+                window.WPP.on('chat.new_message', async (msg) => {
+                    try {
+                        if (!msg) return;
+
+                        // 1. Filter out outgoing / sent messages
+                        if (msg.fromMe || msg.isSentByMe || (msg.id && msg.id.fromMe)) {
+                            return;
+                        }
+
+                        // 2. Filter out status updates / broadcasts
+                        if (msg.isStatusV3 || msg.isBroadcast || (msg.chatId && (msg.chatId._serialized || msg.chatId).includes('@broadcast'))) {
+                            return;
+                        }
+
+                        // 3. Determine chat identifiers
+                        const rawFrom = (msg.from && (msg.from._serialized || msg.from)) || '';
+                        const rawChatId = (msg.chatId && (msg.chatId._serialized || msg.chatId)) || rawFrom;
+                        const rawAuthor = (msg.author && (msg.author._serialized || msg.author)) || rawFrom;
+                        const isGroup = Boolean(msg.isGroupMsg || rawChatId.endsWith('@g.us'));
+
+                        const targetId = isGroup ? rawAuthor : rawFrom;
+                        let resolvedSenderId = targetId;
+                        let senderName = msg.notifyName || '';
+
+                        // 4. Resolve LID / Contact / Phone number
+                        if (targetId) {
+                            // Try getPnLidEntry
+                            try {
+                                const entry = await window.WPP.contact.getPnLidEntry(targetId);
+                                if (entry) {
+                                    if (entry.phoneNumber) {
+                                        resolvedSenderId = entry.phoneNumber._serialized || (entry.phoneNumber.id ? entry.phoneNumber.id + '@c.us' : resolvedSenderId);
+                                    }
+                                    if (entry.contact) {
+                                        senderName = senderName || entry.contact.name || entry.contact.pushname || entry.contact.shortName || '';
+                                    }
+                                }
+                            } catch (e) {}
+
+                            // Try contact.get
+                            if (!senderName || resolvedSenderId.includes('@lid')) {
+                                try {
+                                    const contact = await window.WPP.contact.get(targetId) || (resolvedSenderId !== targetId ? await window.WPP.contact.get(resolvedSenderId) : null);
+                                    if (contact) {
+                                        senderName = senderName || contact.name || contact.pushname || contact.shortName || contact.formattedName || '';
+                                        if (resolvedSenderId.includes('@lid')) {
+                                            const cid = (contact.id && (contact.id._serialized || contact.id)) || '';
+                                            if (cid.includes('@c.us')) {
+                                                resolvedSenderId = cid;
+                                            } else if (contact.phoneNumber) {
+                                                const pn = contact.phoneNumber._serialized || (contact.phoneNumber.id ? contact.phoneNumber.id + '@c.us' : (typeof contact.phoneNumber === 'string' ? contact.phoneNumber : ''));
+                                                if (pn) resolvedSenderId = pn.includes('@') ? pn : pn + '@c.us';
+                                            }
+                                        }
+                                    }
+                                } catch (e) {}
+                            }
+
+                            // Try contact list matching
+                            if (!senderName || resolvedSenderId.includes('@lid')) {
+                                try {
+                                    const contacts = await window.WPP.contact.list();
+                                    const matched = contacts.find(c => {
+                                        const cid = (c.id && (c.id._serialized || c.id)) || '';
+                                        const clid = (c.lid && (c.lid._serialized || c.lid)) || '';
+                                        return cid === targetId || clid === targetId || (resolvedSenderId && (cid === resolvedSenderId || clid === resolvedSenderId));
+                                    });
+                                    if (matched) {
+                                        senderName = senderName || matched.name || matched.pushname || matched.shortName || '';
+                                        const cid = (matched.id && (matched.id._serialized || matched.id)) || '';
+                                        if (cid.includes('@c.us')) {
+                                            resolvedSenderId = cid;
+                                        }
+                                    }
+                                } catch (e) {}
+                            }
+
+                            // If DM, try chat.get for chat name
+                            if (!isGroup) {
+                                try {
+                                    const chat = await window.WPP.chat.get(rawChatId);
+                                    if (chat) {
+                                        senderName = senderName || chat.name || chat.formattedTitle || '';
+                                    }
+                                } catch (e) {}
+                            }
+                        }
+
+                        // Final fallback for senderName
+                        if (!senderName || senderName === 'Unknown') {
+                            senderName = msg.notifyName || (resolvedSenderId.includes('@c.us') ? resolvedSenderId.split('@')[0] : (resolvedSenderId || 'Unknown'));
+                        }
+
+                        const finalChatId = isGroup ? rawChatId : resolvedSenderId;
+                        window.nodeOnMsgReceived(finalChatId, senderName);
+                    } catch (e) {
+                        console.error('Error handling incoming message event:', e);
+                    }
+                });
+            }
+
+            const isAuthed = await window.WPP.conn.isAuthenticated();
+            if (isAuthed) {
+                window.nodeOnReady();
+            } else {
+                const authCode = await window.WPP.conn.getAuthCode();
+                if (authCode && authCode.fullCode) {
+                    window.nodeOnQrCode(authCode.fullCode);
+                } else {
+                    const domEl = document.querySelector('div[data-ref]') || document.querySelector('[data-ref]');
+                    if (domEl) {
+                        const ref = domEl.getAttribute('data-ref');
+                        if (ref) window.nodeOnQrCode(ref);
+                    }
+                }
+            }
+
+            return true;
+        });
+    } catch (e) {
+        return false;
+    }
 }
 
 async function startClient() {
@@ -156,9 +355,14 @@ async function startClient() {
         '--disable-features=IsolateOrigins,site-per-process'
     ];
 
+    if (process.env.PUPPETEER_CACHE_DIR) {
+        ensureExecutablePermissions(process.env.PUPPETEER_CACHE_DIR);
+    }
+
     const exe = findChromeExecutable();
     if (exe) {
         console.log(`Using discovered Chrome executable: ${exe}`);
+        ensureExecutablePermissions(path.dirname(exe));
     }
 
     // Clean any orphaned Chromium profile locks from previous runs
@@ -218,13 +422,14 @@ async function startClient() {
             timeout: 60000
         });
 
-        // Continuous QR code and authentication polling interval
+        // Continuous QR code, authentication, and listener attachment polling interval
         const checkInterval = setInterval(async () => {
-            if (isShuttingDown || isReady || !page) {
-                if (isReady) clearInterval(checkInterval);
+            if (isShuttingDown || !page) {
                 return;
             }
             try {
+                await ensureListenersAttached();
+
                 const state = await page.evaluate(async () => {
                     // 1. Check if WPP ready / authenticated
                     if (typeof window.WPP !== 'undefined' && window.WPP.conn) {
@@ -252,8 +457,6 @@ async function startClient() {
                     if (state.ready) {
                         isReady = true;
                         currentQR = null;
-                        clearInterval(checkInterval);
-                        console.log('WhatsApp Client is ready! Bridge is fully active.');
                     } else if (state.qr && state.qr !== currentQR) {
                         currentQR = state.qr;
                         isReady = false;
@@ -264,80 +467,12 @@ async function startClient() {
             } catch (e) {}
         }, 2000);
 
-        // Loop to ensure WA-JS is injected and event listeners are active
+        // Loop to ensure WA-JS is injected and event listeners are active on startup
         let injected = false;
         for (let i = 0; i < 30; i++) {
             if (isShuttingDown) break;
             try {
-                injected = await page.evaluate(async () => {
-                    if (typeof window.WPP === 'undefined' || !window.WPP.isReady) {
-                        return false;
-                    }
-
-                    if (!window.__wpp_listeners_attached) {
-                        window.__wpp_listeners_attached = true;
-
-                        window.WPP.on('conn.auth_code_change', (authCode) => {
-                            if (authCode && authCode.fullCode) {
-                                window.nodeOnQrCode(authCode.fullCode);
-                            }
-                        });
-
-                        window.WPP.on('conn.authenticated', () => {
-                            window.nodeOnAuthenticated();
-                            window.nodeOnReady();
-                        });
-
-                        window.WPP.on('conn.main_ready', async () => {
-                            try {
-                                if (await window.WPP.conn.isAuthenticated()) {
-                                    window.nodeOnReady();
-                                }
-                            } catch (e) {}
-                        });
-
-                        window.WPP.on('chat.new_message', async (msg) => {
-                            try {
-                                if (!msg) return;
-                                let senderName = msg.notifyName || (msg.author && (msg.author._serialized || msg.author)) || (msg.from && (msg.from._serialized || msg.from)) || 'Unknown';
-                                let chatId = (msg.chatId && (msg.chatId._serialized || msg.chatId)) || (msg.from && (msg.from._serialized || msg.from)) || '';
-                                
-                                if (msg.chat && !msg.chat.isGroup) {
-                                    senderName = msg.chat.name || senderName;
-                                } else if (msg.author) {
-                                    try {
-                                        const contact = await window.WPP.contact.get(msg.author);
-                                        if (contact) {
-                                            senderName = contact.name || contact.pushname || senderName;
-                                        }
-                                    } catch (e) {}
-                                }
-                                window.nodeOnMsgReceived(chatId, senderName);
-                            } catch (e) {
-                                console.error('Error handling incoming message event:', e);
-                            }
-                        });
-                    }
-
-                    const isAuthed = await window.WPP.conn.isAuthenticated();
-                    if (isAuthed) {
-                        window.nodeOnReady();
-                    } else {
-                        const authCode = await window.WPP.conn.getAuthCode();
-                        if (authCode && authCode.fullCode) {
-                            window.nodeOnQrCode(authCode.fullCode);
-                        } else {
-                            const domEl = document.querySelector('div[data-ref]') || document.querySelector('[data-ref]');
-                            if (domEl) {
-                                const ref = domEl.getAttribute('data-ref');
-                                if (ref) window.nodeOnQrCode(ref);
-                            }
-                        }
-                    }
-
-                    return true;
-                });
-
+                injected = await ensureListenersAttached();
                 if (injected) {
                     break;
                 }
@@ -350,6 +485,7 @@ async function startClient() {
         if (!injected) {
             console.log('Attempting direct WA-JS evaluation injection...');
             await injectWaJs();
+            await ensureListenersAttached();
         }
 
     } catch (err) {

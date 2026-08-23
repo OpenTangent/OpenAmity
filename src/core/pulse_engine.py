@@ -3,6 +3,7 @@ import threading
 import logging
 import sqlite3
 import os
+import re
 from datetime import datetime, timedelta
 from .events import Signal
 try:
@@ -277,14 +278,18 @@ class PulseEngine:
 
     # --- WhatsApp Handling Ported from WakeUpService ---
     def handle_whatsapp_message(self, sender_id, sender_name):
-        if sender_id.endswith("@g.us"):
+        if not sender_id:
+            return
+        if sender_id.endswith("@g.us") or sender_id.endswith("@broadcast"):
             return
 
         sys_settings = self.settings_manager.get("core.auto-pulse", {})
         whitelist = sys_settings.get("whitelist", [])
+        if not whitelist:
+            return
 
         clean_sender = sender_id.replace(
-            "@c.us", "").replace("@g.us", "").replace("@lid", "")
+            "@c.us", "").replace("@g.us", "").replace("@lid", "").replace("+", "").strip()
         contact = self.address_book_manager.lookup_by_number(clean_sender)
 
         if contact:
@@ -294,18 +299,47 @@ class PulseEngine:
 
         matched = False
         for w_item in whitelist:
-            w_clean = w_item.replace("+", "").replace(" ", "")
-            if clean_sender.endswith(w_clean) or clean_sender == w_clean:
+            if not w_item:
+                continue
+            w_item_str = str(w_item).strip()
+
+            # 1. Clean phone number comparison
+            w_clean = re.sub(r"[^\d]", "", w_item_str)
+            if w_clean and clean_sender.isdigit():
+                if clean_sender == w_clean:
+                    matched = True
+                    break
+                # Suffix matching for international / national number differences
+                if len(w_clean) >= 7 and len(clean_sender) >= 7:
+                    if clean_sender.endswith(w_clean) or w_clean.endswith(clean_sender):
+                        matched = True
+                        break
+                    # Strip leading zeros for national prefix match (e.g. 083... vs 2783...)
+                    w_no_zero = w_clean.lstrip("0")
+                    sender_no_zero = clean_sender.lstrip("0")
+                    if len(w_no_zero) >= 7 and len(sender_no_zero) >= 7:
+                        if sender_no_zero.endswith(w_no_zero) or w_no_zero.endswith(sender_no_zero):
+                            matched = True
+                            break
+
+            # 2. Name / String comparison
+            w_lower = w_item_str.lower()
+            if sender_name and (sender_name.lower() == w_lower or w_lower in sender_name.lower()):
                 matched = True
                 break
-            if sender_name.lower() == w_item.strip().lower():
-                matched = True
-                break
+            if contact:
+                c_name = contact.get("name", "").lower()
+                c_rel = contact.get("relationship", "").lower()
+                if (c_name and (c_name == w_lower or w_lower in c_name)) or (c_rel and (c_rel == w_lower or w_lower in c_rel)):
+                    matched = True
+                    break
 
         if not matched:
+            logging.debug(
+                f"PulseEngine: WhatsApp message from sender_id='{sender_id}' (name='{sender_name}') not in whitelist.")
             return
 
-        cooldown = sys_settings.get("ratelimit-minutes", 15)
+        cooldown = sys_settings.get("ratelimit-minutes", 5)
         if (time.time() - self.last_pulse_time) < (cooldown * 60):
             logging.info(
                 "PulseEngine: WhatsApp pulse suppressed due to rate limiting.")

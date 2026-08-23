@@ -165,6 +165,41 @@ class WhatsAppDaemon:
 
         return False
 
+    def _ensure_chrome_executable_permissions(self):
+        """Ensures chrome and companion binaries (e.g. chrome_crashpad_handler) in puppeteer cache have executable permissions."""
+        target_dirs = [
+            os.path.join(self.data_dir, "puppeteer_cache"),
+            os.path.expanduser("~/.cache/puppeteer"),
+            "/app/share/puppeteer"
+        ]
+        helper_names = {
+            "chrome",
+            "chrome_crashpad_handler",
+            "crashpad_handler",
+            "chrome_sandbox",
+            "chrome-wrapper",
+            "chromedriver",
+            "chrome_management_service",
+            "interactive_ui_tests",
+            "xdg-mime",
+            "xdg-settings"
+        }
+        for base_dir in target_dirs:
+            if not os.path.exists(base_dir):
+                continue
+            try:
+                for root, _, files in os.walk(base_dir):
+                    for fname in files:
+                        if fname in helper_names or "crashpad" in fname.lower() or fname.startswith("chrome"):
+                            fpath = os.path.join(root, fname)
+                            try:
+                                current_mode = os.stat(fpath).st_mode
+                                os.chmod(fpath, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+                            except Exception as e:
+                                logging.debug(f"Could not chmod {fpath}: {e}")
+            except Exception as e:
+                logging.debug(f"Error scanning {base_dir} for permissions: {e}")
+
     def start(self, force_update: bool = False):
         os.makedirs(self.bridge_dir, exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
@@ -180,6 +215,8 @@ class WhatsAppDaemon:
 
         if force_update:
             self.update_engine_asset(force=True)
+
+        self._ensure_chrome_executable_permissions()
 
         if not os.path.exists(os.path.join(self.bridge_dir, "server.js")):
             logging.error("WhatsApp node server not found.")
@@ -231,9 +268,9 @@ class WhatsAppDaemon:
                     logging.debug(f"[{label}] {line_str}")
                     if line_str.startswith("[MSG_RECEIVED]"):
                         parts = line_str.split(" ", 2)
-                        if len(parts) >= 3:
+                        if len(parts) >= 2:
                             sender_id = parts[1]
-                            sender_name = parts[2]
+                            sender_name = parts[2] if len(parts) >= 3 else ""
                             if self.message_callback:
                                 self.message_callback(sender_id, sender_name)
             pipe.close()

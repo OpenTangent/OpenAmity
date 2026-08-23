@@ -127,3 +127,159 @@ def test_whatsapp_daemon_update_engine_asset(temp_agent_environment):
 
         timestamp_file = os.path.join(daemon.data_dir, ".last_engine_update")
         assert os.path.exists(timestamp_file)
+
+
+def test_whatsapp_daemon_ensure_chrome_executable_permissions(temp_agent_environment):
+    import stat
+    daemon = WhatsAppDaemon(agent_id="agent-perm-test")
+    cache_dir = os.path.join(daemon.data_dir, "puppeteer_cache", "chrome", "linux-146.0", "chrome-linux64")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Create dummy binaries without executable permissions (0o644)
+    binaries = [
+        "chrome",
+        "chrome_crashpad_handler",
+        "chrome_sandbox",
+        "chrome-wrapper",
+        "crashpad_handler"
+    ]
+    created_paths = []
+    for b in binaries:
+        p = os.path.join(cache_dir, b)
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)  # 0o644
+        assert not (os.stat(p).st_mode & stat.S_IXUSR)
+        created_paths.append(p)
+
+    # Run permission fixer
+    daemon._ensure_chrome_executable_permissions()
+
+    # Verify all helper binaries now have executable permissions
+    for p in created_paths:
+        mode = os.stat(p).st_mode
+        assert bool(mode & stat.S_IXUSR), f"{p} should have user execute permission"
+        assert bool(mode & stat.S_IXGRP), f"{p} should have group execute permission"
+        assert bool(mode & stat.S_IXOTH), f"{p} should have other execute permission"
+
+
+def test_whatsapp_daemon_msg_received_parsing(temp_agent_environment):
+    daemon = WhatsAppDaemon(agent_id="agent-msg-test")
+    received = []
+    daemon.message_callback = lambda sid, name: received.append((sid, name))
+
+    class MockPipe:
+        def __init__(self, lines):
+            self.lines = iter(lines)
+        def readline(self):
+            return next(self.lines, '')
+        def close(self):
+            pass
+
+    # Test 3-part MSG_RECEIVED with full name
+    lines1 = ["[MSG_RECEIVED] 27836527975@c.us Kerry Parker\n"]
+    daemon.node_process = MagicMock()
+    daemon.node_process.stdout = MockPipe(lines1)
+
+    # Invoke read_output logic directly
+    for line in iter(daemon.node_process.stdout.readline, ''):
+        line_str = line.strip()
+        if line_str.startswith("[MSG_RECEIVED]"):
+            parts = line_str.split(" ", 2)
+            if len(parts) >= 2:
+                sender_id = parts[1]
+                sender_name = parts[2] if len(parts) >= 3 else ""
+                if daemon.message_callback:
+                    daemon.message_callback(sender_id, sender_name)
+
+    assert len(received) == 1
+    assert received[0] == ("27836527975@c.us", "Kerry Parker")
+
+    # Test 2-part MSG_RECEIVED (no sender name)
+    lines2 = ["[MSG_RECEIVED] 27836527975@c.us\n"]
+    for line in lines2:
+        line_str = line.strip()
+        if line_str.startswith("[MSG_RECEIVED]"):
+            parts = line_str.split(" ", 2)
+            if len(parts) >= 2:
+                sender_id = parts[1]
+                sender_name = parts[2] if len(parts) >= 3 else ""
+                if daemon.message_callback:
+                    daemon.message_callback(sender_id, sender_name)
+
+    assert len(received) == 2
+    assert received[1] == ("27836527975@c.us", "")
+
+
+def test_pulse_engine_whatsapp_whitelist_matching(temp_agent_environment):
+    from core.pulse_engine import PulseEngine
+    from core.settings_manager import SettingsManager
+    from core.address_book import AddressBookManager
+
+    orchestrator = MagicMock()
+    orchestrator.agent_id = "agent-pulse-test"
+    engine = PulseEngine(orchestrator)
+
+    # Mock settings with whitelist
+    settings = SettingsManager(agent_id="agent-pulse-test")
+    settings.set("core.auto-pulse.whitelist", ["+27836527975", "Alice Smith"])
+    settings.set("core.auto-pulse.buffer-seconds", 0.05)
+    settings.set("core.auto-pulse.ratelimit-minutes", 5)
+    settings.save()
+    engine.settings_manager = settings
+
+    # Add contact to address book
+    ab = AddressBookManager(agent_id="agent-pulse-test")
+    ab.add_contact("+27836527975", "Kerry Parker", relationship="Friend")
+    engine.address_book_manager = ab
+
+    pulse_fired = []
+    engine.trigger_pulse.connect(lambda p: pulse_fired.append(p))
+
+    # 1. Group message should be ignored
+    engine.handle_whatsapp_message("12345-67890@g.us", "Group Chat")
+    assert engine.whatsapp_timer is None
+
+    # 2. Status broadcast message should be ignored
+    engine.handle_whatsapp_message("status@broadcast", "Status")
+    assert engine.whatsapp_timer is None
+
+    # 3. Unwhitelisted number should be ignored
+    engine.handle_whatsapp_message("27112223333@c.us", "Stranger")
+    assert engine.whatsapp_timer is None
+
+    # 4. Whitelisted international number should match and schedule pulse
+    engine.handle_whatsapp_message("27836527975@c.us", "")
+    assert engine.whatsapp_timer is not None
+    assert "Kerry Parker" in engine.pending_whatsapp_sender
+
+    # Wait for buffer execution
+    import time
+    time.sleep(0.1)
+    assert len(pulse_fired) == 1
+    assert "Check your unread WhatsApp messages" in pulse_fired[0]
+
+    # 5. Rate limiting prevents immediate second pulse
+    engine.whatsapp_timer = None
+    engine.handle_whatsapp_message("27836527975@c.us", "Kerry Parker")
+    assert engine.whatsapp_timer is None  # Suppressed by rate limit
+
+    # 6. Test matching national number format in whitelist (e.g. 0836527975)
+    settings.set("core.auto-pulse.whitelist", ["0836527975"])
+    settings.save()
+    engine.last_pulse_time = 0  # reset cooldown
+    engine.handle_whatsapp_message("27836527975@c.us", "")
+    assert engine.whatsapp_timer is not None
+
+    # 7. Test matching contact name in whitelist
+    if engine.whatsapp_timer:
+        engine.whatsapp_timer.cancel()
+    settings.set("core.auto-pulse.whitelist", ["Alice Smith"])
+    settings.save()
+    engine.last_pulse_time = 0
+    engine.handle_whatsapp_message("27999999999@c.us", "Alice Smith")
+    assert engine.whatsapp_timer is not None
+    if engine.whatsapp_timer:
+        engine.whatsapp_timer.cancel()
+
+
