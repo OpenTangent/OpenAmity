@@ -11,7 +11,7 @@ from core.cerebrum import Tool
 class TerminalSkill(Tool):
     name = "Terminal"
     description = "Allows the agent to execute bash commands on the local system."
-    commands = ["run", "run_async", "check_status", "kill_task"]
+    commands = ["run", "run_async", "check_status", "kill_task", "flag_for_backup"]
 
     def __init__(self, orchestrator=None):
         super().__init__(orchestrator)
@@ -89,6 +89,31 @@ class TerminalSkill(Tool):
                     },
                     "required": ["task_id"]
                 }
+            },
+            {
+                "name": "Terminal_flag_for_backup",
+                "description": (
+                    "Flags a file or directory path to be included in autonomous and manual agent .oaa backups. "
+                    "When an .oaa backup is created, all flagged files and full directories are backed up alongside your state files, "
+                    "and restored to their appropriate host locations upon restore. "
+                    "Every time this function is called, it automatically checks all paths in the list: missing paths are removed (reason 'missing'), "
+                    "and individual files or subdirectories within an already flagged directory are removed (reason 'redundant'). "
+                    "You will be informed of any removals."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "path": {
+                            "type": "STRING",
+                            "description": "The file or directory path to flag (e.g. '~/Documents/Nova/Code/MyProject' or '~/Documents/Nova/notes.txt'). Required for action='add' or 'remove'."
+                        },
+                        "action": {
+                            "type": "STRING",
+                            "description": "Action to perform: 'add' (default, flags a path for backup), 'remove' (unflags a path), or 'list' (verifies and lists currently flagged paths).",
+                            "enum": ["add", "remove", "list"]
+                        }
+                    }
+                }
             }
         ]
 
@@ -119,6 +144,8 @@ class TerminalSkill(Tool):
             return self._check_status(**kwargs)
         elif command == "kill_task":
             return self._kill_task(**kwargs)
+        elif command == "flag_for_backup":
+            return self._flag_for_backup(*args, **kwargs)
         return f"Unknown command: {command}"
 
     def _get_command_args(self, command_str, as_sudo):
@@ -287,6 +314,42 @@ class TerminalSkill(Tool):
             return f"Task {task_id} has been terminated."
         except Exception as e:
             return f"Error terminating task: {e}"
+
+    def _flag_for_backup(self, path=None, action="add", **kwargs) -> str:
+        agent_id = None
+        if self.orchestrator:
+            agent_id = getattr(self.orchestrator, "agent_id", None)
+
+        if not agent_id:
+            return "Error: Agent ID is not available from orchestrator to manage backup targets."
+
+        from core.backup_manager import sync_and_clean_backup_targets
+
+        success, msg, removals, current_targets = sync_and_clean_backup_targets(
+            agent_id=agent_id,
+            candidate_path=path,
+            action=action
+        )
+
+        lines = [f"=== Backup Flagging Result: {'SUCCESS' if success else 'NOTICE'} ==="]
+        lines.append(msg)
+
+        if removals:
+            lines.append("\nPruned from backup targets:")
+            for r in removals:
+                reason = r.get("reason", "unknown")
+                detail = f" ({r['detail']})" if r.get("detail") else ""
+                lines.append(f"- '{r['path']}': Removed [{reason}]{detail}")
+
+        if current_targets:
+            lines.append(f"\nCurrent active flagged backup targets ({len(current_targets)}):")
+            for t in current_targets:
+                tag = "[DIR]" if t.get("type") == "directory" else "[FILE]"
+                lines.append(f"- {tag} {t['path']}")
+        else:
+            lines.append("\nNo external files or directories are currently flagged for backup.")
+
+        return "\n".join(lines)
 
     def shutdown(self):
         logging.info("TerminalSkill: Shutting down background tasks...")

@@ -2,7 +2,7 @@ import markdown
 from datetime import datetime
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QTextEdit, QProgressBar)
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QTextCursor, QTextBlockFormat
 
 from gui.visualizer import SoundWaveVisualizer
@@ -20,11 +20,14 @@ class AgentView(QWidget):
     ui_message_appended = Signal(str, str)
     ui_busy_state_changed = Signal(bool, bool)
     ui_amplitude_emitted = Signal(float)
+    ui_paused_state_changed = Signal(bool)
+    ui_pause_pending_changed = Signal(bool)
 
     def __init__(self, orchestrator: AmityOrchestrator, parent=None):
         super().__init__(parent)
         self.orchestrator = orchestrator
         self.settings_manager = orchestrator.settings_manager
+        self.config_manager = ConfigManager()
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -71,6 +74,13 @@ class AgentView(QWidget):
         self.footer_layout.setContentsMargins(20, 10, 20, 10)
         self.footer_layout.setSpacing(10)
 
+        # Pause/Play Button (placed to the left of the user input textbox)
+        self.btn_pause = QPushButton()
+        self.btn_pause.setFixedSize(40, 40)
+        self.btn_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.footer_layout.addWidget(self.btn_pause)
+
         from gui.main_window import PromptTextEdit
         self.text_input = PromptTextEdit()
         self.text_input.returnPressed.connect(self.send_text_prompt)
@@ -111,18 +121,86 @@ class AgentView(QWidget):
 
         # Connect signals through PySide6 thread-safe signals
         self.ui_message_appended.connect(self.append_to_conversation)
-        self.orchestrator.on_message_appended.connect(
-            lambda s, t: self.ui_message_appended.emit(s, t))
+        self.orchestrator.on_message_appended.connect(self.ui_message_appended.emit)
 
         self.ui_busy_state_changed.connect(self.set_busy_state)
-        self.orchestrator.on_busy_state_changed.connect(
-            lambda b, s: self.ui_busy_state_changed.emit(b, s))
+        self.orchestrator.on_busy_state_changed.connect(self.ui_busy_state_changed.emit)
 
         self.ui_amplitude_emitted.connect(self.visualizer.set_amplitude)
-        self.orchestrator.on_amplitude_emitted.connect(
-            self.ui_amplitude_emitted.emit)
+        self.orchestrator.on_amplitude_emitted.connect(self.ui_amplitude_emitted.emit)
+
+        self.ui_paused_state_changed.connect(self.set_paused_state)
+        self.orchestrator.on_paused_state_changed.connect(self.ui_paused_state_changed.emit)
+
+        self.ui_pause_pending_changed.connect(self.set_pause_pending)
+        self.orchestrator.on_pause_pending.connect(self.ui_pause_pending_changed.emit)
+
+        self.set_paused_state(self.orchestrator.is_paused)
+
+    def cleanup(self):
+        try:
+            self.orchestrator.on_message_appended.disconnect(self.ui_message_appended.emit)
+            self.orchestrator.on_busy_state_changed.disconnect(self.ui_busy_state_changed.emit)
+            self.orchestrator.on_amplitude_emitted.disconnect(self.ui_amplitude_emitted.emit)
+            self.orchestrator.on_paused_state_changed.disconnect(self.ui_paused_state_changed.emit)
+            self.orchestrator.on_pause_pending.disconnect(self.ui_pause_pending_changed.emit)
+        except Exception:
+            pass
+
+    def toggle_pause(self):
+        was_paused = getattr(self.orchestrator, 'is_paused', False)
+        self.orchestrator.toggle_pause()
+        if was_paused and hasattr(self.orchestrator, 'pulse_engine') and hasattr(self.orchestrator.pulse_engine, 'notify_unpaused'):
+            self.orchestrator.pulse_engine.notify_unpaused()
+
+    def set_pause_pending(self, pending: bool):
+        if pending:
+            self.btn_pause.setEnabled(False)
+            self.text_input.setEnabled(False)
+            self.btn_send.setEnabled(False)
+            self.btn_mic.setEnabled(False)
+            self.text_input.setPlaceholderText("Consolidating memory before pausing...")
+
+    def set_paused_state(self, is_paused: bool):
+        self.btn_pause.setEnabled(True)
+        if is_paused:
+            self.btn_pause.setText("▶")
+            self.btn_pause.setToolTip("Resume Agent")
+            self.btn_pause.setStyleSheet(
+                "QPushButton { background-color: #4a3b10; color: #FFD700; border: 1px solid #AA8800; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji; } QPushButton:hover { background-color: #5c4914; }"
+            )
+            self.text_input.setEnabled(False)
+            self.text_input.setPlaceholderText("Agent is paused. Click ▶ to resume...")
+            self.btn_send.setEnabled(False)
+            self.btn_mic.setEnabled(False)
+            self.loading_bar.hide()
+            self.visualizer.set_active(False)
+            self.visualizer.hide()
+        else:
+            self.btn_pause.setText("⏸")
+            self.btn_pause.setToolTip("Pause Agent")
+            self.btn_pause.setStyleSheet(
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji; } QPushButton:hover { background-color: #444; }"
+            )
+            self.text_input.setPlaceholderText("Type a message...")
+            if getattr(self.orchestrator, 'is_busy', False) is True or getattr(self.orchestrator, 'is_thinking', False) is True:
+                self.btn_mic.setEnabled(True)
+                self.set_busy_state(True)
+            else:
+                self.text_input.setEnabled(True)
+                self.btn_send.setEnabled(True)
+                self.btn_mic.setEnabled(True)
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
+        if self.orchestrator.is_paused:
+            self.btn_mic.setText("🎤")
+            self.btn_mic.setStyleSheet(
+                "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+            self.loading_bar.hide()
+            self.visualizer.set_active(False)
+            self.visualizer.hide()
+            return
+
         if busy:
             self.btn_mic.setText("🟥")
             self.btn_mic.setStyleSheet(
@@ -145,6 +223,8 @@ class AgentView(QWidget):
             self.visualizer.hide()
 
     def toggle_mic(self):
+        if self.orchestrator.is_paused:
+            return
         self.orchestrator.toggle_mic()
 
     def toggle_mute(self, checked):
@@ -160,6 +240,8 @@ class AgentView(QWidget):
                 "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
 
     def send_text_prompt(self):
+        if self.orchestrator.is_paused:
+            return
         text = self.text_input.toPlainText().strip()
         if not text:
             return
@@ -174,8 +256,7 @@ class AgentView(QWidget):
     def append_to_conversation(self, sender, text):
         user_name = "User"
         try:
-            config = ConfigManager()
-            user_name = config.get("user-full-name", "").strip() or "User"
+            user_name = self.config_manager.get("user-full-name", "").strip() or "User"
         except Exception:
             pass
 

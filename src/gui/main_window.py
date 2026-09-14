@@ -26,6 +26,7 @@ class AgentTabButton(QPushButton):
         self.setFixedHeight(30)
         self.setCursor(Qt.PointingHandCursor)
         self.is_selected = False
+        self.is_paused = False
         self.activity_state = "idle"  # "idle", "thinking", "speaking"
         self._is_hovered = False
 
@@ -55,7 +56,18 @@ class AgentTabButton(QPushButton):
             self.pulse_phase -= 2 * math.pi
         self.update()
 
+    def set_paused(self, paused: bool):
+        if self.is_paused != paused:
+            self.is_paused = paused
+            if paused:
+                self.pulse_timer.stop()
+                self.pulse_phase = 0.0
+                self.activity_state = "idle"
+            self.update()
+
     def set_activity_state(self, state: str):
+        if self.is_paused:
+            state = "idle"
         if self.activity_state == state:
             return
         self.activity_state = state
@@ -95,7 +107,8 @@ class AgentTabButton(QPushButton):
 
     def sizeHint(self):
         fm = self.fontMetrics()
-        text_width = fm.horizontalAdvance(self.text())
+        display_text = f"{self.text()} ⏸" if self.is_paused else self.text()
+        text_width = fm.horizontalAdvance(display_text)
         return QSize(max(80, text_width + 30), 30)
 
     def paintEvent(self, event):
@@ -106,7 +119,20 @@ class AgentTabButton(QPushButton):
         rect = self.rect()
         draw_rect = rect.adjusted(0, 0, -1, -1)
 
-        if self.activity_state == "speaking":
+        if self.is_paused:
+            if self.is_selected:
+                bg_color = QColor("#2b2513")
+                border_color = QColor("#8a6d1c")
+                text_color = QColor("#e0c068")
+            elif self._is_hovered:
+                bg_color = QColor("#241e0f")
+                border_color = QColor("#665114")
+                text_color = QColor("#c2a659")
+            else:
+                bg_color = QColor("#1c180d")
+                border_color = QColor("#47380d")
+                text_color = QColor("#857342")
+        elif self.activity_state == "speaking":
             factor = (math.sin(self.pulse_phase) + 1.0) / 2.0
             bg_color = self._interpolate_color(self.secondary_dark, self.secondary_light, factor)
             border_color = self._interpolate_color(self.secondary_base, self.secondary_light, factor)
@@ -141,8 +167,9 @@ class AgentTabButton(QPushButton):
         painter.setPen(text_color)
 
         text_rect = rect.adjusted(15, 0, -15, 0)
+        display_text = f"{self.text()} ⏸" if self.is_paused else self.text()
         elided_text = painter.fontMetrics().elidedText(
-            self.text(), Qt.TextElideMode.ElideRight, text_rect.width())
+            display_text, Qt.TextElideMode.ElideRight, text_rect.width())
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, elided_text)
 
 
@@ -186,6 +213,7 @@ class PromptTextEdit(QTextEdit):
 class MainWindow(QMainWindow):
     ui_shutdown_complete = Signal()
     ui_agent_busy_state_changed = Signal(str, bool, bool)
+    ui_agent_paused_state_changed = Signal(str, bool)
 
     def __init__(self, agent_manager):
         super().__init__()
@@ -200,6 +228,8 @@ class MainWindow(QMainWindow):
 
         self.ui_agent_busy_state_changed.connect(
             self._on_agent_busy_state_changed)
+        self.ui_agent_paused_state_changed.connect(
+            self._on_agent_paused_state_changed)
 
         # Setup sys.stdout and sys.stderr redirection
         self.stdout_logger = StreamLogger(sys.stdout)
@@ -410,6 +440,16 @@ class MainWindow(QMainWindow):
         else:
             btn.set_activity_state("idle")
 
+    def _on_agent_paused_state_changed(self, agent_id: str, paused: bool):
+        if agent_id not in self.tab_buttons:
+            return
+        btn = self.tab_buttons[agent_id]
+        btn.set_paused(paused)
+        if not paused:
+            orch = self.agent_manager.get_orchestrator(agent_id)
+            if orch and hasattr(orch, 'pulse_engine') and hasattr(orch.pulse_engine, 'notify_unpaused'):
+                orch.pulse_engine.notify_unpaused()
+
     def navigate_to_agent_by_uid_or_id(self, target: str):
         if not target:
             return
@@ -433,6 +473,7 @@ class MainWindow(QMainWindow):
 
         agent_name = self.agent_manager.get_agent_name(agent_id)
         btn = AgentTabButton(agent_id, agent_name, self)
+        btn.set_paused(orchestrator.is_paused)
         btn.clicked.connect(lambda checked=False,
                             a=agent_id: self.switch_to_agent(a))
         self.tabs_layout.addWidget(btn)
@@ -441,6 +482,9 @@ class MainWindow(QMainWindow):
         orchestrator.on_shutdown_complete.connect(self.check_all_shutdown)
         orchestrator.on_busy_state_changed.connect(
             lambda busy, speaking, aid=agent_id: self.ui_agent_busy_state_changed.emit(aid, busy, speaking)
+        )
+        orchestrator.on_paused_state_changed.connect(
+            lambda paused, aid=agent_id: self.ui_agent_paused_state_changed.emit(aid, paused)
         )
         self.update_chatroom_tab_visibility()
 
@@ -512,6 +556,7 @@ class MainWindow(QMainWindow):
             view = self.agent_views.pop(aid)
             self.agents_stack.removeWidget(view)
             self.consoles_stack.removeWidget(view.console_log)
+            view.cleanup()
             view.deleteLater()
 
             btn = self.tab_buttons.pop(aid)
@@ -584,6 +629,7 @@ class MainWindow(QMainWindow):
                 old_view = self.agent_views.pop(agent_id)
                 self.agents_stack.removeWidget(old_view)
                 self.consoles_stack.removeWidget(old_view.console_log)
+                old_view.cleanup()
                 old_view.deleteLater()
 
             # Start fresh orchestrator for restored agent
@@ -596,6 +642,14 @@ class MainWindow(QMainWindow):
             new_orch.on_busy_state_changed.connect(
                 lambda busy, speaking, aid=agent_id: self.ui_agent_busy_state_changed.emit(aid, busy, speaking)
             )
+            new_orch.on_paused_state_changed.connect(
+                lambda paused, aid=agent_id: self.ui_agent_paused_state_changed.emit(aid, paused)
+            )
+            if hasattr(new_orch, 'pulse_engine') and hasattr(new_orch.pulse_engine, 'notify_unpaused'):
+                new_orch.pulse_engine.notify_unpaused()
+
+            if agent_id in self.tab_buttons:
+                self.tab_buttons[agent_id].set_paused(getattr(new_orch, 'is_paused', False))
 
             self.update_tab_names()
             self.switch_to_agent(agent_id)
@@ -622,12 +676,12 @@ class MainWindow(QMainWindow):
         for aid, view in self.agent_views.items():
             orch = view.orchestrator
             fatigue = orch.get_fatigue() if hasattr(orch, 'get_fatigue') else 0.0
-            if fatigue >= 0.05:
+            if not getattr(orch, 'is_paused', False) and fatigue >= 0.02:
                 view.append_to_conversation(
                     "System", "Consolidating memories for graceful shutdown... please wait.")
                 orch.shutdown(force_sleep=True)
             else:
-                orch.shutdown()
+                orch.shutdown(force_sleep=False)
 
     def check_all_shutdown(self):
         if not self._shutting_down:

@@ -69,3 +69,8 @@ def get_chatroom_db_path() -> str:
     """Returns the path to the shared chatroom.db SQLite database"""
     return os.path.join(get_chatroom_dir(), "chatroom.db")
 
+
+def get_backup_targets_file(agent_id: str) -> str:
+    """Returns the path to the backup targets JSON file for a specific agent"""
+    return os.path.join(get_base_dir_for(agent_id), "backup_targets.json")
+

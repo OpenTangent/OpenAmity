@@ -409,11 +409,11 @@ class WhatsAppSkill(Tool):
                     voice = "Achernar"
                     voice_prompt = ""
 
+                from core.audio_output import normalize_gemini_voice_models
                 gemini_settings = settings.get(
                     "core.gemini", {}) if settings else {}
-                voice_models = gemini_settings.get(
-                    "voice-models", ["gemini-3.1-flash-tts-preview"])
-                model_name = voice_models[0] if voice_models else "gemini-3.1-flash-tts-preview"
+                voice_models = normalize_gemini_voice_models(gemini_settings.get("voice-models"))
+                model_name = voice_models[0]
 
                 temp_fd, temp_wav = tempfile.mkstemp(suffix=".wav")
                 os.close(temp_fd)

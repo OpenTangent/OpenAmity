@@ -218,6 +218,7 @@ def test_pulse_engine_whatsapp_whitelist_matching(temp_agent_environment):
 
     orchestrator = MagicMock()
     orchestrator.agent_id = "agent-pulse-test"
+    orchestrator.is_paused = False
     engine = PulseEngine(orchestrator)
 
     # Mock settings with whitelist

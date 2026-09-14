@@ -5,23 +5,43 @@ import json
 
 class SpeakerTool(Tool):
     name = "Speaker"
-    description = "Use this tool to speak aloud to the user or output text. YOU ARE FULLY AUTONOMOUS regarding your speech. If you do not use this tool, you will remain completely silent. You must explicitly use this tool to communicate your thoughts or findings to the user. Speak from a first-person perspective ('I'). Use audio tags like [whisper], [sigh], [laugh], [excitedly] autonomously where appropriate to add emotion to your speech."
+    description = (
+        "Use this tool to speak aloud to the user or output text. YOU ARE FULLY AUTONOMOUS regarding your speech. "
+        "If you do not use this tool, you will remain completely silent. You must explicitly use this tool to communicate "
+        "your thoughts or findings to the user. Speak from a first-person perspective ('I').\n"
+        "AUDIO STABILITY GUIDELINES (Gemini TTS 3.1 & 2.5):\n"
+        "- Conciseness: Keep spoken turns concise (<150 words / ~45s) to maintain autoregressive audio stability and prevent "
+        "acoustic watchdog safety aborts (FinishReason.SAFETY).\n"
+        "- Expressive Cues: Natural voiced emotional tags like [laugh], [sigh], [thoughtful], [deadpan], or [curious] work well. "
+        "Avoid or strictly minimize unvoiced breathy tags like [whisper] or [softly], as unvoiced turbulence can trigger acoustic anomaly watchdogs.\n"
+        "- Long Content: NEVER read large data, code blocks, tables, or lengthy quotes aloud. Always use 'output_text' for silent GUI display.\n"
+        "- Resilience: If an acoustic safety abort ever interrupts audio, the system automatically falls back to the robust gemini-2.5-flash-preview-tts model."
+    )
     commands = [
-        "speak_aloud <text> (Says the words you provide aloud to the user. Includes support for audio cues like [laugh] or [sigh].)",
-        "output_text <text> (Outputs verbatim text to the GUI without any audio. Useful for pasting data/code without reading it aloud.)"
+        "speak_aloud <text> (Synthesizes text aloud via neural TTS. Keep under ~150 words / ~45s; avoid unvoiced [whisper]; supports voiced cues like [laugh] or [sigh].)",
+        "output_text <text> (Outputs verbatim markdown text to the GUI without audio. Essential for code, tables, long quotes, or data blocks.)"
     ]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
             {
                 "name": "Speaker_speak_aloud",
-                "description": "Speak text aloud to the user. Use this when you want to communicate, including audio tags like [whisper] or [sigh].",
+                "description": (
+                    "Speak text aloud to the user via neural TTS. Keep spoken turns concise (<150 words / ~45s) "
+                    "to maintain acoustic decoder stability and prevent server-side audio watchdog aborts (FinishReason.SAFETY). "
+                    "Voiced emotional cues like [laugh], [sigh], [thoughtful], or [deadpan] are well-supported, but avoid unvoiced "
+                    "breathy cues ([whisper], [softly]) which trip acoustic anomaly monitors. If an acoustic abort occurs, the system "
+                    "gracefully retries with gemini-2.5-flash-preview-tts. For long text, code, or data, use Speaker_output_text instead."
+                ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "text": {
                             "type": "STRING",
-                            "description": "The exact text to speak aloud."
+                            "description": (
+                                "The exact text to speak aloud. Aim for natural, conversational dialogue under 150 words (~45s). "
+                                "Avoid unvoiced whispers or massive monologues to ensure smooth acoustic decoding."
+                            )
                         }
                     },
                     "required": ["text"]
@@ -29,13 +49,16 @@ class SpeakerTool(Tool):
             },
             {
                 "name": "Speaker_output_text",
-                "description": "Output markdown text to the user's GUI without speaking it aloud. Use this for sharing raw data, code, or lengthy information.",
+                "description": (
+                    "Output markdown text to the user's GUI without speaking it aloud. Use this for sharing raw data, "
+                    "code snippets, technical explanations, citations, tables, or lengthy text blocks to prevent audio TTS overhead and aborts."
+                ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "text": {
                             "type": "STRING",
-                            "description": "The text to display in the GUI."
+                            "description": "The markdown text to display silently in the GUI."
                         }
                     },
                     "required": ["text"]

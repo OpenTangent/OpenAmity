@@ -21,7 +21,7 @@ class MediaSkill(Tool):
         return [
             {
                 "name": "Media_read",
-                "description": "Reads a media file from the local file system and appends it to your multimodal context. Use this when you want to view an image, listen to an audio file, or read a PDF that you have found in the file system.",
+                "description": "Reads a media file from the local file system and appends it to your multimodal context. Use this when you want to view an image, listen to an audio file, or read a PDF.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {

@@ -3,6 +3,7 @@ import importlib
 import inspect
 import os
 import logging
+import threading
 from typing import Dict, List, Any
 
 
@@ -34,6 +35,7 @@ class Cerebrum:
     def __init__(self, orchestrator=None, settings_manager=None, skills_dir="src/tools", manual_path="src/memory/agent_manual.md"):
         self.orchestrator = orchestrator
         self.settings_manager = settings_manager
+        self._tools_lock = threading.RLock()
         self.tools: Dict[str, Tool] = {}
         self.skills_dir = skills_dir
         self.manual_path = os.path.abspath(manual_path)
@@ -45,7 +47,9 @@ class Cerebrum:
             os.makedirs(self.skills_dir)
 
         import sys
-        sys.path.append(os.getcwd())  # Ensure root is in path
+        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
 
         try:
             for filename in os.listdir(self.skills_dir):
@@ -79,34 +83,40 @@ class Cerebrum:
                 f"Error scanning tools directory: {e}", exc_info=True)
 
     def register_skill(self, tool: Tool):
-        self.tools[tool.name] = tool
+        with self._tools_lock:
+            self.tools[tool.name] = tool
 
-    def get_agent_manual(self) -> str:
+    def get_agent_manual(self, include_tool_entries: bool = False) -> str:
         """Generates the Agent Manual from loaded tools and the manual file."""
         manual = ""
         if os.path.exists(self.manual_path):
             try:
-                with open(self.manual_path, 'r') as f:
+                with open(self.manual_path, 'r', encoding='utf-8') as f:
                     manual = f.read() + "\n\n"
             except Exception as e:
                 logging.error(f"Error loading manual file: {e}", exc_info=True)
 
-        manual += "### Available Tools\n"
-        for tool in self.tools.values():
-            manual += tool.get_manual_entry() + "\n"
+        if include_tool_entries:
+            manual += "### Available Tools\n"
+            with self._tools_lock:
+                for tool in self.tools.values():
+                    manual += tool.get_manual_entry() + "\n"
         return manual
 
     def get_all_tool_declarations(self) -> list:
         """Returns all registered tool declarations formatted for the Gemini API."""
         tools = []
-        for tool in self.tools.values():
-            tools.extend(tool.get_tool_declarations())
+        with self._tools_lock:
+            for tool in self.tools.values():
+                tools.extend(tool.get_tool_declarations())
         return tools
 
     def execute_command(self, skill_name: str, command: str, *args, **kwargs) -> str:
         """Executes a command on a specific tool."""
-        if skill_name in self.tools:
-            return self.tools[skill_name].execute(command, *args, **kwargs)
+        with self._tools_lock:
+            tool = self.tools.get(skill_name)
+        if tool:
+            return tool.execute(command, *args, **kwargs)
         return f"Error: Tool '{skill_name}' not found."
 
     def execute_tool_call(self, function_name: str, args: dict) -> str:
@@ -114,7 +124,8 @@ class Cerebrum:
         if "_" in function_name:
             skill_name, command = function_name.split("_", 1)
             try:
-                return self.execute_command(skill_name, command, **args)
+                with self._tools_lock:
+                    return self.execute_command(skill_name, command, **args)
             except Exception as e:
                 logging.getLogger("core.Cerebrum").exception(f"Error executing tool '{function_name}'")
                 return f"Error executing '{function_name}': {type(e).__name__}: {str(e)}"
@@ -126,8 +137,9 @@ class Cerebrum:
             return
 
         import sys
-        if os.getcwd() not in sys.path:
-            sys.path.append(os.getcwd())
+        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
 
         try:
             discovered_tools = {}
@@ -146,25 +158,26 @@ class Cerebrum:
                         logging.error(
                             f"Failed to inspect tool module {module_name}: {e}", exc_info=True)
 
-            for skill_name, obj in discovered_tools.items():
-                is_enabled = True
-                if self.settings_manager:
-                    is_enabled = self.settings_manager.get(
-                        f"core.tools.{skill_name.lower()}", True)
+            with self._tools_lock:
+                for skill_name, obj in discovered_tools.items():
+                    is_enabled = True
+                    if self.settings_manager:
+                        is_enabled = self.settings_manager.get(
+                            f"core.tools.{skill_name.lower()}", True)
 
-                if is_enabled and skill_name not in self.tools:
-                    skill_instance = obj(orchestrator=self.orchestrator)
-                    self.register_skill(skill_instance)
-                    logging.info(f"Dynamically enabled tool: {skill_name}")
-                elif not is_enabled and skill_name in self.tools:
-                    logging.info(f"Dynamically disabling tool: {skill_name}")
-                    tool = self.tools.pop(skill_name)
-                    if hasattr(tool, "shutdown"):
-                        try:
-                            tool.shutdown()
-                        except Exception as e:
-                            logging.error(
-                                f"Error shutting down tool {skill_name}: {e}", exc_info=True)
+                    if is_enabled and skill_name not in self.tools:
+                        skill_instance = obj(orchestrator=self.orchestrator)
+                        self.register_skill(skill_instance)
+                        logging.info(f"Dynamically enabled tool: {skill_name}")
+                    elif not is_enabled and skill_name in self.tools:
+                        logging.info(f"Dynamically disabling tool: {skill_name}")
+                        tool = self.tools.pop(skill_name)
+                        if hasattr(tool, "shutdown"):
+                            try:
+                                tool.shutdown()
+                            except Exception as e:
+                                logging.error(
+                                    f"Error shutting down tool {skill_name}: {e}", exc_info=True)
 
         except Exception as e:
             logging.error(
@@ -173,10 +186,11 @@ class Cerebrum:
     def shutdown(self):
         """Cleanly shuts down all loaded tools."""
         logging.info("Cerebrum: Shutting down tools...")
-        for skill_name, tool in self.tools.items():
-            if hasattr(tool, "shutdown"):
-                try:
-                    tool.shutdown()
-                except Exception as e:
-                    logging.error(
-                        f"Error shutting down tool {skill_name}: {e}", exc_info=True)
+        with self._tools_lock:
+            for skill_name, tool in list(self.tools.items()):
+                if hasattr(tool, "shutdown"):
+                    try:
+                        tool.shutdown()
+                    except Exception as e:
+                        logging.error(
+                            f"Error shutting down tool {skill_name}: {e}", exc_info=True)

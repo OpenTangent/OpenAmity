@@ -527,3 +527,48 @@ def test_restore_preserves_executable_permissions(temp_backup_env):
     assert os.access(restored_script, os.X_OK)
 
 
+def test_backup_manager_c2_sensitive_path_rejection(temp_backup_env):
+    from core.backup_manager import sync_and_clean_backup_targets
+    am = AgentManager()
+    aid = am.create_new_agent()
+
+    # Attempt to flag sensitive dotfiles / system paths
+    sensitive_paths = ["~/.ssh/id_rsa", "~/.bashrc", "~/.profile", "/etc/passwd", "/usr/bin"]
+    for path in sensitive_paths:
+        success, msg, removals, current = sync_and_clean_backup_targets(aid, path, action="add")
+        assert success is False
+        assert "protected or unsafe" in msg
+
+
+def test_backup_manager_c1_zip_slip_rejection(temp_backup_env):
+    am = AgentManager()
+    aid = am.create_new_agent()
+    settings = SettingsManager(agent_id=aid)
+    settings.set("core.agent.name", "SlipTest")
+    settings.save()
+
+    backup_path = create_agent_backup(
+        aid,
+        destination_dir=temp_backup_env["backup_dest_dir"],
+        agent_manager=am
+    )
+
+    # Craft a malicious archive entry attempting Zip Slip
+    with zipfile.ZipFile(backup_path, "a") as zf:
+        zf.writestr("../evil.txt", "payload")
+
+    # Delete agent to restore as new instance
+    am.delete_agent(aid)
+
+    # Restoring should skip the malicious entry without escaping target_dir
+    success, msg, details = restore_agent_backup(backup_path, agent_manager=am)
+    assert success is True
+    new_aid = details["agent_id"]
+    new_dir = paths.get_agent_data_dir(new_aid)
+
+    # Verify evil.txt was NOT written to parent of new_dir
+    parent_dir = os.path.dirname(new_dir)
+    assert not os.path.exists(os.path.join(parent_dir, "evil.txt"))
+
+
+

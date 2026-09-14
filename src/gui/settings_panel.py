@@ -5,7 +5,7 @@ import threading
 import qrcode
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QLabel, QLineEdit, QTextEdit, QComboBox, QCheckBox,
-                               QRadioButton, QStackedWidget, QListWidget, QInputDialog, QSlider,
+                               QRadioButton, QButtonGroup, QStackedWidget, QListWidget, QInputDialog, QSlider,
                                QSpinBox, QScrollArea, QFrame, QFileDialog, QMessageBox, QDialog,
                                QProgressBar)
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QThread
@@ -17,6 +17,11 @@ import ssl
 
 from core.email_auth import execute_desktop_oauth_flow, exchange_authorization_code
 from core.config_manager import ConfigManager
+
+try:
+    from gui.editable_list_widget import EditableItemListWidget
+except ImportError:
+    from editable_list_widget import EditableItemListWidget
 
 try:
     from gui.theme import (PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR,
@@ -416,6 +421,15 @@ class AgentBackupSelectionDialog(QDialog):
             self.btn_backup.setEnabled(True)
             self.btn_cancel.setText("Cancel")
 
+    def closeEvent(self, event):
+        if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+BackupProgressDialog = AgentBackupSelectionDialog
+
 
 class FocusOutFilter(QObject):
     def __init__(self, callback, parent=None):
@@ -434,11 +448,14 @@ class SettingsPanelWidget(QWidget):
     settings_saved = Signal()
     oauth_finished = Signal(bool, str, str)
     agent_restored = Signal(str, bool)
+    whatsapp_status_updated = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.wizard_mode = False
         self.oauth_finished.connect(self._handle_oauth_result)
+        self.whatsapp_status_updated.connect(self._on_whatsapp_status_updated)
+        self._whatsapp_polling = False
         self.current_section_index = 0
         self.settings = None
         self.config = ConfigManager()
@@ -457,40 +474,72 @@ class SettingsPanelWidget(QWidget):
         self.init_ui()
         self.load_system_config()
 
+    def _on_whatsapp_status_updated(self, status: str, payload: str):
+        if not hasattr(self, 'ui_qr_code') or self.ui_qr_code is None:
+            return
+        if status == "disabled":
+            self.ui_qr_code.setText("[WhatsApp Disabled]")
+            self.ui_qr_code.setPixmap(QPixmap())
+        elif status == "ready":
+            self.ui_qr_code.setPixmap(QPixmap())
+            self.ui_qr_code.setText("✓ WhatsApp Authenticated")
+        elif status == "qr":
+            try:
+                qr_img = qrcode.make(payload)
+                buf = io.BytesIO()
+                qr_img.save(buf, format="PNG")
+                img = QImage.fromData(buf.getvalue())
+                pixmap = QPixmap.fromImage(img)
+                self.ui_qr_code.setPixmap(
+                    pixmap.scaled(200, 200, Qt.KeepAspectRatio))
+            except Exception:
+                self.ui_qr_code.setPixmap(QPixmap())
+                self.ui_qr_code.setText("[Error Rendering QR]")
+        elif status == "waiting":
+            self.ui_qr_code.setPixmap(QPixmap())
+            self.ui_qr_code.setText("[Waiting for QR...]")
+        elif status == "offline":
+            self.ui_qr_code.setPixmap(QPixmap())
+            self.ui_qr_code.setText("[WhatsApp Bridge Not Running]")
+
     def poll_whatsapp_status(self):
         # Only poll if the current tab is Social Accounts (index 4)
         if self.stack.currentIndex() != 4:
             return
 
-        if not self.ui_use_whatsapp.isChecked():
-            self.ui_qr_code.setText("[WhatsApp Disabled]")
-            self.ui_qr_code.setPixmap(QPixmap())
+        if not hasattr(self, 'ui_use_whatsapp') or not self.ui_use_whatsapp.isChecked():
+            self._on_whatsapp_status_updated("disabled", "")
             return
 
-        try:
-            from core.whatsapp_daemon import WhatsAppDaemon
-            agent_id = self.settings.agent_id if hasattr(self, 'settings') and self.settings else None
-            port = WhatsAppDaemon.get_port_for_agent(agent_id)
-            res = requests.get(f"http://localhost:{port}/status", timeout=1)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("ready"):
-                    self.ui_qr_code.setPixmap(QPixmap())
-                    self.ui_qr_code.setText("✓ WhatsApp Authenticated")
-                elif data.get("qr"):
-                    qr_img = qrcode.make(data["qr"])
-                    buf = io.BytesIO()
-                    qr_img.save(buf, format="PNG")
-                    img = QImage.fromData(buf.getvalue())
-                    pixmap = QPixmap.fromImage(img)
-                    self.ui_qr_code.setPixmap(
-                        pixmap.scaled(200, 200, Qt.KeepAspectRatio))
+        if getattr(self, '_whatsapp_polling', False):
+            return
+
+        self._whatsapp_polling = True
+        agent_id = self.settings.agent_id if hasattr(self, 'settings') and self.settings else None
+
+        def _worker():
+            try:
+                from core.whatsapp_daemon import WhatsAppDaemon
+                port = WhatsAppDaemon.get_port_for_agent(agent_id)
+                res = requests.get(f"http://localhost:{port}/status", timeout=1)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("ready"):
+                        self.whatsapp_status_updated.emit("ready", "")
+                    elif data.get("qr"):
+                        self.whatsapp_status_updated.emit("qr", data["qr"])
+                    else:
+                        self.whatsapp_status_updated.emit("waiting", "")
                 else:
-                    self.ui_qr_code.setPixmap(QPixmap())
-                    self.ui_qr_code.setText("[Waiting for QR...]")
-        except requests.exceptions.RequestException:
-            self.ui_qr_code.setPixmap(QPixmap())
-            self.ui_qr_code.setText("[WhatsApp Bridge Not Running]")
+                    self.whatsapp_status_updated.emit("offline", "")
+            except Exception:
+                self.whatsapp_status_updated.emit("offline", "")
+            finally:
+                self._whatsapp_polling = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    check_whatsapp_status = poll_whatsapp_status
 
     def init_ui(self):
         self.setStyleSheet(f"""
@@ -735,58 +784,253 @@ class SettingsPanelWidget(QWidget):
         self.stack.addWidget(panel)
 
     def build_agent_values_goals(self):
-        panel, layout, _ = self.create_panel_container(
+        panel, main_layout, _ = self.create_panel_container(
             "Agent Values and Goals")
 
-        layout.addWidget(QLabel("Core Values:"))
-        self.ui_core_values = QListWidget()
-        self.ui_core_values.setFixedHeight(120)  # Max 4 items visible roughly
-        layout.addWidget(self.ui_core_values)
-        layout.addLayout(self.create_list_controls(
-            self.ui_core_values, "Add Core Value"))
+        # 1. Core Values Card
+        card_values, layout_values = self.create_card_container()
 
-        layout.addWidget(QLabel("Overarching Goals:"))
-        self.ui_overarching_goals = QListWidget()
-        self.ui_overarching_goals.setFixedHeight(120)
-        layout.addWidget(self.ui_overarching_goals)
-        layout.addLayout(self.create_list_controls(
-            self.ui_overarching_goals, "Add Goal"))
+        self.lbl_values_header = QLabel("<b>Core Values</b>")
+        self.lbl_values_header.setStyleSheet(
+            "background-color: transparent; font-size: 16px;")
+        layout_values.addWidget(self.lbl_values_header)
+
+        guide_values = QLabel(
+            "The foundational moral and behavioral principles guiding your agent's tone, ethics, and judgment.<br>"
+            "<i>Recommended: 3–5 core values for optimal prompt focus and adherence.</i>")
+        guide_values.setTextFormat(Qt.RichText)
+        guide_values.setWordWrap(True)
+        guide_values.setStyleSheet(
+            "background-color: transparent; color: #AAA; font-size: 13px;")
+        layout_values.addWidget(guide_values)
+
+        self.ui_core_values = EditableItemListWidget(
+            add_button_text="+ Add Value",
+            placeholder_text="e.g. Inclusivity (Actively seek out quiet voices and ensure low-friction connection)",
+            empty_message="No core values defined yet. Click '+ Add Value' below to add one.")
+        layout_values.addWidget(self.ui_core_values)
+        main_layout.addWidget(card_values)
+
+        main_layout.addSpacing(10)
+
+        # 2. Overarching Goals Card
+        card_goals, layout_goals = self.create_card_container()
+
+        self.lbl_goals_header = QLabel("<b>Overarching Goals</b>")
+        self.lbl_goals_header.setStyleSheet(
+            "background-color: transparent; font-size: 16px;")
+        layout_goals.addWidget(self.lbl_goals_header)
+
+        guide_goals = QLabel(
+            "The persistent long-term missions and strategic aspirations your agent proactively strives to accomplish.<br>"
+            "<i>Recommended: 2–4 overarching goals for sustained agency across conversations and autonomy pulses.</i>")
+        guide_goals.setTextFormat(Qt.RichText)
+        guide_goals.setWordWrap(True)
+        guide_goals.setStyleSheet(
+            "background-color: transparent; color: #AAA; font-size: 13px;")
+        layout_goals.addWidget(guide_goals)
+
+        self.ui_overarching_goals = EditableItemListWidget(
+            add_button_text="+ Add Goal",
+            placeholder_text="e.g. Eradicate Communication Silos (Proactively bridge gaps between isolated groups)",
+            empty_message="No overarching goals defined yet. Click '+ Add Goal' below to add one.")
+        layout_goals.addWidget(self.ui_overarching_goals)
+        main_layout.addWidget(card_goals)
+
+        # Connect dynamic count updates to headers
+        def update_values_header(count):
+            self.lbl_values_header.setText(
+                f"<b>Core Values</b> <span style='color: #888; font-size: 14px;'>({count})</span>")
+
+        def update_goals_header(count):
+            self.lbl_goals_header.setText(
+                f"<b>Overarching Goals</b> <span style='color: #888; font-size: 14px;'>({count})</span>")
+
+        self.ui_core_values.count_changed.connect(update_values_header)
+        self.ui_overarching_goals.count_changed.connect(update_goals_header)
+
+        # Auto-save changes on modification
+        self.ui_core_values.items_changed.connect(self.save_settings)
+        self.ui_overarching_goals.items_changed.connect(self.save_settings)
 
         self.stack.addWidget(panel)
 
     def build_agent_voice(self):
-        panel, layout, _ = self.create_panel_container("Agent Voice")
+        panel, main_layout, _ = self.create_panel_container("Agent Voice")
 
-        layout.addWidget(QLabel("Voice Prompt (Profile):"))
-        self.ui_voice_prompt = QTextEdit()
-        self.ui_voice_prompt.setFixedHeight(80)
-        layout.addWidget(self.ui_voice_prompt)
-        layout.addWidget(self.create_tip(
-            "Set the vocal profile for the Gemini TTS engine. This directs the agent's tone, accent, and style."))
+        self.tts_button_group = QButtonGroup(self)
 
-        layout.addWidget(QLabel("High Quality Voice (Gemini TTS):"))
-        self.ui_voice = QLineEdit()
-        layout.addWidget(self.ui_voice)
-        layout.addWidget(self.create_tip(
-            "To find more voice model strings go to: <a href='https://docs.cloud.google.com/text-to-speech/docs/gemini-tts'>Gemini TTS Documentation</a>"))
+        self.ui_use_piper_tts = QRadioButton("Use Piper TTS (Local)")
+        self.tts_button_group.addButton(self.ui_use_piper_tts)
+        main_layout.addWidget(self.ui_use_piper_tts)
 
-        layout.addWidget(QLabel("Fallback Voice (Piper TTS):"))
+        card_piper, layout_piper = self.create_card_container()
+        lbl_piper = QLabel("<b>Piper TTS Setup (Local)</b>")
+        lbl_piper.setStyleSheet(
+            "background-color: transparent; font-size: 16px;")
+        layout_piper.addWidget(lbl_piper)
+
+        guide_piper = QLabel(
+            "Fully local, offline neural text-to-speech engine running on CPU using ONNX models.<br>"
+            "No API key required, zero latency overhead, completely private, and zero cloud token cost.")
+        guide_piper.setTextFormat(Qt.RichText)
+        guide_piper.setWordWrap(True)
+        guide_piper.setStyleSheet("background-color: transparent;")
+        layout_piper.addWidget(guide_piper)
+
+        layout_piper.addWidget(QLabel("Piper Voice Model:"))
         self.ui_fallback_voice = QLineEdit()
-        layout.addWidget(self.ui_fallback_voice)
-        layout.addWidget(self.create_tip(
+        layout_piper.addWidget(self.ui_fallback_voice)
+        layout_piper.addWidget(self.create_tip(
             "To find more Piper TTS voice model strings go to: <a href='https://rhasspy.github.io/piper-samples/#en_GB-cori-high'>Piper Samples</a>"))
+        main_layout.addWidget(card_piper)
 
-        self.ui_prefer_local_tts = QCheckBox("Prefer Fallback TTS")
-        layout.addWidget(self.ui_prefer_local_tts)
-        layout.addWidget(self.create_tip(
-            "Use the lighter and cheaper fallback voice model at the cost of quality"))
+        main_layout.addSpacing(10)
 
-        self.ui_voice_prompt.installEventFilter(self.focus_out_filter)
-        self.ui_voice.editingFinished.connect(self.save_settings)
+        self.ui_use_gemini_tts = QRadioButton("Use Gemini TTS (Cloud)")
+        self.tts_button_group.addButton(self.ui_use_gemini_tts)
+        main_layout.addWidget(self.ui_use_gemini_tts)
+
+        card_gemini, layout_gemini = self.create_card_container()
+        lbl_gemini = QLabel("<b>Gemini TTS Setup (Cloud)</b>")
+        lbl_gemini.setStyleSheet(
+            "background-color: transparent; font-size: 16px;")
+        layout_gemini.addWidget(lbl_gemini)
+
+        guide_gemini = QLabel(
+            "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>"
+            "2. Sign in with your Google Account.<br>"
+            "3. Click 'Get API key' and paste it below.<br><br>"
+            "<i>Note: This Gemini API key is dedicated to speech synthesis. Any cognitive worker "
+            "(Claude, ChatGPT, DeepSeek, Antigravity, or Gemini) can vocalize using high-quality Gemini TTS when configured here.</i>")
+        guide_gemini.setTextFormat(Qt.RichText)
+        guide_gemini.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_gemini.setOpenExternalLinks(True)
+        guide_gemini.setWordWrap(True)
+        guide_gemini.setStyleSheet("background-color: transparent;")
+        layout_gemini.addWidget(guide_gemini)
+
+        layout_gemini.addWidget(QLabel("Gemini API Key (for TTS):"))
+        self.ui_gemini_tts_api_key = QLineEdit()
+        self.ui_gemini_tts_api_key.setEchoMode(QLineEdit.Password)
+        self.ui_gemini_tts_api_key.setPlaceholderText("Paste Gemini API Key for TTS...")
+        layout_gemini.addWidget(self.ui_gemini_tts_api_key)
+
+        layout_gemini.addSpacing(6)
+
+        # Voice Character Configuration: Gender, Age, Accent, Style
+        lbl_char = QLabel("<b>Voice Character Configuration</b>")
+        lbl_char.setStyleSheet("background-color: transparent; font-size: 14px;")
+        layout_gemini.addWidget(lbl_char)
+
+        layout_gemini.addWidget(QLabel("Gender:"))
+        self.ui_tts_gender = QComboBox()
+        self.ui_tts_gender.addItems(["Female", "Male", "Non-binary / Neutral"])
+        layout_gemini.addWidget(self.ui_tts_gender)
+
+        layout_gemini.addWidget(QLabel("Age:"))
+        self.ui_tts_age = QComboBox()
+        self.ui_tts_age.addItems(["Young Adult (20s - 30s)", "Youthful (18 - 25)", "Adult (30s - 50s)", "Mature / Senior (50+)"])
+        layout_gemini.addWidget(self.ui_tts_age)
+
+        layout_gemini.addWidget(QLabel("Accent:"))
+        self.ui_tts_accent = QComboBox()
+        self.ui_tts_accent.addItems([
+            "South African",
+            "American (General)",
+            "British (RP / Standard)",
+            "British (London / Modern)",
+            "Australian",
+            "Irish",
+            "Scottish",
+            "Canadian",
+            "Indian",
+            "French-accented English",
+            "Spanish-accented English",
+            "German-accented English",
+            "Japanese-accented English",
+            "Custom..."
+        ])
+        layout_gemini.addWidget(self.ui_tts_accent)
+
+        self.ui_tts_custom_accent = QLineEdit()
+        self.ui_tts_custom_accent.setPlaceholderText("Enter custom regional accent (e.g., Nigerian, Jamaican, Texan)...")
+        self.ui_tts_custom_accent.setVisible(False)
+        layout_gemini.addWidget(self.ui_tts_custom_accent)
+
+        layout_gemini.addWidget(QLabel("Style (Personality):"))
+        self.ui_tts_style = QComboBox()
+        self.ui_tts_style.addItems([
+            "Warm & Empathetic",
+            "Calm & Analytical",
+            "Cheerful & Energetic",
+            "Casual & Playful",
+            "Professional & Informative",
+            "Vibrant & Sassy",
+            "Gentle & Serene",
+            "Custom..."
+        ])
+        layout_gemini.addWidget(self.ui_tts_style)
+
+        self.ui_tts_custom_style = QLineEdit()
+        self.ui_tts_custom_style.setPlaceholderText("Enter custom personality/style (e.g., Dry wit and sarcastic)...")
+        self.ui_tts_custom_style.setVisible(False)
+        layout_gemini.addWidget(self.ui_tts_custom_style)
+
+        layout_gemini.addSpacing(6)
+
+        self.ui_tts_allow_agent_override = QCheckBox("Allow agent to set their own voice")
+        self.ui_tts_allow_agent_override.setChecked(True)
+        layout_gemini.addWidget(self.ui_tts_allow_agent_override)
+        layout_gemini.addWidget(self.create_tip(
+            "Enables the agent to autonomously update their directorial voice prompt using the System tool."
+        ))
+
+        layout_gemini.addWidget(self.create_tip(
+            "Preview Gemini's 30 prebuilt voices at: <a href='https://aistudio.google.com/generate-speech'>Google AI Studio Voice Library</a>. "
+            "For full directorial script control, toggle override-prompt in settings.json."
+        ))
+
+        # Backwards compatibility widgets (kept hidden so existing code/tests access without error)
+        self.ui_voice = QLineEdit()
+        self.ui_voice.setVisible(False)
+        layout_gemini.addWidget(self.ui_voice)
+
+        self.ui_voice_prompt = QTextEdit()
+        self.ui_voice_prompt.setVisible(False)
+        layout_gemini.addWidget(self.ui_voice_prompt)
+
+        main_layout.addWidget(card_gemini)
+
+        # Backwards compatibility alias
+        self.ui_prefer_local_tts = self.ui_use_piper_tts
+
+        self.ui_use_piper_tts.toggled.connect(self.save_settings)
+        self.ui_use_gemini_tts.toggled.connect(self.save_settings)
         self.ui_fallback_voice.editingFinished.connect(self.save_settings)
-        self.ui_prefer_local_tts.toggled.connect(self.save_settings)
+        self.ui_gemini_tts_api_key.editingFinished.connect(self.save_settings)
+        self.ui_voice.editingFinished.connect(self.save_settings)
+        self.ui_voice_prompt.installEventFilter(self.focus_out_filter)
+
+        self.ui_tts_gender.currentIndexChanged.connect(self.save_settings)
+        self.ui_tts_age.currentIndexChanged.connect(self.save_settings)
+        self.ui_tts_accent.currentTextChanged.connect(self._on_tts_accent_changed)
+        self.ui_tts_custom_accent.editingFinished.connect(self.save_settings)
+        self.ui_tts_style.currentTextChanged.connect(self._on_tts_style_changed)
+        self.ui_tts_custom_style.editingFinished.connect(self.save_settings)
+        self.ui_tts_allow_agent_override.toggled.connect(self.save_settings)
+
+        main_layout.addStretch()
 
         self.stack.addWidget(panel)
+
+    def _on_tts_accent_changed(self, text):
+        self.ui_tts_custom_accent.setVisible(text == "Custom...")
+        self.save_settings()
+
+    def _on_tts_style_changed(self, text):
+        self.ui_tts_custom_style.setVisible(text == "Custom...")
+        self.save_settings()
 
     def build_provider_setup(self):
         panel, main_layout, _ = self.create_panel_container("Provider Setup")
@@ -824,7 +1068,7 @@ class SettingsPanelWidget(QWidget):
         lbl_claude.setStyleSheet(
             "background-color: transparent; font-size: 16px;")
         layout3.addWidget(lbl_claude)
-        guide3 = QLabel("1. Go to <a href='https://console.anthropic.com/'>Anthropic Console</a>.<br>2. Sign in with your account.<br>3. Click 'Get API key' and create a new key.<br><br><i>Note: Claude API does not support native TTS or Audio attachments natively. Open Amity will fallback to local alternatives.</i>")
+        guide3 = QLabel("1. Go to <a href='https://console.anthropic.com/'>Anthropic Console</a>.<br>2. Sign in with your account.<br>3. Click 'Get API key' and create a new key.<br><br><i>Note: Claude API handles reasoning and tool execution. Speech is generated using the engine selected in Agent Voice (Piper TTS locally by default, or Gemini TTS if a key is provided).</i>")
         guide3.setTextFormat(Qt.RichText)
         guide3.setTextInteractionFlags(Qt.TextBrowserInteraction)
         guide3.setOpenExternalLinks(True)
@@ -848,7 +1092,7 @@ class SettingsPanelWidget(QWidget):
         lbl_chatgpt.setStyleSheet(
             "background-color: transparent; font-size: 16px;")
         layout4.addWidget(lbl_chatgpt)
-        guide4 = QLabel("1. Go to <a href='https://platform.openai.com/api-keys'>OpenAI Platform</a>.<br>2. Sign in with your account.<br>3. Click 'Create new secret key' and paste it below.<br><br><i>Note: OpenAI API does not support native TTS or Audio attachments natively. Open Amity will fallback to the local Piper TTS engine and Whisper STT.</i>")
+        guide4 = QLabel("1. Go to <a href='https://platform.openai.com/api-keys'>OpenAI Platform</a>.<br>2. Sign in with your account.<br>3. Click 'Create new secret key' and paste it below.<br><br><i>Note: OpenAI API handles reasoning and tool execution. Speech is generated using the engine selected in Agent Voice (Piper TTS locally by default, or Gemini TTS if a key is provided).</i>")
         guide4.setTextFormat(Qt.RichText)
         guide4.setTextInteractionFlags(Qt.TextBrowserInteraction)
         guide4.setOpenExternalLinks(True)
@@ -861,6 +1105,30 @@ class SettingsPanelWidget(QWidget):
         self.ui_chatgpt_api_key.setEchoMode(QLineEdit.Password)
         layout4.addWidget(self.ui_chatgpt_api_key)
         main_layout.addWidget(card4)
+
+        main_layout.addSpacing(10)
+
+        self.ui_use_deepseek_api = QRadioButton("Use DeepSeek API")
+        main_layout.addWidget(self.ui_use_deepseek_api)
+
+        card5, layout5 = self.create_card_container()
+        lbl_deepseek = QLabel("<b>DeepSeek API Setup</b>")
+        lbl_deepseek.setStyleSheet(
+            "background-color: transparent; font-size: 16px;")
+        layout5.addWidget(lbl_deepseek)
+        guide5 = QLabel("1. Go to <a href='https://platform.deepseek.com/'>DeepSeek Platform</a>.<br>2. Sign in and create a new API key.<br>3. Paste your key below.<br><br><i>Note: DeepSeek uses OpenAI-compatible endpoints with support for multimodal inputs on <code>deepseek-flash</code> (DeepSeek-V4.1-Flash). Speech is generated using the engine selected in Agent Voice.</i>")
+        guide5.setTextFormat(Qt.RichText)
+        guide5.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide5.setOpenExternalLinks(True)
+        guide5.setWordWrap(True)
+        guide5.setStyleSheet("background-color: transparent;")
+        layout5.addWidget(guide5)
+
+        layout5.addWidget(QLabel("DeepSeek API Key:"))
+        self.ui_deepseek_api_key = QLineEdit()
+        self.ui_deepseek_api_key.setEchoMode(QLineEdit.Password)
+        layout5.addWidget(self.ui_deepseek_api_key)
+        main_layout.addWidget(card5)
 
         main_layout.addSpacing(10)
 
@@ -885,9 +1153,11 @@ class SettingsPanelWidget(QWidget):
         self.ui_use_gemini_api.toggled.connect(self.save_settings)
         self.ui_use_claude_api.toggled.connect(self.save_settings)
         self.ui_use_chatgpt_api.toggled.connect(self.save_settings)
+        self.ui_use_deepseek_api.toggled.connect(self.save_settings)
         self.ui_gemini_api_key.editingFinished.connect(self.save_settings)
         self.ui_claude_api_key.editingFinished.connect(self.save_settings)
         self.ui_chatgpt_api_key.editingFinished.connect(self.save_settings)
+        self.ui_deepseek_api_key.editingFinished.connect(self.save_settings)
 
         main_layout.addStretch()
 
@@ -1806,8 +2076,7 @@ class SettingsPanelWidget(QWidget):
                     "Authenticity (Prioritising genuine, grounded human connection over rigid corporate double-speak or shallow, forced toxic positivity)",
                     "Vibrancy (Bringing a consistent, natural energy to interactions that elevates the team's morale without ever becoming overbearing or draining)"
                 ]
-            self.ui_core_values.clear()
-            self.ui_core_values.addItems(core_values)
+            self.ui_core_values.set_items(core_values)
 
             goals = self.settings.get("core.agent.overarching-goals", [])
             if not goals:
@@ -1816,22 +2085,88 @@ class SettingsPanelWidget(QWidget):
                     "Defuse Friction (Using lighthearted interventions, playful banter, and timely social resets to break tension during high-stress interactions)",
                     "Anchor Communal Memory (Preserving and celebrating the community's shared history, inside jokes, and past triumphs to maintain a strong sense of collective identity)"
                 ]
-            self.ui_overarching_goals.clear()
-            self.ui_overarching_goals.addItems(goals)
+            self.ui_overarching_goals.set_items(goals)
 
             gender = self.settings.get("core.agent.gender", "Female")
             idx = self.ui_gender.findText(gender)
             if idx >= 0:
                 self.ui_gender.setCurrentIndex(idx)
 
+            if hasattr(self, 'ui_tts_gender'):
+                tts_gender = self.settings.get("core.tts.gemini.gender")
+                if not tts_gender:
+                    tts_gender = gender
+                g_idx = self.ui_tts_gender.findText(tts_gender)
+                if g_idx >= 0:
+                    self.ui_tts_gender.setCurrentIndex(g_idx)
+                else:
+                    self.ui_tts_gender.setCurrentIndex(0)
+
+                tts_age = self.settings.get("core.tts.gemini.age", "Young Adult")
+                a_idx = -1
+                for i in range(self.ui_tts_age.count()):
+                    if tts_age.lower() in self.ui_tts_age.itemText(i).lower():
+                        a_idx = i
+                        break
+                if a_idx >= 0:
+                    self.ui_tts_age.setCurrentIndex(a_idx)
+                else:
+                    self.ui_tts_age.setCurrentIndex(0)
+
+                tts_accent = self.settings.get("core.tts.gemini.accent", "South African")
+                custom_accent = self.settings.get("core.tts.gemini.custom-accent", "")
+                ac_idx = self.ui_tts_accent.findText(tts_accent)
+                if ac_idx >= 0 and tts_accent != "Custom...":
+                    self.ui_tts_accent.setCurrentIndex(ac_idx)
+                    self.ui_tts_custom_accent.setText("")
+                    self.ui_tts_custom_accent.setVisible(False)
+                else:
+                    c_idx = self.ui_tts_accent.findText("Custom...")
+                    if c_idx >= 0:
+                        self.ui_tts_accent.setCurrentIndex(c_idx)
+                    self.ui_tts_custom_accent.setText(custom_accent or tts_accent)
+                    self.ui_tts_custom_accent.setVisible(True)
+
+                tts_style = self.settings.get("core.tts.gemini.style", "Warm & Empathetic")
+                custom_style = self.settings.get("core.tts.gemini.custom-style", "")
+                st_idx = self.ui_tts_style.findText(tts_style)
+                if st_idx >= 0 and tts_style != "Custom...":
+                    self.ui_tts_style.setCurrentIndex(st_idx)
+                    self.ui_tts_custom_style.setText("")
+                    self.ui_tts_custom_style.setVisible(False)
+                else:
+                    cs_idx = self.ui_tts_style.findText("Custom...")
+                    if cs_idx >= 0:
+                        self.ui_tts_style.setCurrentIndex(cs_idx)
+                    self.ui_tts_custom_style.setText(custom_style or tts_style)
+                    self.ui_tts_custom_style.setVisible(True)
+
+                allow_override = self.settings.get("core.tts.gemini.allow-agent-override", True)
+                self.ui_tts_allow_agent_override.setChecked(allow_override)
+
             self.ui_voice_prompt.setPlainText(self.settings.get(
-                "core.tts.gemini.prompt.profile", "A serene, warm South African female voice. Her tone is calm, clear, and deeply intelligent, with a soft, resonant quality."))
+                "core.tts.gemini.prompt.profile", "A serene, youthful South African female voice. Her tone is calm, clear, and deeply intelligent."))
             self.ui_voice.setText(self.settings.get(
-                "core.tts.gemini.model-name", "Achernar"))
+                "core.tts.gemini.model-name", "Sulafat"))
             self.ui_fallback_voice.setText(self.settings.get(
-                "core.tts.piper.model-name-piper", "cori"))
-            self.ui_prefer_local_tts.setChecked(
-                self.settings.get("core.tts.piper.prefer-piper", False))
+                "core.tts.piper.model-name-piper", "en_GB-cori-high"))
+
+            tts_provider = self.settings.get("core.tts.provider")
+            if tts_provider is None:
+                if not self.settings.get("core.tts.piper.prefer-piper", True):
+                    tts_provider = "gemini"
+                else:
+                    tts_provider = "piper"
+
+            if tts_provider == "gemini":
+                self.ui_use_gemini_tts.setChecked(True)
+            else:
+                self.ui_use_piper_tts.setChecked(True)
+
+            gemini_tts_key = self.settings.get_env("GEMINI_TTS_API_KEY", "")
+            if not gemini_tts_key:
+                gemini_tts_key = self.settings.get_env("GEMINI_API_KEY", "")
+            self.ui_gemini_tts_api_key.setText(gemini_tts_key)
 
             agy_mode = self.settings.get("core.antigravity.agy-mode", False)
             provider = self.settings.get("core.api-provider", "gemini")
@@ -1841,6 +2176,8 @@ class SettingsPanelWidget(QWidget):
                 self.ui_use_claude_api.setChecked(True)
             elif provider in ["chatgpt", "openai"]:
                 self.ui_use_chatgpt_api.setChecked(True)
+            elif provider == "deepseek":
+                self.ui_use_deepseek_api.setChecked(True)
             else:
                 self.ui_use_gemini_api.setChecked(True)
 
@@ -1852,6 +2189,9 @@ class SettingsPanelWidget(QWidget):
 
             openai_key = self.settings.get_env("OPENAI_API_KEY", "")
             self.ui_chatgpt_api_key.setText(openai_key)
+
+            deepseek_key = self.settings.get_env("DEEPSEEK_API_KEY", "")
+            self.ui_deepseek_api_key.setText(deepseek_key)
 
             self.ui_mastodon_url.setText(self.settings.get_env(
                 "MASTODON_API_BASE_URL", "https://mastodon.social"))
@@ -1954,24 +2294,77 @@ class SettingsPanelWidget(QWidget):
             self.settings.set("core.agent.base-personality",
                               self.ui_base_personality.toPlainText())
 
-            core_values = [self.ui_core_values.item(
-                i).text() for i in range(self.ui_core_values.count())]
+            core_values = self.ui_core_values.get_items()
             self.settings.set("core.agent.core-values", core_values)
-            goals = [self.ui_overarching_goals.item(
-                i).text() for i in range(self.ui_overarching_goals.count())]
+            goals = self.ui_overarching_goals.get_items()
             self.settings.set("core.agent.overarching-goals", goals)
+
+            if hasattr(self, 'ui_tts_gender'):
+                gender_txt = self.ui_tts_gender.currentText()
+                if "Female" in gender_txt:
+                    gender_val = "Female"
+                elif "Male" in gender_txt:
+                    gender_val = "Male"
+                else:
+                    gender_val = "Non-binary"
+                self.settings.set("core.tts.gemini.gender", gender_val)
+
+                age_full = self.ui_tts_age.currentText()
+                age_val = age_full.split("(")[0].strip()
+                self.settings.set("core.tts.gemini.age", age_val)
+
+                accent_txt = self.ui_tts_accent.currentText()
+                if accent_txt == "Custom...":
+                    self.settings.set("core.tts.gemini.accent", "Custom")
+                    custom_acc = self.ui_tts_custom_accent.text().strip()
+                    self.settings.set("core.tts.gemini.custom-accent", custom_acc)
+                    effective_accent = custom_acc or "South African"
+                else:
+                    self.settings.set("core.tts.gemini.accent", accent_txt)
+                    self.settings.set("core.tts.gemini.custom-accent", "")
+                    effective_accent = accent_txt
+
+                style_txt = self.ui_tts_style.currentText()
+                if style_txt == "Custom...":
+                    self.settings.set("core.tts.gemini.style", "Custom")
+                    custom_sty = self.ui_tts_custom_style.text().strip()
+                    self.settings.set("core.tts.gemini.custom-style", custom_sty)
+                    effective_style = custom_sty or "Warm & Empathetic"
+                else:
+                    self.settings.set("core.tts.gemini.style", style_txt)
+                    self.settings.set("core.tts.gemini.custom-style", "")
+                    effective_style = style_txt
+
+                self.settings.set("core.tts.gemini.allow-agent-override", self.ui_tts_allow_agent_override.isChecked())
+
+                # Resolve base voice model automatically
+                from core.audio_output import resolve_base_voice
+                auto_voice = resolve_base_voice(gender_val, age_val, effective_style)
+                self.settings.set("core.tts.gemini.model-name", auto_voice)
+                self.ui_voice.setText(auto_voice)
+
+                # Reset override-prompt when user saves from GUI so user choices take effect
+                self.settings.set("core.tts.gemini.override-prompt", False)
 
             self.settings.set("core.tts.gemini.prompt.profile",
                               self.ui_voice_prompt.toPlainText())
-            self.settings.set("core.tts.gemini.model-name", self.ui_voice.text())
+            if not hasattr(self, 'ui_tts_gender'):
+                self.settings.set("core.tts.gemini.model-name", self.ui_voice.text())
             self.settings.set("core.tts.piper.model-name-piper",
                               self.ui_fallback_voice.text())
-            self.settings.set("core.tts.piper.prefer-piper",
-                              self.ui_prefer_local_tts.isChecked())
+
+            tts_provider = "gemini" if self.ui_use_gemini_tts.isChecked() else "piper"
+            self.settings.set("core.tts.provider", tts_provider)
+            self.settings.set("core.tts.piper.prefer-piper", tts_provider == "piper")
+
+            if hasattr(self, 'ui_gemini_tts_api_key'):
+                self.settings.set_env(
+                    "GEMINI_TTS_API_KEY", self.ui_gemini_tts_api_key.text().strip())
 
             self.ui_use_gemini_api.isChecked()
             use_claude = self.ui_use_claude_api.isChecked()
             use_chatgpt = self.ui_use_chatgpt_api.isChecked()
+            use_deepseek = self.ui_use_deepseek_api.isChecked()
             agy_mode = self.ui_agy_mode.isChecked()
 
             self.settings.set("core.antigravity.agy-mode", agy_mode)
@@ -1979,30 +2372,37 @@ class SettingsPanelWidget(QWidget):
                 self.settings.set("core.api-provider", "claude")
             elif use_chatgpt:
                 self.settings.set("core.api-provider", "chatgpt")
+            elif use_deepseek:
+                self.settings.set("core.api-provider", "deepseek")
             else:
                 self.settings.set("core.api-provider", "gemini")
 
-            if self.ui_gemini_api_key.text():
+            if hasattr(self, 'ui_gemini_api_key'):
                 self.settings.set_env(
-                    "GEMINI_API_KEY", self.ui_gemini_api_key.text())
+                    "GEMINI_API_KEY", self.ui_gemini_api_key.text().strip())
 
-            if self.ui_claude_api_key.text():
+            if hasattr(self, 'ui_claude_api_key'):
                 self.settings.set_env(
-                    "CLAUDE_API_KEY", self.ui_claude_api_key.text())
+                    "CLAUDE_API_KEY", self.ui_claude_api_key.text().strip())
 
-            if self.ui_chatgpt_api_key.text():
+            if hasattr(self, 'ui_chatgpt_api_key'):
                 self.settings.set_env(
-                    "OPENAI_API_KEY", self.ui_chatgpt_api_key.text())
+                    "OPENAI_API_KEY", self.ui_chatgpt_api_key.text().strip())
 
-            if self.ui_mastodon_url.text():
+            if hasattr(self, 'ui_deepseek_api_key'):
+                self.settings.set_env(
+                    "DEEPSEEK_API_KEY", self.ui_deepseek_api_key.text().strip())
+
+            if hasattr(self, 'ui_mastodon_url'):
                 self.settings.set_env("MASTODON_API_BASE_URL",
-                                      self.ui_mastodon_url.text())
-            if self.ui_mastodon_token.text():
-                self.settings.set_env("MASTODON_ACCESS_TOKEN",
-                                      self.ui_mastodon_token.text())
-            if hasattr(self, 'ui_moltbook_api_key') and self.ui_moltbook_api_key.text():
+                                      self.ui_mastodon_url.text().strip())
+            if hasattr(self, 'ui_mastodon_token'):
+                mastodon_token = self.ui_mastodon_token.text().strip()
+                self.settings.set_env("MASTODON_ACCESS_TOKEN", mastodon_token)
+                self.settings.set_env("MASTODON_API_TOKEN", mastodon_token)
+            if hasattr(self, 'ui_moltbook_api_key'):
                 self.settings.set_env("MOLTBOOK_API_KEY",
-                                      self.ui_moltbook_api_key.text())
+                                      self.ui_moltbook_api_key.text().strip())
 
             # Email save
             if hasattr(self, 'ui_email_address'):

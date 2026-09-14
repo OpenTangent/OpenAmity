@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 from typing import List, Dict, Any
 from core.cerebrum import Tool
+from core.file_utils import atomic_json_write
 
 
 class TrajectoryTool(Tool):
@@ -93,8 +94,7 @@ class TrajectoryTool(Tool):
 
     def _save_data(self, data: Dict[str, Any]):
         traj_file, _ = self._get_trajectory_paths()
-        with open(traj_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+        atomic_json_write(traj_file, data)
 
     def _archive_aspiration(self, asp: Dict[str, Any], tier: str):
         _, arch_file = self._get_trajectory_paths()
@@ -103,14 +103,13 @@ class TrajectoryTool(Tool):
             try:
                 with open(arch_file, 'r', encoding='utf-8') as f:
                     archive = json.load(f)
-            except:
+            except Exception:
                 archive = []
 
         asp['archived_at'] = datetime.now().isoformat()
         asp['tier'] = tier
         archive.append(asp)
-        with open(arch_file, 'w', encoding='utf-8') as f:
-            json.dump(archive, f, indent=2)
+        atomic_json_write(arch_file, archive)
 
     def _archive_task(self, task: Dict[str, Any]):
         _, arch_file = self._get_trajectory_paths()
@@ -119,14 +118,13 @@ class TrajectoryTool(Tool):
             try:
                 with open(arch_file, 'r', encoding='utf-8') as f:
                     archive = json.load(f)
-            except:
+            except Exception:
                 archive = []
 
         task['archived_at'] = datetime.now().isoformat()
         task['type'] = 'task'
         archive.append(task)
-        with open(arch_file, 'w', encoding='utf-8') as f:
-            json.dump(archive, f, indent=2)
+        atomic_json_write(arch_file, archive)
 
     def execute(self, command: str, *args, **kwargs) -> str:
         if command == "get_bearings":
@@ -168,24 +166,19 @@ class TrajectoryTool(Tool):
 
         try:
             from core.mempalace_manager import MemPalaceManager
-            agent_id = self.orchestrator.agent_id if self.orchestrator else None
-            mp = MemPalaceManager(agent_id=agent_id)
+            mp = getattr(self.orchestrator, 'mempalace_manager', None) if self.orchestrator else None
+            if not isinstance(mp, MemPalaceManager):
+                agent_id = getattr(self.orchestrator, 'agent_id', None) if self.orchestrator else None
+                if agent_id and not isinstance(agent_id, str):
+                    agent_id = str(agent_id)
+                mp = MemPalaceManager(agent_id=agent_id)
             self_perception = mp.get_self_perception(limit=24)
+            if not isinstance(self_perception, str):
+                self_perception = str(self_perception)
         except Exception as e:
             self_perception = f"(Could not load Self Perception: {e})"
 
         data = self._load_data()
-
-        # Track deferrals
-        tasks = data.get("tasks", [])
-        modified_data = False
-        for t in tasks:
-            if t.get("status") == "pending":
-                t["deferral_count"] = t.get("deferral_count", 0) + 1
-                modified_data = True
-
-        if modified_data:
-            self._save_data(data)
 
         # Read Somatic State
         somatic_state_text = ""
@@ -375,6 +368,11 @@ class TrajectoryTool(Tool):
             for i, a in enumerate(aspirations):
                 a['priority'] = i + 1
             data["aspirations"][tier] = aspirations
+
+            # Also clean up any tasks associated with this aspiration
+            tasks = data.get("tasks", [])
+            data["tasks"] = [t for t in tasks if t.get("aspiration_id") != aspiration_id]
+
             self._save_data(data)
             return f"Success: Aspiration {aspiration_id} deleted."
 
@@ -393,6 +391,14 @@ class TrajectoryTool(Tool):
             for i, a in enumerate(aspirations):
                 a['priority'] = i + 1
             data["aspirations"][tier] = aspirations
+
+            # Update any non-completed tasks with task.get("aspiration_id") == aspiration_id to status="completed"
+            tasks = data.get("tasks", [])
+            for t in tasks:
+                if t.get("aspiration_id") == aspiration_id and t.get("status") != "completed":
+                    t["status"] = "completed"
+            data["tasks"] = tasks
+
             self._save_data(data)
             return f"Success: Aspiration {aspiration_id} marked as completed and archived."
 

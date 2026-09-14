@@ -71,11 +71,10 @@ def test_mempalace_curiosity_pulse_scheduling(temp_agent_environment, caplog):
     # Verify pulse was inserted into pulses.db
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT title, context, pulse_type FROM pulses")
+    cursor.execute("SELECT title, context FROM pulses")
     pulses = cursor.fetchall()
     conn.close()
 
     assert len(pulses) == 1
     assert pulses[0][0] == "Curiosity: Quantum Entanglement Teleportation"
     assert "Quantum Entanglement Teleportation" in pulses[0][1]
-    assert pulses[0][2] == "silent"

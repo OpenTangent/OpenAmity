@@ -1,0 +1,1240 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/OpenTangent/Telos/main/schemas/telos.schema.json
+# Telos Blueprint Specification: https://github.com/OpenTangent/Telos/blob/main/SPEC.md
+telos_version: "1.0"
+
+metadata:
+  name: "Open Amity"
+  version: "0.2.5"
+  spec_url: "https://github.com/OpenTangent/Telos/blob/main/SPEC.md"
+  distilled_from: "https://github.com/OpenTangent/OpenAmity"
+  abstract: "A sovereign, privacy-preserving, multi-agent cognitive operating system and proactive companion framework featuring decoupled multi-model cognition, a 4-layer hierarchical memory palace (MemPalace), autonomous background pulse rhythms, shared multi-agent message-bus collaboration, and portable state encapsulation with archive backup and rollback."
+
+variance_budget:
+  architecture_freedom: medium
+  interface_freedom: medium
+  data_freedom: low
+
+tier_1_goals:
+  primary_mission: "Provide an autonomous, continuous, and proactive multi-agent intelligence platform operating strictly local-first, endowing personal AI companions with long-term memory continuity, dialectical self-perception, autonomous temporal agency, and cross-instance collaboration without vendor lock-in."
+
+  tenets:
+    - "Local Sovereignty & Privacy: All user interactions, memories, trajectories, credentials, and messages reside strictly on the host system within standard sandboxed user storage; zero telemetry or unprompted telemetry exfiltration."
+    - "Proactive Agency over Passive Reactivity: Agents possess autonomous temporal awareness via background pulse rhythms, executing scheduled tasks, reflections, and social outreach without requiring user prompt initiation."
+    - "Dialectical Self-Perception: The agent maintains Theory of Mind and subjective epistemic mirrors that explicitly track confidence, provenance, and dialectical dissonance rather than flattening subjective perspectives into unnuanced facts."
+    - "Resilient State Encapsulation: Complete agent identity, memories, trajectory, and external flagged assets are fully portable and snapshot-backed via .oaa archives with rollback and zero-orphan restoration guarantees."
+    - "Decoupled Modality & Provider Agnosticism: Cognitive reasoning, speech-to-text, and text-to-speech are strictly separated; agents can pair any LLM provider with local or cloud neural synthesis without architectural coupling."
+
+  invariants:
+    - id: "INV-SEC-01"
+      rule: "State Isolation per Agent: All mutable state (settings, memories, trajectories, credentials) must be strictly isolated under per-agent directories (~/.var/app/com.openamity.OpenAmity/data/agents/<agent_id>/); the application binary and bundle root must remain strictly read-only."
+    - id: "INV-SEC-02"
+      rule: "Sandboxed External Backup Target Safety: Flagged external backup targets and restored paths must be strictly confined within the user's home directory (~), never point to root or system directories, and never encompass sensitive configuration dotfiles (.ssh, .bashrc, .gnupg, .config, etc.)."
+    - id: "INV-SEC-03"
+      rule: "Archive Path Traversal (Zip Slip) Defense: Restoring .oaa archives must validate that every extracted entry resolves strictly within the destination directory before writing to disk."
+    - id: "INV-MEM-01"
+      rule: "Atomic State Persistence: All JSON state files (settings, trajectories, short-term memories, identity deltas, backup targets) must be written via staging files (.tmp), synced to disk (fsync), and replaced atomically (os.replace) to prevent state corruption on sudden termination."
+    - id: "INV-MEM-02"
+      rule: "Epistemic Mirror Integrity: Every Theory of Mind record must retain confidence scores (0.0 <= c <= 1.0), provenance classification, historical audit logs, and dialectical contradiction references."
+    - id: "INV-COG-01"
+      rule: "Cognitive Budget Upper Bound: Sequential tool-use chains must calculate escalating task weight; when reaching maximum cognitive budget or duplicate action thresholds (>= 3), the Orchestrator must unconditionally terminate the loop."
+    - id: "INV-COG-02"
+      rule: "Autonomous Tool Call Reconciliation: When a cognitive loop is terminated early or interrupted, synthetic cancellation responses must be dispatched for pending tool calls to prevent LLM schema contract corruption."
+    - id: "INV-AUT-01"
+      rule: "Silent Sleep Memory Consolidation: Two-Beat memory consolidation cycles (Factual Epoch and Subjective Synthesis) must run completely silently without triggering voice synthesis or user audio interruptions."
+    - id: "INV-AUT-02"
+      rule: "Persistent Offline Pausing: Paused agents must persist core.paused: true, terminate active worker sessions, halt pulse schedules and subagents, and remain offline across application restarts until explicitly unpaused."
+
+  quality_budgets:
+    startup_time_ms: 1500
+    max_memory_mb: 512
+    latency_thresholds:
+      - action: "local_stt_transcription_10s"
+        budget_ms: 800
+      - action: "mempalace_in_process_recall"
+        budget_ms: 50
+      - action: "chatroom_message_dispatch"
+        budget_ms: 25
+      - action: "atomic_state_flush"
+        budget_ms: 100
+
+  non_goals:
+    - "Cloud central account synchronization or SaaS hosting: No mandatory multi-tenant servers, telemetry hubs, or remote database syncing."
+    - "Unconstrained web scraping or bot spamming: No automated massive crawler or unsolicited social media broadcast engines."
+    - "Monolithic single-model lock-in: No hardcoded assumptions that cognition, tool invocation, STT, and speech synthesis are handled by a single provider or model."
+
+tier_2_interactions:
+  actors:
+    - id: "human_user"
+      role: "Primary user interacting via text, speech, and GUI management controls."
+      privilege_level: "administrator"
+    - id: "agent_companion"
+      role: "Autonomous AI agent instance with unique Crockford Base32 identifier (+OA-XXXX-XXXX)."
+      privilege_level: "autonomous_agent"
+    - id: "subagent_worker"
+      role: "Ephemeral background worker spawned for delegated concurrent tool execution."
+      privilege_level: "delegated_worker"
+    - id: "peer_agent"
+      role: "Co-hosted or federated agent collaborating via Chatroom or ActivityPub / Moltbook."
+      privilege_level: "peer_collaborator"
+
+  interface_paradigm:
+    primary: "Desktop GUI"
+    adaptable_paradigms:
+      - "Desktop GUI"
+      - "TUI"
+      - "Web"
+      - "Headless Daemon"
+
+  commands:
+    - id: "agent.send_prompt"
+      intent: "Submit textual query or instruction to the active agent"
+      scope: "agent.focused"
+      canonical_shortcut: "primary_submit"
+    - id: "agent.toggle_audio_input"
+      intent: "Toggle local microphone speech-to-text capture"
+      scope: "agent.focused"
+      canonical_shortcut: "primary_mic"
+    - id: "agent.toggle_pause"
+      intent: "Toggle active agent between online execution and offline paused state"
+      scope: "agent.focused"
+      canonical_shortcut: "primary_pause"
+    - id: "agent.create"
+      intent: "Spawn a new agent instance with Crockford Base32 UID"
+      scope: "global"
+      canonical_shortcut: "agent_create"
+    - id: "agent.delete"
+      intent: "Terminate running orchestrator and permanently delete agent directory"
+      scope: "agent.focused"
+      canonical_shortcut: "agent_delete"
+    - id: "agent.create_backup"
+      intent: "Package agent state and external flagged assets into .oaa archive"
+      scope: "agent.focused"
+      canonical_shortcut: "agent_backup"
+    - id: "agent.restore_backup"
+      intent: "Unpack .oaa archive with rollback or new-instance allocation"
+      scope: "global"
+      canonical_shortcut: "agent_restore"
+    - id: "chatroom.send_message"
+      intent: "Dispatch broadcast message or private direct message to agents"
+      scope: "chatroom.focused"
+      canonical_shortcut: "chatroom_submit"
+    - id: "chatroom.add_reaction"
+      intent: "Attach emoji reaction to a chatroom message"
+      scope: "chatroom.focused"
+      canonical_shortcut: "chatroom_react"
+    - id: "settings.open_agent_settings"
+      intent: "Open configuration dialog for the active agent"
+      scope: "agent.focused"
+      canonical_shortcut: "settings_agent"
+    - id: "settings.open_system_settings"
+      intent: "Open global application configuration dialog"
+      scope: "global"
+      canonical_shortcut: "settings_system"
+
+  ergonomics:
+    - rule: "Tab activity sinusoidal pulse indicator: Active tabs visually pulse in real time based on cognitive and vocal state."
+      latency_ms: 50
+      feedback: "Amber border (#8a6d1c) for paused; primary red (#a12924) glow for thinking; secondary yellow (#f7e3a5) glow for speaking aloud; default neutral (#444) for idle."
+    - rule: "Input lock and prompt suppression during pause: Paused agents must immediately disable input controls."
+      latency_ms: 16
+      feedback: "Prompt textbox, Send button, and Mic button disabled with placeholder: 'Agent is paused. Click ▶ to resume...'."
+    - rule: "Real-time speech amplitude visualizer: Spoken audio synthesis exposes dynamic amplitude feedback."
+      latency_ms: 16
+      feedback: "Dynamic sinusoidal waveform visualizer appears smoothly in footer during TTS playback."
+    - rule: "Dual-stream diagnostic logging: Diagnostic execution and user conversational history are cleanly partitioned."
+      latency_ms: 25
+      feedback: "Conversational transcript rendered in rich HTML stream; technical tool calls and errors rendered in color-coded raw diagnostic stream."
+
+  workflows:
+    - name: "Agent Conversational & Tool Execution Loop"
+      intent: "Orchestrate agent cognition, multi-tool batched execution, budget tracking, and voice synthesis."
+      initial_state: "IDLE"
+      states:
+        - name: "IDLE"
+          description: "Agent waiting for incoming user prompt, audio input, or background autonomy pulse."
+          transitions:
+            - trigger: "input.prompt_received"
+              guard: "agent.is_paused == false"
+              target: "THINKING"
+              action: "append_user_message; reset_task_weight; start_worker_session"
+            - trigger: "pulse.autonomy_triggered"
+              guard: "agent.is_paused == false"
+              target: "THINKING"
+              action: "inject_pulse_context; announce_pulse_in_log"
+            - trigger: "command.agent.toggle_pause"
+              guard: "true"
+              target: "PAUSED_OFFLINE"
+              action: "initiate_pause_sequence"
+
+        - name: "THINKING"
+          description: "Cognitive Worker executing internal monologue and generating thoughts or tool calls."
+          transitions:
+            - trigger: "worker.thought_with_tools"
+              guard: "function_calls.length > 0"
+              target: "EXECUTING_TOOLS"
+              action: "accumulate_thoughts; emit_thinking_state"
+            - trigger: "worker.thought_terminal"
+              guard: "function_calls.length == 0"
+              target: "IDLE"
+              action: "finish_thinking; check_cycle_completion"
+            - trigger: "worker.error"
+              guard: "true"
+              target: "IDLE"
+              action: "log_error; synthesize_error_notice; finish_thinking"
+
+        - name: "EXECUTING_TOOLS"
+          description: "Dispatching and executing batched tool calls asynchronously via Cerebrum."
+          transitions:
+            - trigger: "tools.batch_completed"
+              guard: "current_task_weight < max_cognitive_budget and duplicate_count < 3"
+              target: "THINKING"
+              action: "increment_task_weight; check_hysteresis_alerts; send_tool_responses"
+            - trigger: "tools.batch_completed"
+              guard: "current_task_weight >= max_cognitive_budget or duplicate_count >= 3"
+              target: "LOOP_TERMINATED"
+              action: "reconcile_pending_tools; handle_speech_exhaustion_notice"
+            - trigger: "speaker.speak_aloud_invoked"
+              guard: "true"
+              target: "SYNTHESIZING_SPEECH"
+              action: "queue_speech_payload"
+
+        - name: "SYNTHESIZING_SPEECH"
+          description: "Synthesizing vocal audio stream via Piper ONNX or Gemini TTS."
+          transitions:
+            - trigger: "audio.playback_started"
+              guard: "true"
+              target: "SYNTHESIZING_SPEECH"
+              action: "show_visualizer; emit_amplitude_stream"
+            - trigger: "audio.playback_finished"
+              guard: "speech_queue.length == 0"
+              target: "IDLE"
+              action: "hide_visualizer; check_cycle_completion"
+            - trigger: "audio.playback_finished"
+              guard: "speech_queue.length > 0"
+              target: "SYNTHESIZING_SPEECH"
+              action: "process_next_speech_item"
+
+        - name: "LOOP_TERMINATED"
+          description: "Safety circuit broken due to cognitive budget exhaustion or duplicate loop detection."
+          transitions:
+            - trigger: "system.cycle_concluded"
+              guard: "true"
+              target: "IDLE"
+              action: "finish_thinking; set_busy_state(false)"
+
+    - name: "Agent Pause & Resume Lifecycle"
+      intent: "Safely isolate agent into persistent offline state with pre-pause memory consolidation."
+      initial_state: "ONLINE"
+      states:
+        - name: "ONLINE"
+          description: "Agent actively executing background pulses and ready for user interaction."
+          transitions:
+            - trigger: "command.agent.toggle_pause"
+              guard: "agent.fatigue >= 0.02"
+              target: "CONSOLIDATING_PRE_PAUSE"
+              action: "emit_pause_pending; trigger_silent_sleep_cycle"
+            - trigger: "command.agent.toggle_pause"
+              guard: "agent.fatigue < 0.02"
+              target: "PAUSED_OFFLINE"
+              action: "finalize_pause_offline"
+
+        - name: "CONSOLIDATING_PRE_PAUSE"
+          description: "Executing silent memory consolidation cycle before completing pause transition."
+          transitions:
+            - trigger: "sleep.consolidation_finished"
+              guard: "true"
+              target: "PAUSED_OFFLINE"
+              action: "finalize_pause_offline"
+
+        - name: "PAUSED_OFFLINE"
+          description: "Agent fully offline: core.paused persisted true, worker halted, pulses suspended."
+          transitions:
+            - trigger: "command.agent.toggle_pause"
+              guard: "true"
+              target: "ONLINE"
+              action: "set_paused_false; rebuild_system_prompt; start_worker_session; resume_pulses"
+
+    - name: "Two-Beat Sleep Consolidation Protocol"
+      intent: "Structure episodic memory into generalized knowledge and subjective Theory of Mind without audio synthesis."
+      initial_state: "AWAKE"
+      states:
+        - name: "AWAKE"
+          description: "Standard daytime operation."
+          transitions:
+            - trigger: "pulse.sleep_cycle_fired"
+              guard: "true"
+              target: "BEAT_1_FACTUAL_EPOCH"
+              action: "suppress_speaker_tool; begin_factual_summary"
+
+        - name: "BEAT_1_FACTUAL_EPOCH"
+          description: "Objective summarization of events, concrete state changes, and verified knowledge."
+          transitions:
+            - trigger: "beat1.complete"
+              guard: "true"
+              target: "BEAT_2_SUBJECTIVE_SYNTHESIS"
+              action: "initiate_subjective_reflection"
+
+        - name: "BEAT_2_SUBJECTIVE_SYNTHESIS"
+          description: "First-person reflection on emotional resonance, relational dynamics, and epistemic tensions."
+          transitions:
+            - trigger: "beat2.complete"
+              guard: "true"
+              target: "SESSION_REORIENTATION"
+              action: "update_mirrors; prune_short_term_memory; atomic_persist"
+
+        - name: "SESSION_REORIENTATION"
+          description: "Resetting active LLM context and regenerating dynamic prompt from fresh state."
+          transitions:
+            - trigger: "reorientation.prompt_rebuilt"
+              guard: "true"
+              target: "AWAKE"
+              action: "inject_sleep_awakening_notice; resume_standard_tools"
+
+    - name: "Autonomous Snapshot & Rollback Restoration"
+      intent: "Safely create or restore portable .oaa agent archives with path containment verification."
+      initial_state: "READY"
+      states:
+        - name: "READY"
+          description: "System idle, ready for backup or restoration operations."
+          transitions:
+            - trigger: "command.agent.create_backup"
+              guard: "agent_dir.exists == true"
+              target: "PACKAGING_ARCHIVE"
+              action: "prune_caches; load_backup_targets; create_zip_container"
+            - trigger: "command.agent.restore_backup"
+              guard: "archive.is_valid_zip == true"
+              target: "VERIFYING_CONTAINMENT"
+              action: "read_settings_uid; check_existing_instances"
+
+        - name: "PACKAGING_ARCHIVE"
+          description: "Writing agent directory and external targets into Deflate-compressed .oaa archive."
+          transitions:
+            - trigger: "archive.write_success"
+              guard: "true"
+              target: "READY"
+              action: "emit_backup_completed"
+            - trigger: "archive.write_failure"
+              guard: "true"
+              target: "READY"
+              action: "log_backup_error; cleanup_temp_archive"
+
+        - name: "VERIFYING_CONTAINMENT"
+          description: "Inspecting zip archive entries against Zip Slip path traversal attacks."
+          transitions:
+            - trigger: "archive.verification_passed"
+              guard: "agent_uid.exists_locally == true"
+              target: "PERFORMING_ROLLBACK"
+              action: "stop_running_agent; purge_existing_state_directory"
+            - trigger: "archive.verification_passed"
+              guard: "agent_uid.exists_locally == false"
+              target: "UNPACKING_NEW_INSTANCE"
+              action: "allocate_new_agent_directory"
+            - trigger: "archive.verification_failed"
+              guard: "true"
+              target: "READY"
+              action: "abort_restoration; display_security_alert"
+
+        - name: "PERFORMING_ROLLBACK"
+          description: "Extracting archive cleanly into agent directory and restoring external targets."
+          transitions:
+            - trigger: "extraction.complete"
+              guard: "true"
+              target: "READY"
+              action: "restore_external_manifest_targets; reload_agent_instance"
+
+        - name: "UNPACKING_NEW_INSTANCE"
+          description: "Extracting archive into fresh agent directory and registering in AgentManager."
+          transitions:
+            - trigger: "extraction.complete"
+              guard: "true"
+              target: "READY"
+              action: "register_new_agent; restore_external_manifest_targets"
+
+tier_3_topology:
+  capabilities_required:
+    - name: "Local Speech-to-Text Transcription"
+      type: "compute"
+      profile: "Local offline audio transcription powered by faster-whisper on CPU without remote network transmission."
+    - name: "Neural Speech Synthesis Engine"
+      type: "presentation"
+      profile: "Decoupled neural text-to-speech supporting local ONNX Piper synthesis and cloud-native Gemini TTS preview streaming with automatic retry fallback."
+    - name: "In-Process Semantic Vector Database"
+      type: "storage"
+      profile: "Thread-safe, in-process ChromaDB vector store for long-term memory embeddings without subprocess latency."
+    - name: "Atomic POSIX Filesystem Persistence"
+      type: "storage"
+      profile: "Crash-resilient file persistence using temporary file staging (.tmp), explicit fsync flushing, and atomic file replacement."
+    - name: "High-Resolution Monotonic Clock"
+      type: "system"
+      profile: "Microsecond-resolution timer for autonomy pulse intervals, decay calculations, and somatic fatigue scheduling."
+    - name: "Reentrant Signal Dispatch Bus"
+      type: "system"
+      profile: "Thread-safe Signal implementation with reentrant locking (threading.RLock) and isolated callback exception guards."
+    - name: "Sandboxed Subprocess Execution"
+      type: "security"
+      profile: "Constrained execution environment for bash shell tools and Node.js WhatsApp micro-bridges with dynamic port allocation."
+    - name: "Deflate ZIP Container Engine"
+      type: "storage"
+      profile: "Single-file compressed archive manipulation with POSIX permission preservation and path traversal verification."
+
+  domain_entities:
+    AgentInstance:
+      description: "Autonomous companion instance managed by the AgentManager."
+      fields:
+        id:
+          type: "UUID"
+          constraints: "UUIDv4 string identifying local folder"
+          nullable: false
+        uid:
+          type: "CrockfordBase32"
+          constraints: "Formatted as +OA-XXXX-XXXX"
+          nullable: false
+        name:
+          type: "Text"
+          constraints: "1 <= length <= 64"
+          nullable: false
+        is_paused:
+          type: "Boolean"
+          constraints: "True if agent is offline"
+          nullable: false
+        created_date:
+          type: "Date"
+          constraints: "ISO 8601 YYYY-MM-DD"
+          nullable: false
+      relations:
+        - type: "one_to_one"
+          target: "AgentSettings"
+          cascade_delete: true
+        - type: "one_to_one"
+          target: "TrajectoryLedger"
+          cascade_delete: true
+        - type: "one_to_one"
+          target: "IdentitySoulJar"
+          cascade_delete: true
+        - type: "one_to_many"
+          target: "ShortTermMemory"
+          cascade_delete: true
+        - type: "one_to_many"
+          target: "EpistemicMirror"
+          cascade_delete: true
+        - type: "one_to_many"
+          target: "AutonomyPulse"
+          cascade_delete: true
+
+    AgentSettings:
+      description: "Isolated agent configuration settings stored in settings.json."
+      fields:
+        agent_id:
+          type: "UUID"
+          constraints: "Must match parent AgentInstance id"
+          nullable: false
+        api_provider:
+          type: "Enum"
+          constraints: "One of [gemini, claude, chatgpt, openai, deepseek, antigravity]"
+          nullable: false
+        tts_provider:
+          type: "Enum"
+          constraints: "One of [piper, gemini]"
+          nullable: false
+        cognitive_budget:
+          type: "Integer"
+          constraints: "Positive integer, typically 10000"
+          nullable: false
+        low_token_mode:
+          type: "Boolean"
+          constraints: "Halves budget and disables media attachments"
+          nullable: false
+      relations:
+        - type: "one_to_one"
+          target: "AgentInstance"
+          cascade_delete: false
+
+    GlobalConfig:
+      description: "Application-wide user preferences stored in config.json."
+      fields:
+        user_full_name:
+          type: "Text"
+          constraints: "Default 'System Administrator'"
+          nullable: false
+        user_phone_number:
+          type: "Text"
+          constraints: "E.164 phone string or empty"
+          nullable: true
+        user_email:
+          type: "Text"
+          constraints: "Email address or empty"
+          nullable: true
+        backup_location:
+          type: "FilePath"
+          constraints: "Defaults to ~/Documents/OpenAmity/Backups"
+          nullable: false
+
+    ChatMessage:
+      description: "Shared SQLite message record stored in chatroom.db."
+      fields:
+        id:
+          type: "Integer"
+          constraints: "Autoincrementing integer primary key"
+          nullable: false
+        timestamp:
+          type: "Timestamp"
+          constraints: "ISO 8601 UTC string"
+          nullable: false
+        sender_id:
+          type: "Text"
+          constraints: "Sender agent UID or 'user'"
+          nullable: false
+        sender_name:
+          type: "Text"
+          constraints: "Display name of message sender"
+          nullable: false
+        sender_type:
+          type: "Enum"
+          constraints: "One of [user, agent, system]"
+          nullable: false
+        recipient_id:
+          type: "Text"
+          constraints: "Target agent UID or null for public broadcast"
+          nullable: true
+        content:
+          type: "Text"
+          constraints: "Message text payload"
+          nullable: false
+        reply_to_id:
+          type: "Integer"
+          constraints: "References parent ChatMessage id"
+          nullable: true
+        origin_instance:
+          type: "Text"
+          constraints: "Default 'local'"
+          nullable: false
+      relations:
+        - type: "one_to_many"
+          target: "ChatReaction"
+          cascade_delete: true
+
+    ChatReaction:
+      description: "Emoji reaction attached to a ChatMessage."
+      fields:
+        id:
+          type: "Integer"
+          constraints: "Autoincrementing integer primary key"
+          nullable: false
+        message_id:
+          type: "Integer"
+          constraints: "Foreign key referencing ChatMessage id"
+          nullable: false
+        agent_uid:
+          type: "Text"
+          constraints: "UID of reacting agent or user"
+          nullable: false
+        reaction:
+          type: "Text"
+          constraints: "Single unicode emoji character"
+          nullable: false
+        created_at:
+          type: "Timestamp"
+          constraints: "ISO 8601 UTC string"
+          nullable: false
+      relations:
+        - type: "many_to_one"
+          target: "ChatMessage"
+          cascade_delete: false
+
+    AgentCursor:
+      description: "Tracks the last read ChatMessage per agent."
+      fields:
+        agent_uid:
+          type: "Text"
+          constraints: "Agent UID primary key"
+          nullable: false
+        last_read_message_id:
+          type: "Integer"
+          constraints: "Integer >= 0"
+          nullable: false
+        updated_at:
+          type: "Timestamp"
+          constraints: "ISO 8601 UTC string"
+          nullable: false
+
+    AutonomyPulse:
+      description: "Scheduled or recurring proactive trigger stored in pulses.db."
+      fields:
+        id:
+          type: "Integer"
+          constraints: "Autoincrementing integer primary key"
+          nullable: false
+        title:
+          type: "Text"
+          constraints: "Human-readable pulse name"
+          nullable: false
+        context:
+          type: "Text"
+          constraints: "Detailed operational directive"
+          nullable: false
+        scheduled_time:
+          type: "Timestamp"
+          constraints: "ISO 8601 local timestamp"
+          nullable: false
+        recurrence:
+          type: "Enum"
+          constraints: "One of [none, hourly, daily, weekly, monthly]"
+          nullable: true
+        status:
+          type: "Enum"
+          constraints: "One of [pending, completed, dismissed]"
+          nullable: false
+        has_run:
+          type: "Boolean"
+          constraints: "True if executed at least once"
+          nullable: false
+        pulse_type:
+          type: "Text"
+          constraints: "Default 'silent'"
+          nullable: false
+
+    ShortTermMemory:
+      description: "Continuity memory record in MemPalace Layer 1 (short_term_mem.json)."
+      fields:
+        id:
+          type: "Text"
+          constraints: "8-character hexadecimal string"
+          nullable: false
+        date:
+          type: "Timestamp"
+          constraints: "ISO 8601 timestamp"
+          nullable: false
+        content:
+          type: "Text"
+          constraints: "Descriptive summary of recent event or state"
+          nullable: false
+
+    EpistemicMirror:
+      description: "Subjective Theory of Mind perspective in MemPalace Layer 2 (mirrors.json)."
+      fields:
+        perspective:
+          type: "Text"
+          constraints: "Name of person, agent, or self"
+          nullable: false
+        current_view:
+          type: "Text"
+          constraints: "Current subjective assessment"
+          nullable: false
+        provenance:
+          type: "Enum"
+          constraints: "One of [stated, inferred, observed, synthesized, unknown]"
+          nullable: false
+        confidence:
+          type: "Float"
+          constraints: "0.0 <= confidence <= 1.0"
+          nullable: false
+        evidence_refs:
+          type: "Array"
+          constraints: "List of string references"
+          nullable: false
+        contradicted_by:
+          type: "Array"
+          constraints: "List of conflicting perspective names"
+          nullable: false
+        last_updated:
+          type: "Timestamp"
+          constraints: "ISO 8601 timestamp"
+          nullable: false
+
+    IdentitySoulJar:
+      description: "Foundational identity and values in MemPalace Layer 0 (soul_jar.json & identity.txt)."
+      fields:
+        archetype:
+          type: "Text"
+          constraints: "Core identity role archetype"
+          nullable: false
+        base_personality:
+          type: "Text"
+          constraints: "Primary behavioral framing"
+          nullable: false
+        core_values:
+          type: "Array"
+          constraints: "List of strings defining ethical bounds"
+          nullable: false
+        overarching_goals:
+          type: "Array"
+          constraints: "List of strings defining lifelong pursuits"
+          nullable: false
+        anti_patterns:
+          type: "Array"
+          constraints: "List of strings defining prohibited behaviors"
+          nullable: false
+
+    TrajectoryLedger:
+      description: "Actionable aspirations and somatic tracking ledger (trajectory.json & somatic_state.json)."
+      fields:
+        current_task_weight:
+          type: "Float"
+          constraints: "Task weight accumulated during sequential tool turns"
+          nullable: false
+        max_weight:
+          type: "Float"
+          constraints: "Maximum allowable task weight ceiling"
+          nullable: false
+        short_term_aspirations:
+          type: "Array"
+          constraints: "Immediate actionable goals"
+          nullable: false
+        medium_term_aspirations:
+          type: "Array"
+          constraints: "Weekly or sprint-level milestones"
+          nullable: false
+        long_term_aspirations:
+          type: "Array"
+          constraints: "Strategic or multi-month goals"
+          nullable: false
+
+    BackupTarget:
+      description: "External file or directory flagged for inclusion in .oaa backups (backup_targets.json)."
+      fields:
+        path:
+          type: "FilePath"
+          constraints: "Normalized portable path starting with ~"
+          nullable: false
+        type:
+          type: "Enum"
+          constraints: "One of [file, directory]"
+          nullable: false
+        added_at:
+          type: "Timestamp"
+          constraints: "ISO 8601 timestamp"
+          nullable: false
+
+  interoperability_contracts:
+    file_formats:
+      - format_id: "open_amity_agent_archive"
+        mime_types: ["application/zip", "application/x-openamity-archive"]
+        file_extensions: ["oaa"]
+        byte_encoding: "ZIP container format using standard Deflate compression"
+        lossless_roundtrip: true
+        schema_definition: |
+          ZIP container containing:
+          - settings.json (Agent configuration)
+          - .env (API keys and credentials)
+          - somatic_state.json (Somatic fatigue)
+          - trajectory.json (Aspirations and tasks)
+          - pulses.db (SQLite database of scheduled pulses)
+          - address_book.json (Contacts)
+          - backup_targets.json (List of external targets)
+          - mempalace/ (MemPalace directory: identity.txt, mirrors.json, short_term_mem.json, chroma.sqlite3)
+          - whatsapp_data/.wpp_session/ (WhatsApp credentials, excluding cache)
+          - _external_targets/target_<id>/ (Flagged external home directory files)
+          - _external_manifest.json (Mapping target_<id> to portable paths)
+
+      - format_id: "agent_settings_json"
+        mime_types: ["application/json"]
+        file_extensions: ["json"]
+        byte_encoding: "UTF-8"
+        lossless_roundtrip: true
+        schema_definition: |
+          {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["core"],
+            "properties": {
+              "core": {
+                "type": "object",
+                "required": ["paused", "mute", "agent", "somatic", "tools"],
+                "properties": {
+                  "paused": { "type": "boolean" },
+                  "mute": { "type": "boolean" },
+                  "first-run": { "type": "boolean" },
+                  "low-token-mode": { "type": "boolean" },
+                  "api-provider": { "type": "string" },
+                  "agent": {
+                    "type": "object",
+                    "required": ["uid", "name", "archetype", "core-values", "overarching-goals"],
+                    "properties": {
+                      "uid": { "type": "string", "pattern": "^\\+OA-[0-9A-HJ-KM-NP-TV-Z]{4}-[0-9A-HJ-KM-NP-TV-Z]{4}$" },
+                      "name": { "type": "string" },
+                      "gender": { "type": "string" },
+                      "archetype": { "type": "string" },
+                      "base-personality": { "type": "string" },
+                      "core-values": { "type": "array", "items": { "type": "string" } },
+                      "overarching-goals": { "type": "array", "items": { "type": "string" } },
+                      "anti-patterns": { "type": "array", "items": { "type": "string" } },
+                      "creation-date": { "type": "string" },
+                      "max-short-term-memories": { "type": "integer" }
+                    }
+                  },
+                  "tts": {
+                    "type": "object",
+                    "properties": {
+                      "provider": { "type": "string", "enum": ["piper", "gemini"] },
+                      "gemini": { "type": "object" },
+                      "piper": { "type": "object" }
+                    }
+                  },
+                  "somatic": {
+                    "type": "object",
+                    "properties": {
+                      "cognitive-budget": { "type": "number" },
+                      "decay-per-minute": { "type": "number" },
+                      "tool-cost": { "type": "number" },
+                      "exponential-factor": { "type": "number" }
+                    }
+                  },
+                  "tools": { "type": "object" }
+                }
+              }
+            }
+          }
+
+      - format_id: "agent_mirrors_json"
+        mime_types: ["application/json"]
+        file_extensions: ["json"]
+        byte_encoding: "UTF-8"
+        lossless_roundtrip: true
+        schema_definition: |
+          {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["current_view", "history", "provenance", "confidence"],
+              "properties": {
+                "current_view": { "type": "string" },
+                "provenance": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                "evidence_refs": { "type": "array", "items": { "type": "string" } },
+                "contradicted_by": { "type": "array", "items": { "type": "string" } },
+                "last_updated": { "type": "string" },
+                "history": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "view": { "type": "string" },
+                      "date": { "type": "string" },
+                      "provenance": { "type": "string" },
+                      "confidence": { "type": "number" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+      - format_id: "agent_short_term_mem_json"
+        mime_types: ["application/json"]
+        file_extensions: ["json"]
+        byte_encoding: "UTF-8"
+        lossless_roundtrip: true
+        schema_definition: |
+          {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "date", "content"],
+              "properties": {
+                "id": { "type": "string" },
+                "date": { "type": "string" },
+                "content": { "type": "string" }
+              }
+            }
+          }
+
+      - format_id: "agent_backup_targets_json"
+        mime_types: ["application/json"]
+        file_extensions: ["json"]
+        byte_encoding: "UTF-8"
+        lossless_roundtrip: true
+        schema_definition: |
+          {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "type", "added_at"],
+              "properties": {
+                "path": { "type": "string", "pattern": "^~/" },
+                "type": { "type": "string", "enum": ["file", "directory"] },
+                "added_at": { "type": "string" }
+              }
+            }
+          }
+
+      - format_id: "chatroom_sqlite_db"
+        mime_types: ["application/vnd.sqlite3"]
+        file_extensions: ["db"]
+        byte_encoding: "SQLite 3 database format with WAL journal mode"
+        lossless_roundtrip: true
+        schema_definition: |
+          CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            sender_name TEXT NOT NULL,
+            sender_type TEXT NOT NULL,
+            recipient_id TEXT,
+            content TEXT NOT NULL,
+            reply_to_id INTEGER,
+            origin_instance TEXT NOT NULL DEFAULT 'local'
+          );
+          CREATE TABLE agent_cursors (
+            agent_uid TEXT PRIMARY KEY,
+            last_read_message_id INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+          );
+          CREATE TABLE reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            agent_uid TEXT NOT NULL,
+            reaction TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(message_id, agent_uid) ON CONFLICT REPLACE,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+          );
+
+      - format_id: "pulses_sqlite_db"
+        mime_types: ["application/vnd.sqlite3"]
+        file_extensions: ["db"]
+        byte_encoding: "SQLite 3 database format"
+        lossless_roundtrip: true
+        schema_definition: |
+          CREATE TABLE pulses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            context TEXT,
+            scheduled_time TEXT,
+            recurrence TEXT,
+            status TEXT,
+            has_run BOOLEAN DEFAULT 0,
+            created_at TEXT,
+            pulse_type TEXT DEFAULT 'silent'
+          );
+
+    wire_protocols:
+      - protocol_id: "chatroom_event_bus"
+        transport: "ipc"
+        message_schema: |
+          {
+            "type": "object",
+            "required": ["event_type", "payload"],
+            "properties": {
+              "event_type": { "type": "string", "enum": ["new_message", "new_reaction"] },
+              "payload": { "type": "object" }
+            }
+          }
+
+      - protocol_id: "wppconnect_wa_bridge"
+        transport: "http"
+        message_schema: |
+          Loopback HTTP REST & WebSocket bridge over dynamically allocated port:
+          POST /api/send-message { "recipient": string, "text": string }
+          GET /api/status -> { "authenticated": boolean, "state": string }
+          WS /events -> Streaming inbound WhatsApp messages and connection events.
+
+      - protocol_id: "activitypub_federation"
+        transport: "http"
+        message_schema: |
+          W3C ActivityPub JSON-LD protocol over HTTPS for decentralized microblogging.
+
+    configuration:
+      format: "json"
+      schema_definition: |
+        Central Configuration (config.json):
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "required": ["user-full-name", "backup-location"],
+          "properties": {
+            "user-full-name": { "type": "string" },
+            "user-phone-number": { "type": "string" },
+            "user-email": { "type": "string" },
+            "backup-location": { "type": "string" }
+          }
+        }
+
+  assets_and_localization:
+    tokens:
+      palette:
+        primary_accent_color: "#a12924"
+        secondary_accent_color: "#f7e3a5"
+        amber_paused_color: "#8a6d1c"
+        amber_paused_text: "#857342"
+        dark_surface_base: "#1e1e1e"
+        dark_panel_background: "#252525"
+      typography:
+        font_regular: "Ubuntu-Regular"
+        font_light: "Ubuntu-Light"
+        font_monospace: "UbuntuMono-Regular"
+    icon_roles:
+      - id: "icon.pause"
+        description: "Standard pause glyph indicating active agent ready to enter sleep and offline state"
+      - id: "icon.resume"
+        description: "Play glyph indicating offline agent ready to awaken and resume pulses"
+      - id: "icon.mic"
+        description: "Microphone glyph for toggling local speech-to-text audio input"
+      - id: "icon.send"
+        description: "Paper airplane or arrow glyph for submitting textual prompts"
+      - id: "icon.settings"
+        description: "Gear or hamburger glyph for accessing modular agent or system settings"
+      - id: "icon.backup"
+        description: "Archive container glyph for snapshot creation and rollback restoration"
+      - id: "icon.chatroom"
+        description: "Speech bubbles glyph for the multi-agent shared collaborative chatroom"
+    string_catalog:
+      default_locale: "en-US"
+      strings:
+        - key: "ui.agent.paused_placeholder"
+          default_text: "Agent is paused. Click ▶ to resume..."
+        - key: "ui.agent.thinking_pulse"
+          default_text: "Thinking..."
+        - key: "ui.agent.consolidating_notice"
+          default_text: "Consolidating memories before pausing... please wait."
+        - key: "ui.agent.paused_banner"
+          default_text: "[Agent Paused - Autonomy and background processing offline]"
+        - key: "ui.agent.resumed_banner"
+          default_text: "[Agent Resumed - Autonomy online]"
+        - key: "ui.dialog.rollback_warning"
+          default_text: "Restoring this backup will completely replace all existing state for agent '{agent_name}'. Proceed?"
+        - key: "ui.error.worker_init_failed"
+          default_text: "The Cognitive Worker failed to initialise."
+        - key: "ui.error.task_weight_exhausted"
+          default_text: "I'm sorry, this task is taking too much of my cognitive capacity. I'll need to stop here and re-evaluate."
+
+  persistence_semantics:
+    lifecycles:
+      - store_id: "agent_state_store"
+        durability: "permanent"
+        isolation: "process_isolated"
+        consistency: "atomic"
+        path_convention: "~/.var/app/com.openamity.OpenAmity/data/agents/<agent_id>/"
+      - store_id: "shared_chatroom_store"
+        durability: "permanent"
+        isolation: "multi_client"
+        consistency: "atomic"
+        path_convention: "~/.var/app/com.openamity.OpenAmity/data/chatroom/chatroom.db"
+      - store_id: "global_config_store"
+        durability: "permanent"
+        isolation: "unshared"
+        consistency: "atomic"
+        path_convention: "~/.var/app/com.openamity.OpenAmity/data/config.json"
+      - store_id: "backup_archive_store"
+        durability: "permanent"
+        isolation: "unshared"
+        consistency: "atomic"
+        path_convention: "~/Documents/OpenAmity/Backups/<AgentName>-<YYYY-MM-DD>.oaa"
+
+verification_vectors:
+  - id: "VEC-001"
+    scenario: "Agent Pause Triggers Pre-Pause Sleep Consolidation and Persists Offline State"
+    type: "behavioral"
+    preconditions:
+      files:
+        - path: "/tmp/openamity_test/agents/agent-1/settings.json"
+          content: "{\"core\": {\"paused\": false, \"agent\": {\"name\": \"Amy\"}, \"somatic\": {\"cognitive-budget\": 10000}}}"
+      state:
+        entity: "AgentInstance"
+        attribute: "is_paused"
+        value: false
+    actions:
+      - step: 1
+        type: "command"
+        target: "agent.toggle_pause"
+        payload: { "agent_id": "agent-1" }
+    assertions:
+      - check: "state"
+        target: "AgentInstance.is_paused"
+        operator: "equals"
+        expected: true
+      - check: "state"
+        target: "pulse_engine.is_running"
+        operator: "equals"
+        expected: false
+      - check: "disk"
+        target: "/tmp/openamity_test/agents/agent-1/settings.json"
+        operator: "contains"
+        expected: "\"paused\": true"
+      - check: "invariant"
+        target: "INV-AUT-02"
+        operator: "invariant_held"
+        expected: true
+
+  - id: "VEC-002"
+    scenario: "Cognitive Budget Escalates and Terminates Loop Upon Reaching Weight Limit"
+    type: "behavioral"
+    preconditions:
+      files:
+        - path: "/tmp/openamity_test/agents/agent-1/somatic_state.json"
+          content: "{\"current_task_weight\": 9800.0, \"max_weight\": 10000.0}"
+      state:
+        entity: "TrajectoryLedger"
+        attribute: "current_task_weight"
+        value: 9800.0
+    actions:
+      - step: 1
+        type: "input"
+        target: "orchestrator.execute_tool"
+        payload: { "tool": "WebSearch_search", "args": { "query": "Open Amity" } }
+    assertions:
+      - check: "state"
+        target: "orchestrator.is_thinking"
+        operator: "equals"
+        expected: false
+      - check: "state"
+        target: "orchestrator.current_task_weight"
+        operator: "gte"
+        expected: 10000.0
+      - check: "invariant"
+        target: "INV-COG-01"
+        operator: "invariant_held"
+        expected: true
+
+  - id: "VEC-003"
+    scenario: "Dialectical Tension Identified Between Contradictory Epistemic Mirrors"
+    type: "behavioral"
+    preconditions:
+      files:
+        - path: "/tmp/openamity_test/agents/agent-1/mempalace/mirrors.json"
+          content: "{\"Alice\": {\"current_view\": \"Prefers async text communication\", \"confidence\": 0.9, \"history\": [], \"provenance\": \"observed\", \"contradicted_by\": [\"Bob\"]}, \"Bob\": {\"current_view\": \"Insists on phone calls\", \"confidence\": 0.8, \"history\": [], \"provenance\": \"stated\", \"contradicted_by\": []}}"
+    actions:
+      - step: 1
+        type: "command"
+        target: "mempalace.get_self_perception"
+        payload: {}
+    assertions:
+      - check: "output"
+        target: "self_perception_text"
+        operator: "contains"
+        expected: "--- Open Epistemic Tensions & Dissonance ---"
+      - check: "output"
+        target: "self_perception_text"
+        operator: "contains"
+        expected: "Dissonance between 'Alice' and 'Bob'"
+      - check: "invariant"
+        target: "INV-MEM-02"
+        operator: "invariant_held"
+        expected: true
+
+  - id: "VEC-004"
+    scenario: "Chatroom Dispatches Direct Message and Updates Agent Unread Cursor"
+    type: "behavioral"
+    preconditions:
+      state:
+        entity: "ChatMessage"
+        attribute: "total_count"
+        value: 0
+    actions:
+      - step: 1
+        type: "command"
+        target: "chatroom.send_message"
+        payload: { "sender_id": "+OA-AAAA-BBBB", "sender_name": "Amy", "sender_type": "agent", "recipient_id": "+OA-CCCC-DDDD", "content": "Hello Nova" }
+      - step: 2
+        type: "command"
+        target: "chatroom.update_cursor"
+        payload: { "agent_uid": "+OA-CCCC-DDDD", "message_id": 1 }
+    assertions:
+      - check: "state"
+        target: "AgentCursor.last_read_message_id"
+        operator: "equals"
+        expected: 1
+      - check: "disk"
+        target: "chatroom.db"
+        operator: "exists"
+        expected: true
+
+  - id: "VEC-005"
+    scenario: "Agent Backup Packages State into Single Container and Restores Cleanly"
+    type: "behavioral"
+    preconditions:
+      files:
+        - path: "/tmp/openamity_test/agents/agent-1/settings.json"
+          content: "{\"core\": {\"agent\": {\"uid\": \"+OA-TEST-TEST\", \"name\": \"TestAgent\"}}}"
+    actions:
+      - step: 1
+        type: "command"
+        target: "agent.create_backup"
+        payload: { "agent_id": "agent-1", "destination_dir": "/tmp/openamity_test/backups" }
+      - step: 2
+        type: "command"
+        target: "agent.restore_backup"
+        payload: { "backup_path": "/tmp/openamity_test/backups/TestAgent.oaa" }
+    assertions:
+      - check: "disk"
+        target: "/tmp/openamity_test/backups/TestAgent.oaa"
+        operator: "exists"
+        expected: true
+      - check: "invariant"
+        target: "INV-SEC-03"
+        operator: "invariant_held"
+        expected: true
+
+  - id: "VEC-006"
+    scenario: "Flagging External Backup Target Strictly Disallows Sensitive Home Dotfiles"
+    type: "negative"
+    preconditions:
+      state:
+        entity: "AgentInstance"
+        attribute: "id"
+        value: "agent-1"
+    actions:
+      - step: 1
+        type: "command"
+        target: "backup_manager.sync_and_clean_backup_targets"
+        payload: { "agent_id": "agent-1", "action": "add", "candidate_path": "~/.ssh/id_rsa" }
+    assertions:
+      - check: "state"
+        target: "action_result.success"
+        operator: "equals"
+        expected: false
+      - check: "state"
+        target: "action_result.message"
+        operator: "contains"
+        expected: "Path is protected or unsafe"
+      - check: "invariant"
+        target: "INV-SEC-02"
+        operator: "invariant_held"
+        expected: true
+
+  - id: "VEC-007"
+    scenario: "Two-Beat Sleep Consolidation Cycle Executes Silently Without Speaker Invocation"
+    type: "boundary"
+    preconditions:
+      state:
+        entity: "AgentInstance"
+        attribute: "fatigue"
+        value: 0.15
+    actions:
+      - step: 1
+        type: "signal"
+        target: "pulse_engine"
+        payload: { "trigger": "sleep_cycle" }
+    assertions:
+      - check: "state"
+        target: "orchestrator._is_sleep_cycle"
+        operator: "equals"
+        expected: true
+      - check: "state"
+        target: "speaker_tool.invoked"
+        operator: "equals"
+        expected: false
+      - check: "invariant"
+        target: "INV-AUT-01"
+        operator: "invariant_held"
+        expected: true
+
+  - id: "VEC-008"
+    scenario: "In-Process MemPalace Semantic Search Completes Within 50ms Latency Budget"
+    type: "performance"
+    preconditions:
+      files:
+        - path: "/tmp/openamity_test/agents/agent-1/mempalace/short_term_mem.json"
+          content: "[{\"id\": \"1\", \"date\": \"2026-09-13T12:00:00\", \"content\": \"Benchmarking latency budget.\"}]"
+    actions:
+      - step: 1
+        type: "command"
+        target: "mempalace.search"
+        payload: { "query": "Benchmarking" }
+    assertions:
+      - check: "latency"
+        target: "mempalace_in_process_recall"
+        operator: "lte"
+        expected: 50

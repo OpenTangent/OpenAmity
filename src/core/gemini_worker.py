@@ -50,11 +50,102 @@ class GeminiWorker:
         self.is_processing = False
         self.sys_instruct = None
         self.tools = None
+        self._chat_lock = threading.RLock()
+        self._process_lock = threading.Lock()
 
         # State for remembering the first successful model per session
         self.thinking_models = []
         self.current_thinker_model = None
         self.thinker_config = None
+
+    def _get_chat_history(self):
+        if not self.thinker_chat:
+            return []
+        if hasattr(self.thinker_chat, '_curated_history') and self.thinker_chat._curated_history is not None:
+            return self.thinker_chat._curated_history
+        if hasattr(self.thinker_chat, 'get_history'):
+            try:
+                return self.thinker_chat.get_history(curated=True)
+            except Exception:
+                return self.thinker_chat.get_history()
+        if hasattr(self.thinker_chat, 'history') and self.thinker_chat.history is not None:
+            return self.thinker_chat.history
+        return []
+
+    def _reconcile_tool_calls(self, content):
+        """
+        Ensures any unfulfilled function calls in the chat history or pending turn
+        have matching function responses synthesized before sending to the Gemini API.
+        """
+        from google.genai import types
+        with self._chat_lock:
+            history = self._get_chat_history()
+            if not history:
+                return content
+
+            # 1. Reconcile internal history pairs if any prior model turn had unfulfilled calls
+            for i in range(len(history) - 1):
+                turn = history[i]
+                if getattr(turn, 'role', None) == 'model':
+                    expected_fcs = []
+                    for p in getattr(turn, 'parts', []) or []:
+                        fc = getattr(p, 'function_call', None)
+                        if fc and getattr(fc, 'name', None):
+                            expected_fcs.append(fc.name)
+                    if expected_fcs:
+                        next_turn = history[i + 1]
+                        if getattr(next_turn, 'role', None) == 'user':
+                            answered = []
+                            for p in getattr(next_turn, 'parts', []) or []:
+                                fr = getattr(p, 'function_response', None)
+                                if fr and getattr(fr, 'name', None):
+                                    answered.append(fr.name)
+                            missing_parts = []
+                            for name in expected_fcs:
+                                if name in answered:
+                                    answered.remove(name)
+                                else:
+                                    missing_parts.append(types.Part.from_function_response(
+                                        name=name,
+                                        response={"result": "[Action cancelled or interrupted by system]"}
+                                    ))
+                                    logging.warning(
+                                        f"GeminiWorker synthesized dummy function response for unfulfilled function_call: {name}")
+                            if missing_parts:
+                                next_turn.parts = missing_parts + (getattr(next_turn, 'parts', []) or [])
+
+            # 2. Check the final turn in history for unfulfilled function calls
+            last_turn = history[-1]
+            if getattr(last_turn, 'role', None) == 'model':
+                expected_fcs = []
+                for p in getattr(last_turn, 'parts', []) or []:
+                    fc = getattr(p, 'function_call', None)
+                    if fc and getattr(fc, 'name', None):
+                        expected_fcs.append(fc.name)
+
+                if expected_fcs:
+                    answered_in_content = []
+                    for item in content:
+                        fr = getattr(item, 'function_response', None)
+                        if fr and getattr(fr, 'name', None):
+                            answered_in_content.append(fr.name)
+
+                    missing_parts = []
+                    for name in expected_fcs:
+                        if name in answered_in_content:
+                            answered_in_content.remove(name)
+                        else:
+                            missing_parts.append(types.Part.from_function_response(
+                                name=name,
+                                response={"result": "[Action cancelled or interrupted by system]"}
+                            ))
+                            logging.warning(
+                                f"GeminiWorker synthesized dummy function response for unfulfilled function_call: {name}")
+
+                    if missing_parts:
+                        content = missing_parts + list(content)
+
+            return content
 
     def is_running(self):
         return self.running
@@ -111,11 +202,10 @@ class GeminiWorker:
             if not self.current_thinker_model or self.current_thinker_model not in self.thinking_models:
                 self.current_thinker_model = self.thinking_models[0]
 
-            old_history = self.thinker_chat.history if (
-                self.thinker_chat and hasattr(self.thinker_chat, 'history')) else None
+            old_history = self._get_chat_history()
             try:
                 self.thinker_chat = self.client.chats.create(
-                    model=self.current_thinker_model, config=self.thinker_config, history=old_history)
+                    model=self.current_thinker_model, config=self.thinker_config, history=old_history if old_history else None)
             except Exception:
                 self.thinker_chat = self.client.chats.create(
                     model=self.current_thinker_model, config=self.thinker_config)
@@ -185,6 +275,7 @@ class GeminiWorker:
         is_low_token = self.settings.get("core.low-token-mode", False)
         for name, response in responses:
             if isinstance(response, dict):
+                response = response.copy()
                 if 'media' in response and isinstance(response['media'], list):
                     for file_path in response['media']:
                         if is_low_token:
@@ -214,6 +305,10 @@ class GeminiWorker:
             parts, None, False, None), daemon=True).start()
 
     def _process_thought(self, prompt, image_path, yolo, audio_path=None):
+        with self._process_lock:
+            self._process_thought_locked(prompt, image_path, yolo, audio_path)
+
+    def _process_thought_locked(self, prompt, image_path, yolo, audio_path=None):
         from core.logger_config import agent_id_var
         if hasattr(self, 'agent_id'):
             agent_id_var.set(self.agent_id)
@@ -257,36 +352,39 @@ class GeminiWorker:
                     self.is_processing = False
                     return
 
-        # Intelligent Media Culling: Strip heavy multimodal tokens from older context
-        if self.thinker_chat and hasattr(self.thinker_chat, 'history'):
-            history_len = len(self.thinker_chat.history)
-            if history_len > 2:
-                from google.genai import types
-                for i in range(history_len - 2):
-                    content_msg = self.thinker_chat.history[i]
-                    if getattr(content_msg, 'parts', None):
-                        new_parts = []
-                        modified = False
-                        for part in content_msg.parts:
-                            if getattr(part, 'inline_data', None) or getattr(part, 'file_data', None):
-                                if getattr(part, 'file_data', None) and getattr(part.file_data, 'file_uri', None):
-                                    try:
-                                        file_name = part.file_data.file_uri.split(
-                                            '/')[-1]
-                                        self.client.files.delete(
-                                            name=f"files/{file_name}")
-                                        logging.debug(
-                                            f"Automatically deleted pruned file from API: files/{file_name}")
-                                    except Exception as e:
-                                        logging.debug(
-                                            f"Could not delete pruned file {part.file_data.file_uri}: {e}")
-                                new_parts.append(types.Part.from_text(
-                                    text="[Media attachment automatically culled to save tokens/memory]"))
-                                modified = True
-                            else:
-                                new_parts.append(part)
-                        if modified:
-                            content_msg.parts = new_parts
+        # Intelligent Media Culling: Strip heavy multimodal tokens from older context (> 4 turns)
+        history = self._get_chat_history()
+        history_len = len(history)
+        if history_len > 4:
+            from google.genai import types
+            for i in range(history_len - 4):
+                content_msg = history[i]
+                if getattr(content_msg, 'parts', None):
+                    new_parts = []
+                    modified = False
+                    for part in content_msg.parts:
+                        if getattr(part, 'inline_data', None) or getattr(part, 'file_data', None):
+                            if getattr(part, 'file_data', None) and getattr(part.file_data, 'file_uri', None):
+                                try:
+                                    file_name = part.file_data.file_uri.split(
+                                        '/')[-1]
+                                    self.client.files.delete(
+                                        name=f"files/{file_name}")
+                                    logging.debug(
+                                        f"Automatically deleted pruned file from API: files/{file_name}")
+                                except Exception as e:
+                                    logging.debug(
+                                        f"Could not delete pruned file {part.file_data.file_uri}: {e}")
+                            new_parts.append(types.Part.from_text(
+                                text="[Media attachment automatically culled to save tokens/memory]"))
+                            modified = True
+                        else:
+                            new_parts.append(part)
+                    if modified:
+                        content_msg.parts = new_parts
+
+        # Automatically reconcile unfulfilled function calls before sending to API
+        content = self._reconcile_tool_calls(content)
 
         start_idx = self.thinking_models.index(
             self.current_thinker_model) if self.current_thinker_model in self.thinking_models else 0
@@ -300,11 +398,10 @@ class GeminiWorker:
             if model_name != self.current_thinker_model or not self.thinker_chat:
                 logging.debug(f"Re-initializing chat for model {model_name}")
                 self.current_thinker_model = model_name
-                old_history = self.thinker_chat.history if (
-                    self.thinker_chat and hasattr(self.thinker_chat, 'history')) else None
+                old_history = self._get_chat_history()
                 try:
                     self.thinker_chat = self.client.chats.create(
-                        model=model_name, config=self.thinker_config, history=old_history)
+                        model=model_name, config=self.thinker_config, history=old_history if old_history else None)
                 except Exception as ex:
                     logging.debug(
                         f"Failed creating chat with history: {ex}. Falling back to fresh chat.")

@@ -3,9 +3,13 @@ import json
 import logging
 import datetime
 import uuid
+import threading
 from core.settings_manager import SettingsManager
+from core.file_utils import atomic_json_write
 
 from mempalace.layers import MemoryStack
+
+_mempalace_lock = threading.Lock()
 
 
 class MemPalaceManager:
@@ -20,6 +24,7 @@ class MemPalaceManager:
 
         self.palace_path = palace_path
         self.soul_jar_path = soul_jar_path
+        self._cache_lock = threading.RLock()
         self._mirrors_cache = None
         self._short_term_cache = None
 
@@ -142,7 +147,9 @@ class MemPalaceManager:
             lines.append("")
 
             lines.append("Anti-Patterns:")
-            for ap in core_id.get("anti_patterns", []):
+            immutable_ap = core_id.get("anti_patterns", [])
+            mutable_ap = soul_jar_settings.get("anti-patterns", [])
+            for ap in immutable_ap + mutable_ap:
                 lines.append(f" - {ap}")
             lines.append("")
 
@@ -160,7 +167,7 @@ class MemPalaceManager:
                 else:
                     lines.append(f" - {key}: {val}")
 
-            temp_path = self.identity_path + ".tmp"
+            temp_path = f"{self.identity_path}.tmp.{uuid.uuid4().hex}"
             with open(temp_path, 'w') as f:
                 f.write("\n".join(lines))
             os.replace(temp_path, self.identity_path)
@@ -244,77 +251,82 @@ class MemPalaceManager:
         return "\n\n".join(context)
 
     def _load_mirrors(self) -> dict:
-        if getattr(self, '_mirrors_cache', None) is not None:
-            return self._mirrors_cache
+        with self._cache_lock:
+            if getattr(self, '_mirrors_cache', None) is not None:
+                return self._mirrors_cache
 
-        path = os.path.join(self.palace_path, "mirrors.json")
-        if os.path.exists(path):
-            try:
-                with open(path, 'r') as f:
-                    mirrors = json.load(f)
+            path = os.path.join(self.palace_path, "mirrors.json")
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        mirrors = json.load(f)
 
-                    modified = False
-                    for perspective, data in mirrors.items():
-                        if not isinstance(data, dict):
-                            mirrors[perspective] = {"current_view": str(
-                                data), "history": [], "provenance": "unknown"}
-                            modified = True
-                            continue
+                        modified = False
+                        for perspective, data in mirrors.items():
+                            if not isinstance(data, dict):
+                                mirrors[perspective] = {"current_view": str(
+                                    data), "history": [], "provenance": "unknown"}
+                                modified = True
+                                continue
 
-                        if "current_view" not in data:
-                            data["current_view"] = ""
-                            modified = True
-                        if "history" not in data:
-                            data["history"] = []
-                            modified = True
-                        if "provenance" not in data:
-                            data["provenance"] = "unknown"
-                            modified = True
+                            if "current_view" not in data:
+                                data["current_view"] = ""
+                                modified = True
+                            if "history" not in data:
+                                data["history"] = []
+                                modified = True
+                            if "provenance" not in data:
+                                data["provenance"] = "unknown"
+                                modified = True
 
-                    if modified:
-                        self._save_mirrors(mirrors)
-                    else:
-                        self._mirrors_cache = mirrors
+                        if modified:
+                            self._save_mirrors(mirrors)
+                        else:
+                            self._mirrors_cache = mirrors
 
-                    return mirrors
-            except Exception as e:
-                logging.error(f"Error reading mirrors: {e}")
-        return {}
+                        return mirrors
+                except Exception as e:
+                    logging.error(f"Error reading mirrors: {e}")
+            return {}
 
     def _save_mirrors(self, mirrors: dict):
-        self._mirrors_cache = mirrors
-        path = os.path.join(self.palace_path, "mirrors.json")
-        try:
-            temp_path = path + ".tmp"
-            with open(temp_path, 'w') as f:
-                json.dump(mirrors, f, indent=2)
-            os.replace(temp_path, path)
-        except Exception as e:
-            logging.error(f"Error writing mirrors: {e}")
+        with self._cache_lock:
+            self._mirrors_cache = mirrors
+            path = os.path.join(self.palace_path, "mirrors.json")
+            try:
+                atomic_json_write(path, mirrors)
+            except Exception as e:
+                logging.error(f"Error writing mirrors: {e}")
 
-    def update_mirror(self, perspective: str, subjective_view: str, provenance: str = "inferred"):
-        mirrors = self._load_mirrors()
-        now_str = datetime.datetime.now().isoformat()
+    def update_mirror(self, perspective: str, subjective_view: str, provenance: str = "inferred",
+                      confidence: float = 1.0, evidence_refs: list = None, contradicted_by: list = None):
+        with self._cache_lock:
+            mirrors = self._load_mirrors()
+            now_str = datetime.datetime.now().isoformat()
 
-        if perspective not in mirrors:
-            mirrors[perspective] = {
-                "current_view": subjective_view,
-                "history": []
-            }
-        else:
-            old_view = mirrors[perspective]["current_view"]
-            mirrors[perspective]["history"].append({
-                "view": old_view,
-                "date": now_str,
-                "provenance": mirrors[perspective].get("provenance", "unknown")
-            })
-            mirrors[perspective]["current_view"] = subjective_view
+            if perspective not in mirrors:
+                mirrors[perspective] = {
+                    "current_view": subjective_view,
+                    "history": []
+                }
+            else:
+                old_view = mirrors[perspective].get("current_view", "")
+                mirrors[perspective].setdefault("history", []).append({
+                    "view": old_view,
+                    "date": now_str,
+                    "provenance": mirrors[perspective].get("provenance", "unknown"),
+                    "confidence": mirrors[perspective].get("confidence", 1.0)
+                })
+                mirrors[perspective]["current_view"] = subjective_view
 
-        mirrors[perspective]["provenance"] = provenance
-        mirrors[perspective]["last_updated"] = now_str
+            mirrors[perspective]["provenance"] = provenance
+            mirrors[perspective]["confidence"] = float(confidence) if confidence is not None else 1.0
+            mirrors[perspective]["evidence_refs"] = list(evidence_refs) if evidence_refs else []
+            mirrors[perspective]["contradicted_by"] = list(contradicted_by) if contradicted_by else []
+            mirrors[perspective]["last_updated"] = now_str
 
-        self._save_mirrors(mirrors)
-        return True
+            self._save_mirrors(mirrors)
+            return True
 
     def get_self_perception(self, limit: int = 24) -> str:
         """Retrieves core self-perception entries (up to `limit` most recently updated) to inject during wake up or bearings."""
@@ -332,19 +344,42 @@ class MemPalaceManager:
             reverse=True
         )
 
+        active_mirrors = sorted_mirrors
         if limit is not None and limit > 0:
-            sorted_mirrors = sorted_mirrors[:limit]
+            active_mirrors = sorted_mirrors[:limit]
 
         lines = ["\n--- Core Self Perception & Theory of Mind ---"]
-        for perspective, data in sorted_mirrors:
+        tensions = []
+
+        for perspective, data in active_mirrors:
             if isinstance(data, dict):
                 lines.append(f"Perspective: {perspective}")
                 lines.append(f"Subjective View: {data.get('current_view', '')}")
-                lines.append(f"Provenance: {data.get('provenance', 'unknown')}\n")
+                prov_str = f"Provenance: {data.get('provenance', 'unknown')}"
+                conf = data.get("confidence")
+                if conf is not None and conf != 1.0:
+                    prov_str += f" | Confidence: {conf:.2f}"
+                lines.append(f"{prov_str}\n")
+
+                contradictions = data.get("contradicted_by", [])
+                if contradictions:
+                    for target in contradictions:
+                        target_view = mirrors.get(target, {}).get("current_view", "(no record)")
+                        tensions.append(
+                            f"- Dissonance between '{perspective}' and '{target}':\n"
+                            f"  * {perspective}'s view: \"{data.get('current_view', '')}\"\n"
+                            f"  * {target}'s view: \"{target_view}\""
+                        )
             else:
                 lines.append(f"Perspective: {perspective}")
                 lines.append(f"Subjective View: {str(data)}")
                 lines.append("Provenance: unknown\n")
+
+        if tensions:
+            lines.append("--- Open Epistemic Tensions & Dissonance ---")
+            lines.append("The following unresolved dialectics exist between perspectives. Sit with these tensions:")
+            lines.extend(tensions)
+            lines.append("")
 
         return "\n".join(lines)
 
@@ -358,7 +393,7 @@ class MemPalaceManager:
                 "content": "System initialized. My immediate goal is to understand who the user is, what their goals are, and how I play a role. I should populate my trajectory data with tasks and aspirations that move us towards our shared goals."
             }]
             try:
-                temp_path = path + ".tmp"
+                temp_path = f"{path}.tmp.{uuid.uuid4().hex}"
                 with open(temp_path, 'w') as f:
                     json.dump(seed_memory, f, indent=2)
                 os.replace(temp_path, path)
@@ -366,76 +401,77 @@ class MemPalaceManager:
                 logging.error(f"Error seeding short term memories: {e}")
 
     def _load_short_term_memories(self) -> list:
-        if getattr(self, '_short_term_cache', None) is not None:
-            return self._short_term_cache
+        with self._cache_lock:
+            if getattr(self, '_short_term_cache', None) is not None:
+                return self._short_term_cache
 
-        path = os.path.join(self.palace_path, "short_term_mem.json")
-        if os.path.exists(path):
-            try:
-                with open(path, 'r') as f:
-                    memories = json.load(f)
+            path = os.path.join(self.palace_path, "short_term_mem.json")
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        memories = json.load(f)
 
-                    modified = False
-                    for m in memories:
-                        if "id" not in m:
-                            m["id"] = str(uuid.uuid4())[:8]
-                            modified = True
-                        if "date" not in m:
-                            m["date"] = datetime.datetime.now().isoformat()
-                            modified = True
-                        if "content" not in m:
-                            m["content"] = ""
-                            modified = True
+                        modified = False
+                        for m in memories:
+                            if "id" not in m:
+                                m["id"] = str(uuid.uuid4())[:8]
+                                modified = True
+                            if "date" not in m:
+                                m["date"] = datetime.datetime.now().isoformat()
+                                modified = True
+                            if "content" not in m:
+                                m["content"] = ""
+                                modified = True
 
-                    if modified:
-                        self._save_short_term_memories(memories)
-                    else:
-                        self._short_term_cache = memories
+                        if modified:
+                            self._save_short_term_memories(memories)
+                        else:
+                            self._short_term_cache = memories
 
-                    return memories
-            except Exception as e:
-                logging.error(f"Error reading short term memories: {e}")
-        return []
+                        return memories
+                except Exception as e:
+                    logging.error(f"Error reading short term memories: {e}")
+            return []
 
     def _save_short_term_memories(self, memories: list):
-        self._short_term_cache = memories
-        path = os.path.join(self.palace_path, "short_term_mem.json")
-        try:
-            temp_path = path + ".tmp"
-            with open(temp_path, 'w') as f:
-                json.dump(memories, f, indent=2)
-            os.replace(temp_path, path)
-        except Exception as e:
-            logging.error(f"Error writing short term memories: {e}")
+        with self._cache_lock:
+            self._short_term_cache = memories
+            path = os.path.join(self.palace_path, "short_term_mem.json")
+            try:
+                atomic_json_write(path, memories)
+            except Exception as e:
+                logging.error(f"Error writing short term memories: {e}")
 
     def add_short_term_memory(self, content: str, supersedes: list = None):
         """Appends a new short-term memory and prunes if necessary"""
-        memories = self._load_short_term_memories()
+        with self._cache_lock:
+            memories = self._load_short_term_memories()
 
-        if supersedes:
-            memories = [m for m in memories if m.get("id") not in supersedes]
+            if supersedes:
+                memories = [m for m in memories if m.get("id") not in supersedes]
 
-        new_memory = {
-            "id": str(uuid.uuid4())[:8],
-            "date": datetime.datetime.now().isoformat(),
-            "content": content
-        }
-        memories.append(new_memory)
+            new_memory = {
+                "id": str(uuid.uuid4())[:8],
+                "date": datetime.datetime.now().isoformat(),
+                "content": content
+            }
+            memories.append(new_memory)
 
-        settings = SettingsManager(agent_id=self.agent_id)
-        max_memories = settings.get("core.agent.max-short-term-memories", 80)
+            settings = SettingsManager(agent_id=self.agent_id)
+            max_memories = settings.get("core.agent.max-short-term-memories", 80)
 
-        if len(memories) > max_memories:
-            memories = memories[-max_memories:]
+            if len(memories) > max_memories:
+                memories = memories[-max_memories:]
 
-        self._save_short_term_memories(memories)
+            self._save_short_term_memories(memories)
 
     def remove_short_term_memory(self, memory_id: str):
         """Removes a short-term memory by its ID"""
-        memories = self._load_short_term_memories()
-        filtered = [m for m in memories if m.get("id") != memory_id]
-        if len(filtered) != len(memories):
-            self._save_short_term_memories(filtered)
+        with self._cache_lock:
+            memories = self._load_short_term_memories()
+            filtered = [m for m in memories if m.get("id") != memory_id]
+            if len(filtered) != len(memories):
+                self._save_short_term_memories(filtered)
 
     def get_short_term_context(self) -> str:
         """Reads and formats the short term memory context"""
@@ -451,84 +487,34 @@ class MemPalaceManager:
         return "\n\n".join(lines)
 
     def add_memory(self, content: str, wing: str = "default", room: str = "general", source_file: str = "agent_thoughts"):
-        """Add a new memory to the MemPalace"""
-        import subprocess
-        import sys
-
-        script = """
-import os
-import sys
-import json
-payload = json.loads(sys.stdin.read())
-os.environ['MEMPALACE_PALACE_PATH'] = payload['palace_path']
-from mempalace.mcp_server import tool_add_drawer
-res = tool_add_drawer(wing=payload['wing'], room=payload['room'], content=payload['content'], source_file=payload['source_file'], added_by=payload['added_by'])
-print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
-"""
-        payload = {
-            "palace_path": self.palace_path,
-            "wing": wing,
-            "room": room,
-            "content": content,
-            "source_file": source_file,
-            "added_by": "the_agent"
-        }
-
-        try:
-            proc = subprocess.run([sys.executable, "-c", script], input=json.dumps(
-                payload), text=True, capture_output=True, check=True)
-            stdout = proc.stdout
-            if "<<<RESULT>>>" in stdout and "<<<END>>>" in stdout:
-                result_str = stdout.split("<<<RESULT>>>")[
-                    1].split("<<<END>>>")[0]
-                result = json.loads(result_str)
-                return result.get("result", str(result))
-            else:
-                try:
-                    result = json.loads(stdout)
-                    return result.get("result", str(result))
-                except json.JSONDecodeError:
-                    return stdout.strip() if stdout.strip() else "Success (response parse failed but write committed)"
-        except Exception as e:
-            return f"Failed to add memory: {e}\nStderr: {proc.stderr if 'proc' in locals() else ''}\nStdout: {proc.stdout if 'proc' in locals() else ''}"
+        """Add a new memory to the MemPalace directly in-process."""
+        with _mempalace_lock:
+            try:
+                os.environ['MEMPALACE_PALACE_PATH'] = self.palace_path
+                from mempalace.mcp_server import tool_add_drawer
+                res = tool_add_drawer(
+                    wing=wing,
+                    room=room,
+                    content=content,
+                    source_file=source_file,
+                    added_by="the_agent"
+                )
+                return res
+            except Exception as e:
+                logging.error(f"MemPalaceManager.add_memory error: {e}", exc_info=True)
+                return f"Failed to add memory: {e}"
 
     def delete_memory(self, drawer_id: str):
-        """Delete a memory from the MemPalace"""
-        import subprocess
-        import sys
-
-        script = """
-import os
-import sys
-import json
-payload = json.loads(sys.stdin.read())
-os.environ['MEMPALACE_PALACE_PATH'] = payload['palace_path']
-from mempalace.mcp_server import tool_delete_drawer
-res = tool_delete_drawer(drawer_id=payload['drawer_id'])
-print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
-"""
-        payload = {
-            "palace_path": self.palace_path,
-            "drawer_id": drawer_id
-        }
-
-        try:
-            proc = subprocess.run([sys.executable, "-c", script], input=json.dumps(
-                payload), text=True, capture_output=True, check=True)
-            stdout = proc.stdout
-            if "<<<RESULT>>>" in stdout and "<<<END>>>" in stdout:
-                result_str = stdout.split("<<<RESULT>>>")[
-                    1].split("<<<END>>>")[0]
-                result = json.loads(result_str)
-                return result.get("result", str(result))
-            else:
-                try:
-                    result = json.loads(stdout)
-                    return result.get("result", str(result))
-                except json.JSONDecodeError:
-                    return stdout.strip() if stdout.strip() else "Success (response parse failed but delete committed)"
-        except Exception as e:
-            return f"Failed to delete memory: {e}\nStderr: {proc.stderr if 'proc' in locals() else ''}\nStdout: {proc.stdout if 'proc' in locals() else ''}"
+        """Delete a memory from the MemPalace directly in-process."""
+        with _mempalace_lock:
+            try:
+                os.environ['MEMPALACE_PALACE_PATH'] = self.palace_path
+                from mempalace.mcp_server import tool_delete_drawer
+                res = tool_delete_drawer(drawer_id=drawer_id)
+                return res
+            except Exception as e:
+                logging.error(f"MemPalaceManager.delete_memory error: {e}", exc_info=True)
+                return f"Failed to delete memory: {e}"
 
     def initialize_sanctuary(self, sanctuary_file: str = None):
         """Inject sanctuary_init.json data into the MemPalace if it hasn't been done yet"""
@@ -570,10 +556,73 @@ print("<<<RESULT>>>" + json.dumps({"result": res}) + "<<<END>>>")
                                 room="character_memories", source_file="sanctuary_init.json")
 
             # Touch the flag file so it's not processed again
-            temp_path = initialized_flag + ".tmp"
+            temp_path = f"{initialized_flag}.tmp.{uuid.uuid4().hex}"
             with open(temp_path, 'w') as f:
                 f.write("Initialized")
             os.replace(temp_path, initialized_flag)
             logging.info("Sanctuary initialized successfully.")
         except Exception as e:
             logging.error(f"Error initializing sanctuary: {e}", exc_info=True)
+
+    _init_sanctuary = initialize_sanctuary
+
+    def apply_identity_delta(self, target_section: str, delta_type: str, content: str, rationale: str = "") -> str:
+        """
+        Autonomously applies an approved Identity Delta to the agent's Layer 0 settings,
+        logs the evolution history, re-syncs identity.txt, and invalidates L0 cache.
+        """
+        settings = SettingsManager(agent_id=self.agent_id)
+        valid_sections = {
+            "core_values": "core.agent.core-values",
+            "overarching_goals": "core.agent.overarching-goals",
+            "anti_patterns": "core.agent.anti-patterns"
+        }
+        config_key = valid_sections.get(target_section)
+        if not config_key:
+            return f"Error: target_section must be one of {list(valid_sections.keys())}"
+
+        current_items = settings.get(config_key, [])
+        if not isinstance(current_items, list):
+            current_items = []
+        current_items = list(current_items)
+
+        now_iso = datetime.datetime.now().isoformat()
+        if delta_type == "add":
+            if content not in current_items:
+                current_items.append(content)
+        elif delta_type in ("modify", "update"):
+            current_items.append(content)
+        elif delta_type in ("retire", "remove"):
+            current_items = [item for item in current_items if item != content and content not in item]
+        else:
+            return "Error: delta_type must be 'add', 'modify', or 'retire'"
+
+        settings.set(config_key, current_items)
+        settings.save()
+
+        # Record evolution history in identity_evolution.json
+        history_path = os.path.join(self.palace_path, "identity_evolution.json")
+        history = []
+        if os.path.exists(history_path):
+            try:
+                with open(history_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+
+        history.append({
+            "timestamp": now_iso,
+            "target_section": target_section,
+            "delta_type": delta_type,
+            "content": content,
+            "rationale": rationale
+        })
+        atomic_json_write(history_path, history)
+
+        # Re-sync Layer 0 identity.txt
+        self._sync_identity()
+        if hasattr(self, 'stack') and hasattr(self.stack, 'l0'):
+            self.stack.l0._text = None
+
+        logging.info(f"Identity Delta applied successfully: {delta_type} {target_section} -> '{content}'")
+        return f"Successfully applied identity delta to {target_section} ({delta_type}): '{content}'. Identity regenerated."

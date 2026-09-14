@@ -61,3 +61,39 @@ def test_config_corrupt_file_handling(temp_config_env):
     assert cm.get("user-full-name") == "System Administrator"
     # Corrupt backup should exist
     assert os.path.exists(temp_config_env + ".corrupt")
+
+
+def test_settings_manager_c5_in_memory_caching(temp_config_env, monkeypatch):
+    from core.settings_manager import SettingsManager
+    from config import paths
+    from unittest.mock import patch
+
+    temp_dir = os.path.dirname(temp_config_env)
+    monkeypatch.setattr(paths, "get_base_dir_for", lambda aid: temp_dir)
+
+    sm = SettingsManager(agent_id="test_c5_agent")
+    sm.set("core.agent.name", "CachedBot")
+    sm.save()
+
+    # Verify that get() does NOT call load_settings on every read
+    with patch.object(sm, "load_settings", side_effect=AssertionError("load_settings called during get()!")):
+        val = sm.get("core.agent.name")
+        assert val == "CachedBot"
+
+    # Test deepcopy protection: mutating returned list does not mutate cache
+    sm.set("core.agent.core-values", ["Value1", "Value2"])
+    vals = sm.get("core.agent.core-values")
+    vals.append("MutatedValue")
+    assert sm.get("core.agent.core-values") == ["Value1", "Value2"]
+
+    # Test refresh: external change picked up after refresh()
+    with open(sm.settings_file, "r") as f:
+        data = json.load(f)
+    data["core"]["agent"]["name"] = "DiskUpdatedBot"
+    with open(sm.settings_file, "w") as f:
+        json.dump(data, f)
+
+    assert sm.get("core.agent.name") == "CachedBot"
+    sm.refresh()
+    assert sm.get("core.agent.name") == "DiskUpdatedBot"
+

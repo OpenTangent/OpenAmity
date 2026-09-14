@@ -1,8 +1,10 @@
+import copy
 import json
 import os
 import logging
 import shutil
 import threading
+import uuid
 try:
     from dotenv import set_key, get_key
 except ImportError:
@@ -18,7 +20,8 @@ class SettingsManager:
         self.config_dir = paths.get_base_dir_for(agent_id)
         os.makedirs(self.config_dir, exist_ok=True)
 
-        self.settings_file = os.path.join(self.config_dir, settings_file)
+        self._lock = threading.RLock()
+        self._settings_file = os.path.join(self.config_dir, settings_file)
         self.default_file = os.path.join(os.path.dirname(
             os.path.dirname(__file__)), 'config', 'settings.default.json')
 
@@ -36,6 +39,16 @@ class SettingsManager:
 
         self.settings = self.load_settings()
 
+    @property
+    def settings_file(self):
+        return self._settings_file
+
+    @settings_file.setter
+    def settings_file(self, value):
+        self._settings_file = value
+        if hasattr(self, '_lock'):
+            self.refresh()
+
     def deep_merge(self, dict1, dict2):
         """Recursively merge dict2 into dict1."""
         for k, v in dict2.items():
@@ -45,7 +58,11 @@ class SettingsManager:
                 dict1[k] = v
         return dict1
 
-    _lock = threading.Lock()
+    _lock = threading.RLock()
+
+    def refresh(self):
+        with self._lock:
+            self.settings = self.load_settings()
 
     def load_settings(self):
         with self._lock:
@@ -85,7 +102,7 @@ class SettingsManager:
             # Skip this if there was a load error to avoid overwriting a corrupted but fixable file with defaults
             if merged_settings != user_settings and not load_error:
                 try:
-                    temp_file = self.settings_file + ".tmp"
+                    temp_file = f"{self.settings_file}.tmp.{uuid.uuid4().hex}"
                     with open(temp_file, "w") as f:
                         json.dump(merged_settings, f, indent=2)
                     os.replace(temp_file, self.settings_file)
@@ -96,15 +113,17 @@ class SettingsManager:
             return merged_settings
 
     def get(self, key, default=None):
-        self.settings = self.load_settings()
-        keys = key.split('.')
-        val = self.settings
-        for k in keys:
-            if isinstance(val, dict) and k in val:
-                val = val[k]
-            else:
-                return default
-        return val
+        with self._lock:
+            keys = key.split('.')
+            val = self.settings
+            for k in keys:
+                if isinstance(val, dict) and k in val:
+                    val = val[k]
+                else:
+                    return default
+            if isinstance(val, (dict, list)):
+                return copy.deepcopy(val)
+            return val
 
     def set(self, key, value):
         with self._lock:
@@ -119,7 +138,7 @@ class SettingsManager:
     def save(self):
         with self._lock:
             try:
-                temp_file = self.settings_file + ".tmp"
+                temp_file = f"{self.settings_file}.tmp.{uuid.uuid4().hex}"
                 with open(temp_file, "w") as f:
                     json.dump(self.settings, f, indent=2)
                 os.replace(temp_file, self.settings_file)

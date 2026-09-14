@@ -213,3 +213,111 @@ def test_piper_tts_routing_for_chatgpt(monkeypatch, tmp_path):
             tts._stream_and_play()
             assert mock_piper.called
             assert not mock_gemini.called
+
+
+def test_chatgpt_worker_reconcile_unfulfilled_tool_calls(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test prompt")
+
+        # Simulate assistant message with unfulfilled tool calls in history
+        worker.history.append({
+            "role": "assistant",
+            "content": "Checking terminal...",
+            "tool_calls": [
+                {
+                    "id": "call_gpt_1",
+                    "type": "function",
+                    "function": {"name": "Terminal_run", "arguments": "{}"}
+                }
+            ]
+        })
+
+        captured_kwargs = {}
+        def mock_create(**kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        worker.client.chat.completions.create = mock_create
+
+        worker._process_thought(prompt="Continue please")
+
+        assert "call_gpt_1" in worker.consumed_tool_call_ids
+        messages = captured_kwargs["messages"]
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0]["tool_call_id"] == "call_gpt_1"
+        assert "[Action cancelled or interrupted by system]" in tool_messages[0]["content"]
+
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"] == "Continue please"
+        assert messages[-2]["role"] == "tool"
+
+
+def test_chatgpt_worker_user_prompt_rollback_on_error(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test prompt")
+
+        def mock_error(**kwargs):
+            raise RuntimeError("OpenAI 500 error")
+
+        worker.client.chat.completions.create = mock_error
+
+        errors = []
+        worker.error_occurred.connect(lambda e: errors.append(e))
+
+        worker._process_thought(prompt="Will fail")
+        assert len(errors) == 1
+        assert "OpenAI 500 error" in errors[0]
+        assert len(worker.history) == 0
+
+
+def test_chatgpt_worker_empty_content_without_tool_calls(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test prompt")
+
+        # Mock chunk with no content and no tool calls
+        chunk = MagicMock()
+        chunk.choices = [MagicMock()]
+        chunk.choices[0].delta = MagicMock()
+        chunk.choices[0].delta.content = None
+        chunk.choices[0].delta.tool_calls = None
+        chunk.usage = None
+
+        worker.client.chat.completions.create = MagicMock(return_value=[chunk])
+
+        worker._process_thought(prompt="Say something")
+
+        assert len(worker.history) == 2
+        assistant_msg = worker.history[1]
+        assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["content"] == ""  # Must not be None
+        assert "tool_calls" not in assistant_msg
+
+
+def test_chatgpt_worker_reconcile_sanitizes_none_content(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test prompt")
+
+        # Inject legacy corrupted assistant message
+        worker.history.append({
+            "role": "assistant",
+            "content": None
+        })
+
+        worker._reconcile_tool_calls()
+
+        assert worker.history[0]["content"] == ""
+
+

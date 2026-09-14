@@ -1,8 +1,11 @@
+import os
 import time
-import uuid
 import threading
 import logging
 import json
+import base64
+import mimetypes
+import uuid
 from dotenv import load_dotenv
 from .events import Signal
 from .settings_manager import SettingsManager
@@ -49,18 +52,18 @@ class FunctionCallObject:
         self.args = args
 
 
-class ChatGptWorker:
+class DeepSeekWorker:
     def __init__(self, agent_id=None):
         super().__init__()
         self.agent_id = agent_id
-        logging.debug("ChatGptWorker.__init__ called.")
+        logging.debug("DeepSeekWorker.__init__ called.")
         self.client = None
         self.settings = SettingsManager(agent_id=self.agent_id)
         self.thought_received = Signal()  # text, list of function calls
         self.error_occurred = Signal()
         self.tokens_consumed = Signal()  # int
 
-        self.api_key = self.settings.get_env("OPENAI_API_KEY")
+        self.api_key = self.settings.get_env("DEEPSEEK_API_KEY")
         self.available = False
         self.last_error = None
         if openai is None:
@@ -69,20 +72,23 @@ class ChatGptWorker:
                 logging.error(self.last_error)
                 self.error_occurred.emit("OpenAI package not installed.")
         elif not self.api_key:
-            self.last_error = "OPENAI_API_KEY not found in .env"
+            self.last_error = "DEEPSEEK_API_KEY not found in .env"
             if self.settings.get("core.first-run", False):
                 logging.info(
-                    "OPENAI_API_KEY not found in .env (expected on first run)")
+                    "DEEPSEEK_API_KEY not found in .env (expected on first run)")
             else:
                 logging.error(self.last_error)
                 self.error_occurred.emit(
-                    "Missing OpenAI API Key. Please check settings.")
+                    "Missing DeepSeek API Key. Please check settings.")
         else:
             try:
-                self.client = openai.OpenAI(api_key=self.api_key)
+                self.client = openai.OpenAI(
+                    api_key=self.api_key,
+                    base_url="https://api.deepseek.com"
+                )
                 self.available = True
             except Exception as e:
-                self.last_error = f"Error initializing OpenAI Client: {e}"
+                self.last_error = f"Error initializing DeepSeek Client: {e}"
                 logging.error(self.last_error, exc_info=True)
                 self.error_occurred.emit(f"Client Init Error: {e}")
 
@@ -94,7 +100,8 @@ class ChatGptWorker:
         self.openai_tools = None
         self.history = []
         self.consumed_tool_call_ids = set()
-        self.current_model = "gpt-5.6-terra"
+        self._uploaded_file_ids = set()
+        self.current_model = "deepseek-flash"
 
         # Audio STT setup
         from .local_stt import LocalSTT
@@ -104,12 +111,12 @@ class ChatGptWorker:
         return self.running
 
     def start_session(self, system_instruction=None, tools=None):
-        logging.debug("start_session called in ChatGptWorker")
+        logging.debug("start_session called in DeepSeekWorker")
         if not getattr(self, 'available', False):
             logging.error(
-                "Attempted to start session but ChatGptWorker is unavailable.")
+                "Attempted to start session but DeepSeekWorker is unavailable.")
             self.error_occurred.emit(
-                "Session Start Error: ChatGPT Worker is not available")
+                "Session Start Error: DeepSeek Worker is not available")
             return
 
         self.sys_instruct = system_instruction or ""
@@ -130,33 +137,40 @@ class ChatGptWorker:
 
         # Load models from settings
         light_models = self.settings.get(
-            "core.chatgpt.light-models", ["gpt-5.6-luna"])
-        chatgpt_models = self.settings.get(
-            "core.chatgpt.chatgpt-models", ["gpt-5.6-terra", "gpt-5.6-sol"])
+            "core.deepseek.light-models", ["deepseek-flash", "deepseek-v4-flash"])
+        deepseek_models = self.settings.get(
+            "core.deepseek.deepseek-models", ["deepseek-flash", "deepseek-v4-flash"])
 
         if not isinstance(light_models, list):
             light_models = [light_models]
-        if not isinstance(chatgpt_models, list):
-            chatgpt_models = [chatgpt_models]
+        if not isinstance(deepseek_models, list):
+            deepseek_models = [deepseek_models]
 
-        self.current_model = light_models[0] if is_low_token else chatgpt_models[0]
+        self.current_model = light_models[0] if is_low_token else deepseek_models[0]
 
         self.running = True
         logging.info(
-            f"ChatGPT SDK session started with model {self.current_model}.")
+            f"DeepSeek session started with model {self.current_model}.")
 
     def stop_session(self):
         self.running = False
         self.history = []
         self.consumed_tool_call_ids = set()
-        logging.info("ChatGPT SDK session stopped.")
+        if hasattr(self, '_uploaded_file_ids') and self._uploaded_file_ids and self.client:
+            for fid in list(self._uploaded_file_ids):
+                try:
+                    self.client.files.delete(fid)
+                except Exception:
+                    pass
+            self._uploaded_file_ids.clear()
+        logging.info("DeepSeek session stopped.")
 
     def abort(self):
         self._abort_flag = True
         self.is_processing = False
 
     def send_prompt(self, prompt: str, image_path: str = None, yolo: bool = False, audio_path: str = None):
-        logging.debug("send_prompt called in ChatGptWorker")
+        logging.debug("send_prompt called in DeepSeekWorker")
         if not self.running:
             self.error_occurred.emit("Session not started.")
             return
@@ -165,6 +179,85 @@ class ChatGptWorker:
         self.is_processing = True
         threading.Thread(target=self._process_thought, args=(
             prompt, image_path, yolo, audio_path), daemon=True).start()
+
+    def _prepare_image_block(self, image_path: str, detail: str = "auto") -> dict:
+        if not image_path:
+            return None
+
+        # Check if external URL
+        if image_path.startswith("http://") or image_path.startswith("https://"):
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": image_path,
+                    "detail": detail
+                }
+            }
+
+        exp_path = os.path.expanduser(image_path)
+        if not os.path.exists(exp_path):
+            raise FileNotFoundError(f"Image file not found: {exp_path}")
+
+        file_size = os.path.getsize(exp_path)
+        mime_type, _ = mimetypes.guess_type(exp_path)
+        supported_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if not mime_type or mime_type not in supported_mimes:
+            ext = os.path.splitext(exp_path)[1].lower()
+            if ext in [".jpg", ".jpeg"]:
+                mime_type = "image/jpeg"
+            elif ext == ".png":
+                mime_type = "image/png"
+            elif ext == ".gif":
+                mime_type = "image/gif"
+            elif ext == ".webp":
+                mime_type = "image/webp"
+            else:
+                mime_type = "image/jpeg"
+
+        # If file size is larger than 32 MiB inline limit, DeepSeek Chat Completions API does not support file attachments
+        if file_size > 32 * 1024 * 1024:
+            raise ValueError(
+                f"Image {exp_path} exceeds 32 MiB inline limit. DeepSeek Chat Completions API does not support file attachments.")
+
+        with open(exp_path, "rb") as image_file:
+            image_data = base64.b64encode(image_file.read()).decode("utf-8")
+
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{image_data}",
+                "detail": detail
+            }
+        }
+
+    def _cull_media_from_history(self):
+        # Intelligent Media Culling: Strip heavy multimodal attachments from older turns (> 4 turns)
+        if len(self.history) > 4:
+            for i in range(len(self.history) - 4):
+                msg = self.history[i]
+                if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                    new_content = []
+                    modified = False
+                    for part in msg["content"]:
+                        if isinstance(part, dict) and part.get("type") in ("image_url", "file"):
+                            if part.get("type") == "file" and part.get("file_id") and self.client and hasattr(self.client, 'files'):
+                                fid = part.get("file_id")
+                                try:
+                                    self.client.files.delete(fid)
+                                    if hasattr(self, '_uploaded_file_ids'):
+                                        self._uploaded_file_ids.discard(fid)
+                                    logging.debug(f"DeepSeekWorker automatically deleted culled file: {fid}")
+                                except Exception as e:
+                                    logging.debug(f"DeepSeekWorker could not delete culled file {fid}: {e}")
+                            new_content.append({
+                                "type": "text",
+                                "text": "[Media attachment automatically culled to save tokens/memory]"
+                            })
+                            modified = True
+                        else:
+                            new_content.append(part)
+                    if modified:
+                        msg["content"] = new_content
 
     def send_function_response(self, name: str, response: dict):
         self.send_function_responses([(name, response)])
@@ -177,10 +270,15 @@ class ChatGptWorker:
         self._abort_flag = False
         self.is_processing = True
 
+        attached_media = []
         for name, response in responses:
             clean_resp = dict(response) if isinstance(response, dict) else {"result": str(response)}
             if 'media' in clean_resp:
-                del clean_resp['media']
+                media_val = clean_resp.pop('media')
+                if isinstance(media_val, list):
+                    attached_media.extend(media_val)
+                elif isinstance(media_val, str):
+                    attached_media.append(media_val)
 
             tool_call_id = None
             for msg in reversed(self.history):
@@ -205,6 +303,35 @@ class ChatGptWorker:
                 "tool_call_id": tool_call_id,
                 "content": json.dumps(clean_resp)
             })
+
+        # DeepSeek API restricts image inputs to user messages only.
+        # If any tool execution produced media attachments, append them in a follow-up user message.
+        if attached_media:
+            is_low_token = self.settings.get("core.low-token-mode", False)
+            if is_low_token:
+                self.history.append({
+                    "role": "user",
+                    "content": "[Tool media attachments skipped: Low Token Mode is active]"
+                })
+            else:
+                user_content_blocks = [
+                    {"type": "text", "text": "[Attached media from tool execution]:"}
+                ]
+                for m_path in attached_media:
+                    try:
+                        img_block = self._prepare_image_block(m_path)
+                        if img_block:
+                            user_content_blocks.append(img_block)
+                    except Exception as e:
+                        logging.warning(f"Failed to attach tool media {m_path}: {e}")
+                        user_content_blocks.append({
+                            "type": "text",
+                            "text": f"[Error attaching media {m_path}: {e}]"
+                        })
+                self.history.append({
+                    "role": "user",
+                    "content": user_content_blocks
+                })
 
         threading.Thread(target=self._process_thought, args=(
             None, None, False, None), daemon=True).start()
@@ -245,7 +372,7 @@ class ChatGptWorker:
                         new_history.append(dummy_resp)
                         self.consumed_tool_call_ids.add(tid)
                         logging.warning(
-                            f"ChatGPTWorker synthesized dummy tool response for unfulfilled tool_call_id: {tid}")
+                            f"DeepSeekWorker synthesized dummy tool response for unfulfilled tool_call_id: {tid}")
 
                 i = j - 1
             i += 1
@@ -275,18 +402,9 @@ class ChatGptWorker:
                         {"type": "text", "text": "[Image attachment skipped: Low Token Mode is active]"})
                 else:
                     try:
-                        import mimetypes
-                        import base64
-                        mime_type, _ = mimetypes.guess_type(image_path)
-                        with open(image_path, "rb") as image_file:
-                            image_data = base64.b64encode(
-                                image_file.read()).decode("utf-8")
-                        content_blocks.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type or 'image/jpeg'};base64,{image_data}"
-                            }
-                        })
+                        img_block = self._prepare_image_block(image_path)
+                        if img_block:
+                            content_blocks.append(img_block)
                     except Exception as e:
                         self.error_occurred.emit(f"Image load error: {e}")
                         self.is_processing = False
@@ -299,7 +417,7 @@ class ChatGptWorker:
                 else:
                     try:
                         logging.info(
-                            f"Transcribing audio for ChatGPT: {audio_path}")
+                            f"Transcribing audio for DeepSeek: {audio_path}")
                         transcription = self.local_stt.transcribe(audio_path)
                         content_blocks.append(
                             {"type": "text", "text": f"[Audio Transcribed via Whisper]: {transcription}"})
@@ -317,8 +435,9 @@ class ChatGptWorker:
 
         try:
             self._reconcile_tool_calls()
+            self._cull_media_from_history()
             logging.debug(
-                f"Calling ChatGPT with message length {len(self.history)}...")
+                f"Calling DeepSeek with message length {len(self.history)}...")
 
             messages = [{"role": "system", "content": self.sys_instruct or ""}] + self.history
 
@@ -326,12 +445,14 @@ class ChatGptWorker:
                 "model": self.current_model,
                 "messages": messages,
                 "stream": True,
-                "stream_options": {"include_usage": True}
+                "stream_options": {"include_usage": True},
+                "extra_body": {"thinking": {"type": "enabled"}}
             }
             if self.openai_tools:
                 kwargs["tools"] = self.openai_tools
 
             full_text = ""
+            full_reasoning = ""
             tool_calls_data = {}
             total_tokens = 0
 
@@ -354,6 +475,9 @@ class ChatGptWorker:
                     continue
 
                 delta = chunk.choices[0].delta
+                if getattr(delta, 'reasoning_content', None):
+                    full_reasoning += delta.reasoning_content
+
                 if getattr(delta, 'content', None):
                     full_text += delta.content
 
@@ -405,6 +529,9 @@ class ChatGptWorker:
             else:
                 assistant_msg["content"] = full_text or ""
 
+            if full_reasoning:
+                assistant_msg["reasoning_content"] = full_reasoning
+
             self.history.append(assistant_msg)
 
             # Token tracking (excluding static system instruction and tool declarations)
@@ -417,22 +544,30 @@ class ChatGptWorker:
                 tokens = int(output_tokens) + input_tokens
             else:
                 est_content_chars = sum(len(str(p)) for p in content_blocks) if ('content_blocks' in locals() and content_blocks) else 0
-                tokens = int((est_content_chars + len(full_text)) / 4)
+                thought_len = len(full_reasoning) + len(full_text)
+                tokens = int((est_content_chars + thought_len) / 4)
 
             if tokens > 0 and hasattr(self, 'tokens_consumed'):
                 self.tokens_consumed.emit(tokens)
 
+            # Determine combined thought output for the agent's monologue
+            emitted_thought = full_text
+            if full_reasoning and full_text:
+                emitted_thought = f"{full_reasoning}\n\n{full_text}"
+            elif full_reasoning and not full_text:
+                emitted_thought = full_reasoning
+
             logging.debug(
-                f"About to emit thought_received. Text length: {len(full_text)}, Tools: {len(function_calls)}")
-            self.thought_received.emit(full_text, function_calls)
+                f"About to emit thought_received. Text length: {len(emitted_thought)}, Tools: {len(function_calls)}")
+            self.thought_received.emit(emitted_thought, function_calls)
             self.is_processing = False
             return
 
         except Exception as e:
             err_str = str(e)
-            logging.error(f"ChatGPT API Error: {err_str}", exc_info=True)
+            logging.error(f"DeepSeek API Error: {err_str}", exc_info=True)
             self.history = self.history[:history_snapshot_len]
-            self.error_occurred.emit(f"ChatGPT API Error: {err_str}")
+            self.error_occurred.emit(f"DeepSeek API Error: {err_str}")
             self.is_processing = False
             return
 
@@ -449,7 +584,7 @@ class ChatGptWorker:
 
         try:
             light_models = self.settings.get(
-                "core.chatgpt.light-models", ["gpt-5.6-luna"])
+                "core.deepseek.light-models", ["deepseek-flash", "deepseek-v4-flash"])
             if not isinstance(light_models, list):
                 light_models = [light_models]
             reformulator_model = light_models[0]
@@ -466,5 +601,5 @@ class ChatGptWorker:
                 return response.choices[0].message.content.strip()
             return user_prompt
         except Exception as e:
-            logging.warning(f"ChatGPT Reformulator API Error: {e}")
+            logging.warning(f"DeepSeek Reformulator API Error: {e}")
             return user_prompt

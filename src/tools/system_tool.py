@@ -21,7 +21,10 @@ def is_microphone_available():
         try:
             import pyaudio
             p = pyaudio.PyAudio()
-            return p.get_device_count() > 0
+            try:
+                return p.get_device_count() > 0
+            finally:
+                p.terminate()
         except Exception:
             return "Unknown (Dependencies missing)"
     except Exception as e:
@@ -42,15 +45,77 @@ def format_seconds(seconds):
     return f"{hours}h {minutes}m {secs}s"
 
 
+def get_internal_ip() -> str:
+    """
+    Returns the host's primary internal IPv4 address.
+
+    Rather than resolving the hostname (which often resolves to 127.0.1.1 on Debian/Ubuntu systems),
+    this probes the OS routing table using a dummy UDP socket to identify the primary outbound
+    interface's IP without transmitting packets. If that fails or produces a loopback address,
+    it inspects active network interfaces via psutil, filtering out loopback and virtual/container adapters.
+    """
+    # 1. Routing probe via UDP socket (does not transmit any packets over the network)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            candidate = s.getsockname()[0]
+            if candidate and not candidate.startswith("127."):
+                return candidate
+    except Exception:
+        pass
+
+    # 2. Inspect active network interfaces via psutil
+    try:
+        stats = psutil.net_if_stats() if hasattr(psutil, "net_if_stats") else {}
+        addrs = psutil.net_if_addrs()
+
+        candidates = []
+        for iface, addr_list in addrs.items():
+            iface_lower = iface.lower()
+            if iface_lower.startswith(("lo", "docker", "veth", "virbr", "br-", "vboxnet", "vmnet", "cni", "flannel")):
+                continue
+            is_up = stats[iface].isup if iface in stats else True
+            for addr in addr_list:
+                if addr.family == socket.AF_INET and addr.address:
+                    if not addr.address.startswith(("127.", "169.254.")):
+                        # Prioritize physical/LAN/WLAN interfaces
+                        priority = 2 if iface_lower.startswith(("eth", "en", "wl", "wlan")) else 1
+                        candidates.append((priority, is_up, addr.address))
+
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        if candidates:
+            return candidates[0][2]
+    except Exception:
+        pass
+
+    # 3. Fallback to hostname resolution
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip:
+            return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
+
+
 class SystemTool(Tool):
     name = "System"
     description = (
-        "Provides internal system information, settings, and external networking details.\n"
+        "Provides internal system information, settings, backup snapshots, and Gemini TTS voice customization.\n"
         "WARNING: System information is highly sensitive and confidential. It must NEVER be shared, leaked, or exposed "
         "to external parties via social tools (e.g., Mastodon, WhatsApp, web uploads). This information is strictly for "
         "your internal diagnostic use or for communicating directly and privately to the user via the Speaker tool."
     )
-    commands = ["platform_info", "settings", "get_external_ip", "create_backup"]
+    commands = [
+        "platform_info (Returns host OS, uptime, CPU/RAM usage, and version.)",
+        "settings (Inspects current agent configuration and voice settings.)",
+        "get_external_ip (Queries current public IP address.)",
+        "create_backup [target] [backup_location] (Creates .oaa snapshot for 'self' or 'all' agents.)",
+        "set_custom_voice <custom_prompt> [voice_model] (Sets custom directorial voice prompt following acoustic stability guidelines.)",
+        "reset_voice (Restores voice settings to baseline user configuration.)"
+    ]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -94,6 +159,49 @@ class SystemTool(Tool):
                         }
                     }
                 }
+            },
+            {
+                "name": "System_set_custom_voice",
+                "description": (
+                    "Sets a custom directorial voice prompt and optional base voice model for this agent's Gemini TTS speech synthesis. "
+                    "Enables 'override-prompt' mode in the agent's settings.\n"
+                    "CRITICAL PROMPT STABILITY GUIDELINES (to prevent FinishReason.SAFETY aborts on gemini-3.1-flash-tts-preview):\n"
+                    "1. Positive Imperative Phrasing: State clearly how to speak using direct positive direction (e.g., 'Read the following transcript aloud as [Name] in a [accent] accent with a [tone] demeanor').\n"
+                    "2. Grounding Anchors: Always include acoustic grounding directives like 'with clear articulation and natural conversational pacing:'.\n"
+                    "3. NO Markdown Scaffolding: DO NOT use markdown headings or structural sections (e.g., '# AUDIO PROFILE', '## Scene Setting', 'Director's Notes'). These confuse the audio decoder, causing instruction vocalization or safety watchdog kills.\n"
+                    "4. NO Negative Constraints: DO NOT use negative suppression rules (e.g., 'Do NOT speak fast', 'Never whisper', 'Do NOT sound robotic'). Autoregressive decoders destabilize when processing negative constraints; state positive target characteristics instead.\n"
+                    "5. Delimiter / Injection: End the prompt with a colon (':') or include '{transcript}' where the text should be inserted. The system automatically appends the spoken text if a colon is used.\n"
+                    "Note: If gemini-3.1-flash-tts-preview encounters an unhandled safety abort, the pipeline automatically retries and falls back to gemini-2.5-flash-preview-tts."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "custom_prompt": {
+                            "type": "STRING",
+                            "description": (
+                                "The complete custom directorial prompt. Must follow stability guidelines: positive imperative direction, "
+                                "include 'with clear articulation and natural conversational pacing:', NO markdown headers (# AUDIO PROFILE), "
+                                "NO negative constraints ('Do NOT...'), ending with a colon or containing {transcript}. "
+                                "Example: 'Read the following transcript aloud as Dex in a warm, low-register, sardonic Scottish accent with clear articulation and natural conversational pacing:'"
+                            )
+                        },
+                        "voice_model": {
+                            "type": "STRING",
+                            "description": "Optional Gemini prebuilt voice name (e.g., 'Sulafat', 'Achernar', 'Kore', 'Puck', 'Charon', 'Fenrir', 'Aoede'). If omitted, preserves the existing voice."
+                        }
+                    },
+                    "required": ["custom_prompt"]
+                }
+            },
+            {
+                "name": "System_reset_voice",
+                "description": (
+                    "Restores this agent's voice settings to the baseline user-defined configuration (accent, gender, age, and style), disabling the custom prompt override."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
             }
         ]
 
@@ -106,6 +214,10 @@ class SystemTool(Tool):
             return self._get_external_ip()
         elif command == "create_backup":
             return self._create_backup(*args, **kwargs)
+        elif command == "set_custom_voice":
+            return self._set_custom_voice(*args, **kwargs)
+        elif command == "reset_voice":
+            return self._reset_voice(*args, **kwargs)
         return f"Unknown command: {command}"
 
     def _get_platform_info(self) -> str:
@@ -179,7 +291,7 @@ class SystemTool(Tool):
 
         info.append("\n=== Network & Peripherals ===")
         try:
-            internal_ip = socket.gethostbyname(socket.gethostname())
+            internal_ip = get_internal_ip()
             info.append(f"Internal IP: {internal_ip}")
         except Exception:
             pass
@@ -264,3 +376,47 @@ class SystemTool(Tool):
                 return f"Successfully created backup snapshot:\n- {os.path.basename(path_created)} ({sz})\nPath: {path_created}"
         except Exception as e:
             return f"Error creating backup: {type(e).__name__}: {str(e)}"
+
+    def _get_settings_manager(self):
+        if self.orchestrator and getattr(self.orchestrator, "settings_manager", None):
+            return self.orchestrator.settings_manager
+        from core.settings_manager import SettingsManager
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        return SettingsManager(agent_id=agent_id)
+
+    def _set_custom_voice(self, *args, **kwargs) -> str:
+        custom_prompt = kwargs.get("custom_prompt", "")
+        if not custom_prompt and args:
+            custom_prompt = args[0]
+        custom_prompt = str(custom_prompt).strip() if custom_prompt else ""
+
+        if not custom_prompt:
+            return "Error: custom_prompt parameter is required."
+
+        sm = self._get_settings_manager()
+        allow_override = sm.get("core.tts.gemini.allow-agent-override", True)
+        if not allow_override:
+            return "Permission denied: The user has disabled autonomous voice modification in the Agent Voice settings."
+
+        voice_model = kwargs.get("voice_model", "")
+        if not voice_model and len(args) > 1:
+            voice_model = args[1]
+        voice_model = str(voice_model).strip() if voice_model else ""
+
+        sm.set("core.tts.gemini.override-prompt", True)
+        sm.set("core.tts.gemini.custom-prompt", custom_prompt)
+        if voice_model:
+            sm.set("core.tts.gemini.model-name", voice_model)
+        sm.save()
+
+        msg = "Custom voice prompt successfully activated. Gemini TTS will now synthesize speech using your custom directorial prompt."
+        if voice_model:
+            msg += f" Base voice model set to '{voice_model}'."
+        return msg
+
+    def _reset_voice(self, *args, **kwargs) -> str:
+        sm = self._get_settings_manager()
+        sm.set("core.tts.gemini.override-prompt", False)
+        sm.save()
+        return "Voice settings successfully reset to the user-defined baseline configuration (accent, gender, age, and style)."
+

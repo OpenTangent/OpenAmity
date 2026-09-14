@@ -6,6 +6,7 @@ import uuid
 import shutil
 import zipfile
 import logging
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -13,6 +14,313 @@ from config import paths
 from core.config_manager import ConfigManager
 from core.settings_manager import SettingsManager
 from core.uid_generator import is_valid_agent_uid
+from core.file_utils import atomic_json_write
+
+_backup_targets_lock = threading.RLock()
+
+DISALLOWED_SYSTEM_DIRS = (
+    "/", "/etc", "/usr", "/boot", "/sys", "/proc", "/dev",
+    "/bin", "/sbin", "/lib", "/lib64", "/var"
+)
+
+DISALLOWED_SENSITIVE_HOME_ENTRIES = (
+    ".ssh",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_history",
+    ".zshrc",
+    ".profile",
+    ".gnupg",
+    ".config",
+    ".local",
+    ".var",
+)
+
+
+def is_safe_external_backup_path(path: str) -> bool:
+    """
+    Validates that a path is safe for external backup target flagging or restoration.
+    The path MUST be within the user's home directory, cannot be the home directory itself,
+    cannot reside in root/system directories, and cannot match sensitive user dotfiles/directories.
+    """
+    if not path:
+        return False
+
+    abs_p = os.path.abspath(os.path.expanduser(path.strip()))
+    home_dir = os.path.abspath(os.path.expanduser("~"))
+
+    # Must be strictly within user's home directory
+    if abs_p == home_dir or not abs_p.startswith(home_dir + os.sep):
+        return False
+
+    # Disallow root and system directories
+    if abs_p in DISALLOWED_SYSTEM_DIRS:
+        return False
+    for sys_dir in DISALLOWED_SYSTEM_DIRS:
+        if sys_dir != "/" and (abs_p == sys_dir or abs_p.startswith(sys_dir.rstrip(os.sep) + os.sep)):
+            return False
+
+    # Disallow sensitive user paths and dotfiles under the home directory
+    for pattern in DISALLOWED_SENSITIVE_HOME_ENTRIES:
+        sensitive_abs = os.path.abspath(os.path.join(home_dir, pattern))
+        if abs_p == sensitive_abs or abs_p.startswith(sensitive_abs + os.sep):
+            return False
+
+    return True
+
+
+def to_portable_path(path: str) -> str:
+    """Normalizes a filesystem path and converts user home references to ~ for portability."""
+    if not path:
+        return ""
+    expanded = os.path.abspath(os.path.expanduser(path.strip()))
+    home_dir = os.path.abspath(os.path.expanduser("~"))
+    if expanded == home_dir:
+        return "~"
+    if expanded.startswith(home_dir + os.sep):
+        return "~" + expanded[len(home_dir):]
+    return expanded
+
+
+def from_portable_path(portable_path: str) -> str:
+    """Expands a portable path (e.g. starting with ~) to an absolute host filesystem path."""
+    if not portable_path:
+        return ""
+    return os.path.abspath(os.path.expanduser(portable_path.strip()))
+
+
+def load_backup_targets(agent_id: str) -> List[Dict[str, Any]]:
+    """Loads and returns the list of flagged backup target objects for an agent."""
+    with _backup_targets_lock:
+        if not agent_id:
+            return []
+        targets_file = paths.get_backup_targets_file(agent_id)
+        if not os.path.exists(targets_file):
+            return []
+        try:
+            with open(targets_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_targets = data.get("targets", []) if isinstance(data, dict) else data
+            normalized = []
+            if isinstance(raw_targets, list):
+                for item in raw_targets:
+                    if isinstance(item, str):
+                        p = to_portable_path(item)
+                        normalized.append({
+                            "path": p,
+                            "type": "directory" if os.path.isdir(from_portable_path(p)) else "file",
+                            "added_at": datetime.now().isoformat()
+                        })
+                    elif isinstance(item, dict) and "path" in item:
+                        p = to_portable_path(item["path"])
+                        normalized.append({
+                            "path": p,
+                            "type": item.get("type", "directory" if os.path.isdir(from_portable_path(p)) else "file"),
+                            "added_at": item.get("added_at", datetime.now().isoformat())
+                        })
+            return normalized
+        except Exception as e:
+            logging.error(f"BackupManager: Error reading backup targets for agent {agent_id}: {e}")
+            return []
+
+
+def save_backup_targets(agent_id: str, targets: List[Dict[str, Any]]) -> None:
+    """Atomically saves the list of flagged backup targets for an agent."""
+    with _backup_targets_lock:
+        if not agent_id:
+            return
+        targets_file = paths.get_backup_targets_file(agent_id)
+        payload = {
+            "version": 1,
+            "targets": targets,
+            "last_updated": datetime.now().isoformat()
+        }
+        atomic_json_write(targets_file, payload)
+
+
+def sync_and_clean_backup_targets(
+    agent_id: str,
+    candidate_path: Optional[str] = None,
+    action: str = "add"
+) -> Tuple[bool, str, List[Dict[str, str]], List[Dict[str, Any]]]:
+    """
+    Validates, synchronizes, and prunes the flagged backup targets list for an agent.
+    Checks for existence (prunes missing) and subsumption within flagged directories (prunes redundant).
+    
+    Args:
+        agent_id: Agent identifier.
+        candidate_path: Optional path to add or remove.
+        action: 'add', 'remove', or 'list'.
+        
+    Returns:
+        Tuple of (success: bool, message: str, removals: List[Dict[str, str]], current_targets: List[Dict[str, Any]])
+    """
+    with _backup_targets_lock:
+        if not agent_id:
+            return False, "Error: Agent ID is required.", [], []
+
+        existing = load_backup_targets(agent_id)
+        removals: List[Dict[str, str]] = []
+        agent_data_dir = os.path.abspath(paths.get_agent_data_dir(agent_id))
+        act = (action or "add").strip().lower()
+
+        candidate_abs = None
+        candidate_portable = None
+        if candidate_path:
+            c_strip = candidate_path.strip()
+            if not os.path.isabs(os.path.expanduser(c_strip)):
+                # Relative path resolved against ~/Documents (standard agent workdir)
+                candidate_abs = os.path.abspath(os.path.join(os.path.expanduser("~/Documents"), c_strip))
+            else:
+                candidate_abs = os.path.abspath(os.path.expanduser(c_strip))
+            candidate_portable = to_portable_path(candidate_abs)
+
+        success = True
+        msg = ""
+
+        if act == "remove":
+            if not candidate_portable:
+                return False, "Error: Missing path parameter to remove.", [], existing
+            found = False
+            new_existing = []
+            for t in existing:
+                if t["path"] == candidate_portable or from_portable_path(t["path"]) == candidate_abs:
+                    found = True
+                else:
+                    new_existing.append(t)
+            existing = new_existing
+            msg = f"Path '{candidate_portable}' was removed from backup targets." if found else f"Path '{candidate_path}' was not found in backup targets."
+            success = found
+
+        elif act == "list":
+            msg = "Backup targets verified."
+            success = True
+
+        elif act == "add":
+            if not candidate_path:
+                return False, "Error: Missing required path parameter for action='add'.", [], existing
+
+            is_inside_agent_dir = (candidate_abs == agent_data_dir or candidate_abs.startswith(agent_data_dir + os.sep))
+            if not is_inside_agent_dir and not is_safe_external_backup_path(candidate_abs):
+                msg = f"Cannot flag '{candidate_path}': Path is protected or unsafe."
+                success = False
+            elif not os.path.exists(candidate_abs):
+                msg = f"Cannot flag '{candidate_path}': Path does not exist on filesystem."
+                success = False
+            else:
+                cand_type = "directory" if os.path.isdir(candidate_abs) else "file"
+                existing.append({
+                    "path": candidate_portable,
+                    "type": cand_type,
+                    "added_at": datetime.now().isoformat()
+                })
+                msg = f"Path '{candidate_portable}' ({cand_type}) flagged for backup."
+                success = True
+
+        else:
+            return False, f"Unknown action: '{action}'. Expected 'add', 'remove', or 'list'.", [], existing
+
+        # --- Verification and Pruning Pass ---
+        # 1. Existence check ("missing")
+        surviving_step1 = []
+        for item in existing:
+            abs_p = from_portable_path(item["path"])
+            if not os.path.exists(abs_p):
+                removals.append({
+                    "path": item["path"],
+                    "reason": "missing",
+                    "detail": f"Path no longer exists on filesystem ('{abs_p}')"
+                })
+            else:
+                item["type"] = "directory" if os.path.isdir(abs_p) else "file"
+                surviving_step1.append(item)
+
+        # 2. Self-containment check (inside agent's stateful data directory)
+        surviving_step2 = []
+        for item in surviving_step1:
+            abs_p = from_portable_path(item["path"])
+            if abs_p == agent_data_dir or abs_p.startswith(agent_data_dir + os.sep):
+                removals.append({
+                    "path": item["path"],
+                    "reason": "redundant",
+                    "detail": "Path is inside agent state directory, which is already backed up automatically"
+                })
+            else:
+                surviving_step2.append(item)
+
+        # 3. Deduplicate exact paths
+        surviving_step3 = []
+        seen_abs = set()
+        for item in surviving_step2:
+            abs_p = from_portable_path(item["path"])
+            if abs_p in seen_abs:
+                removals.append({
+                    "path": item["path"],
+                    "reason": "redundant",
+                    "detail": "Duplicate path already flagged"
+                })
+            else:
+                seen_abs.add(abs_p)
+                surviving_step3.append(item)
+
+        # 4. Subsumption within flagged directories ("redundant")
+        # Identify directories and sort by path length ascending so parents precede children
+        dir_entries = [t for t in surviving_step3 if t["type"] == "directory"]
+        dir_entries.sort(key=lambda d: len(from_portable_path(d["path"])))
+
+        redundant_dirs = set()
+        for i in range(len(dir_entries)):
+            parent_abs = from_portable_path(dir_entries[i]["path"])
+            if dir_entries[i]["path"] in redundant_dirs:
+                continue
+            for j in range(i + 1, len(dir_entries)):
+                child_abs = from_portable_path(dir_entries[j]["path"])
+                if child_abs.startswith(parent_abs + os.sep):
+                    redundant_dirs.add(dir_entries[j]["path"])
+                    removals.append({
+                        "path": dir_entries[j]["path"],
+                        "reason": "redundant",
+                        "detail": f"Subsumed by flagged parent directory '{dir_entries[i]['path']}'"
+                    })
+
+        active_dirs = [d for d in dir_entries if d["path"] not in redundant_dirs]
+
+        final_targets = []
+        for item in surviving_step3:
+            if item["type"] == "directory":
+                if item["path"] not in redundant_dirs:
+                    final_targets.append(item)
+            else:
+                f_abs = from_portable_path(item["path"])
+                subsumed_by = None
+                for d in active_dirs:
+                    d_abs = from_portable_path(d["path"])
+                    if f_abs.startswith(d_abs + os.sep):
+                        subsumed_by = d["path"]
+                        break
+                if subsumed_by:
+                    removals.append({
+                        "path": item["path"],
+                        "reason": "redundant",
+                        "detail": f"Subsumed by flagged directory '{subsumed_by}'"
+                    })
+                else:
+                    final_targets.append(item)
+
+        # If candidate path itself was pruned during verification, update message accordingly
+        if act == "add" and candidate_portable:
+            for r in removals:
+                if r["path"] == candidate_portable:
+                    if r["reason"] == "redundant":
+                        msg = f"Path '{candidate_portable}' is redundant ({r['detail']}) and was not added."
+                        success = True
+                    elif r["reason"] == "missing":
+                        msg = f"Path '{candidate_portable}' is missing and was not added."
+                        success = False
+                    break
+
+        save_backup_targets(agent_id, final_targets)
+        return success, msg, removals, final_targets
 
 
 def get_default_backup_location() -> str:
@@ -89,8 +397,16 @@ def create_agent_backup(
         "SingletonLock", "SingletonCookie", "SingletonSocket",
         "daemon.pid", "daemon.port", ".last_engine_update"
     }
+    EXCLUDED_EXTERNAL_DIR_NAMES = {
+        "node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__",
+        ".git", ".venv", "venv", ".cache"
+    }
 
-    eligible_files = []
+    # Synchronize and clean backup targets before archiving
+    sync_and_clean_backup_targets(agent_id, action="list")
+    backup_targets = load_backup_targets(agent_id)
+
+    eligible_internal_files = []
     for root, dirs, files in os.walk(agent_dir):
         # Prune excluded directories in-place so os.walk does not traverse them
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
@@ -105,15 +421,69 @@ def create_agent_backup(
             if os.path.islink(full_file_path) and not os.path.exists(full_file_path):
                 continue
 
-            eligible_files.append(full_file_path)
+            eligible_internal_files.append(full_file_path)
 
-    total_files = len(eligible_files)
+    # Discover external flagged targets
+    eligible_external_files: List[Tuple[str, str]] = []  # (full_path, arcname)
+    external_manifest: Dict[str, Any] = {"version": 1, "targets": []}
+
+    for idx, target in enumerate(backup_targets):
+        t_path = from_portable_path(target["path"])
+        t_type = target.get("type", "file")
+        archive_prefix = f"_external_targets/target_{idx}"
+        manifest_entry = {
+            "target_id": idx,
+            "archive_prefix": archive_prefix,
+            "target_type": t_type,
+            "portable_path": target["path"]
+        }
+
+        if t_type == "file":
+            if os.path.isfile(t_path):
+                basename = os.path.basename(t_path)
+                manifest_entry["basename"] = basename
+                arcname = f"{archive_prefix}/{basename}"
+                eligible_external_files.append((t_path, arcname))
+                external_manifest["targets"].append(manifest_entry)
+            else:
+                logging.warning(f"BackupManager: Flagged file '{t_path}' does not exist during backup, skipping.")
+        elif t_type == "directory":
+            if os.path.isdir(t_path):
+                manifest_entry["dir_name"] = os.path.basename(t_path.rstrip("/\\"))
+                for root, dirs, files in os.walk(t_path):
+                    dirs[:] = [d for d in dirs if d not in EXCLUDED_EXTERNAL_DIR_NAMES]
+                    for f in files:
+                        if f in EXCLUDED_FILE_NAMES:
+                            continue
+                        fpath = os.path.join(root, f)
+                        if os.path.islink(fpath) and not os.path.exists(fpath):
+                            continue
+                        rel = os.path.relpath(fpath, t_path)
+                        arcname = f"{archive_prefix}/{rel}"
+                        eligible_external_files.append((fpath, arcname))
+                external_manifest["targets"].append(manifest_entry)
+            else:
+                logging.warning(f"BackupManager: Flagged directory '{t_path}' does not exist during backup, skipping.")
+
+    total_files = len(eligible_internal_files) + len(eligible_external_files)
+    if external_manifest["targets"]:
+        total_files += 1
 
     # Write compressed ZIP archive with .oaa extension
     temp_backup_path = backup_path + f".tmp_{uuid.uuid4().hex[:8]}"
     try:
         with zipfile.ZipFile(temp_backup_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file:
-            for idx, full_file_path in enumerate(eligible_files, start=1):
+            cur_file_idx = 1
+
+            # Write external manifest if targets exist
+            if external_manifest["targets"]:
+                zip_file.writestr("_external_manifest.json", json.dumps(external_manifest, indent=2))
+                if progress_callback:
+                    progress_callback("_external_manifest.json", cur_file_idx, total_files)
+                cur_file_idx += 1
+
+            # Write internal agent data files
+            for full_file_path in eligible_internal_files:
                 try:
                     st = os.stat(full_file_path)
                     # Skip special files like sockets or FIFOs
@@ -125,10 +495,28 @@ def create_agent_backup(
                     zip_file.write(full_file_path, arcname=arcname)
 
                     if progress_callback:
-                        progress_callback(os.path.basename(full_file_path), idx, total_files)
+                        progress_callback(os.path.basename(full_file_path), cur_file_idx, total_files)
+                    cur_file_idx += 1
                 except (FileNotFoundError, PermissionError, OSError) as write_err:
                     logging.warning(
                         f"BackupManager: Skipping transient or unreadable file '{full_file_path}': {write_err}"
+                    )
+
+            # Write external flagged files
+            for full_file_path, arcname in eligible_external_files:
+                try:
+                    st = os.stat(full_file_path)
+                    if stat.S_ISSOCK(st.st_mode) or stat.S_ISFIFO(st.st_mode):
+                        continue
+
+                    zip_file.write(full_file_path, arcname=arcname)
+
+                    if progress_callback:
+                        progress_callback(os.path.basename(full_file_path), cur_file_idx, total_files)
+                    cur_file_idx += 1
+                except (FileNotFoundError, PermissionError, OSError) as write_err:
+                    logging.warning(
+                        f"BackupManager: Skipping transient or unreadable external file '{full_file_path}': {write_err}"
                     )
         
         # Atomically replace or move into destination
@@ -223,6 +611,20 @@ def inspect_backup(backup_path: str) -> Dict[str, Any]:
             if not uid:
                 return {"valid": False, "error": "settings.json is missing core.agent.uid"}
 
+            # Check for _external_manifest.json
+            external_manifest = None
+            for entry_name in namelist:
+                norm = entry_name.replace("\\", "/").strip("/")
+                if norm == "_external_manifest.json" or norm.endswith("/_external_manifest.json"):
+                    try:
+                        with zip_file.open(entry_name) as mf:
+                            external_manifest = json.load(mf)
+                    except Exception:
+                        pass
+                    break
+
+            ext_targets = external_manifest.get("targets", []) if external_manifest else []
+
             return {
                 "valid": True,
                 "uid": uid,
@@ -231,7 +633,9 @@ def inspect_backup(backup_path: str) -> Dict[str, Any]:
                 "creation_date": creation_date,
                 "file_count": len(namelist),
                 "archive_size": os.path.getsize(backup_path),
-                "settings": settings_data
+                "settings": settings_data,
+                "external_targets": ext_targets,
+                "external_targets_count": len(ext_targets)
             }
     except Exception as e:
         return {"valid": False, "error": f"Failed to read backup archive: {str(e)}"}
@@ -306,6 +710,25 @@ def restore_agent_backup(
                     settings_prefix = n[:-len("settings.json")]
                     break
 
+            # Find _external_manifest.json if present
+            external_manifest = None
+            for n in namelist:
+                norm = n.strip("/")
+                if norm == "_external_manifest.json" or norm.endswith("/_external_manifest.json"):
+                    try:
+                        with zip_file.open(n) as mf:
+                            external_manifest = json.load(mf)
+                    except Exception as me:
+                        logging.warning(f"BackupManager: Could not read _external_manifest.json: {me}")
+                    break
+
+            ext_target_map = {}
+            if external_manifest and "targets" in external_manifest:
+                for t in external_manifest["targets"]:
+                    prefix = t.get("archive_prefix", "").strip("/")
+                    if prefix:
+                        ext_target_map[prefix] = t
+
             for member in zip_file.infolist():
                 norm_name = member.filename.replace("\\", "/")
                 
@@ -318,9 +741,58 @@ def restore_agent_backup(
                 if not rel_name or rel_name.endswith("/"):
                     continue
 
-                # Ensure safe target path
+                if rel_name == "_external_manifest.json":
+                    continue
+
+                # Check if this member is an external target
+                if rel_name.startswith("_external_targets/"):
+                    matched_target = None
+                    matched_prefix = None
+                    for pfx, tgt in ext_target_map.items():
+                        if rel_name == pfx or rel_name.startswith(pfx + "/"):
+                            matched_target = tgt
+                            matched_prefix = pfx
+                            break
+
+                    if not matched_target:
+                        logging.warning(f"BackupManager: Unknown external target archive path {member.filename}")
+                        continue
+
+                    portable_dest = matched_target.get("portable_path", "")
+                    dest_base = os.path.abspath(from_portable_path(portable_dest))
+                    target_type = matched_target.get("target_type", "file")
+
+                    if target_type == "directory":
+                        sub_rel = rel_name[len(matched_prefix) + 1:]
+                        out_path = os.path.abspath(os.path.join(dest_base, sub_rel))
+                        # Prevent Zip Slip / escaping dest_base
+                        if not (out_path == dest_base or out_path.startswith(dest_base + os.sep)):
+                            logging.warning(f"BackupManager: Skipping unsafe path {member.filename} escaping {dest_base}")
+                            continue
+                    else:  # file
+                        out_path = dest_base
+
+                    # Prevent writing to disallowed system directories and sensitive user paths
+                    if not is_safe_external_backup_path(out_path):
+                        logging.warning(f"BackupManager: Skipping restoration to disallowed or unsafe path: {out_path}")
+                        continue
+
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                    with zip_file.open(member) as src, open(out_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+
+                    attr = (member.external_attr >> 16) & 0xFFFF
+                    if attr:
+                        try:
+                            os.chmod(out_path, attr)
+                        except Exception as chmod_err:
+                            logging.debug(f"BackupManager: Could not set permissions on {out_path}: {chmod_err}")
+                    continue
+
+                # Ensure safe target path for internal state files
                 out_path = os.path.abspath(os.path.join(target_dir, rel_name))
-                if not out_path.startswith(os.path.abspath(target_dir)):
+                abs_target = os.path.abspath(target_dir)
+                if not (out_path == abs_target or out_path.startswith(abs_target + os.sep)):
                     logging.warning(f"BackupManager: Skipping unsafe archive path {member.filename}")
                     continue
 
@@ -342,16 +814,20 @@ def restore_agent_backup(
             with open(env_path, "w") as f:
                 f.write("")
 
+        ext_count = len(external_manifest.get("targets", [])) if external_manifest else 0
         details = {
             "agent_id": target_agent_id,
             "is_rollback": is_rollback,
             "uid": uid,
             "name": agent_name,
-            "target_dir": target_dir
+            "target_dir": target_dir,
+            "external_targets_restored": ext_count
         }
 
         action_word = "rolled back and restored" if is_rollback else "restored as a new agent instance"
         msg = f"Agent '{agent_name}' ({uid}) was successfully {action_word}."
+        if ext_count > 0:
+            msg += f" (Restored {ext_count} external backup target(s))."
         logging.info(f"BackupManager: {msg}")
         return True, msg, details
 

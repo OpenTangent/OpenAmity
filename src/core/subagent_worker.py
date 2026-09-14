@@ -110,15 +110,108 @@ class SubagentWorker:
         threading.Thread(target=self._process_thought,
                          args=([prompt],), daemon=True).start()
 
-    def send_function_response(self, name: str, response: dict):
+    def send_function_responses(self, responses: list):
         if not self.available or not self.thinker_chat:
             return
 
         self._abort_flag = False
         self.is_processing = True
-        part = types.Part.from_function_response(name=name, response=response)
+        parts = [
+            types.Part.from_function_response(name=name, response=response)
+            for name, response in responses
+        ]
         threading.Thread(target=self._process_thought,
-                         args=([part],), daemon=True).start()
+                         args=(parts,), daemon=True).start()
+
+    def send_function_response(self, name: str, response: dict):
+        self.send_function_responses([(name, response)])
+
+    def _get_chat_history(self):
+        if not self.thinker_chat:
+            return []
+        if hasattr(self.thinker_chat, '_curated_history') and self.thinker_chat._curated_history is not None:
+            return self.thinker_chat._curated_history
+        if hasattr(self.thinker_chat, 'get_history'):
+            try:
+                return self.thinker_chat.get_history(curated=True)
+            except Exception:
+                return self.thinker_chat.get_history()
+        if hasattr(self.thinker_chat, 'history') and self.thinker_chat.history is not None:
+            return self.thinker_chat.history
+        return []
+
+    def _reconcile_tool_calls(self, content):
+        """
+        Ensures any unfulfilled function calls in the subagent chat history or pending turn
+        have matching function responses synthesized before sending to the Gemini API.
+        """
+        history = self._get_chat_history()
+        if not history:
+            return content
+
+        # 1. Reconcile internal history pairs if any prior model turn had unfulfilled calls
+        for i in range(len(history) - 1):
+            turn = history[i]
+            if getattr(turn, 'role', None) == 'model':
+                expected_fcs = []
+                for p in getattr(turn, 'parts', []) or []:
+                    fc = getattr(p, 'function_call', None)
+                    if fc and getattr(fc, 'name', None):
+                        expected_fcs.append(fc.name)
+                if expected_fcs:
+                    next_turn = history[i + 1]
+                    if getattr(next_turn, 'role', None) == 'user':
+                        answered = []
+                        for p in getattr(next_turn, 'parts', []) or []:
+                            fr = getattr(p, 'function_response', None)
+                            if fr and getattr(fr, 'name', None):
+                                answered.append(fr.name)
+                        missing_parts = []
+                        for name in expected_fcs:
+                            if name in answered:
+                                answered.remove(name)
+                            else:
+                                missing_parts.append(types.Part.from_function_response(
+                                    name=name,
+                                    response={"result": "[Action cancelled or interrupted by system]"}
+                                ))
+                                self.logger.warning(
+                                    f"[Subagent {self.subagent_id}] Synthesized dummy function response for unfulfilled function_call: {name}")
+                        if missing_parts:
+                            next_turn.parts = missing_parts + (getattr(next_turn, 'parts', []) or [])
+
+        # 2. Check the final turn in history for unfulfilled function calls
+        last_turn = history[-1]
+        if getattr(last_turn, 'role', None) == 'model':
+            expected_fcs = []
+            for p in getattr(last_turn, 'parts', []) or []:
+                fc = getattr(p, 'function_call', None)
+                if fc and getattr(fc, 'name', None):
+                    expected_fcs.append(fc.name)
+
+            if expected_fcs:
+                answered_in_content = []
+                for item in content:
+                    fr = getattr(item, 'function_response', None)
+                    if fr and getattr(fr, 'name', None):
+                        answered_in_content.append(fr.name)
+
+                missing_parts = []
+                for name in expected_fcs:
+                    if name in answered_in_content:
+                        answered_in_content.remove(name)
+                    else:
+                        missing_parts.append(types.Part.from_function_response(
+                            name=name,
+                            response={"result": "[Action cancelled or interrupted by system]"}
+                        ))
+                        self.logger.warning(
+                            f"[Subagent {self.subagent_id}] Synthesized dummy function response for unfulfilled function_call: {name}")
+
+                if missing_parts:
+                    content = missing_parts + list(content)
+
+        return content
 
     def _process_thought(self, content):
         with self._process_lock:
@@ -130,6 +223,8 @@ class SubagentWorker:
             agent_id_var.set(self.agent_id)
 
         self.logger.info(f"[Subagent {self.subagent_id}] Processing prompt...")
+
+        content = self._reconcile_tool_calls(content)
 
         try:
             response_stream = self.thinker_chat.send_message_stream(

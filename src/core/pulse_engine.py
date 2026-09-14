@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import os
 import re
+import calendar
 from datetime import datetime, timedelta
 from .events import Signal
 try:
@@ -28,19 +29,43 @@ class PulseEngine:
         self.settings_manager = SettingsManager(agent_id=self.agent_id)
         self.address_book_manager = AddressBookManager(agent_id=self.agent_id)
         self.last_interaction_time = time.time()
+        self._last_unpause_time = 0.0
+
+        if hasattr(self.orchestrator, 'on_paused_state_changed'):
+            try:
+                self.orchestrator.on_paused_state_changed.connect(
+                    lambda is_paused: self.notify_unpaused() if not is_paused else None)
+            except Exception:
+                pass
 
         self.init_db()
 
         # WhatsApp state
         self.last_pulse_time = 0
         self.whatsapp_timer = None
-        self.pending_whatsapp_sender = None
+        self.pending_whatsapp_senders = set()
 
         # Timer for time-based checking
         self.is_running = True
         self.schedule_thread = threading.Thread(
             target=self._schedule_loop, daemon=True)
         self.schedule_thread.start()
+
+    def notify_unpaused(self):
+        self._last_unpause_time = time.time()
+
+    @property
+    def pending_whatsapp_sender(self):
+        if not self.pending_whatsapp_senders:
+            return None
+        return ", ".join(sorted(self.pending_whatsapp_senders))
+
+    @pending_whatsapp_sender.setter
+    def pending_whatsapp_sender(self, val):
+        if val is None:
+            self.pending_whatsapp_senders.clear()
+        else:
+            self.pending_whatsapp_senders = {val}
 
     def stop(self):
         self.is_running = False
@@ -57,8 +82,8 @@ class PulseEngine:
                 return
         try:
             self.check_pulses()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"PulseEngine: Error in check_pulses: {e}", exc_info=True)
 
         while self.is_running:
             for _ in range(60):
@@ -67,8 +92,8 @@ class PulseEngine:
                     return
             try:
                 self.check_pulses()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error(f"PulseEngine: Error in check_pulses: {e}", exc_info=True)
 
     def get_db_connection(self):
         return sqlite3.connect(self.db_path)
@@ -124,9 +149,9 @@ class PulseEngine:
 
             for title, context, sched in pulses_to_seed:
                 c.execute('''
-                    INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at, pulse_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (title, context, sched.isoformat(), "daily", "pending", 0, now.isoformat(), "silent"))
+                    INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (title, context, sched.isoformat(), "daily", "pending", 0, now.isoformat()))
 
         conn.commit()
         conn.close()
@@ -161,15 +186,8 @@ class PulseEngine:
     def user_interacted(self):
         self.last_interaction_time = time.time()
 
-    def is_idle(self):
-        sys_settings = self.settings_manager.get("core.auto-pulse", {})
-        idle_timeout = sys_settings.get("idle-timeout-minutes", 1)
-        return (time.time() - self.last_interaction_time) > (idle_timeout * 60)
-
-    def is_deep_idle(self):
-        return (time.time() - self.last_interaction_time) > (4 * 60 * 60)  # 4 hours
-
-    def calculate_next_recurrence(self, current_sched, recurrence, now):
+    def calculate_next_recurrence(self, current_sched, recurrence, now, target_day=None):
+        target_day = target_day if target_day is not None else current_sched.day
         next_time = current_sched
         while next_time <= now:
             if recurrence == 'daily':
@@ -179,22 +197,18 @@ class PulseEngine:
             elif recurrence == 'monthly':
                 month = next_time.month % 12 + 1
                 year = next_time.year + (next_time.month // 12)
-                d = next_time.day
-                while d > 28:
-                    try:
-                        next_time = next_time.replace(
-                            year=year, month=month, day=d)
-                        break
-                    except ValueError:
-                        d -= 1
-                if d <= 28:
-                    next_time = next_time.replace(
-                        year=year, month=month, day=d)
+                max_days = calendar.monthrange(year, month)[1]
+                d = min(target_day, max_days)
+                next_time = next_time.replace(
+                    year=year, month=month, day=d)
             else:
                 next_time += timedelta(days=1)
         return next_time
 
     def check_pulses(self):
+        if getattr(self.orchestrator, 'is_paused', False):
+            return
+
         # Allow pulses to enter the event queue normally regardless of idle/busy state
 
         # Check for sleep cycle (Memory Consolidation)
@@ -221,63 +235,111 @@ class PulseEngine:
                         self.orchestrator.session_fatigue_tokens = 0
 
                     title = "Sleep Cycle (Memory Consolidation)"
-                    context = f"You have been idle long enough given your current context fatigue ({int(fatigue*100)}%). It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. Keep your summary under 500 words. Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
+                    context = (
+                        f"You have reached context fatigue ({int(fatigue*100)}%) or long session duration. It is time for Memory Consolidation (Sleep Cycle). "
+                        "Follow the Two-Beat Protocol:\n"
+                        "1. Factual Epoch: Review the lived events of this session, noting milestones achieved, people engaged with, and tools used.\n"
+                        "2. Subjective Synthesis: Reflect on what this day meant—how your character developed, lessons learned from errors or friction, and how your priorities or mirrors should adjust.\n"
+                        "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
+                        "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
+                        "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
+                    )
                     self.fire_pulse(title, context, "sleep_cycle")
                     return  # Give sleep cycle priority
 
         now = datetime.now()
         conn = self.get_db_connection()
-        c = conn.cursor()
+        try:
+            c = conn.cursor()
 
-        # Fetch pending pulses scheduled in the past
-        c.execute('SELECT id, title, context, scheduled_time, recurrence, has_run, pulse_type FROM pulses WHERE status="pending" AND scheduled_time <= ?', (now.isoformat(),))
-        pending = c.fetchall()
+            # Fetch pending pulses scheduled in the past
+            c.execute('SELECT id, title, context, scheduled_time, recurrence, has_run FROM pulses WHERE status="pending" AND scheduled_time <= ?', (now.isoformat(),))
+            pending = c.fetchall()
 
-        for p in pending:
-            p_id, title, context, sched_str, recurrence, has_run, pulse_type = p
-            sched = datetime.fromisoformat(sched_str)
+            for p in pending:
+                p_id, title, context, sched_str, recurrence, has_run = p
+                sched = datetime.fromisoformat(sched_str)
 
-            if recurrence == 'none':
-                # Fire once-off pulse. It fires even if it was missed while offline.
-                self.fire_pulse(title, context, pulse_type)
-                c.execute(
-                    'UPDATE pulses SET has_run=1, status="completed" WHERE id=?', (p_id,))
-                conn.commit()
-                break  # Process one pulse at a time to prevent cognitive overload
-            else:
-                # It's a recurring pulse
-                next_sched = self.calculate_next_recurrence(
-                    sched, recurrence, now)
-
-                # Check if it was missed (offline or busy for more than 15 mins)
-                delta = (now - sched).total_seconds()
-                if delta > 900:  # 15 minutes grace period
-                    logging.info(
-                        f"PulseEngine: Skipped missed recurring pulse '{title}' (was scheduled for {sched_str})")
-                    c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
-                              (next_sched.isoformat(), p_id))
+                if recurrence == 'none':
+                    # Fire once-off pulse. It fires even if it was missed while offline.
+                    self.fire_pulse(title, context)
+                    c.execute(
+                        'UPDATE pulses SET has_run=1, status="completed" WHERE id=?', (p_id,))
                     conn.commit()
+                    break  # Process one pulse at a time to prevent cognitive overload
                 else:
-                    # Within grace period, fire it
-                    self.fire_pulse(title, context, pulse_type)
-                    c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
-                              (next_sched.isoformat(), p_id))
-                    conn.commit()
-                    break
+                    # It's a recurring pulse
+                    next_sched = self.calculate_next_recurrence(
+                        sched, recurrence, now, target_day=sched.day)
 
-        conn.close()
+                    # Check if it was missed (offline or busy for more than 15 mins)
+                    delta = (now - sched).total_seconds()
+                    recently_unpaused = (time.time() - self._last_unpause_time) < 900
+                    if delta > 900 and not recently_unpaused:  # 15 minutes grace period
+                        logging.info(
+                            f"PulseEngine: Skipped missed recurring pulse '{title}' (was scheduled for {sched_str})")
+                        c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
+                                  (next_sched.isoformat(), p_id))
+                        conn.commit()
+                    else:
+                        # Within grace period, fire it
+                        self.fire_pulse(title, context)
+                        c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
+                                  (next_sched.isoformat(), p_id))
+                        conn.commit()
+                        break
+        finally:
+            conn.close()
 
-    def fire_pulse(self, title, context, pulse_type="standard"):
-        if pulse_type == "sleep_cycle":
-            prompt = f"[CHANNEL: SYSTEM_CONTEMPLATION]\n[AGENT_PULSE] Event: {title}\nContext:\n{context}\n[Directive]: This is a silent Memory Consolidation (Sleep Cycle). You MUST NOT speak or invoke the Speaker tool. Perform all memory synthesis, updates, and reflections completely silently."
-        elif pulse_type == "silent":
-            prompt = f"[CHANNEL: SYSTEM_CONTEMPLATION]\n[AGENT_PULSE] Event: {title}\nContext:\n{context}\n[Directive]: This is a silent contemplation cycle. The system will not automatically vocalize your internal monologue. You do not need to use the Speaker tool to summarize, but you may still explicitly use your voice (via Speaker or WhatsApp voice notes) if you have an urgent realization or deem it necessary to speak."
+    def fire_pulse(self, title, context, pulse_type=None):
+        purpose = title.strip() if title else "Autonomous Pulse"
+        if context:
+            first_line = context.strip().split("\n")[0].strip()
+            first_sentence = first_line.split(". ")[0].strip().rstrip(".")
+            if first_sentence and len(first_sentence) < 80 and first_sentence.lower() != purpose.lower():
+                purpose = f"{purpose} - {first_sentence}"
+
+        if pulse_type == "sleep_cycle" or "Sleep Cycle" in title:
+            prompt = (
+                f"[CHANNEL: SYSTEM_CONTEMPLATION]\n"
+                f"[AGENT_PULSE] Event: {title}\n"
+                f"Context:\n{context}\n"
+                f"[Directive]: This is a Memory Consolidation (Sleep Cycle). You MUST NOT speak aloud or invoke the Speaker tool. "
+                f"Perform all memory synthesis, updates, and reflections completely silently."
+            )
+            self.trigger_pulse.emit(prompt, purpose=purpose)
+            return
+
+        available_social = []
+        if self.orchestrator and hasattr(self.orchestrator, 'cerebrum') and hasattr(self.orchestrator.cerebrum, 'tools'):
+            for tool_name in ["WhatsApp", "Moltbook", "Mastodon", "Email"]:
+                if tool_name in self.orchestrator.cerebrum.tools:
+                    available_social.append(tool_name)
+
+        if available_social:
+            social_instruction = f"Check your active social tools ({', '.join(available_social)}) for new messages or updates."
         else:
-            prompt = f"[CHANNEL: SYSTEM_SCHEDULE]\n[AGENT_PULSE] Event: {title}\nContext:\n{context}"
-        self.trigger_pulse.emit(prompt)
+            social_instruction = "Check any other social tools (WhatsApp, Moltbook, etc.) if available in your tool declarations."
+
+        prompt = (
+            f"[CHANNEL: SYSTEM_SCHEDULE]\n"
+            f"[AGENT_PULSE] Event: {title}\n"
+            f"Context:\n{context}\n\n"
+            f"[Operational Protocol]:\n"
+            f"1. Perform the assigned pulse task.\n"
+            f"2. Check your Trajectory (e.g. Trajectory_get_bearings) to maintain situational awareness and momentum.\n"
+            f"3. Check the local chatroom for new messages or mentions (Chatroom_unread / Chatroom_unread_mentions).\n"
+            f"4. {social_instruction}\n"
+            f"5. Communication: Actively report back on what you are doing and share your progress using Speaker_output_text, "
+            f"the Chatroom, and/or social tools. Avoid speaking aloud (Speaker_speak_aloud) unless you have good reason to believe "
+            f"the user is present in the room to hear it, as the host PC may be unattended."
+        )
+        self.trigger_pulse.emit(prompt, purpose=purpose)
 
     # --- WhatsApp Handling Ported from WakeUpService ---
     def handle_whatsapp_message(self, sender_id, sender_name):
+        if getattr(self.orchestrator, 'is_paused', False):
+            return
         if not sender_id:
             return
         if sender_id.endswith("@g.us") or sender_id.endswith("@broadcast"):
@@ -346,7 +408,8 @@ class PulseEngine:
             return
 
         buffer_seconds = sys_settings.get("buffer-seconds", 30)
-        self.pending_whatsapp_sender = sender_name or f"+{clean_sender}"
+        sender_label = sender_name or f"+{clean_sender}"
+        self.pending_whatsapp_senders.add(sender_label)
 
         if self.whatsapp_timer:
             self.whatsapp_timer.cancel()
@@ -355,12 +418,15 @@ class PulseEngine:
             buffer_seconds, self.execute_whatsapp_pulse, args=[sys_settings])
         self.whatsapp_timer.start()
         logging.debug(
-            f"PulseEngine: WhatsApp message from {self.pending_whatsapp_sender} buffered for {buffer_seconds}s.")
+            f"PulseEngine: WhatsApp message from {sender_label} buffered for {buffer_seconds}s.")
 
     def execute_whatsapp_pulse(self, sys_settings):
         from core.logger_config import agent_id_var
         agent_id_var.set(self.agent_id)
         self.last_pulse_time = time.time()
 
-        prompt = "[AGENT_PULSE] Check your unread WhatsApp messages now."
-        self.trigger_pulse.emit(prompt)
+        sender_label = ", ".join(sorted(self.pending_whatsapp_senders)) if self.pending_whatsapp_senders else "Contact"
+        self.pending_whatsapp_senders.clear()
+        title = f"WhatsApp Message from {sender_label}"
+        context = "Check your unread WhatsApp messages now and reply if appropriate."
+        self.fire_pulse(title, context)
