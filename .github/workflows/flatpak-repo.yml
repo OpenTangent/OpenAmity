@@ -13,6 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -27,17 +28,23 @@ jobs:
 
       - name: Install flatpak-builder and dependencies
         run: |
-          sudo apt-get update
+          # Prevent APT from hanging indefinitely on stalled Azure mirror connections
+          echo 'Acquire::http::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/99timeouts
+          echo 'Acquire::https::Timeout "30";' | sudo tee -a /etc/apt/apt.conf.d/99timeouts
+          echo 'Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99timeouts
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+
+          timeout 120 sudo apt-get update || timeout 120 sudo apt-get update || true
           sudo apt-get install -y flatpak flatpak-builder
           sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          sudo flatpak install -y flathub org.kde.Sdk//6.11 org.kde.Platform//6.11
+          sudo flatpak install -y --noninteractive flathub org.kde.Sdk//6.11 org.kde.Platform//6.11
           BASEAPP_VER=$(flatpak remote-info --system flathub io.qt.PySide.BaseApp//6.11 2>/dev/null | awk '/Version:/ {print $2}')
           if [ -z "$BASEAPP_VER" ] || [ "$(printf '%s\n6.11.2\n' "$BASEAPP_VER" | sort -V | head -n1)" != "6.11.2" ]; then
             echo "Flathub BaseApp is at $BASEAPP_VER (< 6.11.2). Installing Qt 6.11.2 compatible BaseApp build..."
-            sudo flatpak install -y https://dl.flathub.org/build-repo/320285/io.qt.PySide.BaseApp.flatpakref
+            sudo flatpak install -y --noninteractive https://dl.flathub.org/build-repo/320285/io.qt.PySide.BaseApp.flatpakref
           else
             echo "Flathub BaseApp is at $BASEAPP_VER (>= 6.11.2). Installing from flathub..."
-            sudo flatpak install -y flathub io.qt.PySide.BaseApp//6.11
+            sudo flatpak install -y --noninteractive flathub io.qt.PySide.BaseApp//6.11
           fi
 
       - name: Import GPG Key
@@ -58,6 +65,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
