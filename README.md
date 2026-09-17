@@ -54,7 +54,7 @@ Open Amity bridges the gap between passive assistant and genuine digital collabo
   - **Layer 1 (Continuity)**: Short-term memory for contextual bridging.
   - **Layer 2 (The Sanctuary)**: On-demand records of social dynamics, Theory of Mind (mirrors), and subjective experiences.
   - **Layer 3 (Deep Search)**: A vector database enabling semantic search for facts and general knowledge.
-- **📦 Agent Snapshots (.oaa)**: Complete state portability via Open Amity Agent (`.oaa`) snapshot archives. Agents can autonomously create their own snapshots, and users can easily export and restore complete agent instances with full memory, trajectories, settings, and external targets preserved.
+- **📦 Agent Snapshots (.oaa)**: Complete state portability via Open Amity Agent (`.oaa`) snapshot archives. Agents can autonomously create their own snapshots, and users can easily export and restore complete agent instances with full memory, trajectories, settings, and created files.
 - **🛠️ Tool Usage**: Open Amity agents have access to a rich suite of built-in and optional tools:
   - **Email**: (Optional) Dedicated IMAP/SMTP email client supporting OAuth 2.0 to read, search, draft, and send emails.
   - **WhatsApp**: (Optional) Natively converse, send media, and interact in WhatsApp chats and groups.

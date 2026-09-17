@@ -24,7 +24,7 @@ class TerminalSkill(Tool):
         return [
             {
                 "name": "Terminal_run",
-                "description": "Executes a short bash command synchronously (max 30s timeout). Use this for quick file reads, listing dirs, etc. IMPORTANT: Due to Flatpak sandboxing, you only have host access to ~/Documents, ~/Pictures, ~/Downloads, and ~/Desktop.",
+                "description": "Executes a short bash command synchronously (max 30s timeout). Use this for quick file reads, listing dirs, etc. IMPORTANT: Due to Flatpak sandboxing, you generally only have host access to ~/Documents, ~/Pictures, ~/Downloads, and ~/Desktop.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -93,12 +93,7 @@ class TerminalSkill(Tool):
             {
                 "name": "Terminal_flag_for_backup",
                 "description": (
-                    "Flags a file or directory path to be included in autonomous and manual agent .oaa backups. "
-                    "When an .oaa backup is created, all flagged files and full directories are backed up alongside your state files, "
-                    "and restored to their appropriate host locations upon restore. "
-                    "Every time this function is called, it automatically checks all paths in the list: missing paths are removed (reason 'missing'), "
-                    "and individual files or subdirectories within an already flagged directory are removed (reason 'redundant'). "
-                    "You will be informed of any removals."
+                    "Flags a file or directory path to be included in .oaa snapshots. When an .oaa snapshot is created, all flagged files and full directories are included alongside your state files, and restored to their appropriate locations upon restore. Every time this function is called, it automatically checks all paths in the list: missing paths are removed (reason 'missing'), and individual files or subdirectories within an already flagged directory are removed (reason 'redundant'). You will be informed of any removals."
                 ),
                 "parameters": {
                     "type": "OBJECT",

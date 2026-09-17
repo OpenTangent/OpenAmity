@@ -124,3 +124,16 @@ def test_system_tool_api_key_lifecycle(tmp_path):
         assert "RATE_LIMITED" in docs_out
         assert "PULSE_COLLISION" in docs_out
 
+
+def test_system_tool_annotations_and_cerebrum_loading():
+    """Verify all SystemTool methods have valid annotations and can be inspected without NameError."""
+    import inspect
+    from typing import get_type_hints
+    from tools.system_tool import SystemTool
+
+    for name, member in inspect.getmembers(SystemTool, predicate=callable):
+        # get_type_hints eagerly evaluates annotations, replicating Python <=3.13 behavior
+        hints = get_type_hints(member)
+        assert isinstance(hints, dict)
+
+

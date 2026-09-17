@@ -33,6 +33,11 @@ def test_speaker_tool_brevity_and_offloading():
     assert "xdg-open" in text_decl["description"]
     assert "file location" in text_decl["description"]
 
+    # Verify complementary output reminder
+    assert "complement each other, not summarise each other" in tool.description
+    assert "complement each other, not summarise each other" in speak_decl["description"]
+    assert "complement each other, not summarise each other" in text_decl["description"]
+
 
 def test_agent_manual_directives():
     manual_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/memory/agent_manual.md"))
