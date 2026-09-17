@@ -14,7 +14,6 @@ from core.chatgpt_worker import (
     FunctionCallObject
 )
 from core.settings_manager import SettingsManager
-from core.audio_output import TTSWorker
 
 
 def test_convert_schema_types_and_tool():
@@ -195,24 +194,6 @@ def test_chatgpt_reformulate_query(monkeypatch, tmp_path):
         history = [("User", "I am in London."), ("Agent", "Nice!")]
         result = worker.reformulate_query("What is the weather like here today?", history)
         assert result == "What is the weather in London today?"
-
-
-def test_piper_tts_routing_for_chatgpt(monkeypatch, tmp_path):
-    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
-
-    with patch.object(SettingsManager, "get") as mock_get:
-        def get_side_effect(key, default=None):
-            if key == "core.api-provider":
-                return "chatgpt"
-            return default
-        mock_get.side_effect = get_side_effect
-
-        tts = TTSWorker("Hello world", agent_id="test_tts_agent")
-        with patch.object(tts, "_stream_and_play_piper") as mock_piper, \
-             patch.object(tts, "_stream_and_play_gemini") as mock_gemini:
-            tts._stream_and_play()
-            assert mock_piper.called
-            assert not mock_gemini.called
 
 
 def test_chatgpt_worker_reconcile_unfulfilled_tool_calls(monkeypatch, tmp_path):

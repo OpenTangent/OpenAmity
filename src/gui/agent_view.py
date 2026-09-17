@@ -1,11 +1,17 @@
-import markdown
 from datetime import datetime
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QTextEdit, QProgressBar)
+                               QPushButton, QTextEdit, QTextBrowser, QProgressBar)
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QTextCursor, QTextBlockFormat
 
 from gui.visualizer import SoundWaveVisualizer
+from gui.chat_formatter import (
+    setup_chat_browser,
+    render_markdown_to_html,
+    render_user_message_content,
+    wrap_in_isolated_container,
+    insert_message_into_log,
+)
 from core.orchestrator import AmityOrchestrator
 from core.config_manager import ConfigManager
 
@@ -50,13 +56,9 @@ class AgentView(QWidget):
         self.main_layout.addWidget(self.visualizer)
 
         # Conversation Log
-        self.conversation_log = QTextEdit()
-        self.conversation_log.setReadOnly(True)
-        self.conversation_log.setStyleSheet(
-            "background-color: #1a1a1a; color: #FFF; border: none; padding: 20px; font-family: 'Ubuntu Light'; font-weight: 300; font-size: 16px;")
-        scroll_bar = self.conversation_log.verticalScrollBar()
-        scroll_bar.rangeChanged.connect(
-            lambda min, max: scroll_bar.setValue(max))
+        self.conversation_log = QTextBrowser()
+        setup_chat_browser(self.conversation_log)
+        self.conversation_log.setOpenExternalLinks(True)
         self.main_layout.addWidget(self.conversation_log, 1)
 
         # Console Log
@@ -263,45 +265,45 @@ class AgentView(QWidget):
         if sender in ["User", user_name]:
             display_name = user_name
             name_color = PRIMARY_ACCENT_COLOR
-            text_color = "#808080"
+            text_color = "#888888"
+            bg_color = "#19191b"
+            border_color = "#28282c"
+            formatted_text = render_user_message_content(text)
         elif sender.startswith("System"):
             display_name = sender
-            name_color = "#808080"
-            text_color = "#808080"
+            name_color = "#666666"
+            text_color = "#777777"
+            bg_color = "#171718"
+            border_color = "#242426"
+            formatted_text = render_markdown_to_html(text)
         else:
             display_name = self.settings_manager.get(
                 "core.agent.name", "Agent")
             name_color = SECONDARY_ACCENT_COLOR
             text_color = "#FFFFFF"
+            bg_color = "#222225"
+            border_color = "#36363b"
+            formatted_text = render_markdown_to_html(text)
+
         timestamp = datetime.now().strftime("%H:%M")
 
-        if sender in ["User", user_name]:
-            safe_text = text.replace("<", "&lt;").replace(
-                ">", "&gt;").replace("\n", "<br>")
-            formatted_text = safe_text
-        else:
-            formatted_text = markdown.markdown(
-                text, extensions=['fenced_code', 'tables'])
-
-        html = f"""
-        <div style='margin-bottom: 10px; text-align: left;'>
-            <span style='color: {name_color}; font-weight: bold;'>{display_name}</span>
-            <div style='margin-top: 5px; color: {text_color};'>
-                {formatted_text}
-                <table width="100%" cellpadding="0" cellspacing="0" style="margin-top: 2px;">
-                    <tr><td align="right">
-                        <span style='color: #666; font-size: 12px;'>{timestamp}</span>
-                    </td></tr>
-                </table>
-            </div>
+        inner_html = f"""
+        <div style="margin-bottom: 4px; text-align: left;">
+            <span style="color: {name_color}; font-weight: bold; font-size: 14px;">{display_name}</span>
+        </div>
+        <div style="color: {text_color}; font-size: 18px; line-height: 1.65;">
+            {formatted_text}
+        </div>
+        <div style="text-align: right; color: #555555; font-size: 11px; margin-top: 6px;">
+            {timestamp}
         </div>
         """
-        cursor = self.conversation_log.textCursor()
-        cursor.movePosition(QTextCursor.End)
-
-        if not self.conversation_log.document().isEmpty():
-            block_format = QTextBlockFormat()
-            cursor.insertBlock(block_format)
-
-        self.conversation_log.setTextCursor(cursor)
-        cursor.insertHtml(html)
+        isolated_html = wrap_in_isolated_container(
+            inner_html,
+            margin_bottom=14,
+            bg_color=bg_color,
+            border_color=border_color,
+            border_radius=8,
+            padding="12px 18px",
+        )
+        insert_message_into_log(self.conversation_log, isolated_html)

@@ -11,6 +11,8 @@ class AgentManager:
         self.orchestrators = {}
         os.makedirs(self.agents_dir, exist_ok=True)
         self.migrate_legacy_data()
+        self.hook_server = None
+        self.start_hook_server()
 
     def migrate_legacy_data(self):
         legacy_files = [
@@ -180,5 +182,29 @@ class AgentManager:
             if agent_uid and agent_uid.strip().upper() == clean_uid:
                 return aid
         return None
+
+    def start_hook_server(self):
+        if self.hook_server and getattr(self.hook_server, 'is_running', False):
+            return
+        try:
+            from core.config_manager import ConfigManager
+            from core.hook_server import HookServer
+            cm = ConfigManager()
+            if cm.get("pulse-hooks.enabled", True):
+                host = cm.get("pulse-hooks.host", "127.0.0.1")
+                port = cm.get("pulse-hooks.port", 7965)
+                self.hook_server = HookServer(agent_manager=self, host=host, port=port)
+                self.hook_server.start()
+        except Exception as e:
+            logging.error(f"AgentManager: Error starting HookServer: {e}", exc_info=True)
+
+    def stop_hook_server(self):
+        if self.hook_server:
+            try:
+                self.hook_server.stop()
+            except Exception as e:
+                logging.debug(f"AgentManager: Error stopping HookServer: {e}")
+            self.hook_server = None
+
 
 

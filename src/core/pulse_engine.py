@@ -45,6 +45,9 @@ class PulseEngine:
         self.whatsapp_timer = None
         self.pending_whatsapp_senders = set()
 
+        # Wakeup event for instant trigger
+        self._wakeup_event = threading.Event()
+
         # Timer for time-based checking
         self.is_running = True
         self.schedule_thread = threading.Thread(
@@ -53,6 +56,11 @@ class PulseEngine:
 
     def notify_unpaused(self):
         self._last_unpause_time = time.time()
+        self.notify_external_pulse()
+
+    def notify_external_pulse(self):
+        """Notifies the background schedule loop of an injected pulse for immediate evaluation."""
+        self._wakeup_event.set()
 
     @property
     def pending_whatsapp_sender(self):
@@ -69,6 +77,7 @@ class PulseEngine:
 
     def stop(self):
         self.is_running = False
+        self._wakeup_event.set()
         if self.whatsapp_timer:
             self.whatsapp_timer.cancel()
 
@@ -86,10 +95,10 @@ class PulseEngine:
             logging.error(f"PulseEngine: Error in check_pulses: {e}", exc_info=True)
 
         while self.is_running:
-            for _ in range(60):
-                time.sleep(1)
-                if not self.is_running:
-                    return
+            self._wakeup_event.wait(timeout=60)
+            self._wakeup_event.clear()
+            if not self.is_running:
+                return
             try:
                 self.check_pulses()
             except Exception as e:
@@ -253,16 +262,17 @@ class PulseEngine:
             c = conn.cursor()
 
             # Fetch pending pulses scheduled in the past
-            c.execute('SELECT id, title, context, scheduled_time, recurrence, has_run FROM pulses WHERE status="pending" AND scheduled_time <= ?', (now.isoformat(),))
+            c.execute('SELECT id, title, context, scheduled_time, recurrence, has_run, pulse_type FROM pulses WHERE status="pending" AND scheduled_time <= ?', (now.isoformat(),))
             pending = c.fetchall()
 
             for p in pending:
-                p_id, title, context, sched_str, recurrence, has_run = p
+                p_id, title, context, sched_str, recurrence, has_run, p_type = p
                 sched = datetime.fromisoformat(sched_str)
 
                 if recurrence == 'none':
                     # Fire once-off pulse. It fires even if it was missed while offline.
-                    self.fire_pulse(title, context)
+                    active_type = p_type if p_type in ["external_hook", "sleep_cycle", "whatsapp"] else "scheduled_task"
+                    self.fire_pulse(title, context, pulse_type=active_type)
                     c.execute(
                         'UPDATE pulses SET has_run=1, status="completed" WHERE id=?', (p_id,))
                     conn.commit()
@@ -283,7 +293,8 @@ class PulseEngine:
                         conn.commit()
                     else:
                         # Within grace period, fire it
-                        self.fire_pulse(title, context)
+                        active_type = p_type if p_type == "external_hook" else "scheduled_routine"
+                        self.fire_pulse(title, context, pulse_type=active_type)
                         c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
                                   (next_sched.isoformat(), p_id))
                         conn.commit()
@@ -292,12 +303,18 @@ class PulseEngine:
             conn.close()
 
     def fire_pulse(self, title, context, pulse_type=None):
-        purpose = title.strip() if title else "Autonomous Pulse"
-        if context:
-            first_line = context.strip().split("\n")[0].strip()
-            first_sentence = first_line.split(". ")[0].strip().rstrip(".")
-            if first_sentence and len(first_sentence) < 80 and first_sentence.lower() != purpose.lower():
-                purpose = f"{purpose} - {first_sentence}"
+        if pulse_type == "sleep_cycle" or "Sleep Cycle" in (title or ""):
+            purpose = "Memory consolidation cycle"
+        elif pulse_type == "whatsapp" or "WhatsApp Message" in (title or ""):
+            purpose = "WhatsApp message received"
+        elif pulse_type == "external_hook" or "External Pulse" in (title or "") or "External pulse" in (title or ""):
+            purpose = "External pulse received"
+        elif pulse_type == "scheduled_task":
+            purpose = "Scheduled task"
+        elif pulse_type == "scheduled_routine":
+            purpose = "Scheduled routine"
+        else:
+            purpose = "Scheduled routine"
 
         if pulse_type == "sleep_cycle" or "Sleep Cycle" in title:
             prompt = (
@@ -330,9 +347,9 @@ class PulseEngine:
             f"2. Check your Trajectory (e.g. Trajectory_get_bearings) to maintain situational awareness and momentum.\n"
             f"3. Check the local chatroom for new messages or mentions (Chatroom_unread / Chatroom_unread_mentions).\n"
             f"4. {social_instruction}\n"
-            f"5. Communication: Actively report back on what you are doing and share your progress using Speaker_output_text, "
-            f"the Chatroom, and/or social tools. Avoid speaking aloud (Speaker_speak_aloud) unless you have good reason to believe "
-            f"the user is present in the room to hear it, as the host PC may be unattended."
+            f"5. Output & Voice Discretion:\n"
+            f"   - Avoid unnecessary text output: You may use Speaker_output_text when necessary, but avoid unnecessary text output. Autonomous pulses run quietly by default; routine bearings checks, internal updates, and empty sweeps must complete silently without posting commentary to the user.\n"
+            f"   - Avoid speaking aloud: Speaker_speak_aloud should only be used when responding to user prompts. Pulses should almost never use Speaker_speak_aloud. You are strongly dissuaded from speaking aloud during pulses as there will likely be no one in the room to hear it, though you retain autonomy to speak if you have an urgent, compelling reason."
         )
         self.trigger_pulse.emit(prompt, purpose=purpose)
 
@@ -429,4 +446,4 @@ class PulseEngine:
         self.pending_whatsapp_senders.clear()
         title = f"WhatsApp Message from {sender_label}"
         context = "Check your unread WhatsApp messages now and reply if appropriate."
-        self.fire_pulse(title, context)
+        self.fire_pulse(title, context, pulse_type="whatsapp")

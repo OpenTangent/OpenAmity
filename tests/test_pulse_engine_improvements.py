@@ -30,14 +30,13 @@ def test_pulse_purpose_in_chat_log():
     appended_messages = []
     orch.append_to_conversation = lambda sender, text: appended_messages.append((sender, text))
 
-    # 1. Pulse with explicit purpose passed
-    orch.process_pulse("Sample prompt text", purpose="Morning Kickoff - Plan daily tasks")
+    # 1. Pulse with prewritten category passed
+    orch.process_pulse("Sample prompt text", purpose="Scheduled task")
     assert len(appended_messages) == 1
     assert appended_messages[0][0] == "System"
-    assert appended_messages[0][1] == "[Autonomy Pulse: Morning Kickoff - Plan daily tasks]"
-    assert "[Autonomy Pulse Triggered]" not in appended_messages[0][1]
+    assert appended_messages[0][1] == "[Autonomy Pulse: Scheduled task]"
 
-    # 2. Pulse without explicit purpose, extracted from [AGENT_PULSE] Event and Context
+    # 2. Pulse without explicit purpose, categorized from [AGENT_PULSE]
     prompt = (
         "[CHANNEL: SYSTEM_SCHEDULE]\n"
         "[AGENT_PULSE] Event: Mid-Day Check-In\n"
@@ -47,7 +46,9 @@ def test_pulse_purpose_in_chat_log():
     orch.process_pulse(prompt)
     assert len(appended_messages) == 2
     assert appended_messages[1][0] == "System"
-    assert appended_messages[1][1] == "[Autonomy Pulse: Mid-Day Check-In - Review your trajectory data and recent memories]"
+    assert appended_messages[1][1] == "[Autonomy Pulse: Scheduled routine]"
+    # Ensure no context leaks
+    assert "Review your trajectory data" not in appended_messages[1][1]
 
     # 3. WhatsApp pulse
     wa_prompt = (
@@ -57,13 +58,46 @@ def test_pulse_purpose_in_chat_log():
     )
     orch.process_pulse(wa_prompt)
     assert len(appended_messages) == 3
-    assert appended_messages[2][1] == "[Autonomy Pulse: WhatsApp Message from Kerry Parker - Check your unread WhatsApp messages now and reply if appropriate]"
+    assert appended_messages[2][1] == "[Autonomy Pulse: WhatsApp message received]"
+    assert "Check your unread WhatsApp" not in appended_messages[2][1]
+    assert "Kerry Parker" not in appended_messages[2][1]
 
-    # 4. System notification pulse (e.g. from background task)
+    # 4. System notification pulse from completed background task
     bg_prompt = "[SYSTEM_NOTIFICATION] Background Task 42 ('make test') has completed.\n\nOutput: ok"
     orch.process_pulse(bg_prompt)
     assert len(appended_messages) == 4
-    assert appended_messages[3][1] == "[Autonomy Pulse: Background Task 42 ('make test') has completed.]"
+    assert appended_messages[3][1] == "[Autonomy Pulse: Terminal command completed]"
+    assert "make test" not in appended_messages[3][1]
+
+    # 5. Background task in progress
+    bg_running = "[SYSTEM_NOTIFICATION] Background Task 42 ('make test') is still running."
+    orch.process_pulse(bg_running)
+    assert len(appended_messages) == 5
+    assert appended_messages[4][1] == "[Autonomy Pulse: Terminal command in progress]"
+
+    # 6. Subagent finished
+    sub_finish = "[System Feedback: Subagent sid_1 finished - result data]"
+    orch.process_pulse(sub_finish)
+    assert len(appended_messages) == 6
+    assert appended_messages[5][1] == "[Autonomy Pulse: Subagent task completed]"
+
+    # 7. Subagent error
+    sub_err = "[System Warning: Subagent sid_1 encountered an error: network timeout]"
+    orch.process_pulse(sub_err)
+    assert len(appended_messages) == 7
+    assert appended_messages[6][1] == "[Autonomy Pulse: Subagent task error]"
+
+    # 8. Memory consolidation cycle
+    sleep_prompt = "[CHANNEL: SYSTEM_CONTEMPLATION]\n[AGENT_PULSE] Event: Sleep Cycle (Memory Consolidation)\nContext:\nConsolidate..."
+    orch.process_pulse(sleep_prompt)
+    assert len(appended_messages) == 8
+    assert appended_messages[7][1] == "[Autonomy Pulse: Memory consolidation cycle]"
+
+    # 9. External pulse received
+    external_prompt = "[CHANNEL: SYSTEM_SCHEDULE]\n[AGENT_PULSE] Event: Home Alarm\nContext:\nSensor 1 triggered..."
+    orch.process_pulse(external_prompt, purpose="External pulse received")
+    assert len(appended_messages) == 9
+    assert appended_messages[8][1] == "[Autonomy Pulse: External pulse received]"
 
 
 def test_pulse_prompt_contains_protocol_and_available_social_tools():
@@ -87,19 +121,20 @@ def test_pulse_prompt_contains_protocol_and_available_social_tools():
     emitted_prompt = engine.trigger_pulse.emit.call_args[0][0]
     emitted_purpose = engine.trigger_pulse.emit.call_args[1].get("purpose")
 
-    # Verify purpose
-    assert "Review Roadmap" in emitted_purpose
+    # Verify prewritten purpose
+    assert emitted_purpose == "Scheduled routine"
 
     # Verify protocol points
     assert "Trajectory_get_bearings" in emitted_prompt
     assert "Chatroom_unread" in emitted_prompt
     # Dynamic social tools detection
     assert "WhatsApp, Moltbook" in emitted_prompt
-    # Proactive reporting & voice discretion
+    # Quiet-by-default output & voice discretion
     assert "Speaker_output_text" in emitted_prompt
-    assert "Speaker_speak_aloud" in emitted_prompt
-    assert "Avoid speaking aloud" in emitted_prompt
-    assert "Actively report back" in emitted_prompt
+    assert "Avoid unnecessary text output" in emitted_prompt
+    assert "Speaker_speak_aloud should only be used when responding to user prompts" in emitted_prompt
+    assert "strongly dissuaded from speaking aloud" in emitted_prompt
+    assert "Actively report back" not in emitted_prompt
 
 
 def test_pulse_prompt_fallback_when_no_social_tools():

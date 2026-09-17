@@ -688,6 +688,8 @@ class MainWindow(QMainWindow):
             return
         self.agents_pending_shutdown -= 1
         if self.agents_pending_shutdown <= 0:
+            if hasattr(self.agent_manager, 'stop_hook_server'):
+                self.agent_manager.stop_hook_server()
             self.ui_shutdown_complete.emit()
 
     def keyPressEvent(self, event: QKeyEvent):

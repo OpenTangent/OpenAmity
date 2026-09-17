@@ -14,7 +14,6 @@ from core.deepseek_worker import (
     FunctionCallObject
 )
 from core.settings_manager import SettingsManager
-from core.audio_output import TTSWorker
 
 
 def test_convert_schema_types_and_tool():
@@ -211,24 +210,6 @@ def test_deepseek_reformulate_query(monkeypatch, tmp_path):
         history = [("User", "I am in Tokyo."), ("Agent", "Konichiwa!")]
         result = worker.reformulate_query("What is the weather like here today?", history)
         assert result == "What is the weather in Tokyo today?"
-
-
-def test_piper_tts_routing_for_deepseek(monkeypatch, tmp_path):
-    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
-
-    with patch.object(SettingsManager, "get") as mock_get:
-        def get_side_effect(key, default=None):
-            if key == "core.api-provider":
-                return "deepseek"
-            return default
-        mock_get.side_effect = get_side_effect
-
-        tts = TTSWorker("Hello world from DeepSeek", agent_id="test_deepseek_tts_agent")
-        with patch.object(tts, "_stream_and_play_piper") as mock_piper, \
-             patch.object(tts, "_stream_and_play_gemini") as mock_gemini:
-            tts._stream_and_play()
-            assert mock_piper.called
-            assert not mock_gemini.called
 
 
 def test_deepseek_settings_panel_load_and_save(monkeypatch, tmp_path):

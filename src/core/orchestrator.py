@@ -63,6 +63,9 @@ class AmityOrchestrator:
         self.last_action_result = None
         self.current_user_prompt = ""
         self.recent_history = []
+        self._is_user_interaction = False
+        self._speaker_invoked_in_cycle = False
+        self._user_turn_nudged = False
 
         self.on_shutdown_complete = Signal()
         self.session_fatigue_tokens = 0
@@ -506,6 +509,9 @@ class AmityOrchestrator:
         self.set_busy_state(True)
         self.current_user_prompt = text
         self._is_sleep_cycle = False
+        self._is_user_interaction = True
+        self._speaker_invoked_in_cycle = False
+        self._user_turn_nudged = False
 
         with self.budget_lock:
             try:
@@ -599,30 +605,52 @@ class AmityOrchestrator:
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
-        if not purpose:
-            import re
-            m = re.search(r'\[AGENT_PULSE\]\s*Event:\s*([^\n]+)', text)
-            if m:
-                event_title = m.group(1).strip()
-                purpose = event_title
-                ctx_m = re.search(r'Context:\s*([^\n]+)', text)
-                if ctx_m:
-                    first_sentence = ctx_m.group(1).strip().split(". ")[0].strip().rstrip(".")
-                    if first_sentence and len(first_sentence) < 80 and first_sentence.lower() != event_title.lower():
-                        purpose = f"{event_title} - {first_sentence}"
-            else:
-                n_m = re.search(r'\[SYSTEM_NOTIFICATION\]\s*([^\n]+)', text)
-                if n_m:
-                    purpose = n_m.group(1).strip()
-                else:
-                    purpose = "Autonomous Pulse"
+        PREWRITTEN_PULSE_CATEGORIES = {
+            "Terminal command completed",
+            "Terminal command in progress",
+            "WhatsApp message received",
+            "Subagent task completed",
+            "Subagent task error",
+            "Memory consolidation cycle",
+            "Scheduled routine",
+            "Scheduled task",
+            "Autonomous routine",
+            "External pulse received",
+        }
 
-        self._is_sleep_cycle = ("Sleep Cycle (Memory Consolidation)" in text or "Sleep Cycle" in str(purpose))
+        category = purpose
+        if category not in PREWRITTEN_PULSE_CATEGORIES:
+            cat_lower = str(category).lower() if category else ""
+            if "memory consolidation" in cat_lower or "sleep cycle" in cat_lower or "Sleep Cycle" in text:
+                category = "Memory consolidation cycle"
+            elif "whatsapp" in cat_lower or "WhatsApp Message" in text:
+                category = "WhatsApp message received"
+            elif "external" in cat_lower or "hook" in cat_lower:
+                category = "External pulse received"
+            elif "still running" in text or "in progress" in cat_lower:
+                category = "Terminal command in progress"
+            elif "[SYSTEM_NOTIFICATION] Background Task" in text or "terminal" in cat_lower or "background task" in cat_lower:
+                category = "Terminal command completed"
+            elif "[System Feedback: Subagent" in text or ("subagent" in cat_lower and "finish" in cat_lower):
+                category = "Subagent task completed"
+            elif "[System Warning: Subagent" in text or ("subagent" in cat_lower and ("error" in cat_lower or "fail" in cat_lower)):
+                category = "Subagent task error"
+            elif cat_lower == "scheduled task" or "task" in cat_lower:
+                category = "Scheduled task"
+            elif "[AGENT_PULSE]" in text or "routine" in cat_lower:
+                category = "Scheduled routine"
+            else:
+                category = "Scheduled routine"
+
+        self._is_sleep_cycle = ("Sleep Cycle" in text or category == "Memory consolidation cycle")
         if "You are shutting down." not in text:
-            self.append_to_conversation("System", f"[Autonomy Pulse: {purpose}]")
+            self.append_to_conversation("System", f"[Autonomy Pulse: {category}]")
         self.is_thinking = True
         self.set_busy_state(True)
         self.current_user_prompt = text
+        self._is_user_interaction = False
+        self._speaker_invoked_in_cycle = False
+        self._user_turn_nudged = False
 
         with self.budget_lock:
             try:
@@ -713,6 +741,22 @@ class AmityOrchestrator:
             self.accumulated_thoughts += clean_text + "\n"
 
         if not function_calls:
+            if (
+                getattr(self, '_is_user_interaction', False)
+                and not getattr(self, '_speaker_invoked_in_cycle', False)
+                and not getattr(self, '_user_turn_nudged', False)
+                and not getattr(self, 'is_paused', False)
+                and not getattr(self, '_shutdown_flag', False)
+                and self.gemini_worker
+                and getattr(self.gemini_worker, 'running', False)
+            ):
+                self._user_turn_nudged = True
+                nudge_text = "[System Notice: You have not responded to the user. Please invoke Speaker_speak_aloud or Speaker_output_text to respond now.]"
+                logging.info(
+                    f"Agent {self.agent_id} completed turn without speaking to user. Triggering auto-nudge.")
+                self.gemini_worker.send_prompt(nudge_text)
+                return
+
             logging.debug(
                 "handle_gemini_thought found no function calls, calling finish_thinking")
             self.finish_thinking()
@@ -769,6 +813,7 @@ class AmityOrchestrator:
 
         for i, (name, resp) in enumerate(function_responses):
             if name.startswith("Speaker_"):
+                self._speaker_invoked_in_cycle = True
                 result_str = resp.get("result", "")
                 try:
                     payload = json.loads(result_str)
@@ -1052,7 +1097,7 @@ class AmityOrchestrator:
 
         if text:
             self.event_queue.append(
-                {"type": "pulse", "text": f"[System Feedback: Subagent {sid} finished - {text}]"})
+                {"type": "pulse", "text": f"[System Feedback: Subagent {sid} finished - {text}]", "purpose": "Subagent task completed"})
             self.check_cycle_completion()
 
     def _async_subagent_tool_execution(self, sid, function_calls):
@@ -1084,5 +1129,5 @@ class AmityOrchestrator:
     @with_agent_context
     def handle_subagent_error(self, sid, error):
         self.event_queue.append(
-            {"type": "pulse", "text": f"[System Warning: Subagent {sid} encountered an error: {error}]"})
+            {"type": "pulse", "text": f"[System Warning: Subagent {sid} encountered an error: {error}]", "purpose": "Subagent task error"})
         self.check_cycle_completion()

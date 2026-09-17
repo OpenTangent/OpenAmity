@@ -6,6 +6,7 @@ import getpass
 import psutil
 import json
 import urllib.request
+from datetime import datetime
 from typing import List, Dict, Any
 
 from core.cerebrum import Tool
@@ -114,7 +115,11 @@ class SystemTool(Tool):
         "get_external_ip (Queries current public IP address.)",
         "create_backup [target] [backup_location] (Creates .oaa snapshot for 'self' or 'all' agents.)",
         "set_custom_voice <custom_prompt> [voice_model] (Sets custom directorial voice prompt following acoustic stability guidelines.)",
-        "reset_voice (Restores voice settings to baseline user configuration.)"
+        "reset_voice (Restores voice settings to baseline user configuration.)",
+        "generate_api_key <name> [scopes] [expires_in_days] (Generates an isolated API key for third-party pulse injection.)",
+        "list_api_keys (Lists existing API keys with metadata, scopes, and expiration.)",
+        "revoke_api_key <key_id> (Revokes an API key to permanently deny access.)",
+        "api_docs (Returns complete Pulse Hook API documentation and integration curl recipes.)"
     ]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
@@ -202,6 +207,66 @@ class SystemTool(Tool):
                     "type": "OBJECT",
                     "properties": {}
                 }
+            },
+            {
+                "name": "System_generate_api_key",
+                "description": (
+                    "Generates a new secure API key for third-party apps, services, or webhooks (e.g. Home Assistant, GitHub, IoT sensors) "
+                    "to inject pulses into your pulse database using your Crockford Base32 UID (+OA-XXXX-XXXX). "
+                    "The raw key is returned ONLY once upon generation and is hashed before storage."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {
+                            "type": "STRING",
+                            "description": "Descriptive name or label for the integration (e.g., 'HomeAssistant', 'GitHub_CI', 'Cron_Trigger')."
+                        },
+                        "scopes": {
+                            "type": "STRING",
+                            "description": "Optional comma-separated list of scopes. Defaults to 'pulse:inject'."
+                        },
+                        "expires_in_days": {
+                            "type": "INTEGER",
+                            "description": "Optional expiration duration in days. Defaults to null (never expires)."
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "System_list_api_keys",
+                "description": "Lists all API keys configured for this agent, including key IDs, labels, prefix previews, scopes, expiration dates, and revoked statuses.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "System_revoke_api_key",
+                "description": "Permanently revokes an API key by its key ID or prefix, preventing any further external access.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "key_id": {
+                            "type": "STRING",
+                            "description": "The ID of the key (e.g. 'key_1a2b3c4d') or its prefix."
+                        }
+                    },
+                    "required": ["key_id"]
+                }
+            },
+            {
+                "name": "System_api_docs",
+                "description": (
+                    "Returns comprehensive Open Amity Pulse Hook API documentation, OpenAPI specifications, request schemas, "
+                    "rate limit rules, error codes, and copy-pasteable curl recipes. Use this whenever you need to integrate "
+                    "third-party services or explain API usage to the user."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
             }
         ]
 
@@ -218,6 +283,14 @@ class SystemTool(Tool):
             return self._set_custom_voice(*args, **kwargs)
         elif command == "reset_voice":
             return self._reset_voice(*args, **kwargs)
+        elif command == "generate_api_key":
+            return self._generate_api_key(*args, **kwargs)
+        elif command == "list_api_keys":
+            return self._list_api_keys(*args, **kwargs)
+        elif command == "revoke_api_key":
+            return self._revoke_api_key(*args, **kwargs)
+        elif command in ["api_docs", "get_api_documentation"]:
+            return self._get_api_docs(*args, **kwargs)
         return f"Unknown command: {command}"
 
     def _get_platform_info(self) -> str:
@@ -419,4 +492,221 @@ class SystemTool(Tool):
         sm.set("core.tts.gemini.override-prompt", False)
         sm.save()
         return "Voice settings successfully reset to the user-defined baseline configuration (accent, gender, age, and style)."
+
+    def _get_agent_id(self) -> Optional[str]:
+        if self.orchestrator and getattr(self.orchestrator, "agent_id", None):
+            return self.orchestrator.agent_id
+        return None
+
+    def _get_agent_uid(self) -> str:
+        agent_id = self._get_agent_id()
+        if not agent_id:
+            return "+OA-UNKNOWN"
+        sm = self._get_settings_manager()
+        uid = sm.get("core.agent.uid", "")
+        if not uid:
+            from core.uid_generator import generate_agent_uid
+            uid = generate_agent_uid()
+            sm.set("core.agent.uid", uid)
+            sm.save()
+        return uid
+
+    def _get_hook_server_url(self) -> str:
+        from core.config_manager import ConfigManager
+        cm = ConfigManager()
+        host = cm.get("pulse-hooks.host", "127.0.0.1")
+        port = cm.get("pulse-hooks.port", 7965)
+        return f"http://{host}:{port}"
+
+    def _generate_api_key(self, *args, **kwargs) -> str:
+        agent_id = self._get_agent_id()
+        if not agent_id:
+            return "Error: Agent ID not available for API key generation."
+
+        name = kwargs.get("name", "")
+        if not name and args:
+            name = args[0]
+        name = str(name).strip() if name else ""
+        if not name:
+            return "Error: 'name' parameter is required for API key generation (e.g. 'HomeAssistant')."
+
+        scopes_raw = kwargs.get("scopes", "")
+        if not scopes_raw and len(args) > 1:
+            scopes_raw = args[1]
+        if scopes_raw and isinstance(scopes_raw, str):
+            scopes = [s.strip() for s in scopes_raw.split(",") if s.strip()]
+        elif isinstance(scopes_raw, list):
+            scopes = scopes_raw
+        else:
+            scopes = ["pulse:inject"]
+
+        expires_in_days = kwargs.get("expires_in_days", None)
+        if expires_in_days is None and len(args) > 2:
+            expires_in_days = args[2]
+        if expires_in_days is not None:
+            try:
+                expires_in_days = int(expires_in_days)
+            except (ValueError, TypeError):
+                expires_in_days = None
+
+        from core.api_key_manager import ApiKeyManager
+        key_mgr = ApiKeyManager(agent_id=agent_id)
+        record, raw_key = key_mgr.generate_key(
+            name=name,
+            scopes=scopes,
+            expires_in_days=expires_in_days
+        )
+
+        agent_uid = self._get_agent_uid()
+        server_url = self._get_hook_server_url()
+        endpoint = f"{server_url}/api/v1/agents/{agent_uid}/pulses"
+
+        exp_label = record.get("expires_at") if record.get("expires_at") else "Never (Indefinite)"
+
+        res = [
+            "=== API Key Successfully Generated ===",
+            f"Key ID:       {record['key_id']}",
+            f"Name:         {record['name']}",
+            f"Scopes:       {', '.join(record['scopes'])}",
+            f"Expires At:   {exp_label}",
+            f"Created At:   {record['created_at']}",
+            "",
+            "CRITICAL SECURITY NOTICE:",
+            f"API Key: {raw_key}",
+            "Store or provide this key to your external service immediately.",
+            "This secret token is NEVER stored in plaintext and CANNOT be retrieved again!",
+            "",
+            "=== Ready-to-Use Integration Recipe ===",
+            f"Target Agent UID: {agent_uid}",
+            f"Endpoint:         {endpoint}",
+            "",
+            "Example cURL Command:",
+            f'curl -X POST "{endpoint}" \\',
+            f'  -H "Authorization: Bearer {raw_key}" \\',
+            '  -H "Content-Type: application/json" \\',
+            '  -d \'{',
+            f'    "title": "Alert from {name}",',
+            '    "context": "External event details and instructions for the agent.",',
+            '    "recurrence": "none"',
+            '  }\'',
+            "",
+            "Rate Limit Notice: Maximum 1 pulse per 60 seconds per agent. Schedule collisions within +/- 1 minute are rejected."
+        ]
+        return "\n".join(res)
+
+    def _list_api_keys(self, *args, **kwargs) -> str:
+        agent_id = self._get_agent_id()
+        if not agent_id:
+            return "Error: Agent ID not available."
+
+        from core.api_key_manager import ApiKeyManager
+        key_mgr = ApiKeyManager(agent_id=agent_id)
+        keys = key_mgr.list_keys(include_revoked=True)
+        if not keys:
+            return "No API keys are currently configured for this agent."
+
+        lines = ["=== Agent API Keys ==="]
+        now = datetime.now()
+        for k in keys:
+            status = "Active"
+            if k.get("revoked", False):
+                status = "Revoked"
+            elif k.get("expires_at"):
+                try:
+                    if datetime.fromisoformat(k["expires_at"]) <= now:
+                        status = "Expired"
+                except ValueError:
+                    pass
+
+            exp_str = k.get("expires_at") or "Never"
+            last_used = k.get("last_used_at") or "Never"
+            lines.append(
+                f"- [{status}] ID: {k.get('key_id')} | Name: '{k.get('name')}' | Prefix: {k.get('key_prefix')} | "
+                f"Scopes: {', '.join(k.get('scopes', []))} | Expires: {exp_str} | Last Used: {last_used}"
+            )
+        return "\n".join(lines)
+
+    def _revoke_api_key(self, *args, **kwargs) -> str:
+        agent_id = self._get_agent_id()
+        if not agent_id:
+            return "Error: Agent ID not available."
+
+        key_id = kwargs.get("key_id", "")
+        if not key_id and args:
+            key_id = args[0]
+        key_id = str(key_id).strip() if key_id else ""
+        if not key_id:
+            return "Error: 'key_id' parameter is required to revoke an API key."
+
+        from core.api_key_manager import ApiKeyManager
+        key_mgr = ApiKeyManager(agent_id=agent_id)
+        success = key_mgr.revoke_key(key_id)
+        if success:
+            return f"API key '{key_id}' successfully revoked. All external requests using this key will be denied immediately."
+        return f"Error: API key '{key_id}' not found."
+
+    def _get_api_docs(self, *args, **kwargs) -> str:
+        agent_uid = self._get_agent_uid()
+        server_url = self._get_hook_server_url()
+
+        docs = [
+            "=== Open Amity Pulse Hook API Documentation ===",
+            "",
+            "### 1. Overview",
+            "The Open Amity Pulse Hook System provides a secure HTTP REST interface for third-party applications,",
+            "services, IoT sensors, Home Assistant automations, and GitHub webhooks to inject autonomy pulses",
+            "into an agent's pulse database using their Crockford Base32 UID.",
+            "",
+            f"Base Server URL: {server_url}",
+            f"Your Agent UID:  {agent_uid}",
+            "",
+            "### 2. Endpoints",
+            f"1. POST /api/v1/agents/{agent_uid}/pulses",
+            f"   (Alias: POST /api/v1/pulses/{agent_uid})",
+            "   Injects an autonomy pulse into your pulse queue.",
+            "",
+            "2. GET /api/v1/health",
+            "   Probe health and server status. No authentication required.",
+            "",
+            "### 3. Authentication & Headers",
+            "- Header: 'Authorization: Bearer <API_KEY>' OR 'X-API-Key: <API_KEY>'",
+            "- Header: 'Content-Type: application/json'",
+            "- Note: Generate API keys using the 'System_generate_api_key' command.",
+            "",
+            "### 4. Request Body Schema (POST /api/v1/agents/{agent_uid}/pulses)",
+            "- title: (String, required, 1-256 chars) A concise title describing the event.",
+            "- context: (String, required, 1-65536 chars) Complete background details and instructions.",
+            "- scheduled_time: (String, optional, ISO-8601) Target execution time. Defaults to now (immediate pulse).",
+            "- recurrence: (String, optional) One of 'none', 'daily', 'weekly', 'monthly'. Defaults to 'none'.",
+            "",
+            "### 5. Rate Limiting & Anti-Collision Guards",
+            "- 60-Second Injection Cooldown: An agent can receive at most 1 pulse injection every 60 seconds.",
+            "  If exceeded, returns HTTP 429 RATE_LIMITED with a 'Retry-After' header and retry_after count.",
+            "- 1-Minute Anti-Collision Guard: If the requested scheduled_time falls within +/- 60 seconds of",
+            "  an existing pending/recurring pulse in your pulses.db, it is rejected with HTTP 409 PULSE_COLLISION.",
+            "",
+            "### 6. Consistent Error Codes",
+            "- MISSING_API_KEY (401): Missing Authorization or X-API-Key header.",
+            "- INVALID_API_KEY (401): Provided API key is incorrect, revoked, or expired.",
+            "- FORBIDDEN_SCOPE (403): Key lacks 'pulse:inject' scope.",
+            "- INVALID_UID (400): UID syntax does not match +OA-XXXX-XXXX.",
+            "- AGENT_NOT_FOUND (404): No agent exists matching the requested UID.",
+            "- AGENT_PAUSED (409): Target agent is currently offline/paused.",
+            "- RATE_LIMITED (429): Injected within 60s of previous pulse.",
+            "- PULSE_COLLISION (409): Target time collides within +/- 60s of existing pulse.",
+            "- INVALID_PAYLOAD (400): Malformed JSON or invalid schema values.",
+            "- PAYLOAD_TOO_LARGE (413): Payload exceeds 128KB.",
+            "",
+            "### 7. Example cURL Recipe",
+            f'curl -X POST "{server_url}/api/v1/agents/{agent_uid}/pulses" \\',
+            '  -H "Authorization: Bearer oa_sec_YOUR_KEY_HERE" \\',
+            '  -H "Content-Type: application/json" \\',
+            '  -d \'{',
+            '    "title": "Home Security Warning",',
+            '    "context": "Front motion sensor triggered while in Away mode.",',
+            '    "recurrence": "none"',
+            '  }\''
+        ]
+        return "\n".join(docs)
+
 

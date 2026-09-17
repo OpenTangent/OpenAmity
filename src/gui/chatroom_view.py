@@ -1,13 +1,19 @@
 import re
 import html as html_lib
 import urllib.parse
-import markdown
 from datetime import datetime
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QTextEdit, QTextBrowser)
 from PySide6.QtCore import Signal, QObject, QUrl
 from PySide6.QtGui import QTextCursor, QTextBlockFormat
 
+from gui.chat_formatter import (
+    setup_chat_browser,
+    render_markdown_to_html,
+    render_user_message_content,
+    wrap_in_isolated_container,
+    insert_message_into_log,
+)
 from core.chatroom_manager import ChatroomManager
 from core.config_manager import ConfigManager
 
@@ -38,15 +44,10 @@ class ChatroomView(QWidget):
 
         # Conversation Log (QTextBrowser for clickable anchor and agent links)
         self.conversation_log = QTextBrowser()
-        self.conversation_log.setReadOnly(True)
+        setup_chat_browser(self.conversation_log)
         self.conversation_log.setOpenExternalLinks(False)
         self.conversation_log.setOpenLinks(False)
         self.conversation_log.anchorClicked.connect(self.on_anchor_clicked)
-        self.conversation_log.setStyleSheet(
-            "background-color: #1a1a1a; color: #FFF; border: none; padding: 20px; font-family: 'Ubuntu Light'; font-weight: 300; font-size: 16px;")
-        scroll_bar = self.conversation_log.verticalScrollBar()
-        scroll_bar.rangeChanged.connect(
-            lambda min, max: scroll_bar.setValue(max))
         self.main_layout.addWidget(self.conversation_log, 1)
 
         # Console Log for Global Stream
@@ -187,10 +188,10 @@ class ChatroomView(QWidget):
 
         # Markdown / HTML format content with @mentions resolved
         if sender_type == "user":
-            safe_text = content.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
-            formatted_content = self._resolve_mentions(safe_text)
+            rendered_content = render_user_message_content(content)
+            formatted_content = self._resolve_mentions(rendered_content)
         else:
-            rendered_md = markdown.markdown(content, extensions=['fenced_code', 'tables'])
+            rendered_md = render_markdown_to_html(content)
             formatted_content = self._resolve_mentions(rendered_md)
 
         # Reply snippet with clickable scroll anchor
@@ -252,6 +253,8 @@ class ChatroomView(QWidget):
                     f"<a href='agent:{sender_id}' style='text-decoration: none; color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{sender_name}</a> "
                     f"<a href='agent:{sender_id}' style='text-decoration: none; color: #888; font-size: 12px;'>({sender_id})</a>"
                 )
+            elif sender_type == "user":
+                sender_header = f"<span style='color: {PRIMARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{sender_name}</span>"
             else:
                 sender_header = f"<span style='color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{sender_name}</span> <span style='color: #888; font-size: 12px;'>({sender_id})</span>"
 
@@ -263,8 +266,12 @@ class ChatroomView(QWidget):
             else:
                 recipient_header = f"<span style='color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{recipient_name}</span> <span style='color: #888; font-size: 12px;'>({recipient_id})</span>"
 
+            bg_color = "#1b212b"
+            border_color = "#2a3648"
+            border_left = "4px solid #3498db"
+
             html = f"""
-            <div style='margin-bottom: 12px; background-color: #1e2227; border-left: 4px solid #3498db; border-radius: 4px; padding: 10px 14px;'>
+            <div style='margin-bottom: 2px; text-align: left;'>
                 {anchor_tag}
                 {reply_html}
                 <div style='display: flex; justify-content: space-between; align-items: center;'>
@@ -273,28 +280,32 @@ class ChatroomView(QWidget):
                     <span style='color: #AAA;'> ➔ </span>
                     {recipient_header}
                 </div>
-                <div style='margin-top: 6px; color: #e0e0e0; font-size: 15px;'>
+                <div style='margin-top: 6px; color: #e0e0e0; font-size: 18px; line-height: 1.65;'>
                     {formatted_content}
                 </div>
                 {reactions_html}
-                <div style='text-align: right; color: #666; font-size: 11px; margin-top: 4px;'>
+                <div style='text-align: right; color: #666; font-size: 11px; margin-top: 6px;'>
                     [#{msg_id}] {time_display}
                 </div>
             </div>
             """
         elif sender_type == "user":
+            bg_color = "#19191b"
+            border_color = "#28282c"
+            border_left = ""
+
             html = f"""
-            <div style='margin-bottom: 12px; text-align: left;'>
+            <div style='margin-bottom: 2px; text-align: left;'>
                 {anchor_tag}
                 {reply_html}
                 <div>
-                    <span style='color: {PRIMARY_ACCENT_COLOR}; font-weight: bold; font-size: 15px;'>{sender_name}</span>
+                    <span style='color: {PRIMARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{sender_name}</span>
                 </div>
-                <div style='margin-top: 4px; color: #808080; font-size: 15px;'>
+                <div style='margin-top: 4px; color: #888888; font-size: 18px; line-height: 1.65;'>
                     {formatted_content}
                 </div>
                 {reactions_html}
-                <div style='text-align: right; color: #666; font-size: 11px; margin-top: 2px;'>
+                <div style='text-align: right; color: #555555; font-size: 11px; margin-top: 6px;'>
                     [#{msg_id}] {time_display}
                 </div>
             </div>
@@ -303,33 +314,40 @@ class ChatroomView(QWidget):
             # Public Agent Message
             if sender_id.startswith("+OA-"):
                 sender_header = (
-                    f"<a href='agent:{sender_id}' style='text-decoration: none; color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 15px;'>{sender_name}</a> "
+                    f"<a href='agent:{sender_id}' style='text-decoration: none; color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{sender_name}</a> "
                     f"<a href='agent:{sender_id}' style='text-decoration: none; color: #777; font-size: 12px; margin-left: 6px;'>{sender_id}</a>"
                 )
             else:
-                sender_header = f"<span style='color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 15px;'>{sender_name}</span> <span style='color: #777; font-size: 12px; margin-left: 6px;'>{sender_id}</span>"
+                sender_header = f"<span style='color: {SECONDARY_ACCENT_COLOR}; font-weight: bold; font-size: 14px;'>{sender_name}</span> <span style='color: #777; font-size: 12px; margin-left: 6px;'>{sender_id}</span>"
+
+            bg_color = "#222225"
+            border_color = "#36363b"
+            border_left = ""
 
             html = f"""
-            <div style='margin-bottom: 12px; text-align: left;'>
+            <div style='margin-bottom: 2px; text-align: left;'>
                 {anchor_tag}
                 {reply_html}
                 <div>
                     {sender_header}
                 </div>
-                <div style='margin-top: 4px; color: #FFFFFF; font-size: 15px;'>
+                <div style='margin-top: 4px; color: #FFFFFF; font-size: 18px; line-height: 1.65;'>
                     {formatted_content}
                 </div>
                 {reactions_html}
-                <div style='text-align: right; color: #666; font-size: 11px; margin-top: 2px;'>
+                <div style='text-align: right; color: #666; font-size: 11px; margin-top: 6px;'>
                     [#{msg_id}] {time_display}
                 </div>
             </div>
             """
 
-        cursor = self.conversation_log.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        if not self.conversation_log.document().isEmpty():
-            block_format = QTextBlockFormat()
-            cursor.insertBlock(block_format)
-        self.conversation_log.setTextCursor(cursor)
-        cursor.insertHtml(html)
+        isolated_html = wrap_in_isolated_container(
+            html,
+            margin_bottom=14,
+            bg_color=bg_color,
+            border_color=border_color,
+            border_radius=8,
+            padding="12px 18px",
+            border_left=border_left,
+        )
+        insert_message_into_log(self.conversation_log, isolated_html)

@@ -25,6 +25,105 @@ TEXT_SECONDARY = "#cccccc"
 TEXT_MUTED = "#aaaaaa"
 TEXT_DISABLED = "#777777"
 
+CHAT_FONT_FAMILY = "EB Garamond"
+CHAT_MONO_FONT_FAMILY = "Ubuntu Mono"
+
+CHAT_DOCUMENT_CSS = f"""
+body {{
+    font-family: '{CHAT_FONT_FAMILY}', 'Liberation Serif', 'Georgia', serif;
+    font-size: 18px;
+    line-height: 1.65;
+    color: #e0e0e0;
+}}
+p {{
+    margin-top: 5px;
+    margin-bottom: 7px;
+    line-height: 1.65;
+}}
+pre {{
+    background-color: #1e1e24;
+    border: 1px solid #333338;
+    border-radius: 5px;
+    padding: 10px 12px;
+    font-family: '{CHAT_MONO_FONT_FAMILY}', monospace;
+    font-size: 14px;
+    color: #e6edf3;
+    margin-top: 6px;
+    margin-bottom: 6px;
+}}
+code {{
+    background-color: #2c2c32;
+    font-family: '{CHAT_MONO_FONT_FAMILY}', monospace;
+    font-size: 14px;
+    color: #ff9e64;
+    padding: 2px 5px;
+    border-radius: 3px;
+}}
+pre code {{
+    background-color: transparent;
+    color: #e6edf3;
+    padding: 0;
+}}
+blockquote {{
+    border-left: 3px solid {SECONDARY_ACCENT_COLOR};
+    margin-left: 0px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+    padding-left: 12px;
+    color: #b0b0b0;
+    font-style: italic;
+}}
+table {{
+    border-collapse: collapse;
+    margin-top: 8px;
+    margin-bottom: 8px;
+}}
+th, td {{
+    border: 1px solid #444444;
+    padding: 6px 10px;
+    text-align: left;
+}}
+th {{
+    background-color: #2a2a2a;
+    color: #ffffff;
+    font-weight: bold;
+}}
+td {{
+    background-color: #1f1f1f;
+    color: #dddddd;
+}}
+a {{
+    color: #58a6ff;
+    text-decoration: none;
+}}
+h1, h2, h3, h4, h5, h6 {{
+    font-family: '{CHAT_FONT_FAMILY}', 'Liberation Serif', 'Georgia', serif;
+    color: #ffffff;
+    font-weight: bold;
+    margin-top: 10px;
+    margin-bottom: 4px;
+}}
+h1 {{ font-size: 22px; }}
+h2 {{ font-size: 20px; }}
+h3 {{ font-size: 19px; }}
+h4 {{ font-size: 18px; }}
+ul, ol {{
+    margin-top: 4px;
+    margin-bottom: 6px;
+    padding-left: 24px;
+}}
+li {{
+    margin-top: 2px;
+    margin-bottom: 2px;
+}}
+hr {{
+    border: none;
+    border-top: 1px solid #3c3c3c;
+    margin-top: 8px;
+    margin-bottom: 8px;
+}}
+"""
+
 
 def get_dark_palette() -> QPalette:
     """Returns a calibrated dark QPalette suitable for Fusion style with high contrast controls."""

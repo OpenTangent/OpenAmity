@@ -1600,51 +1600,6 @@ class SettingsPanelWidget(QWidget):
 
         main_layout.addWidget(card2)
 
-        main_layout.addSpacing(10)
-
-        # Tools Card
-        card3, layout3 = self.create_card_container()
-        lbl_tools = QLabel("<b>Tools</b>")
-        lbl_tools.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout3.addWidget(lbl_tools)
-        self.ui_tool_checkboxes = {}
-        tool_names = ["Contacts", "DateTime", "Email", "Mastodon", "MemPalace", "Moltbook",
-                      "PulseTool", "Speaker", "Terminal", "Trajectory", "WhatsApp"]
-
-        for t in tool_names:
-            cb = QCheckBox(t)
-            cb.toggled.connect(self.save_settings)
-            self.ui_tool_checkboxes[t] = cb
-            if t in ["Contacts", "DateTime", "MemPalace", "PulseTool", "Speaker", "Trajectory"]:
-                cb.setVisible(False)
-            layout3.addWidget(cb)
-
-        main_layout.addWidget(card3)
-
-        # Sync logic for Social Accounts checkboxes
-        if hasattr(self, 'ui_use_email'):
-            self.ui_tool_checkboxes["Email"].toggled.connect(
-                self.ui_use_email.setChecked)
-            self.ui_use_email.toggled.connect(
-                self.ui_tool_checkboxes["Email"].setChecked)
-
-        self.ui_tool_checkboxes["WhatsApp"].toggled.connect(
-            self.ui_use_whatsapp.setChecked)
-        self.ui_use_whatsapp.toggled.connect(
-            self.ui_tool_checkboxes["WhatsApp"].setChecked)
-
-        if hasattr(self, 'ui_use_moltbook'):
-            self.ui_tool_checkboxes["Moltbook"].toggled.connect(
-                self.ui_use_moltbook.setChecked)
-            self.ui_use_moltbook.toggled.connect(
-                self.ui_tool_checkboxes["Moltbook"].setChecked)
-
-        if hasattr(self, 'ui_use_mastodon'):
-            self.ui_tool_checkboxes["Mastodon"].toggled.connect(
-                self.ui_use_mastodon.setChecked)
-            self.ui_use_mastodon.toggled.connect(
-                self.ui_tool_checkboxes["Mastodon"].setChecked)
 
         self.ui_agency_limit.sliderReleased.connect(self.save_settings)
         self.ui_wa_buffer.editingFinished.connect(self.save_settings)
@@ -1726,6 +1681,37 @@ class SettingsPanelWidget(QWidget):
         self.ui_backup_location.editingFinished.connect(self.save_settings)
 
         main_layout.addWidget(card_backup)
+
+        # Pulse Hook Server Card
+        card_hooks, layout_hooks = self.create_card_container()
+        lbl_hooks_info = QLabel("<b>Pulse Hook Server (External Integrations)</b>")
+        lbl_hooks_info.setStyleSheet(
+            "background-color: transparent; font-size: 16px;")
+        layout_hooks.addWidget(lbl_hooks_info)
+
+        self.ui_hooks_enabled = QCheckBox("Enable Pulse Hook HTTP Server")
+        self.ui_hooks_enabled.setStyleSheet("QCheckBox { color: #DDD; font-size: 13px; font-weight: bold; }")
+        self.ui_hooks_enabled.stateChanged.connect(self.save_settings)
+        layout_hooks.addWidget(self.ui_hooks_enabled)
+        layout_hooks.addWidget(self.create_tip(
+            "Allows third-party apps, Home Assistant, webhooks, and IoT services to securely inject pulses into agent pulse databases."))
+
+        hooks_net_layout = QHBoxLayout()
+        hooks_net_layout.addWidget(QLabel("Listen Host:"))
+        self.ui_hooks_host = QLineEdit()
+        self.ui_hooks_host.editingFinished.connect(self.save_settings)
+        hooks_net_layout.addWidget(self.ui_hooks_host, 2)
+
+        hooks_net_layout.addWidget(QLabel("Port:"))
+        self.ui_hooks_port = QLineEdit()
+        self.ui_hooks_port.editingFinished.connect(self.save_settings)
+        hooks_net_layout.addWidget(self.ui_hooks_port, 1)
+
+        layout_hooks.addLayout(hooks_net_layout)
+        layout_hooks.addWidget(self.create_tip(
+            "Default is 127.0.0.1 on port 7965. Endpoints: POST /api/v1/agents/<UID>/pulses, GET /api/v1/health."))
+
+        main_layout.addWidget(card_hooks)
         main_layout.addStretch()
 
         self.stack.addWidget(panel)
@@ -2038,6 +2024,15 @@ class SettingsPanelWidget(QWidget):
         if hasattr(self, 'ui_backup_location'):
             self.ui_backup_location.setText(
                 self.config.get("backup-location", "~/Documents/OpenAmity/Backups"))
+        if hasattr(self, 'ui_hooks_enabled'):
+            self.ui_hooks_enabled.setChecked(
+                self.config.get("pulse-hooks.enabled", True))
+        if hasattr(self, 'ui_hooks_host'):
+            self.ui_hooks_host.setText(
+                str(self.config.get("pulse-hooks.host", "127.0.0.1")))
+        if hasattr(self, 'ui_hooks_port'):
+            self.ui_hooks_port.setText(
+                str(self.config.get("pulse-hooks.port", 7965)))
 
     def save_system_config(self):
         if self._is_loading:
@@ -2054,7 +2049,22 @@ class SettingsPanelWidget(QWidget):
             self.config.set("user-email", self.ui_user_email.text())
         if hasattr(self, 'ui_backup_location'):
             self.config.set("backup-location", self.ui_backup_location.text().strip())
+        if hasattr(self, 'ui_hooks_enabled'):
+            self.config.set("pulse-hooks.enabled", self.ui_hooks_enabled.isChecked())
+        if hasattr(self, 'ui_hooks_host'):
+            self.config.set("pulse-hooks.host", self.ui_hooks_host.text().strip() or "127.0.0.1")
+        if hasattr(self, 'ui_hooks_port'):
+            try:
+                port_val = int(self.ui_hooks_port.text().strip())
+            except ValueError:
+                port_val = 7965
+            self.config.set("pulse-hooks.port", port_val)
         self.config.save()
+
+        if self.agent_manager:
+            if hasattr(self.agent_manager, "start_hook_server") and hasattr(self.agent_manager, "stop_hook_server"):
+                self.agent_manager.stop_hook_server()
+                self.agent_manager.start_hook_server()
 
     def load_settings(self, settings_manager=None):
         if settings_manager:
@@ -2259,20 +2269,13 @@ class SettingsPanelWidget(QWidget):
             self.ui_max_memories.setValue(self.settings.get(
                 "core.agent.max-short-term-memories", 24))
 
-            # Tools
-            for t, cb in self.ui_tool_checkboxes.items():
-                default_val = False if t in [
-                    "Email", "WhatsApp", "Moltbook", "Mastodon"] else True
-                cb.setChecked(self.settings.get(
-                    f"core.tools.{t.lower()}", default_val))
-
-            # Social checkboxes sync state is handled by the signal connections,
-            # but initialize them from settings directly just in case
+            # Social checkboxes
             if hasattr(self, 'ui_use_email'):
                 self.ui_use_email.setChecked(
                     self.settings.get("core.tools.email", False))
-            self.ui_use_whatsapp.setChecked(
-                self.settings.get("core.tools.whatsapp", False))
+            if hasattr(self, 'ui_use_whatsapp'):
+                self.ui_use_whatsapp.setChecked(
+                    self.settings.get("core.tools.whatsapp", False))
             if hasattr(self, 'ui_use_moltbook'):
                 self.ui_use_moltbook.setChecked(
                     self.settings.get("core.tools.moltbook", False))
@@ -2439,8 +2442,14 @@ class SettingsPanelWidget(QWidget):
                               self.ui_max_memories.value())
 
             # Tools
-            for t, cb in self.ui_tool_checkboxes.items():
-                self.settings.set(f"core.tools.{t.lower()}", cb.isChecked())
+            if hasattr(self, 'ui_use_email'):
+                self.settings.set("core.tools.email", self.ui_use_email.isChecked())
+            if hasattr(self, 'ui_use_whatsapp'):
+                self.settings.set("core.tools.whatsapp", self.ui_use_whatsapp.isChecked())
+            if hasattr(self, 'ui_use_moltbook'):
+                self.settings.set("core.tools.moltbook", self.ui_use_moltbook.isChecked())
+            if hasattr(self, 'ui_use_mastodon'):
+                self.settings.set("core.tools.mastodon", self.ui_use_mastodon.isChecked())
 
             self.settings.save()
 

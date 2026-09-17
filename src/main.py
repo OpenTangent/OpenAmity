@@ -54,26 +54,15 @@ def main():
 
     # Load custom fonts
     font_dir = os.path.join(paths.get_assets_dir(), "fonts")
-    ubuntu_font_path = os.path.join(font_dir, "Ubuntu-Regular.ttf")
-    ubuntu_mono_font_path = os.path.join(font_dir, "UbuntuMono-Regular.ttf")
-    ubuntu_light_font_path = os.path.join(font_dir, "Ubuntu-Light.ttf")
-
-    if os.path.exists(ubuntu_font_path):
-        QFontDatabase.addApplicationFont(ubuntu_font_path)
+    if os.path.exists(font_dir):
+        for font_file in sorted(os.listdir(font_dir)):
+            if font_file.lower().endswith((".ttf", ".otf")):
+                font_path = os.path.join(font_dir, font_file)
+                res_id = QFontDatabase.addApplicationFont(font_path)
+                if res_id < 0:
+                    logging.warning(f"Could not load font at {font_path}")
     else:
-        logging.warning(f"Could not find Ubuntu font at {ubuntu_font_path}")
-
-    if os.path.exists(ubuntu_mono_font_path):
-        QFontDatabase.addApplicationFont(ubuntu_mono_font_path)
-    else:
-        logging.warning(
-            f"Could not find Ubuntu Mono font at {ubuntu_mono_font_path}")
-
-    if os.path.exists(ubuntu_light_font_path):
-        QFontDatabase.addApplicationFont(ubuntu_light_font_path)
-    else:
-        logging.warning(
-            f"Could not find Ubuntu Light font at {ubuntu_light_font_path}")
+        logging.warning(f"Fonts directory not found at {font_dir}")
 
     # Set the default application font to Ubuntu
     app.setFont(QFont("Ubuntu", 10))

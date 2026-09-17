@@ -248,7 +248,7 @@ class TerminalSkill(Tool):
                 reminded = True
                 prompt = f"[SYSTEM_NOTIFICATION] Background Task {task_id} ('{task['command_str']}') is still running. You can check its status using Terminal_check_status or let it continue."
                 if hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'pulse_engine'):
-                    self.orchestrator.pulse_engine.trigger_pulse.emit(prompt)
+                    self.orchestrator.pulse_engine.trigger_pulse.emit(prompt, purpose="Terminal command in progress")
 
         with self.lock:
             task["completed"] = True
@@ -265,7 +265,7 @@ class TerminalSkill(Tool):
         prompt = f"[SYSTEM_NOTIFICATION] Background Task {task_id} ('{task['command_str']}') has completed.\n\nOutput:\n{output}"
 
         if hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'pulse_engine'):
-            self.orchestrator.pulse_engine.trigger_pulse.emit(prompt)
+            self.orchestrator.pulse_engine.trigger_pulse.emit(prompt, purpose="Terminal command completed")
 
     def _check_status(self, task_id=None):
         if task_id is None:

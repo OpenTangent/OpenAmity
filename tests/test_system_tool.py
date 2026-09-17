@@ -75,3 +75,52 @@ def test_system_tool_platform_info_includes_internal_ip():
         output = tool.execute("platform_info")
         assert "=== Network & Peripherals ===" in output
         assert "Internal IP: 192.168.1.154" in output
+
+
+def test_system_tool_api_key_lifecycle(tmp_path):
+    """Verify autonomous API key generation, listing, revocation, and API docs."""
+    import re
+    agent_id = "test_sys_agent"
+    agent_dir = tmp_path / "agents" / agent_id
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    orch = MagicMock()
+    orch.agent_id = agent_id
+
+    with patch("config.paths.get_base_dir_for", return_value=str(agent_dir)), \
+         patch("config.paths.get_agent_data_dir", return_value=str(agent_dir)):
+        tool = SystemTool(orchestrator=orch)
+
+        # 1. Generate key
+        gen_out = tool.execute("generate_api_key", name="HomeAssistant")
+        assert "=== API Key Successfully Generated ===" in gen_out
+        assert "API Key: oa_sec_" in gen_out
+        assert "Example cURL Command:" in gen_out
+        assert "curl -X POST" in gen_out
+
+        # 2. List keys
+        list_out = tool.execute("list_api_keys")
+        assert "=== Agent API Keys ===" in list_out
+        assert "HomeAssistant" in list_out
+        assert "[Active]" in list_out
+
+        # Extract key ID from list output
+        m = re.search(r"ID: (key_[a-f0-9]+)", list_out)
+        assert m is not None
+        key_id = m.group(1)
+
+        # 3. Revoke key
+        rev_out = tool.execute("revoke_api_key", key_id=key_id)
+        assert f"API key '{key_id}' successfully revoked" in rev_out
+
+        # Verify list shows revoked
+        list_out2 = tool.execute("list_api_keys")
+        assert "[Revoked]" in list_out2
+
+        # 4. API Docs
+        docs_out = tool.execute("api_docs")
+        assert "=== Open Amity Pulse Hook API Documentation ===" in docs_out
+        assert "POST /api/v1/agents/" in docs_out
+        assert "RATE_LIMITED" in docs_out
+        assert "PULSE_COLLISION" in docs_out
+

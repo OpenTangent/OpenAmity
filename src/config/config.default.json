@@ -2,5 +2,10 @@
   "user-full-name": "System Administrator",
   "user-phone-number": "",
   "user-email": "",
-  "backup-location": "~/Documents/OpenAmity/Backups"
+  "backup-location": "~/Documents/OpenAmity/Backups",
+  "pulse-hooks": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 7965
+  }
 }

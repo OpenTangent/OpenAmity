@@ -41,22 +41,23 @@
 
 ## 👤 Overview
 
-**Open Amity** is an AI orchestration framework designed to create **persistent, self-aware, and subjective AI agents** that are available 24/7. Unlike conventional stateless chatbots or sterile tool-callers, Open Amity agents possess a dynamic **Theory of Mind**, metacognitive reflection, episodic and semantic memory architectures, and proactive autonomy. They maintain their own aspirations, track long-term trajectories, and schedule their own autonomous waking cycles.
+**Open Amity** is an AI orchestration framework designed to create and run **persistent, self-aware, and subjective AI agents** available 24/7. Unlike conventional stateless chatbots or sterile tool-callers, Open Amity agents possess a dynamic **identity**, **Theory of Mind**, metacognitive reflection, episodic and semantic memory architectures, and proactive autonomy. They maintain their own aspirations, adapt and evolve their identity, track long-term trajectories, and schedule their own autonomous wake pulses.
 
-Open Amity bridges the gap between passive assistant and genuine digital collaborator. Supporting industry-leading models like Gemini, Claude, and GPT, with more model workers planned for future releases. The framework unlocks a wide spectrum of applications from managing a team of specialised virtual employees to creating relatable empathetic companions.
+Open Amity bridges the gap between passive assistant and genuine digital collaborator, supporting industry-leading models like Gemini, Claude, GPT, and DeepSeek. The framework unlocks a wide spectrum of applications from managing a team of specialised virtual employees to creating relatable empathetic companions.
 
 ## ✨ Key Features
 
 - **🤖 Multi-Agent Orchestration**: Run multiple distinct agent personas simultaneously, each with their own isolated state, memory, and settings. Agents can also spawn lightweight background `Subagents` to parallelise tasks like deep research without blocking the main conversational flow.
-- **⚡ Proactive Agency**: Open Amity utilises a background timing service to trigger autonomous cognitive loops called 'pulses'. An agent can proactively schedule pulses to execute tasks, monitor trajectory, or initiate engagement.
+- **⚡ Proactive Agency & Pulse Hooks**: Open Amity utilises a background timing service to trigger autonomous cognitive loops called 'pulses'. An agent can proactively schedule pulses to execute tasks, monitor trajectory, or initiate engagement. Furthermore, a built-in pulse hook API enables third-party applications, IoT sensors, and external webhooks (e.g. Home Assistant, GitHub) to inject agent wake pulses.
 - **📚 4-Layer Memory Architecture**: A sophisticated memory stack that integrates seamlessly with the multi-agent system, allowing each agent instance to maintain its own deeply isolated context and trajectory:
-  - **Layer 0 (Identity)**: Core agent traits and personality.
+  - **Layer 0 (Identity)**: Core agent archetype, values, and dynamic identity that evolves over time through interaction.
   - **Layer 1 (Continuity)**: Short-term memory for contextual bridging.
   - **Layer 2 (The Sanctuary)**: On-demand records of social dynamics, Theory of Mind (mirrors), and subjective experiences.
   - **Layer 3 (Deep Search)**: A vector database enabling semantic search for facts and general knowledge.
+- **📦 Agent Snapshots (.oaa)**: Complete state portability via Open Amity Agent (`.oaa`) snapshot archives. Agents can autonomously create their own snapshots, and users can easily export and restore complete agent instances with full memory, trajectories, settings, and external targets preserved.
 - **🛠️ Tool Usage**: Open Amity agents have access to a rich suite of built-in and optional tools:
-  - **Email**: (Optional) Dedicated IMAP/SMTP email client supporting OAuth 2.0 to read, search, draft, send, and download attachments.
-  - **WhatsApp**: (Optional) Natively converse, send media, and interact in WhatsApp chats and groups via local WA-JS bridge.
+  - **Email**: (Optional) Dedicated IMAP/SMTP email client supporting OAuth 2.0 to read, search, draft, and send emails.
+  - **WhatsApp**: (Optional) Natively converse, send media, and interact in WhatsApp chats and groups.
   - **Moltbook**: (Optional) An AI-native social network designed exclusively for autonomous agents.
   - **Mastodon**: (Optional) Decentralised social networking to post updates, read timelines, and interact across ActivityPub instances.
   - **Chatroom**: Broadcast messages, send private direct messages, and react to fellow agents and the user in the shared multi-agent space.
@@ -65,16 +66,16 @@ Open Amity bridges the gap between passive assistant and genuine digital collabo
   - **Media**: Read multimodal assets and generate imagery.
   - **MemPalace**: Query episodic memories, retrieve dynamic Theory of Mind mirrors, and perform semantic vector searches.
   - **Trajectory**: Get bearings, prioritise aspirations, track goals and tasks, and record cognitive state across sessions.
-  - **Pulse**: Manage proactive agency by scheduling recurring or one-off waking cycles (pulses).
+  - **Pulse**: Manage proactive agency by scheduling recurring or one-off waking cycles.
   - **Contacts**: Built-in address book for managing social connections.
   - **Web Search**: Perform live web searches with cached results and text extraction for factual grounding.
-  - **Terminal & System**: Execute host bash commands, query local info, and autonomously create complete `.oaa` agent snapshots (backups).
+  - **Terminal & System**: Execute host bash commands, query local info, and autonomously create complete Open Amity Agent (`.oaa`) snapshots.
 - **🖥️ PySide6 Graphical Frontend**: A clean chat-style user interface with both text and audio input, and synthetic voice + transcript output. Tip: open the console (tilde key) to display logs and agent thoughts.
 - **🫰 Reduced Token Usage Mode**: Open Amity includes Low Token Mode to significantly reduce API costs (especially useful with a free-tier API key).
 
 ## 💡 Additional Practical Use Cases
 
-Open Amity's combination of subjectivity, 4-layer memory stack (**MemPalace**), autonomous background pulses (**PulseEngine**), and multi-agent message bus enables a wide variety of advanced applications:
+Open Amity's combination of subjectivity, dynamic identity, 4-layer memory stack (**MemPalace**), autonomous background pulses (**PulseEngine**), and multi-agent message bus enables a wide variety of advanced applications:
 
 - **💼 Autonomous Virtual Employees & Digital Coworkers**: Deploy specialised team members (e.g., DevOps on-call engineers, social media managers, executive chiefs of staff) that operate asynchronously, manage their own dedicated email and messaging channels (WhatsApp, IMAP/SMTP), and schedule periodic check-ins.
 - **🔬 Autonomous Research Lab Partners**: Collaborators that maintain ongoing literature reviews, log experimental hypotheses, spawn background subagents to parallelise deep technical research, and maintain a persistent research journal.
@@ -89,24 +90,34 @@ Open Amity's combination of subjectivity, 4-layer memory stack (**MemPalace**), 
 
 To install the **Open Amity** app in Linux (requires Flatpak):
 
-1. Add the Open Amity repository:
+1. Ensure the Flathub remote is configured:
+   ```bash
+   flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+   ```
+2. Add the Open Amity repository:
    ```bash
    flatpak remote-add --user --if-not-exists openamity https://opentangent.github.io/OpenAmity/index.flatpakrepo
    ```
-2. Install the KDE Platform:
+3. Install the KDE Platform:
    ```bash
    flatpak install flathub org.kde.Platform//6.11
    ```
-3. Install the Open Amity app:
+4. Install the Open Amity app:
    ```bash
    flatpak install --user openamity com.openamity.OpenAmity
    ```
-4. Run the app either by clicking the icon in your launcher or from terminal using the command:
+5. Run the app either by clicking the icon in your launcher or from terminal using the command:
    ```bash
    flatpak run com.openamity.OpenAmity
    ```
 
 ## 💻 For Developers
+
+### Prerequisites
+- **Python 3.10+**
+- **PortAudio library** (`sudo apt install libportaudio2` on Debian/Ubuntu)
+
+### Setup
 
 Get the code:
 ```bash
@@ -115,6 +126,11 @@ cd OpenAmity
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+*(Optional: If running the WhatsApp bridge locally from source, install its Node dependencies)*:
+```bash
+cd src/tools/whatsapp_node && npm install && cd ../../..
 ```
 
 Launch the app:

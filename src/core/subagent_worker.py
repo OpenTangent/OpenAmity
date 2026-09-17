@@ -58,7 +58,7 @@ class SubagentWorker:
             return
 
         sys_instruct = f"You are a subagent with ID {self.subagent_id}. You operate in the background to assist the primary agent. You must be concise, objective, and task-oriented. You will not interact directly with the user. Your output is read by the primary agent, so deliver exactly what is asked."
-        sys_instruct += "\n\nCRITICAL INSTRUCTION: You must always output your internal reasoning and thought process as plain text BEFORE invoking any tool. Explain what you are about to do and why."
+        sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
 
         # Load restricted tools from Cerebrum
         tool_declarations = []
