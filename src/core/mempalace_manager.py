@@ -5,6 +5,7 @@ import datetime
 import uuid
 import threading
 import hashlib
+from typing import Optional
 from core.settings_manager import SettingsManager
 from core.file_utils import atomic_json_write
 
