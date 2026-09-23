@@ -37,15 +37,7 @@ jobs:
           timeout 120 sudo apt-get update || timeout 120 sudo apt-get update || true
           sudo apt-get install -y flatpak flatpak-builder
           sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          sudo flatpak install -y --noninteractive flathub org.kde.Sdk//6.11 org.kde.Platform//6.11
-          BASEAPP_VER=$(flatpak remote-info --system flathub io.qt.PySide.BaseApp//6.11 2>/dev/null | awk '/Version:/ {print $2}')
-          if [ -z "$BASEAPP_VER" ] || [ "$(printf '%s\n6.11.2\n' "$BASEAPP_VER" | sort -V | head -n1)" != "6.11.2" ]; then
-            echo "Flathub BaseApp is at $BASEAPP_VER (< 6.11.2). Installing Qt 6.11.2 compatible BaseApp build..."
-            sudo flatpak install -y --noninteractive https://dl.flathub.org/build-repo/320285/io.qt.PySide.BaseApp.flatpakref
-          else
-            echo "Flathub BaseApp is at $BASEAPP_VER (>= 6.11.2). Installing from flathub..."
-            sudo flatpak install -y --noninteractive flathub io.qt.PySide.BaseApp//6.11
-          fi
+          sudo flatpak install -y --noninteractive flathub org.kde.Sdk//6.11 org.kde.Platform//6.11 io.qt.PySide.BaseApp//6.11
 
       - name: Import GPG Key
         id: gpg
