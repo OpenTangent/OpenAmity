@@ -44,8 +44,8 @@
             "sources": [
                 {
                     "type": "archive",
-                    "url": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz",
-                    "sha256": "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
+                    "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz",
+                    "sha256": "fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6"
                 }
             ]
         },
@@ -60,8 +60,24 @@
             "sources": [
                 {
                     "type": "archive",
-                    "url": "https://storage.googleapis.com/chrome-for-testing-public/127.0.6533.88/linux64/chrome-linux64.zip",
-                    "sha256": "20e2000334f8cefa115ad3e2c55d6ad0e3e254be33a5fd0b9178c3d1a9c78ba9"
+                    "url": "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chrome-linux64.zip",
+                    "sha256": "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8"
+                }
+            ]
+        },
+        {
+            "name": "camoufox",
+            "buildsystem": "simple",
+            "build-commands": [
+                "mkdir -p /app/share/camoufox",
+                "cp -a * /app/share/camoufox/",
+                "chmod -R 755 /app/share/camoufox"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.30/camoufox-152.0.4-beta.30-lin.x86_64.zip",
+                    "sha256": "5720d45b894ce1770543de024c6f10d514b38be560fa2dc3226b3d8586caf672"
                 }
             ]
         },
@@ -87,7 +103,7 @@
                 "install -D compile/com.openamity.OpenAmity.desktop /app/share/applications/com.openamity.OpenAmity.desktop",
                 "install -D compile/com.openamity.OpenAmity.metainfo.xml /app/share/metainfo/com.openamity.OpenAmity.metainfo.xml",
                 "install -D src/assets/com.openamity.OpenAmity.png /app/share/icons/hicolor/512x512/apps/com.openamity.OpenAmity.png",
-                "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true PUPPETEER_SKIP_DOWNLOAD=true npm --prefix src/tools/whatsapp_node --cache flatpak-node/npm-cache --prefer-offline --no-audit --no-fund ci",
+                "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true PUPPETEER_SKIP_DOWNLOAD=true npm --prefix src/tools/whatsapp_node --cache flatpak-node/npm-cache --prefer-offline --no-audit --no-fund ci",
                 "cp -r src /app/src",
                 "cp run_OpenAmity.sh /app/bin/run_OpenAmity.sh",
                 "chmod +x /app/bin/run_OpenAmity.sh"

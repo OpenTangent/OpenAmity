@@ -6,6 +6,9 @@ from core.chatroom_manager import ChatroomManager
 
 class ChatroomSkill(Tool):
     name = "Chatroom"
+    icon = "🗫"
+    color = "#A855F7"
+    async_commands = []
     description = (
         "Interact with the Open Amity persistent agent chatroom. "
         "Allows reading unread/recent public messages and private direct messages (DMs), "

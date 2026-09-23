@@ -58,6 +58,14 @@ class GeminiWorker:
         self.current_thinker_model = None
         self.thinker_config = None
 
+    @property
+    def current_model(self):
+        return self.current_thinker_model
+
+    @current_model.setter
+    def current_model(self, value):
+        self.current_thinker_model = value
+
     def _get_chat_history(self):
         if not self.thinker_chat:
             return []
@@ -170,11 +178,25 @@ class GeminiWorker:
 
         try:
             is_low_token = self.settings.get("core.low-token-mode", False)
-            model_key = "core.gemini.light-models" if is_low_token else "core.gemini.gemini-models"
-            self.thinking_models = self.settings.get(
-                model_key, ["gemini-3.1-pro-preview"])
-            if not isinstance(self.thinking_models, list):
-                self.thinking_models = [self.thinking_models]
+            primary_model = self.settings.get("core.gemini.model", "")
+            if not primary_model:
+                legacy = self.settings.get("core.gemini.gemini-models", ["gemini-3.8-flash"])
+                primary_model = legacy[0] if isinstance(legacy, list) and legacy else "gemini-3.8-flash"
+
+            light_model = self.settings.get("core.gemini.light-model", "")
+            if not light_model:
+                legacy_l = self.settings.get("core.gemini.light-models", ["gemini-3.5-flash-lite"])
+                light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gemini-3.5-flash-lite"
+
+            self.primary_model = primary_model
+            self.light_model = light_model
+
+            if is_low_token:
+                self.thinking_models = [light_model]
+            else:
+                self.thinking_models = [primary_model]
+                if light_model != primary_model:
+                    self.thinking_models.append(light_model)
 
             tool_list = []
             if self.tools:
@@ -191,9 +213,25 @@ class GeminiWorker:
                     tool_list.append(
                         Tool(function_declarations=func_declarations))
 
+            thinking_level = str(self.settings.get("core.gemini.thinking-level", "low")).lower()
+            budget_map = {
+                "low": 1024,
+                "medium": 4096,
+                "high": 16384,
+                "max": -1
+            }
+            thinking_budget = budget_map.get(thinking_level, 1024)
+            thinking_config = None
+            if hasattr(types, 'ThinkingConfig'):
+                try:
+                    thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+                except Exception:
+                    thinking_config = None
+
             self.thinker_config = types.GenerateContentConfig(
                 system_instruction=self.sys_instruct,
                 tools=tool_list if tool_list else None,
+                thinking_config=thinking_config,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=True)
             )
@@ -472,10 +510,12 @@ class GeminiWorker:
                 elif "500" in err_str or "503" in err_str:
                     logging.warning(
                         f"Servers at Peak Capacity (500/503) with {model_name}: {err_str}")
-                    self.error_occurred.emit(
-                        "Gemini servers are currently at peak capacity (500/503).")
-                    self.is_processing = False
-                    return
+                    if is_last_model:
+                        self.error_occurred.emit(
+                            "Gemini servers are currently at peak capacity (500/503).")
+                        self.is_processing = False
+                        return
+                    continue
                 elif "400" in err_str and "INVALID_ARGUMENT" in err_str:
                     logging.error(
                         f"Thinker API Error (400 INVALID_ARGUMENT) with {model_name}: {err_str}", exc_info=True)
@@ -544,11 +584,11 @@ class GeminiWorker:
             prompt += f"{sender}: {text}\n"
         prompt += f"\nUser's Latest Prompt: {user_prompt}\n\nRewritten Query:"
 
-        is_low_token = self.settings.get("core.low-token-mode", False)
-        model_key = "core.gemini.light-models" if is_low_token else "core.gemini.gemini-models"
-        models = self.settings.get(model_key, ["gemini-3.1-flash-preview"])
-        if not isinstance(models, list):
-            models = [models]
+        light_model = self.settings.get("core.gemini.light-model", "")
+        if not light_model:
+            legacy_l = self.settings.get("core.gemini.light-models", ["gemini-3.5-flash-lite"])
+            light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gemini-3.5-flash-lite"
+        models = [light_model]
 
         from google.genai import types
         for model_name in models:
@@ -557,7 +597,11 @@ class GeminiWorker:
                     model=model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        system_instruction=system_instruction)
+                        system_instruction=system_instruction,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        )
+                    )
                 )
                 if getattr(response, 'parts', None):
                     text_parts = [

@@ -165,9 +165,8 @@ def test_claude_worker_streaming_thought_thinking_and_tool_calls(monkeypatch, tm
         assert captured_kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
         assert "Test system prompt" in captured_kwargs["system"][0]["text"]
 
-        # Verify adaptive thinking effort is passed via output_config
-        assert "output_config" in captured_kwargs
-        assert captured_kwargs["output_config"]["effort"] == "high"
+        # Verify thinking defaults to "low" effort
+        assert captured_kwargs.get("output_config") == {"effort": "low"}
 
         # Verify tools payload has ephemeral cache control on the last tool
         assert "tools" in captured_kwargs
@@ -186,9 +185,10 @@ def test_claude_worker_streaming_thought_thinking_and_tool_calls(monkeypatch, tm
         assert received_tools[0][0].name == "Weather_check"
         assert received_tools[0][0].args == {"location": "Cape Town"}
 
-        # Verify token accounting including cache read/write tokens
-        # Total tokens = 1500 + 320 + 3500 + 500 = 5820
-        assert received_tokens == [5820]
+        # Verify token accounting isolating delta tokens (output + turn input)
+        # "What's the weather in Cape Town?" block has 62 chars -> int(62 / 4) = 15
+        # Total tokens = 320 output + 15 input = 335
+        assert received_tokens == [335]
 
         # Verify assistant message in history contains full content blocks
         assert len(worker.history) == 2  # user + assistant
@@ -553,4 +553,44 @@ def test_claude_worker_reconcile_partial_tool_calls(monkeypatch, tmp_path):
         tool_ids = [block["tool_use_id"] for block in user_msg["content"]]
         assert "toolu_part_1" in tool_ids
         assert "toolu_part_2" in tool_ids
+
+
+def test_claude_worker_light_model_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-ant-test-key-12345"):
+        worker = ClaudeWorker(agent_id="test_claude_agent")
+        worker.start_session(system_instruction="Test prompt")
+        assert worker.current_model == "claude-fable-5-1"
+        assert worker.light_model == "claude-haiku-4-5"
+
+        attempted_models = []
+        mock_stream = MagicMock()
+        mock_stream.text_stream = ["Fallback succeeded"]
+        mock_stream.get_final_message.return_value = MagicMock(
+            content=[MagicMock(type="text", text="Fallback succeeded")],
+            usage=MagicMock(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+        )
+        mock_stream.__enter__.return_value = mock_stream
+        mock_stream.__exit__.return_value = None
+
+        def mock_stream_method(**kwargs):
+            model = kwargs.get("model")
+            attempted_models.append(model)
+            if model == worker.primary_model:
+                raise Exception("Primary model overloaded (529)")
+            return mock_stream
+
+        worker.client.messages.stream = MagicMock(side_effect=mock_stream_method)
+
+        emitted_thoughts = []
+        worker.thought_received.connect(lambda text, tools: emitted_thoughts.append(text))
+
+        worker._process_thought(prompt="Hello", image_path=None, yolo=False)
+
+        assert attempted_models == ["claude-fable-5-1", "claude-haiku-4-5"]
+        assert worker.current_model == "claude-haiku-4-5"
+        assert len(emitted_thoughts) == 1
+        assert "Fallback succeeded" in emitted_thoughts[0]
+
 

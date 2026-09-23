@@ -235,6 +235,8 @@ class HookRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 target_sched = datetime.fromisoformat(sched_str.strip())
+                if target_sched.tzinfo is not None:
+                    target_sched = target_sched.astimezone().replace(tzinfo=None)
             except ValueError:
                 self._send_error("INVALID_PAYLOAD", f"Invalid ISO-8601 timestamp for 'scheduled_time': {sched_str}", status_code=400)
                 return
@@ -273,6 +275,8 @@ class HookRequestHandler(BaseHTTPRequestHandler):
                     for p_id, p_title, p_time_str in existing_pulses:
                         try:
                             p_time = datetime.fromisoformat(p_time_str)
+                            if p_time.tzinfo is not None:
+                                p_time = p_time.astimezone().replace(tzinfo=None)
                             diff_sec = abs((target_sched - p_time).total_seconds())
                             if diff_sec < 60.0:
                                 conn.close()

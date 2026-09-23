@@ -74,10 +74,18 @@ Available Tools:
         self.sys_instruct = base_instruct + "\n\n" + schema_instruct
         self.history = []
 
-        self.current_model = self.settings.get(
-            "core.antigravity.agy-models", ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (High)"])
-        if isinstance(self.current_model, list):
-            self.current_model = self.current_model[0]
+        primary_model = self.settings.get("core.antigravity.model", "")
+        if not primary_model:
+            legacy = self.settings.get("core.antigravity.agy-models", ["Gemini 3.8 Flash (High)"])
+            primary_model = legacy[0] if isinstance(legacy, list) and legacy else "Gemini 3.8 Flash (High)"
+
+        light_model = self.settings.get("core.antigravity.light-model", "")
+        if not light_model:
+            light_model = "Gemini 3.5 Flash (High)"
+
+        self.primary_model = primary_model
+        self.light_model = light_model
+        self.current_model = primary_model
 
         self.running = True
         logging.info(
@@ -126,10 +134,9 @@ Available Tools:
         threading.Thread(target=self._process_thought, daemon=True).start()
 
     def _process_thought(self):
-        models = self.settings.get(
-            "core.antigravity.agy-models", ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (High)"])
-        if not isinstance(models, list):
-            models = [models]
+        models = [self.primary_model]
+        if self.light_model != self.primary_model:
+            models.append(self.light_model)
 
         start_idx = models.index(
             self.current_model) if self.current_model in models else 0

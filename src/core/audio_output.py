@@ -336,6 +336,9 @@ class TTSWorker(threading.Thread):
                             voice_name=self.voice
                         )
                     )
+                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
                 )
             )
         )

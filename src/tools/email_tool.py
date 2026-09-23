@@ -91,6 +91,9 @@ def _resolve_attachment_path(raw_path: str, agent_name: str = "Agent") -> Option
 
 class EmailTool(Tool):
     name = "Email"
+    icon = "✉️"
+    color = "#4169E1"
+    async_commands = []
     description = "Manage the agent's dedicated email account: send emails, fetch recent messages, read full emails, search mailboxes, download attachments, and organize folders."
     commands = [
         "send_email",

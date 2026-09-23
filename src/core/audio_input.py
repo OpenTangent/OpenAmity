@@ -9,6 +9,7 @@ import logging
 from .events import Signal
 from .settings_manager import SettingsManager
 from google import genai
+from google.genai import types
 
 # Audio Configuration
 SAMPLE_RATE = 16000
@@ -156,10 +157,17 @@ class AudioService:
                 if not self.client:
                     raise Exception(
                         "Gemini client not initialized. Check API Key.")
-                models = self.settings.get(
-                    "core.gemini.gemini-models", ["gemini-3.1-flash-preview"])
-                if not isinstance(models, list):
-                    models = [models]
+                model = self.settings.get("core.gemini.model", "")
+                if not model:
+                    legacy = self.settings.get("core.gemini.gemini-models", ["gemini-3.8-flash"])
+                    model = legacy[0] if isinstance(legacy, list) and legacy else "gemini-3.8-flash"
+                light_model = self.settings.get("core.gemini.light-model", "")
+                if not light_model:
+                    legacy_l = self.settings.get("core.gemini.light-models", ["gemini-3.5-flash-lite"])
+                    light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gemini-3.5-flash-lite"
+                models = [model]
+                if light_model != model:
+                    models.append(light_model)
 
                 audio_file = self.client.files.upload(file=temp_wav)
                 prompt = "Please transcribe this audio accurately. Output only the exact transcription without any commentary."
@@ -169,7 +177,12 @@ class AudioService:
                     try:
                         response = self.client.models.generate_content(
                             model=model_name,
-                            contents=[prompt, audio_file]
+                            contents=[prompt, audio_file],
+                            config=types.GenerateContentConfig(
+                                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                                    disable=True
+                                )
+                            )
                         )
                         if response.text:
                             text = response.text.strip()

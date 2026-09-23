@@ -233,3 +233,65 @@ def test_agent_speech_autonomy_preserved():
     assert orch.handle_gemini_speech.called
     assert orch.handle_gemini_speech.call_args[0][0] == "Hello user, I see you are here!"
     assert responses[0][1]["result"] == "Speech queued."
+
+
+def test_pulse_timezone_awareness_and_agenda_sort(tmp_path, monkeypatch):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    orch = MagicMock()
+    orch.agent_id = "test_tz_agent"
+    pt = PulseTool(orchestrator=orch)
+
+    # 1. Add pulse with timezone offset (+02:00)
+    aware_sched = "2026-09-25T14:00:00+02:00"
+    res1 = pt.execute("add_pulse", title="Aware Pulse", context="Check timezone", scheduled_time=aware_sched, recurrence="none")
+    assert "Success: Pulse 'Aware Pulse' scheduled" in res1
+
+    # Verify stored scheduled_time is normalized to naive ISO
+    conn = pt._get_db()
+    c = conn.cursor()
+    c.execute("SELECT scheduled_time FROM pulses WHERE title = 'Aware Pulse'")
+    stored_sched = c.fetchone()[0]
+    assert "+" not in stored_sched
+    assert "Z" not in stored_sched
+
+    # 2. Directly insert a legacy pulse with timezone offset to simulate historical records like Pulse 44
+    c.execute("""
+        INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at)
+        VALUES ('Legacy Aware Complete Pulse', 'Historical test', '2026-07-10T12:12:29+02:00', 'none', 'complete', 1, '2026-07-10T12:00:00')
+    """)
+    # Insert another legacy pulse with UTC Z offset that is pending in the future
+    import datetime
+    future_z = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c.execute(f"""
+        INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at)
+        VALUES ('Legacy Z Pending Pulse', 'Future Z test', '{future_z}', 'none', 'pending', 0, '2026-07-10T12:00:00')
+    """)
+    # Insert a standard naive pending pulse
+    future_naive = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    c.execute(f"""
+        INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at)
+        VALUES ('Standard Naive Pulse', 'Future test', '{future_naive}', 'none', 'pending', 0, '2026-07-10T12:00:00')
+    """)
+    conn.commit()
+    conn.close()
+
+    # 3. View agenda: Must sort chronologically across aware & naive without raising TypeError
+    agenda = pt.execute("view_agenda", days_ahead=7)
+    assert "Standard Naive Pulse" in agenda
+    assert "Legacy Z Pending Pulse" in agenda
+    # Completed pulse from July should NOT be in the upcoming agenda
+    assert "Legacy Aware Complete Pulse" not in agenda
+
+
+def test_pulse_engine_handles_aware_datetimes(tmp_path):
+    import datetime
+    engine = PulseEngine.__new__(PulseEngine)
+    engine.last_interaction_time = 0
+
+    # 1. calculate_next_recurrence with aware sched and naive now
+    aware_sched = datetime.datetime(2026, 9, 20, 10, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    naive_now = datetime.datetime(2026, 9, 22, 10, 0)
+    next_sched = engine.calculate_next_recurrence(aware_sched, "daily", naive_now)
+    assert next_sched > naive_now
+    assert next_sched.tzinfo is None

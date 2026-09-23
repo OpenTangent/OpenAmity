@@ -3,7 +3,7 @@ import io
 import os
 import threading
 import qrcode
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton,
                                QLabel, QLineEdit, QTextEdit, QComboBox, QCheckBox,
                                QRadioButton, QButtonGroup, QStackedWidget, QListWidget, QInputDialog, QSlider,
                                QSpinBox, QScrollArea, QFrame, QFileDialog, QMessageBox, QDialog,
@@ -19,6 +19,11 @@ from core.email_auth import execute_desktop_oauth_flow, exchange_authorization_c
 from core.config_manager import ConfigManager
 
 try:
+    from config.presets import AGENT_PRESETS, get_preset, list_presets
+except ImportError:
+    from presets import AGENT_PRESETS, get_preset, list_presets
+
+try:
     from gui.editable_list_widget import EditableItemListWidget
 except ImportError:
     from editable_list_widget import EditableItemListWidget
@@ -28,7 +33,7 @@ try:
                            BG_DARK, BG_CARD, BG_CARD_DISABLED, BG_INPUT, BG_INPUT_FOCUS,
                            BG_BUTTON, BG_BUTTON_HOVER, BG_BUTTON_PRESSED,
                            BORDER_COLOR, BORDER_COLOR_DISABLED, BORDER_INPUT, BORDER_BUTTON,
-                           TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED)
+                           TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, MODERN_SCROLLBAR_STYLE)
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
@@ -47,6 +52,95 @@ except ImportError:
     TEXT_PRIMARY = "#eeeeee"
     TEXT_SECONDARY = "#cccccc"
     TEXT_MUTED = "#aaaaaa"
+    MODERN_SCROLLBAR_STYLE = ""
+
+
+THINKING_LEVELS = ["low", "medium", "high", "max"]
+
+PROVIDER_MODELS = {
+    "gemini": {
+        "models": [
+            "gemini-3.8-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-flash-latest",
+            "Custom..."
+        ],
+        "light_models": [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-flash-lite-latest",
+            "Custom..."
+        ],
+        "default_model": "gemini-3.8-flash",
+        "default_light_model": "gemini-3.5-flash-lite"
+    },
+    "claude": {
+        "models": [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "Custom..."
+        ],
+        "light_models": [
+            "claude-haiku-4-5",
+            "claude-sonnet-5",
+            "Custom..."
+        ],
+        "default_model": "claude-fable-5-1",
+        "default_light_model": "claude-haiku-4-5"
+    },
+    "chatgpt": {
+        "models": [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "Custom..."
+        ],
+        "light_models": [
+            "gpt-6-luna",
+            "gpt-5.6-luna",
+            "Custom..."
+        ],
+        "default_model": "gpt-6-astra",
+        "default_light_model": "gpt-6-luna"
+    },
+    "deepseek": {
+        "models": [
+            "deepseek-v4-pro",
+            "deepseek-flash",
+            "deepseek-reasoner",
+            "deepseek-chat",
+            "Custom..."
+        ],
+        "light_models": [
+            "deepseek-flash",
+            "deepseek-chat",
+            "Custom..."
+        ],
+        "default_model": "deepseek-v4-pro",
+        "default_light_model": "deepseek-flash"
+    },
+    "antigravity": {
+        "models": [
+            "Gemini 3.8 Flash (High)",
+            "Gemini 3.5 Flash (High)",
+            "Gemini 3.1 Pro (High)",
+            "Custom..."
+        ],
+        "light_models": [
+            "Gemini 3.5 Flash (High)",
+            "Gemini 3.8 Flash (High)",
+            "Custom..."
+        ],
+        "default_model": "Gemini 3.8 Flash (High)",
+        "default_light_model": "Gemini 3.5 Flash (High)"
+    }
+}
 
 
 EMAIL_PRESETS = {
@@ -315,7 +409,7 @@ class AgentBackupSelectionDialog(QDialog):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("background-color: #2a2a2a; border: 1px solid #444; border-radius: 5px;")
+        scroll.setStyleSheet(f"QScrollArea {{ background-color: #2a2a2a; border: 1px solid #444; border-radius: 5px; }} {MODERN_SCROLLBAR_STYLE}")
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
         scroll_layout.setContentsMargins(15, 15, 15, 15)
@@ -442,6 +536,310 @@ class FocusOutFilter(QObject):
         return super().eventFilter(obj, event)
 
 
+class PresetCardWidget(QFrame):
+    clicked = Signal(str)
+
+    def __init__(self, preset: dict, parent=None):
+        super().__init__(parent)
+        self.preset_id = preset["id"]
+        self.is_selected = False
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.TabFocus)
+        self.setObjectName("presetCard")
+        self.setMinimumHeight(155)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        # Top row: Icon + Name + Archetype + Selected Badge
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
+        name_lbl = QLabel(f"{preset.get('icon', '')} <b>{preset.get('name', '')}</b>")
+        name_lbl.setStyleSheet("font-size: 16px; color: #FFF; font-weight: bold; background-color: transparent;")
+        top_row.addWidget(name_lbl)
+
+        archetype_lbl = QLabel(f"— {preset.get('archetype', '')}")
+        archetype_lbl.setStyleSheet("font-size: 13px; color: #BBB; background-color: transparent;")
+        top_row.addWidget(archetype_lbl, 1)
+
+        self.badge = QLabel("✓ Selected")
+        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.badge.setStyleSheet(
+            "background-color: #1b3820; "
+            "border: 1px solid #2e7d32; "
+            "color: #81c784; "
+            "border-radius: 4px; "
+            "padding: 2px 8px; "
+            "font-weight: bold; "
+            "font-size: 12px;"
+        )
+        sp = self.badge.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.badge.setSizePolicy(sp)
+        self.badge.setVisible(False)
+        top_row.addWidget(self.badge)
+
+        layout.addLayout(top_row)
+
+        # Tagline / Description
+        tagline_lbl = QLabel(preset.get("tagline", ""))
+        tagline_lbl.setWordWrap(True)
+        tagline_lbl.setStyleSheet("font-size: 13px; color: #AAA; background-color: transparent; line-height: 1.4;")
+        layout.addWidget(tagline_lbl)
+
+        # Badges row
+        badge_row = QHBoxLayout()
+        badge_row.setSpacing(8)
+
+        focus_badge = QLabel(f"🎯 {preset.get('focus_badge', '')}")
+        focus_badge.setStyleSheet(
+            f"background-color: #2a2a2a; color: {SECONDARY_ACCENT_COLOR}; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #444;"
+        )
+        badge_row.addWidget(focus_badge)
+
+        voice_badge = QLabel(f"🎙️ {preset.get('voice_badge', '')}")
+        voice_badge.setStyleSheet(
+            "background-color: #2a2a2a; color: #BBB; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #444;"
+        )
+        badge_row.addWidget(voice_badge)
+        badge_row.addStretch()
+
+        layout.addLayout(badge_row)
+        self._update_appearance()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.preset_id)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.clicked.emit(self.preset_id)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def set_selected(self, selected: bool):
+        self.is_selected = selected
+        self.badge.setVisible(selected)
+        self._update_appearance()
+
+    def _update_appearance(self):
+        if self.is_selected:
+            self.setStyleSheet(f"""
+                QFrame#presetCard {{
+                    background-color: {BG_CARD};
+                    border: 1px solid #2e7d32;
+                    border-radius: 8px;
+                }}
+                QFrame#presetCard:hover {{
+                    background-color: #2c2c2c;
+                    border: 1px solid #2e7d32;
+                }}
+            """)
+        else:
+            self.setStyleSheet(f"""
+                QFrame#presetCard {{
+                    background-color: {BG_CARD};
+                    border: 1px solid {BORDER_COLOR};
+                    border-radius: 8px;
+                }}
+                QFrame#presetCard:hover {{
+                    background-color: #2c2c2c;
+                    border: 1px solid #4a4a4a;
+                }}
+            """)
+
+
+class AccordionHeaderWidget(QWidget):
+    clicked = Signal()
+
+    def __init__(self, title: str, parent=None, badge_text: str = "✓ Selected"):
+        super().__init__(parent)
+        self.setObjectName("settingsAccordionHeader")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.TabFocus)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.chevron = QLabel("▶")
+        self.chevron.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.chevron.setStyleSheet(
+            "color: #888888; font-size: 11px; font-weight: bold; background-color: transparent;"
+        )
+        layout.addWidget(self.chevron)
+
+        self.title_label = QLabel(title)
+        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.title_label.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #CCCCCC; background-color: transparent;"
+        )
+        layout.addWidget(self.title_label)
+
+        layout.addStretch()
+
+        self.badge = QLabel(badge_text)
+        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.badge.setStyleSheet(
+            "background-color: #1b3820; "
+            "border: 1px solid #2e7d32; "
+            "color: #81c784; "
+            "border-radius: 4px; "
+            "padding: 2px 8px; "
+            "font-weight: bold; "
+            "font-size: 12px;"
+        )
+        self.badge.setVisible(False)
+        layout.addWidget(self.badge)
+
+    def set_expanded(self, expanded: bool):
+        self.chevron.setText("▼" if expanded else "▶")
+        self.chevron.setStyleSheet(
+            "color: #CCCCCC; font-size: 11px; font-weight: bold; background-color: transparent;"
+            if expanded else
+            "color: #888888; font-size: 11px; font-weight: bold; background-color: transparent;"
+        )
+        self.title_label.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #FFFFFF; background-color: transparent;"
+            if expanded else
+            "font-size: 15px; font-weight: bold; color: #CCCCCC; background-color: transparent;"
+        )
+        self.badge.setVisible(expanded)
+        self.setCursor(Qt.ArrowCursor if expanded else Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
+class AccordionCard(QFrame):
+    clicked = Signal()
+
+    def __init__(self, card_id: str, title: str, parent=None, badge_text: str = "✓ Selected"):
+        super().__init__(parent)
+        self.card_id = card_id
+        self.provider_id = card_id
+        self.title_text = title
+        self._is_expanded = False
+        self.setObjectName("settingsCard")
+
+        self.outer_layout = QVBoxLayout(self)
+        self.outer_layout.setContentsMargins(15, 10, 15, 10)
+        self.outer_layout.setSpacing(10)
+
+        # Header Row (Always visible as a single line)
+        self.header_widget = AccordionHeaderWidget(title, self, badge_text=badge_text)
+        self.header_widget.clicked.connect(self._on_header_clicked)
+        self.outer_layout.addWidget(self.header_widget)
+
+        # Body Container (Holds guides, inputs, model controls; hidden when collapsed)
+        self.body_widget = QWidget(self)
+        self.body_widget.setObjectName("settingsCardBody")
+        self.body_layout = QVBoxLayout(self.body_widget)
+        self.body_layout.setContentsMargins(0, 5, 0, 0)
+        self.body_layout.setSpacing(10)
+        self.outer_layout.addWidget(self.body_widget)
+
+        self.set_expanded(False)
+
+    @property
+    def is_expanded(self) -> bool:
+        return self._is_expanded
+
+    def _on_header_clicked(self):
+        self.clicked.emit()
+
+    def set_expanded(self, expanded: bool):
+        self._is_expanded = expanded
+        self.header_widget.set_expanded(expanded)
+        self.body_widget.setVisible(expanded)
+
+        if expanded:
+            self.outer_layout.setContentsMargins(15, 14, 15, 15)
+            self.setProperty("cardState", "selected")
+            self.setCursor(Qt.ArrowCursor)
+            self.setToolTip("")
+        else:
+            self.outer_layout.setContentsMargins(15, 10, 15, 10)
+            self.setProperty("cardState", "collapsed")
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip(f"Click to select {self.title_text}")
+
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if not self._is_expanded:
+                self.clicked.emit()
+                event.accept()
+                return
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if self.header_widget.geometry().contains(pos):
+                self.clicked.emit()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
+class ProviderAccordionCard(AccordionCard):
+    """Accordion card representing an AI model provider configuration."""
+
+    def __init__(self, provider_id: str, title: str, parent=None):
+        super().__init__(card_id=provider_id, title=title, parent=parent)
+
+
+class VoiceAccordionCard(AccordionCard):
+    """Accordion card representing a TTS voice engine configuration."""
+
+    def __init__(self, voice_provider_id: str, title: str, parent=None):
+        super().__init__(card_id=voice_provider_id, title=title, parent=parent)
+
+
+class SocialAccordionCard(AccordionCard):
+    """Accordion card representing a toggleable social account configuration."""
+
+    def __init__(self, tool_id: str, title: str, parent=None):
+        super().__init__(card_id=tool_id, title=title, parent=parent, badge_text="✓ Active")
+        self.checkbox = QCheckBox(title, self)
+        self.checkbox.setVisible(False)
+        self.checkbox.setChecked(False)
+        self.checkbox.toggled.connect(self._on_checkbox_toggled)
+        self.clicked.connect(self.toggle)
+
+    def toggle(self):
+        self.checkbox.setChecked(not self.checkbox.isChecked())
+
+    def _on_checkbox_toggled(self, checked: bool):
+        if self._is_expanded != checked:
+            self.set_expanded(checked)
+
+    def set_expanded(self, expanded: bool):
+        super().set_expanded(expanded)
+        self.header_widget.setCursor(Qt.PointingHandCursor)
+        if hasattr(self, "checkbox") and self.checkbox.isChecked() != expanded:
+            self.checkbox.setChecked(expanded)
+        if expanded:
+            self.header_widget.setToolTip(f"Click to deactivate and collapse {self.title_text}")
+        else:
+            self.setToolTip(f"Click to activate {self.title_text}")
+            self.header_widget.setToolTip(f"Click to activate {self.title_text}")
+
+
 class SettingsPanelWidget(QWidget):
     close_requested = Signal()
     wizard_finished = Signal()
@@ -462,10 +860,13 @@ class SettingsPanelWidget(QWidget):
         self.agent_manager = None
         self._is_loading = False
 
-        self.focus_out_filter = FocusOutFilter(self.save_settings, self)
-
         self.save_buttons = []
         self.close_buttons = []
+        self.back_buttons = []
+        self.preset_cards = {}
+        self.voice_cards = {}
+        self.social_cards = {}
+        self.selected_preset_id = "amy"
 
         self.whatsapp_timer = QTimer(self)
         self.whatsapp_timer.timeout.connect(self.poll_whatsapp_status)
@@ -503,8 +904,8 @@ class SettingsPanelWidget(QWidget):
             self.ui_qr_code.setText("[WhatsApp Bridge Not Running]")
 
     def poll_whatsapp_status(self):
-        # Only poll if the current tab is Social Accounts (index 4)
-        if self.stack.currentIndex() != 4:
+        # Only poll if the current tab is Social Accounts (index 5)
+        if self.stack.currentIndex() != 5:
             return
 
         if not hasattr(self, 'ui_use_whatsapp') or not self.ui_use_whatsapp.isChecked():
@@ -556,6 +957,21 @@ class SettingsPanelWidget(QWidget):
             QFrame#settingsCard[cardState="disabled"] {{
                 background-color: {BG_CARD_DISABLED};
                 border: 1px solid {BORDER_COLOR_DISABLED};
+            }}
+            QFrame#settingsCard[cardState="selected"] {{
+                background-color: {BG_CARD};
+                border: 1px solid #2e7d32;
+            }}
+            QFrame#settingsCard[cardState="collapsed"] {{
+                background-color: #202020;
+                border: 1px solid #333333;
+            }}
+            QFrame#settingsCard[cardState="collapsed"]:hover {{
+                background-color: #272727;
+                border: 1px solid #4a4a4a;
+            }}
+            QWidget#settingsAccordionHeader {{
+                background-color: transparent;
             }}
             QWidget#settingsCardBody, QWidget#settingsSubContainer {{
                 background-color: transparent;
@@ -633,6 +1049,7 @@ class SettingsPanelWidget(QWidget):
                 selection-background-color: #4a4a4a;
                 border: 1px solid #555;
             }}
+            {MODERN_SCROLLBAR_STYLE}
         """)
 
         main_layout = QVBoxLayout(self)
@@ -644,6 +1061,7 @@ class SettingsPanelWidget(QWidget):
         main_layout.addWidget(self.stack, 1)
 
         # Build Panels
+        self.build_agent_presets()
         self.build_basic_agent_settings()
         self.build_agent_values_goals()
         self.build_agent_voice()
@@ -654,6 +1072,9 @@ class SettingsPanelWidget(QWidget):
 
         # Disable mouse scroll on input controls so mouse wheel scrolls page only
         self.disable_scroll_wheel_recursively(self)
+
+        # Select initial default preset
+        self.select_preset(self.selected_preset_id, populate_ui=True)
 
     def disable_scroll_wheel_recursively(self, widget):
         from PySide6.QtWidgets import QComboBox, QSpinBox, QSlider
@@ -688,6 +1109,7 @@ class SettingsPanelWidget(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
         scroll_layout.setAlignment(Qt.AlignTop)
@@ -696,6 +1118,13 @@ class SettingsPanelWidget(QWidget):
         layout.addWidget(scroll, 1)
 
         btn_layout = QHBoxLayout()
+        back_btn = QPushButton("Back")
+        back_btn.setObjectName("settingsBackBtn")
+        back_btn.setMinimumWidth(100)
+        back_btn.clicked.connect(self.on_back_clicked)
+        back_btn.setVisible(False)
+        btn_layout.addWidget(back_btn)
+
         btn_layout.addStretch()
         save_btn = QPushButton("Save")
         save_btn.setMinimumWidth(100)
@@ -703,6 +1132,7 @@ class SettingsPanelWidget(QWidget):
         btn_layout.addWidget(save_btn)
         layout.addLayout(btn_layout)
 
+        self.back_buttons.append(back_btn)
         self.save_buttons.append(save_btn)
 
         return container, scroll_layout, save_btn
@@ -716,40 +1146,125 @@ class SettingsPanelWidget(QWidget):
         return card, layout
 
     def create_toggleable_card_container(self, title, is_checked=False):
-        card = QFrame()
-        card.setObjectName("settingsCard")
-        outer_layout = QVBoxLayout(card)
-        outer_layout.setContentsMargins(15, 15, 15, 15)
-        outer_layout.setSpacing(10)
-
-        # Header with styled checkbox (no <b> tags)
-        header_layout = QHBoxLayout()
         clean_title = str(title).replace("<b>", "").replace("</b>", "")
-        checkbox = QCheckBox(clean_title)
-        checkbox.setChecked(is_checked)
-        checkbox.setStyleSheet("font-size: 15px; font-weight: bold; color: #FFF; background-color: transparent;")
-        header_layout.addWidget(checkbox)
-        header_layout.addStretch()
-        outer_layout.addLayout(header_layout)
+        tool_id = clean_title.lower().split()[0]
+        card = SocialAccordionCard(tool_id, clean_title, self)
+        card.checkbox.setChecked(is_checked)
+        return card, card.body_layout, card.checkbox
 
-        # Body container that gets enabled/disabled
-        body = QWidget()
-        body.setObjectName("settingsCardBody")
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 5, 0, 0)
-        body_layout.setSpacing(10)
-        outer_layout.addWidget(body)
+    def build_agent_presets(self):
+        panel, layout, _ = self.create_panel_container("Agent Presets")
 
-        def update_enabled(checked):
-            body.setEnabled(checked)
-            card.setProperty("cardState", "enabled" if checked else "disabled")
-            card.style().unpolish(card)
-            card.style().polish(card)
+        guide = QLabel(
+            "Select an agent preset archetype to begin. Selecting a preset pre-populates your agent's "
+            "name, personality, core values, overarching goals, and voice profile. You can customize "
+            "any of these settings in the following wizard steps."
+        )
+        guide.setWordWrap(True)
+        guide.setStyleSheet("color: #AAA; font-size: 13px; line-height: 1.4; margin-bottom: 10px; background-color: transparent;")
+        layout.addWidget(guide)
+        layout.setSpacing(14)
+        self.preset_cards = {}
+        presets = list_presets()
+        for p in presets:
+            card = PresetCardWidget(p)
+            card.clicked.connect(self.select_preset)
+            self.preset_cards[p["id"]] = card
+            layout.addWidget(card)
 
-        checkbox.toggled.connect(update_enabled)
-        update_enabled(is_checked)
+        self.stack.addWidget(panel)
 
-        return card, body_layout, checkbox
+    def select_preset(self, preset_id: str, populate_ui: bool = True):
+        clean_id = preset_id.lower()
+        if clean_id not in AGENT_PRESETS:
+            clean_id = "amy"
+        self.selected_preset_id = clean_id
+
+        for pid, card in self.preset_cards.items():
+            card.set_selected(pid == self.selected_preset_id)
+
+        if populate_ui:
+            self.apply_preset_to_ui(self.selected_preset_id)
+
+    def apply_preset_to_ui(self, preset_id: str):
+        preset = get_preset(preset_id)
+        if not preset:
+            return
+
+        # Basic Agent Settings
+        if hasattr(self, 'ui_agent_name'):
+            self.ui_agent_name.setText(preset.get("name", ""))
+        if hasattr(self, 'ui_gender'):
+            idx = self.ui_gender.findText(preset.get("gender", "Female"))
+            if idx >= 0:
+                self.ui_gender.setCurrentIndex(idx)
+        if hasattr(self, 'ui_archetype'):
+            self.ui_archetype.setText(preset.get("archetype", ""))
+        if hasattr(self, 'ui_base_personality'):
+            self.ui_base_personality.setPlainText(preset.get("base_personality", ""))
+
+        # Values & Goals
+        if hasattr(self, 'ui_core_values'):
+            self.ui_core_values.set_items(preset.get("core_values", []))
+        if hasattr(self, 'ui_overarching_goals'):
+            self.ui_overarching_goals.set_items(preset.get("overarching_goals", []))
+
+        # Voice Settings
+        voice = preset.get("voice", {})
+        if hasattr(self, 'ui_fallback_voice'):
+            self.ui_fallback_voice.setText(voice.get("piper_model", "en_GB-cori-high"))
+
+        if hasattr(self, 'ui_tts_gender'):
+            g_idx = self.ui_tts_gender.findText(voice.get("gemini_gender", "Female"))
+            if g_idx >= 0:
+                self.ui_tts_gender.setCurrentIndex(g_idx)
+
+        if hasattr(self, 'ui_tts_age'):
+            age_str = voice.get("gemini_age", "")
+            for i in range(self.ui_tts_age.count()):
+                if age_str.lower() in self.ui_tts_age.itemText(i).lower():
+                    self.ui_tts_age.setCurrentIndex(i)
+                    break
+
+        if hasattr(self, 'ui_tts_accent'):
+            acc_str = voice.get("gemini_accent", "")
+            a_idx = self.ui_tts_accent.findText(acc_str)
+            if a_idx >= 0:
+                self.ui_tts_accent.setCurrentIndex(a_idx)
+                if hasattr(self, 'ui_tts_custom_accent'):
+                    self.ui_tts_custom_accent.setText("")
+                    self.ui_tts_custom_accent.setVisible(False)
+
+        if hasattr(self, 'ui_tts_style'):
+            style_str = voice.get("gemini_style", "")
+            s_idx = self.ui_tts_style.findText(style_str)
+            if s_idx >= 0:
+                self.ui_tts_style.setCurrentIndex(s_idx)
+                if hasattr(self, 'ui_tts_custom_style'):
+                    self.ui_tts_custom_style.setText("")
+                    self.ui_tts_custom_style.setVisible(False)
+
+        if hasattr(self, 'ui_voice_prompt'):
+            self.ui_voice_prompt.setPlainText(voice.get("gemini_prompt_profile", ""))
+
+        if hasattr(self, 'ui_voice'):
+            self.ui_voice.setText(voice.get("gemini_model_name", "Sulafat"))
+
+        # Other Agent Settings
+        if hasattr(self, 'ui_agency_limit'):
+            limit = preset.get("cognitive_budget", 10000)
+            self.ui_agency_limit.setValue(limit)
+            if hasattr(self, 'ui_agency_limit_val'):
+                self.ui_agency_limit_val.setText(str(limit))
+
+        if hasattr(self, 'ui_max_memories'):
+            self.ui_max_memories.setValue(preset.get("max_memories", 24))
+
+        if hasattr(self, 'ui_low_token_mode'):
+            self.ui_low_token_mode.setChecked(preset.get("low_token_mode", False))
+
+        if self.settings:
+            self.settings.set("core.agent.preset", preset_id)
 
     def build_basic_agent_settings(self):
         panel, layout, _ = self.create_panel_container("Basic Agent Settings")
@@ -775,11 +1290,6 @@ class SettingsPanelWidget(QWidget):
         layout.addWidget(self.ui_base_personality)
         layout.addWidget(self.create_tip(
             "The base personality must be written in the first person because the agent will read it as if they wrote it themselves. This helps with subjectivity."))
-
-        self.ui_agent_name.editingFinished.connect(self.save_settings)
-        self.ui_gender.currentTextChanged.connect(self.save_settings)
-        self.ui_archetype.editingFinished.connect(self.save_settings)
-        self.ui_base_personality.installEventFilter(self.focus_out_filter)
 
         self.stack.addWidget(panel)
 
@@ -848,55 +1358,51 @@ class SettingsPanelWidget(QWidget):
 
         self.ui_core_values.count_changed.connect(update_values_header)
         self.ui_overarching_goals.count_changed.connect(update_goals_header)
-
-        # Auto-save changes on modification
-        self.ui_core_values.items_changed.connect(self.save_settings)
-        self.ui_overarching_goals.items_changed.connect(self.save_settings)
-
         self.stack.addWidget(panel)
 
     def build_agent_voice(self):
         panel, main_layout, _ = self.create_panel_container("Agent Voice")
 
+        # Compatibility radio buttons (kept hidden from layout, grouped for exclusivity)
+        self.ui_use_piper_tts = QRadioButton("Use Piper TTS (Local)", self)
+        self.ui_use_gemini_tts = QRadioButton("Use Gemini TTS (Cloud)", self)
+        self.ui_use_piper_tts.setVisible(False)
+        self.ui_use_gemini_tts.setVisible(False)
+
         self.tts_button_group = QButtonGroup(self)
-
-        self.ui_use_piper_tts = QRadioButton("Use Piper TTS (Local)")
         self.tts_button_group.addButton(self.ui_use_piper_tts)
-        main_layout.addWidget(self.ui_use_piper_tts)
+        self.tts_button_group.addButton(self.ui_use_gemini_tts)
 
-        card_piper, layout_piper = self.create_card_container()
-        lbl_piper = QLabel("<b>Piper TTS Setup (Local)</b>")
-        lbl_piper.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout_piper.addWidget(lbl_piper)
+        self.ui_use_piper_tts.toggled.connect(
+            lambda checked: self._on_voice_radio_toggled("piper", checked))
+        self.ui_use_gemini_tts.toggled.connect(
+            lambda checked: self._on_voice_radio_toggled("gemini", checked))
 
+        self.voice_cards = {}
+
+        # 1. Piper TTS (Local)
+        card_piper = VoiceAccordionCard("piper", "Piper TTS Setup (Local)", self)
         guide_piper = QLabel(
             "Fully local, offline neural text-to-speech engine running on CPU using ONNX models.<br>"
             "No API key required, zero latency overhead, completely private, and zero cloud token cost.")
         guide_piper.setTextFormat(Qt.RichText)
         guide_piper.setWordWrap(True)
         guide_piper.setStyleSheet("background-color: transparent;")
-        layout_piper.addWidget(guide_piper)
+        card_piper.body_layout.addWidget(guide_piper)
 
-        layout_piper.addWidget(QLabel("Piper Voice Model:"))
+        card_piper.body_layout.addWidget(QLabel("Piper Voice Model:"))
         self.ui_fallback_voice = QLineEdit()
-        layout_piper.addWidget(self.ui_fallback_voice)
-        layout_piper.addWidget(self.create_tip(
+        card_piper.body_layout.addWidget(self.ui_fallback_voice)
+        card_piper.body_layout.addWidget(self.create_tip(
             "To find more Piper TTS voice model strings go to: <a href='https://rhasspy.github.io/piper-samples/#en_GB-cori-high'>Piper Samples</a>"))
+        card_piper.clicked.connect(lambda: self._select_voice_provider("piper"))
+        self.voice_cards["piper"] = card_piper
         main_layout.addWidget(card_piper)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(6)
 
-        self.ui_use_gemini_tts = QRadioButton("Use Gemini TTS (Cloud)")
-        self.tts_button_group.addButton(self.ui_use_gemini_tts)
-        main_layout.addWidget(self.ui_use_gemini_tts)
-
-        card_gemini, layout_gemini = self.create_card_container()
-        lbl_gemini = QLabel("<b>Gemini TTS Setup (Cloud)</b>")
-        lbl_gemini.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout_gemini.addWidget(lbl_gemini)
-
+        # 2. Gemini TTS (Cloud)
+        card_gemini = VoiceAccordionCard("gemini", "Gemini TTS Setup (Cloud)", self)
         guide_gemini = QLabel(
             "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>"
             "2. Sign in with your Google Account.<br>"
@@ -908,32 +1414,32 @@ class SettingsPanelWidget(QWidget):
         guide_gemini.setOpenExternalLinks(True)
         guide_gemini.setWordWrap(True)
         guide_gemini.setStyleSheet("background-color: transparent;")
-        layout_gemini.addWidget(guide_gemini)
+        card_gemini.body_layout.addWidget(guide_gemini)
 
-        layout_gemini.addWidget(QLabel("Gemini API Key (for TTS):"))
+        card_gemini.body_layout.addWidget(QLabel("Gemini API Key (for TTS):"))
         self.ui_gemini_tts_api_key = QLineEdit()
         self.ui_gemini_tts_api_key.setEchoMode(QLineEdit.Password)
         self.ui_gemini_tts_api_key.setPlaceholderText("Paste Gemini API Key for TTS...")
-        layout_gemini.addWidget(self.ui_gemini_tts_api_key)
+        card_gemini.body_layout.addWidget(self.ui_gemini_tts_api_key)
 
-        layout_gemini.addSpacing(6)
+        card_gemini.body_layout.addSpacing(6)
 
         # Voice Character Configuration: Gender, Age, Accent, Style
         lbl_char = QLabel("<b>Voice Character Configuration</b>")
         lbl_char.setStyleSheet("background-color: transparent; font-size: 14px;")
-        layout_gemini.addWidget(lbl_char)
+        card_gemini.body_layout.addWidget(lbl_char)
 
-        layout_gemini.addWidget(QLabel("Gender:"))
+        card_gemini.body_layout.addWidget(QLabel("Gender:"))
         self.ui_tts_gender = QComboBox()
         self.ui_tts_gender.addItems(["Female", "Male", "Non-binary / Neutral"])
-        layout_gemini.addWidget(self.ui_tts_gender)
+        card_gemini.body_layout.addWidget(self.ui_tts_gender)
 
-        layout_gemini.addWidget(QLabel("Age:"))
+        card_gemini.body_layout.addWidget(QLabel("Age:"))
         self.ui_tts_age = QComboBox()
         self.ui_tts_age.addItems(["Young Adult (20s - 30s)", "Youthful (18 - 25)", "Adult (30s - 50s)", "Mature / Senior (50+)"])
-        layout_gemini.addWidget(self.ui_tts_age)
+        card_gemini.body_layout.addWidget(self.ui_tts_age)
 
-        layout_gemini.addWidget(QLabel("Accent:"))
+        card_gemini.body_layout.addWidget(QLabel("Accent:"))
         self.ui_tts_accent = QComboBox()
         self.ui_tts_accent.addItems([
             "South African",
@@ -951,14 +1457,14 @@ class SettingsPanelWidget(QWidget):
             "Japanese-accented English",
             "Custom..."
         ])
-        layout_gemini.addWidget(self.ui_tts_accent)
+        card_gemini.body_layout.addWidget(self.ui_tts_accent)
 
         self.ui_tts_custom_accent = QLineEdit()
         self.ui_tts_custom_accent.setPlaceholderText("Enter custom regional accent (e.g., Nigerian, Jamaican, Texan)...")
         self.ui_tts_custom_accent.setVisible(False)
-        layout_gemini.addWidget(self.ui_tts_custom_accent)
+        card_gemini.body_layout.addWidget(self.ui_tts_custom_accent)
 
-        layout_gemini.addWidget(QLabel("Style (Personality):"))
+        card_gemini.body_layout.addWidget(QLabel("Style (Personality):"))
         self.ui_tts_style = QComboBox()
         self.ui_tts_style.addItems([
             "Warm & Empathetic",
@@ -970,23 +1476,23 @@ class SettingsPanelWidget(QWidget):
             "Gentle & Serene",
             "Custom..."
         ])
-        layout_gemini.addWidget(self.ui_tts_style)
+        card_gemini.body_layout.addWidget(self.ui_tts_style)
 
         self.ui_tts_custom_style = QLineEdit()
         self.ui_tts_custom_style.setPlaceholderText("Enter custom personality/style (e.g., Dry wit and sarcastic)...")
         self.ui_tts_custom_style.setVisible(False)
-        layout_gemini.addWidget(self.ui_tts_custom_style)
+        card_gemini.body_layout.addWidget(self.ui_tts_custom_style)
 
-        layout_gemini.addSpacing(6)
+        card_gemini.body_layout.addSpacing(6)
 
         self.ui_tts_allow_agent_override = QCheckBox("Allow agent to set their own voice")
         self.ui_tts_allow_agent_override.setChecked(True)
-        layout_gemini.addWidget(self.ui_tts_allow_agent_override)
-        layout_gemini.addWidget(self.create_tip(
+        card_gemini.body_layout.addWidget(self.ui_tts_allow_agent_override)
+        card_gemini.body_layout.addWidget(self.create_tip(
             "Enables the agent to autonomously update their directorial voice prompt using the System tool."
         ))
 
-        layout_gemini.addWidget(self.create_tip(
+        card_gemini.body_layout.addWidget(self.create_tip(
             "Preview Gemini's 30 prebuilt voices at: <a href='https://aistudio.google.com/generate-speech'>Google AI Studio Voice Library</a>. "
             "For full directorial script control, toggle override-prompt in settings.json."
         ))
@@ -994,181 +1500,198 @@ class SettingsPanelWidget(QWidget):
         # Backwards compatibility widgets (kept hidden so existing code/tests access without error)
         self.ui_voice = QLineEdit()
         self.ui_voice.setVisible(False)
-        layout_gemini.addWidget(self.ui_voice)
+        card_gemini.body_layout.addWidget(self.ui_voice)
 
         self.ui_voice_prompt = QTextEdit()
         self.ui_voice_prompt.setVisible(False)
-        layout_gemini.addWidget(self.ui_voice_prompt)
+        card_gemini.body_layout.addWidget(self.ui_voice_prompt)
 
+        card_gemini.clicked.connect(lambda: self._select_voice_provider("gemini"))
+        self.voice_cards["gemini"] = card_gemini
         main_layout.addWidget(card_gemini)
 
         # Backwards compatibility alias
         self.ui_prefer_local_tts = self.ui_use_piper_tts
 
-        self.ui_use_piper_tts.toggled.connect(self.save_settings)
-        self.ui_use_gemini_tts.toggled.connect(self.save_settings)
-        self.ui_fallback_voice.editingFinished.connect(self.save_settings)
-        self.ui_gemini_tts_api_key.editingFinished.connect(self.save_settings)
-        self.ui_voice.editingFinished.connect(self.save_settings)
-        self.ui_voice_prompt.installEventFilter(self.focus_out_filter)
-
-        self.ui_tts_gender.currentIndexChanged.connect(self.save_settings)
-        self.ui_tts_age.currentIndexChanged.connect(self.save_settings)
         self.ui_tts_accent.currentTextChanged.connect(self._on_tts_accent_changed)
-        self.ui_tts_custom_accent.editingFinished.connect(self.save_settings)
         self.ui_tts_style.currentTextChanged.connect(self._on_tts_style_changed)
-        self.ui_tts_custom_style.editingFinished.connect(self.save_settings)
-        self.ui_tts_allow_agent_override.toggled.connect(self.save_settings)
 
         main_layout.addStretch()
+
+        # Default initial selection
+        self.ui_use_piper_tts.setChecked(True)
+        self._update_voice_accordion("piper")
 
         self.stack.addWidget(panel)
 
     def _on_tts_accent_changed(self, text):
         self.ui_tts_custom_accent.setVisible(text == "Custom...")
-        self.save_settings()
 
     def _on_tts_style_changed(self, text):
         self.ui_tts_custom_style.setVisible(text == "Custom...")
-        self.save_settings()
 
     def build_provider_setup(self):
         panel, main_layout, _ = self.create_panel_container("Provider Setup")
 
-        self.ui_use_gemini_api = QRadioButton("Use Gemini API")
-        main_layout.addWidget(self.ui_use_gemini_api)
+        # Compatibility radio buttons (kept hidden from layout, grouped for exclusivity)
+        self.ui_use_gemini_api = QRadioButton("Use Gemini API", self)
+        self.ui_use_claude_api = QRadioButton("Use Claude API", self)
+        self.ui_use_chatgpt_api = QRadioButton("Use ChatGPT API", self)
+        self.ui_use_deepseek_api = QRadioButton("Use DeepSeek API", self)
+        self.ui_agy_mode = QRadioButton("Use Antigravity", self)
 
-        card1, layout1 = self.create_card_container()
-        lbl_gemini = QLabel("<b>Gemini API Setup</b>")
-        lbl_gemini.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout1.addWidget(lbl_gemini)
-        guide2 = QLabel(
-            "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>2. Sign in with your Google Account.<br>3. Click 'Get API key' and create a new key.")
-        guide2.setTextFormat(Qt.RichText)
-        guide2.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        guide2.setOpenExternalLinks(True)
-        guide2.setWordWrap(True)
-        guide2.setStyleSheet("background-color: transparent;")
-        layout1.addWidget(guide2)
+        self.ui_use_gemini_api.setVisible(False)
+        self.ui_use_claude_api.setVisible(False)
+        self.ui_use_chatgpt_api.setVisible(False)
+        self.ui_use_deepseek_api.setVisible(False)
+        self.ui_agy_mode.setVisible(False)
 
-        layout1.addWidget(QLabel("Gemini API Key:"))
+        self.provider_button_group = QButtonGroup(self)
+        self.provider_button_group.addButton(self.ui_use_gemini_api)
+        self.provider_button_group.addButton(self.ui_use_claude_api)
+        self.provider_button_group.addButton(self.ui_use_chatgpt_api)
+        self.provider_button_group.addButton(self.ui_use_deepseek_api)
+        self.provider_button_group.addButton(self.ui_agy_mode)
+
+        self.ui_use_gemini_api.toggled.connect(
+            lambda checked: self._on_provider_radio_toggled("gemini", checked))
+        self.ui_use_claude_api.toggled.connect(
+            lambda checked: self._on_provider_radio_toggled("claude", checked))
+        self.ui_use_chatgpt_api.toggled.connect(
+            lambda checked: self._on_provider_radio_toggled("chatgpt", checked))
+        self.ui_use_deepseek_api.toggled.connect(
+            lambda checked: self._on_provider_radio_toggled("deepseek", checked))
+        self.ui_agy_mode.toggled.connect(
+            lambda checked: self._on_provider_radio_toggled("antigravity", checked))
+
+        self.provider_cards = {}
+
+        # 1. Gemini
+        card_gemini = ProviderAccordionCard("gemini", "Gemini API Setup", self)
+        guide_gemini = QLabel(
+            "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>"
+            "2. Sign in with your Google Account.<br>"
+            "3. Click 'Get API key' and create a new key."
+        )
+        guide_gemini.setTextFormat(Qt.RichText)
+        guide_gemini.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_gemini.setOpenExternalLinks(True)
+        guide_gemini.setWordWrap(True)
+        guide_gemini.setStyleSheet("background-color: transparent;")
+        card_gemini.body_layout.addWidget(guide_gemini)
+
+        card_gemini.body_layout.addWidget(QLabel("Gemini API Key:"))
         self.ui_gemini_api_key = QLineEdit()
         self.ui_gemini_api_key.setEchoMode(QLineEdit.Password)
-        layout1.addWidget(self.ui_gemini_api_key)
-        main_layout.addWidget(card1)
+        card_gemini.body_layout.addWidget(self.ui_gemini_api_key)
 
-        main_layout.addSpacing(10)
+        self._setup_provider_model_controls("gemini", card_gemini.body_layout)
+        card_gemini.clicked.connect(lambda: self._select_provider("gemini"))
+        self.provider_cards["gemini"] = card_gemini
+        main_layout.addWidget(card_gemini)
 
-        self.ui_use_claude_api = QRadioButton("Use Claude API")
-        main_layout.addWidget(self.ui_use_claude_api)
+        main_layout.addSpacing(6)
 
-        card3, layout3 = self.create_card_container()
-        lbl_claude = QLabel("<b>Claude API Setup</b>")
-        lbl_claude.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout3.addWidget(lbl_claude)
-        guide3 = QLabel("1. Go to <a href='https://console.anthropic.com/'>Anthropic Console</a>.<br>2. Sign in with your account.<br>3. Click 'Get API key' and create a new key.<br><br><i>Note: Claude API handles reasoning and tool execution. Speech is generated using the engine selected in Agent Voice (Piper TTS locally by default, or Gemini TTS if a key is provided).</i>")
-        guide3.setTextFormat(Qt.RichText)
-        guide3.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        guide3.setOpenExternalLinks(True)
-        guide3.setWordWrap(True)
-        guide3.setStyleSheet("background-color: transparent;")
-        layout3.addWidget(guide3)
+        # 2. Claude
+        card_claude = ProviderAccordionCard("claude", "Claude API Setup", self)
+        guide_claude = QLabel(
+            "1. Go to <a href='https://console.anthropic.com/'>Anthropic Console</a>.<br>"
+            "2. Sign in with your account.<br>"
+            "3. Click 'Get API key' and create a new key.<br><br>"
+            "<i>Note: Claude API handles reasoning and tool execution. Speech is generated using the engine "
+            "selected in Agent Voice (Piper TTS locally by default, or Gemini TTS if a key is provided).</i>"
+        )
+        guide_claude.setTextFormat(Qt.RichText)
+        guide_claude.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_claude.setOpenExternalLinks(True)
+        guide_claude.setWordWrap(True)
+        guide_claude.setStyleSheet("background-color: transparent;")
+        card_claude.body_layout.addWidget(guide_claude)
 
-        layout3.addWidget(QLabel("Claude API Key:"))
+        card_claude.body_layout.addWidget(QLabel("Claude API Key:"))
         self.ui_claude_api_key = QLineEdit()
         self.ui_claude_api_key.setEchoMode(QLineEdit.Password)
-        layout3.addWidget(self.ui_claude_api_key)
-        main_layout.addWidget(card3)
+        card_claude.body_layout.addWidget(self.ui_claude_api_key)
 
-        main_layout.addSpacing(10)
+        self._setup_provider_model_controls("claude", card_claude.body_layout)
+        card_claude.clicked.connect(lambda: self._select_provider("claude"))
+        self.provider_cards["claude"] = card_claude
+        main_layout.addWidget(card_claude)
 
-        self.ui_use_chatgpt_api = QRadioButton("Use ChatGPT API")
-        main_layout.addWidget(self.ui_use_chatgpt_api)
+        main_layout.addSpacing(6)
 
-        card4, layout4 = self.create_card_container()
-        lbl_chatgpt = QLabel("<b>ChatGPT API Setup</b>")
-        lbl_chatgpt.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout4.addWidget(lbl_chatgpt)
-        guide4 = QLabel("1. Go to <a href='https://platform.openai.com/api-keys'>OpenAI Platform</a>.<br>2. Sign in with your account.<br>3. Click 'Create new secret key' and paste it below.<br><br><i>Note: OpenAI API handles reasoning and tool execution. Speech is generated using the engine selected in Agent Voice (Piper TTS locally by default, or Gemini TTS if a key is provided).</i>")
-        guide4.setTextFormat(Qt.RichText)
-        guide4.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        guide4.setOpenExternalLinks(True)
-        guide4.setWordWrap(True)
-        guide4.setStyleSheet("background-color: transparent;")
-        layout4.addWidget(guide4)
+        # 3. ChatGPT
+        card_chatgpt = ProviderAccordionCard("chatgpt", "ChatGPT API Setup", self)
+        guide_chatgpt = QLabel(
+            "1. Go to <a href='https://platform.openai.com/api-keys'>OpenAI Platform</a>.<br>"
+            "2. Sign in with your account.<br>"
+            "3. Click 'Create new secret key' and paste it below.<br><br>"
+            "<i>Note: OpenAI API handles reasoning and tool execution. Speech is generated using the engine "
+            "selected in Agent Voice (Piper TTS locally by default, or Gemini TTS if a key is provided).</i>"
+        )
+        guide_chatgpt.setTextFormat(Qt.RichText)
+        guide_chatgpt.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_chatgpt.setOpenExternalLinks(True)
+        guide_chatgpt.setWordWrap(True)
+        guide_chatgpt.setStyleSheet("background-color: transparent;")
+        card_chatgpt.body_layout.addWidget(guide_chatgpt)
 
-        layout4.addWidget(QLabel("OpenAI API Key:"))
+        card_chatgpt.body_layout.addWidget(QLabel("OpenAI API Key:"))
         self.ui_chatgpt_api_key = QLineEdit()
         self.ui_chatgpt_api_key.setEchoMode(QLineEdit.Password)
-        layout4.addWidget(self.ui_chatgpt_api_key)
-        main_layout.addWidget(card4)
+        card_chatgpt.body_layout.addWidget(self.ui_chatgpt_api_key)
 
-        main_layout.addSpacing(10)
+        self._setup_provider_model_controls("chatgpt", card_chatgpt.body_layout)
+        card_chatgpt.clicked.connect(lambda: self._select_provider("chatgpt"))
+        self.provider_cards["chatgpt"] = card_chatgpt
+        main_layout.addWidget(card_chatgpt)
 
-        self.ui_use_deepseek_api = QRadioButton("Use DeepSeek API")
-        main_layout.addWidget(self.ui_use_deepseek_api)
+        main_layout.addSpacing(6)
 
-        card5, layout5 = self.create_card_container()
-        lbl_deepseek = QLabel("<b>DeepSeek API Setup</b>")
-        lbl_deepseek.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout5.addWidget(lbl_deepseek)
-        guide5 = QLabel("1. Go to <a href='https://platform.deepseek.com/'>DeepSeek Platform</a>.<br>2. Sign in and create a new API key.<br>3. Paste your key below.<br><br><i>Note: DeepSeek uses OpenAI-compatible endpoints with support for multimodal inputs on <code>deepseek-flash</code> (DeepSeek-V4.1-Flash). Speech is generated using the engine selected in Agent Voice.</i>")
-        guide5.setTextFormat(Qt.RichText)
-        guide5.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        guide5.setOpenExternalLinks(True)
-        guide5.setWordWrap(True)
-        guide5.setStyleSheet("background-color: transparent;")
-        layout5.addWidget(guide5)
+        # 4. DeepSeek
+        card_deepseek = ProviderAccordionCard("deepseek", "DeepSeek API Setup", self)
+        guide_deepseek = QLabel(
+            "1. Go to <a href='https://platform.deepseek.com/'>DeepSeek Platform</a>.<br>"
+            "2. Sign in and create a new API key.<br>"
+            "3. Paste your key below.<br><br>"
+            "<i>Note: DeepSeek uses OpenAI-compatible endpoints with support for multimodal inputs on "
+            "<code>deepseek-flash</code> (DeepSeek-V4.1-Flash). Speech is generated using the engine "
+            "selected in Agent Voice.</i>"
+        )
+        guide_deepseek.setTextFormat(Qt.RichText)
+        guide_deepseek.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_deepseek.setOpenExternalLinks(True)
+        guide_deepseek.setWordWrap(True)
+        guide_deepseek.setStyleSheet("background-color: transparent;")
+        card_deepseek.body_layout.addWidget(guide_deepseek)
 
-        layout5.addWidget(QLabel("DeepSeek API Key:"))
+        card_deepseek.body_layout.addWidget(QLabel("DeepSeek API Key:"))
         self.ui_deepseek_api_key = QLineEdit()
         self.ui_deepseek_api_key.setEchoMode(QLineEdit.Password)
-        layout5.addWidget(self.ui_deepseek_api_key)
-        main_layout.addWidget(card5)
+        card_deepseek.body_layout.addWidget(self.ui_deepseek_api_key)
 
-        main_layout.addSpacing(10)
-
-        self.ui_agy_mode = QRadioButton("Use Antigravity")
-        main_layout.addWidget(self.ui_agy_mode)
-
-        card2, layout2 = self.create_card_container()
-        lbl_agy = QLabel("<b>Antigravity Setup</b>")
-        lbl_agy.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout2.addWidget(lbl_agy)
-        guide1 = QLabel("Antigravity is a hacky fallback solution that lacks features and isn't ideal.<br><br>1. Install the Antigravity CLI (<code>agy</code>) on your Linux system.<br>2. Run <code>agy login</code> in your terminal to authenticate.")
-        guide1.setTextFormat(Qt.RichText)
-        guide1.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        guide1.setOpenExternalLinks(True)
-        guide1.setWordWrap(True)
-        guide1.setStyleSheet("background-color: transparent;")
-        layout2.addWidget(guide1)
-        main_layout.addWidget(card2)
-
-        self.ui_agy_mode.toggled.connect(self.save_settings)
-        self.ui_use_gemini_api.toggled.connect(self.save_settings)
-        self.ui_use_claude_api.toggled.connect(self.save_settings)
-        self.ui_use_chatgpt_api.toggled.connect(self.save_settings)
-        self.ui_use_deepseek_api.toggled.connect(self.save_settings)
-        self.ui_gemini_api_key.editingFinished.connect(self.save_settings)
-        self.ui_claude_api_key.editingFinished.connect(self.save_settings)
-        self.ui_chatgpt_api_key.editingFinished.connect(self.save_settings)
-        self.ui_deepseek_api_key.editingFinished.connect(self.save_settings)
+        self._setup_provider_model_controls("deepseek", card_deepseek.body_layout)
+        card_deepseek.clicked.connect(lambda: self._select_provider("deepseek"))
+        self.provider_cards["deepseek"] = card_deepseek
+        main_layout.addWidget(card_deepseek)
 
         main_layout.addStretch()
+
+        # Default initial selection
+        self.ui_use_gemini_api.setChecked(True)
+        self._update_provider_accordion("gemini")
 
         self.stack.addWidget(panel)
 
     def build_social_accounts(self):
         panel, main_layout, _ = self.create_panel_container("Social Accounts")
 
+        self.social_cards = {}
+
         # 1. Email Section (First Section)
         card_email, layout_email, self.ui_use_email = self.create_toggleable_card_container(
             "Email Account", is_checked=False)
+        self.social_cards["email"] = card_email
 
         # 1. 2-Column Info Row: Email Address & Display Name (First Row)
         info_row = QHBoxLayout()
@@ -1412,11 +1935,12 @@ class SettingsPanelWidget(QWidget):
         layout_email.addLayout(test_row)
 
         main_layout.addWidget(card_email)
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(6)
 
         # 2. WhatsApp Section
         card_wa, layout_wa, self.ui_use_whatsapp = self.create_toggleable_card_container(
             "WhatsApp Account", is_checked=False)
+        self.social_cards["whatsapp"] = card_wa
         w_guide = QLabel(
             "This will be the agent's own WhatsApp account. Do not link your personal WhatsApp account here, rather set up a dedicated account for the agent.")
         w_guide.setWordWrap(True)
@@ -1431,11 +1955,12 @@ class SettingsPanelWidget(QWidget):
         layout_wa.addWidget(self.ui_qr_code, 0, Qt.AlignCenter)
         main_layout.addWidget(card_wa)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(6)
 
         # 3. Moltbook Section
         card_mb, layout_mb, self.ui_use_moltbook = self.create_toggleable_card_container(
             "Moltbook Account", is_checked=False)
+        self.social_cards["moltbook"] = card_mb
         mb_guide = QLabel(
             "<b>Setup Guide:</b><br>"
             "1. To set up Moltbook, simply ask your agent in chat to register an account for itself!<br>"
@@ -1455,11 +1980,12 @@ class SettingsPanelWidget(QWidget):
         layout_mb.addWidget(self.ui_moltbook_api_key)
         main_layout.addWidget(card_mb)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(6)
 
         # 4. Mastodon Section
         card_mastodon, layout_mastodon, self.ui_use_mastodon = self.create_toggleable_card_container(
             "Mastodon Account", is_checked=False)
+        self.social_cards["mastodon"] = card_mastodon
         m_guide = QLabel(
             "<b>Setup Guide:</b><br>"
             "1. Create an account for your agent on <a href='https://mastodon.bot'>mastodon.bot</a>.<br>"
@@ -1495,16 +2021,10 @@ class SettingsPanelWidget(QWidget):
         main_layout.addWidget(card_mastodon)
 
         # Signal Connections for Email
-        self.ui_use_email.toggled.connect(self.save_settings)
         self.ui_email_provider.currentIndexChanged.connect(self._on_email_preset_changed)
         self.ui_email_address.editingFinished.connect(self._on_email_address_changed)
-        self.ui_email_display_name.editingFinished.connect(self.save_settings)
         self.ui_email_auth_password_radio.toggled.connect(self._on_email_auth_type_radio_changed)
         self.ui_email_auth_oauth_radio.toggled.connect(self._on_email_auth_type_radio_changed)
-        self.ui_email_password.editingFinished.connect(self.save_settings)
-        self.ui_email_oauth_client_id.editingFinished.connect(self.save_settings)
-        self.ui_email_oauth_client_secret.editingFinished.connect(self.save_settings)
-        self.ui_email_oauth_refresh_token.editingFinished.connect(self.save_settings)
         self.ui_email_oauth_btn.clicked.connect(self._on_start_email_oauth)
         self.ui_email_oauth_paste_btn.clicked.connect(self._on_paste_email_oauth_code)
         self.ui_email_imap_host.editingFinished.connect(self._on_custom_server_field_edited)
@@ -1513,15 +2033,6 @@ class SettingsPanelWidget(QWidget):
         self.ui_email_smtp_host.editingFinished.connect(self._on_custom_server_field_edited)
         self.ui_email_smtp_port.editingFinished.connect(self._on_custom_server_field_edited)
         self.ui_email_smtp_security.currentIndexChanged.connect(self._on_custom_server_field_edited)
-        self.ui_email_username.editingFinished.connect(self.save_settings)
-
-        # Existing Social Signals
-        self.ui_use_whatsapp.toggled.connect(self.save_settings)
-        self.ui_use_moltbook.toggled.connect(self.save_settings)
-        self.ui_moltbook_api_key.editingFinished.connect(self.save_settings)
-        self.ui_use_mastodon.toggled.connect(self.save_settings)
-        self.ui_mastodon_url.editingFinished.connect(self.save_settings)
-        self.ui_mastodon_token.editingFinished.connect(self.save_settings)
 
         main_layout.addStretch()
 
@@ -1600,12 +2111,6 @@ class SettingsPanelWidget(QWidget):
 
         main_layout.addWidget(card2)
 
-
-        self.ui_agency_limit.sliderReleased.connect(self.save_settings)
-        self.ui_wa_buffer.editingFinished.connect(self.save_settings)
-        self.ui_low_token_mode.toggled.connect(self.save_settings)
-        self.ui_max_memories.editingFinished.connect(self.save_settings)
-
         main_layout.addStretch()
 
         self.stack.addWidget(panel)
@@ -1637,10 +2142,6 @@ class SettingsPanelWidget(QWidget):
         layout.addWidget(self.ui_user_email)
         layout.addWidget(self.create_tip(
             "The primary user email address for notifications and contact."))
-
-        self.ui_user_full_name.editingFinished.connect(self.save_settings)
-        self.ui_user_phone_number.editingFinished.connect(self.save_settings)
-        self.ui_user_email.editingFinished.connect(self.save_settings)
 
         main_layout.addWidget(card)
 
@@ -1678,8 +2179,6 @@ class SettingsPanelWidget(QWidget):
         btns_layout.addStretch()
         layout_backup.addLayout(btns_layout)
 
-        self.ui_backup_location.editingFinished.connect(self.save_settings)
-
         main_layout.addWidget(card_backup)
 
         # Pulse Hook Server Card
@@ -1691,7 +2190,6 @@ class SettingsPanelWidget(QWidget):
 
         self.ui_hooks_enabled = QCheckBox("Enable Pulse Hook HTTP Server")
         self.ui_hooks_enabled.setStyleSheet("QCheckBox { color: #DDD; font-size: 13px; font-weight: bold; }")
-        self.ui_hooks_enabled.stateChanged.connect(self.save_settings)
         layout_hooks.addWidget(self.ui_hooks_enabled)
         layout_hooks.addWidget(self.create_tip(
             "Allows third-party apps, Home Assistant, webhooks, and IoT services to securely inject pulses into agent pulse databases."))
@@ -1699,12 +2197,10 @@ class SettingsPanelWidget(QWidget):
         hooks_net_layout = QHBoxLayout()
         hooks_net_layout.addWidget(QLabel("Listen Host:"))
         self.ui_hooks_host = QLineEdit()
-        self.ui_hooks_host.editingFinished.connect(self.save_settings)
         hooks_net_layout.addWidget(self.ui_hooks_host, 2)
 
         hooks_net_layout.addWidget(QLabel("Port:"))
         self.ui_hooks_port = QLineEdit()
-        self.ui_hooks_port.editingFinished.connect(self.save_settings)
         hooks_net_layout.addWidget(self.ui_hooks_port, 1)
 
         layout_hooks.addLayout(hooks_net_layout)
@@ -1725,7 +2221,6 @@ class SettingsPanelWidget(QWidget):
         selected_dir = QFileDialog.getExistingDirectory(self, "Select Backup Location", start_dir)
         if selected_dir:
             self.ui_backup_location.setText(selected_dir)
-            self.save_settings()
 
     def on_create_backups_clicked(self):
         if not self.agent_manager:
@@ -1812,7 +2307,6 @@ class SettingsPanelWidget(QWidget):
         self.ui_email_auth_tip.setText(f"<i>Tip: {tip_text}</i>")
 
         self._update_advanced_summary()
-        self.save_settings()
 
     def _on_email_address_changed(self):
         if self._is_loading:
@@ -1825,7 +2319,6 @@ class SettingsPanelWidget(QWidget):
                 p_idx = self.ui_email_provider.findText(detected)
                 if p_idx >= 0 and p_idx != self.ui_email_provider.currentIndex():
                     self.ui_email_provider.setCurrentIndex(p_idx)
-        self.save_settings()
 
     def _toggle_email_password_visibility(self):
         if self.ui_email_password.echoMode() == QLineEdit.Password:
@@ -1839,7 +2332,6 @@ class SettingsPanelWidget(QWidget):
         is_oauth = self.ui_email_auth_oauth_radio.isChecked()
         self.ui_email_password_container.setVisible(not is_oauth)
         self.ui_email_oauth_container.setVisible(is_oauth)
-        self.save_settings()
 
     def _toggle_advanced_email_settings(self):
         is_visible = self.ui_email_adv_container.isHidden()
@@ -1856,7 +2348,6 @@ class SettingsPanelWidget(QWidget):
 
     def _on_custom_server_field_edited(self):
         self._update_advanced_summary()
-        self.save_settings()
 
     def _on_test_email_connection(self):
         self.ui_email_test_btn.setEnabled(False)
@@ -1942,7 +2433,6 @@ class SettingsPanelWidget(QWidget):
                 self.ui_email_oauth_refresh_token.setText(token)
             self.ui_email_oauth_status.setText(
                 f"<font color='#4CAF50'>{msg}</font>")
-            self.save_settings()
         else:
             self.ui_email_oauth_status.setText(
                 f"<font color='#F44336'>{msg}</font>")
@@ -1974,12 +2464,10 @@ class SettingsPanelWidget(QWidget):
         text, ok = QInputDialog.getText(self, "Add Item", "Enter new item:")
         if ok and text:
             list_widget.addItem(text)
-            self.save_settings()
 
     def remove_from_list(self, list_widget):
         for item in list_widget.selectedItems():
             list_widget.takeItem(list_widget.row(item))
-        self.save_settings()
 
     def set_wizard_mode(self, enabled):
         self.wizard_mode = enabled
@@ -1987,24 +2475,259 @@ class SettingsPanelWidget(QWidget):
             btn.setVisible(not enabled)
         if enabled:
             for i, btn in enumerate(self.save_buttons):
-                if i < 4:
+                if i < 5:
                     btn.setText("Next")
-                elif i == 4:
+                elif i == 5:
                     btn.setText("Finish")
                 else:
                     btn.setText("Save")
+            self._update_wizard_nav_buttons()
         else:
             for btn in self.save_buttons:
                 btn.setText("Save")
+            for btn in self.back_buttons:
+                btn.setVisible(False)
+
+    def _update_wizard_nav_buttons(self):
+        for i, btn in enumerate(self.back_buttons):
+            if self.wizard_mode and self.current_section_index == i:
+                btn.setVisible(1 <= i <= 5)
+            else:
+                btn.setVisible(False)
+
+    def on_back_clicked(self):
+        if self.wizard_mode and self.current_section_index > 0:
+            self.set_section(self.current_section_index - 1)
 
     def set_section(self, index):
         if 0 <= index < self.stack.count():
             self.current_section_index = index
             self.stack.setCurrentIndex(index)
+            if self.wizard_mode:
+                self._update_wizard_nav_buttons()
 
     def request_close(self):
         if not self.wizard_mode:
+            self.save_settings()
             self.close_requested.emit()
+
+    def _get_provider_radio(self, provider_id: str):
+        radio_map = {
+            "gemini": getattr(self, "ui_use_gemini_api", None),
+            "claude": getattr(self, "ui_use_claude_api", None),
+            "chatgpt": getattr(self, "ui_use_chatgpt_api", None),
+            "deepseek": getattr(self, "ui_use_deepseek_api", None),
+            "antigravity": getattr(self, "ui_agy_mode", None),
+        }
+        return radio_map.get(provider_id)
+
+    def _select_provider(self, provider_id: str):
+        target_radio = self._get_provider_radio(provider_id)
+        if target_radio and not target_radio.isChecked():
+            target_radio.setChecked(True)
+        self._update_provider_accordion(provider_id)
+
+    def _on_provider_radio_toggled(self, provider_id: str, checked: bool):
+        if checked:
+            self._update_provider_accordion(provider_id)
+
+    def _update_provider_accordion(self, selected_provider_id: str):
+        if not hasattr(self, "provider_cards"):
+            return
+        for pid, card in self.provider_cards.items():
+            card.set_expanded(pid == selected_provider_id)
+
+    def _get_voice_radio(self, voice_provider_id: str):
+        radio_map = {
+            "piper": getattr(self, "ui_use_piper_tts", None),
+            "gemini": getattr(self, "ui_use_gemini_tts", None),
+        }
+        return radio_map.get(voice_provider_id)
+
+    def _select_voice_provider(self, voice_provider_id: str):
+        target_radio = self._get_voice_radio(voice_provider_id)
+        if target_radio and not target_radio.isChecked():
+            target_radio.setChecked(True)
+        self._update_voice_accordion(voice_provider_id)
+
+    def _on_voice_radio_toggled(self, voice_provider_id: str, checked: bool):
+        if checked:
+            self._update_voice_accordion(voice_provider_id)
+
+    def _update_voice_accordion(self, selected_voice_provider_id: str):
+        if not hasattr(self, "voice_cards"):
+            return
+        for vid, card in self.voice_cards.items():
+            card.set_expanded(vid == selected_voice_provider_id)
+
+    def _update_social_accordions(self):
+        if not hasattr(self, "social_cards"):
+            return
+        for tool_id, card in self.social_cards.items():
+            if hasattr(card, "checkbox"):
+                card.set_expanded(card.checkbox.isChecked())
+
+    def _setup_provider_model_controls(self, provider_id, layout):
+        cfg = PROVIDER_MODELS[provider_id]
+
+        layout.addSpacing(6)
+        layout.addWidget(QLabel("AI Model:"))
+        combo_model = QComboBox()
+        combo_model.addItems(cfg["models"])
+        custom_model = QLineEdit()
+        custom_model.setPlaceholderText("Enter custom model identifier...")
+        custom_model.setVisible(False)
+        combo_model.currentTextChanged.connect(
+            lambda text, cm=custom_model: cm.setVisible(text == "Custom..."))
+        layout.addWidget(combo_model)
+        layout.addWidget(custom_model)
+
+        layout.addSpacing(4)
+        layout.addWidget(QLabel("Thinking Level:"))
+        combo_thinking = QComboBox()
+        combo_thinking.addItems(THINKING_LEVELS)
+        combo_thinking.setCurrentText("low")
+        layout.addWidget(combo_thinking)
+        tip_thinking = self.create_tip(
+            "Low thinking tends to perform better and agents are able to contemplate within the Open Amity framework anyway which has the benefit of audit trails.")
+        layout.addWidget(tip_thinking)
+
+        layout.addWidget(QLabel("Light Model:"))
+        combo_light = QComboBox()
+        combo_light.addItems(cfg["light_models"])
+        custom_light = QLineEdit()
+        custom_light.setPlaceholderText("Enter custom light model identifier...")
+        custom_light.setVisible(False)
+        combo_light.currentTextChanged.connect(
+            lambda text, cl=custom_light: cl.setVisible(text == "Custom..."))
+        layout.addWidget(combo_light)
+        layout.addWidget(custom_light)
+        tip_light = self.create_tip(
+            "The light model is used for low token mode, background subagents, rapid utility tasks (such as query reformulation), and acts as an automatic fallback if the primary model encounters rate limits or errors.")
+        layout.addWidget(tip_light)
+
+        setattr(self, f"ui_{provider_id}_model", combo_model)
+        setattr(self, f"ui_{provider_id}_custom_model", custom_model)
+        setattr(self, f"ui_{provider_id}_thinking_level", combo_thinking)
+        setattr(self, f"ui_{provider_id}_thinking_tip", tip_thinking)
+        setattr(self, f"ui_{provider_id}_light_model", combo_light)
+        setattr(self, f"ui_{provider_id}_custom_light_model", custom_light)
+        setattr(self, f"ui_{provider_id}_light_model_tip", tip_light)
+
+    def _load_provider_model_controls(self, provider_id):
+        cfg = PROVIDER_MODELS.get(provider_id)
+        if not cfg:
+            return
+        combo_model = getattr(self, f"ui_{provider_id}_model", None)
+        custom_model = getattr(self, f"ui_{provider_id}_custom_model", None)
+        combo_thinking = getattr(self, f"ui_{provider_id}_thinking_level", None)
+        combo_light = getattr(self, f"ui_{provider_id}_light_model", None)
+        custom_light = getattr(self, f"ui_{provider_id}_custom_light_model", None)
+
+        if not combo_model:
+            return
+
+        # 1. Primary Model
+        model_val = self.settings.get(f"core.{provider_id}.model", "")
+        if not model_val:
+            legacy_key = "core.antigravity.agy-models" if provider_id == "antigravity" else f"core.{provider_id}.{provider_id}-models"
+            legacy = self.settings.get(legacy_key, [])
+            if isinstance(legacy, list) and legacy:
+                model_val = legacy[0]
+            elif isinstance(legacy, str):
+                model_val = legacy
+        if not model_val:
+            model_val = cfg["default_model"]
+
+        idx = combo_model.findText(model_val)
+        if idx >= 0:
+            combo_model.setCurrentIndex(idx)
+            if custom_model:
+                custom_model.setText("")
+                custom_model.setVisible(False)
+        else:
+            c_idx = combo_model.findText("Custom...")
+            if c_idx >= 0:
+                combo_model.setCurrentIndex(c_idx)
+            if custom_model:
+                custom_model.setText(model_val)
+                custom_model.setVisible(True)
+
+        # 2. Thinking Level
+        thinking_val = str(self.settings.get(f"core.{provider_id}.thinking-level", "low")).lower()
+        if combo_thinking:
+            t_idx = combo_thinking.findText(thinking_val)
+            if t_idx >= 0:
+                combo_thinking.setCurrentIndex(t_idx)
+            else:
+                combo_thinking.setCurrentText("low")
+
+        # 3. Light Model
+        light_val = self.settings.get(f"core.{provider_id}.light-model", "")
+        if not light_val:
+            legacy_light = self.settings.get(f"core.{provider_id}.light-models", [])
+            if isinstance(legacy_light, list) and legacy_light:
+                light_val = legacy_light[0]
+            elif isinstance(legacy_light, str):
+                light_val = legacy_light
+        if not light_val:
+            light_val = cfg["default_light_model"]
+
+        if combo_light:
+            idx_l = combo_light.findText(light_val)
+            if idx_l >= 0:
+                combo_light.setCurrentIndex(idx_l)
+                if custom_light:
+                    custom_light.setText("")
+                    custom_light.setVisible(False)
+            else:
+                c_idx = combo_light.findText("Custom...")
+                if c_idx >= 0:
+                    combo_light.setCurrentIndex(c_idx)
+                if custom_light:
+                    custom_light.setText(light_val)
+                    custom_light.setVisible(True)
+
+    def _save_provider_model_controls(self, provider_id):
+        cfg = PROVIDER_MODELS.get(provider_id)
+        if not cfg:
+            return
+        combo_model = getattr(self, f"ui_{provider_id}_model", None)
+        custom_model = getattr(self, f"ui_{provider_id}_custom_model", None)
+        combo_thinking = getattr(self, f"ui_{provider_id}_thinking_level", None)
+        combo_light = getattr(self, f"ui_{provider_id}_light_model", None)
+        custom_light = getattr(self, f"ui_{provider_id}_custom_light_model", None)
+
+        if not combo_model:
+            return
+
+        # Primary Model
+        if combo_model.currentText() == "Custom...":
+            primary_model = (custom_model.text().strip() if custom_model else "") or cfg["default_model"]
+        else:
+            primary_model = combo_model.currentText().strip() or cfg["default_model"]
+
+        # Thinking Level
+        thinking_level = (combo_thinking.currentText().strip().lower() if combo_thinking else "low") or "low"
+
+        # Light Model
+        if combo_light and combo_light.currentText() == "Custom...":
+            light_model = (custom_light.text().strip() if custom_light else "") or cfg["default_light_model"]
+        elif combo_light:
+            light_model = combo_light.currentText().strip() or cfg["default_light_model"]
+        else:
+            light_model = cfg["default_light_model"]
+
+        self.settings.set(f"core.{provider_id}.model", primary_model)
+        self.settings.set(f"core.{provider_id}.thinking-level", thinking_level)
+        self.settings.set(f"core.{provider_id}.light-model", light_model)
+
+        # Legacy lists synchronization for backwards compatibility
+        if provider_id == "antigravity":
+            self.settings.set("core.antigravity.agy-models", [primary_model, light_model])
+        else:
+            self.settings.set(f"core.{provider_id}.{provider_id}-models", [primary_model, light_model])
+            self.settings.set(f"core.{provider_id}.light-models", [light_model])
 
     def load_system_config(self):
         if self.config is None:
@@ -2072,6 +2795,18 @@ class SettingsPanelWidget(QWidget):
         self._is_loading = True
 
         if self.settings:
+            saved_preset = self.settings.get("core.agent.preset")
+            if not saved_preset:
+                cur_name = self.settings.get("core.agent.name", "")
+                cur_arch = self.settings.get("core.agent.archetype", "")
+                saved_preset = "amy"
+                for pid, pdata in AGENT_PRESETS.items():
+                    if (cur_name and pdata["name"].lower() == cur_name.lower()) or \
+                       (cur_arch and pdata["archetype"].lower() == cur_arch.lower()):
+                        saved_preset = pid
+                        break
+            self.select_preset(saved_preset, populate_ui=False)
+
             self.ui_agent_name.setText(
                 self.settings.get("core.agent.name", "Amy"))
             self.ui_archetype.setText(self.settings.get(
@@ -2172,6 +2907,9 @@ class SettingsPanelWidget(QWidget):
                 self.ui_use_gemini_tts.setChecked(True)
             else:
                 self.ui_use_piper_tts.setChecked(True)
+                tts_provider = "piper"
+
+            self._update_voice_accordion(tts_provider)
 
             gemini_tts_key = self.settings.get_env("GEMINI_TTS_API_KEY", "")
             if not gemini_tts_key:
@@ -2182,14 +2920,21 @@ class SettingsPanelWidget(QWidget):
             provider = self.settings.get("core.api-provider", "gemini")
             if agy_mode:
                 self.ui_agy_mode.setChecked(True)
+                sel_p = "antigravity"
             elif provider == "claude":
                 self.ui_use_claude_api.setChecked(True)
+                sel_p = "claude"
             elif provider in ["chatgpt", "openai"]:
                 self.ui_use_chatgpt_api.setChecked(True)
+                sel_p = "chatgpt"
             elif provider == "deepseek":
                 self.ui_use_deepseek_api.setChecked(True)
+                sel_p = "deepseek"
             else:
                 self.ui_use_gemini_api.setChecked(True)
+                sel_p = "gemini"
+
+            self._update_provider_accordion(sel_p)
 
             api_key = self.settings.get_env("GEMINI_API_KEY", "")
             self.ui_gemini_api_key.setText(api_key)
@@ -2202,6 +2947,9 @@ class SettingsPanelWidget(QWidget):
 
             deepseek_key = self.settings.get_env("DEEPSEEK_API_KEY", "")
             self.ui_deepseek_api_key.setText(deepseek_key)
+
+            for p in ["gemini", "claude", "chatgpt", "deepseek"]:
+                self._load_provider_model_controls(p)
 
             self.ui_mastodon_url.setText(self.settings.get_env(
                 "MASTODON_API_BASE_URL", "https://mastodon.social"))
@@ -2282,6 +3030,7 @@ class SettingsPanelWidget(QWidget):
             if hasattr(self, 'ui_use_mastodon'):
                 self.ui_use_mastodon.setChecked(
                     self.settings.get("core.tools.mastodon", False))
+            self._update_social_accordions()
 
         self.load_system_config()
         self._is_loading = False
@@ -2396,6 +3145,9 @@ class SettingsPanelWidget(QWidget):
                 self.settings.set_env(
                     "DEEPSEEK_API_KEY", self.ui_deepseek_api_key.text().strip())
 
+            for p in ["gemini", "claude", "chatgpt", "deepseek"]:
+                self._save_provider_model_controls(p)
+
             if hasattr(self, 'ui_mastodon_url'):
                 self.settings.set_env("MASTODON_API_BASE_URL",
                                       self.ui_mastodon_url.text().strip())
@@ -2457,16 +3209,15 @@ class SettingsPanelWidget(QWidget):
         self.settings_saved.emit()
 
     def on_save_clicked(self):
-        self.save_settings()
-
         if self.wizard_mode:
-            if self.current_section_index < 4:
+            if self.current_section_index < 5:
                 self.set_section(self.current_section_index + 1)
             else:
                 if self.settings:
                     self.settings.set("core.first-run", False)
-                    self.settings.save()
+                self.save_settings()
                 self.wizard_finished.emit()
                 self.close_requested.emit()
         else:
+            self.save_settings()
             self.close_requested.emit()

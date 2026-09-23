@@ -18,10 +18,11 @@ from core.chatroom_manager import ChatroomManager
 from core.config_manager import ConfigManager
 
 try:
-    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR
+    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR, MODERN_SCROLLBAR_STYLE
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
+    MODERN_SCROLLBAR_STYLE = ""
 
 
 class ChatroomBridgeSignals(QObject):
@@ -53,14 +54,24 @@ class ChatroomView(QWidget):
         # Console Log for Global Stream
         self.console_log = QTextEdit()
         self.console_log.setReadOnly(True)
-        self.console_log.setStyleSheet(
-            "background-color: #000; color: #0F0; border: none; font-family: 'Ubuntu Mono'; font-size: 12px; padding: 10px;")
+        self.console_log.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #000;
+                color: #0F0;
+                border: none;
+                font-family: 'Ubuntu Mono';
+                font-size: 12px;
+                padding: 10px;
+            }}
+            {MODERN_SCROLLBAR_STYLE}
+        """)
         self.console_log.hide()
 
         # Footer
         self.footer_widget = QWidget()
+        self.footer_widget.setObjectName("footerWidget")
         self.footer_widget.setStyleSheet(
-            "background-color: #222; border-top: 1px solid #333;")
+            "QWidget#footerWidget { background-color: #222; border-top: 1px solid #333; }")
         self.footer_layout = QHBoxLayout(self.footer_widget)
         self.footer_layout.setContentsMargins(20, 10, 20, 10)
         self.footer_layout.setSpacing(10)
@@ -71,11 +82,12 @@ class ChatroomView(QWidget):
         self.text_input.returnPressed.connect(self.send_user_message)
         self.footer_layout.addWidget(self.text_input, 1)
 
-        self.btn_send = QPushButton("Send")
+        self.btn_send = QPushButton("⌯⌲")
+        self.btn_send.setToolTip("Send")
         self.btn_send.setMinimumSize(80, 40)
         self.btn_send.clicked.connect(self.send_user_message)
         self.btn_send.setStyleSheet(
-            "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-weight: bold; } QPushButton:hover { background-color: #444; }")
+            "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-bottom: 4px; } QPushButton:hover { background-color: #444; }")
         self.footer_layout.addWidget(self.btn_send)
 
         self.main_layout.addWidget(self.footer_widget)

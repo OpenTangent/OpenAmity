@@ -137,3 +137,38 @@ def test_system_tool_annotations_and_cerebrum_loading():
         assert isinstance(hints, dict)
 
 
+def test_system_tool_contemplate():
+    """Verify System_contemplate declaration, execution, and Cerebrum routing."""
+    from core.cerebrum import Cerebrum
+
+    tool = SystemTool(orchestrator=None)
+
+    # 1. Verify commands list
+    assert any("contemplate" in cmd for cmd in tool.commands)
+
+    # 2. Verify tool declaration
+    declarations = tool.get_tool_declarations()
+    contemplate_decl = next((d for d in declarations if d["name"] == "System_contemplate"), None)
+    assert contemplate_decl is not None
+    assert "contemplat" in contemplate_decl["description"].lower()
+    assert contemplate_decl["parameters"]["type"] == "OBJECT"
+
+    # 3. Direct execution
+    result = tool.execute("contemplate")
+    assert "Contemplation cycle completed" in result
+
+    # 4. Execution with arbitrary args / kwargs (no-op filler behavior)
+    result_with_args = tool.execute("contemplate", "thought_arg", notes="planning next move")
+    assert "Contemplation cycle completed" in result_with_args
+
+    # 5. Cerebrum routing
+    cerebrum = Cerebrum(orchestrator=None)
+    cerebrum.register_skill(tool)
+
+    cerebrum_result = cerebrum.execute_tool_call("System_contemplate", {})
+    assert "Contemplation cycle completed" in cerebrum_result
+
+    cerebrum_result_kwargs = cerebrum.execute_tool_call("System_contemplate", {"notes": "evaluating options"})
+    assert "Contemplation cycle completed" in cerebrum_result_kwargs
+
+

@@ -13,6 +13,9 @@ except ImportError:
 
 class WebSearchSkill(Tool):
     name = "WebSearch"
+    icon = "🔍"
+    color = "#00BCD4"
+    async_commands = []
     description = "Allows you to search the web, read webpages, and download images for viewing. Use this to find up-to-date information or answer questions you don't know the answer to."
     commands = ["search", "view_page", "download_image"]
 

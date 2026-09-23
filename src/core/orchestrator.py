@@ -48,6 +48,9 @@ class AmityOrchestrator:
         self.on_amplitude_emitted = Signal()  # float
         self.on_paused_state_changed = Signal()  # is_paused (bool)
         self.on_pause_pending = Signal()  # is_pending (bool)
+        self.on_tool_started = Signal()  # call_id, tool_name, icon, color, call_text, is_async
+        self.on_tool_finished = Signal()  # call_id
+        self.subagent_call_ids = {}
 
         self.settings_manager = SettingsManager(agent_id=self.agent_id)
         self.config_manager = ConfigManager()
@@ -395,6 +398,12 @@ class AmityOrchestrator:
     def finish_thinking(self):
         logging.debug("finish_thinking called")
         self.is_thinking = False
+        if hasattr(self, 'mempalace_manager') and self.mempalace_manager:
+            try:
+                is_sleep = getattr(self, '_is_sleep_cycle', False)
+                self.mempalace_manager.flush_turn_coactivation(is_sleep_cycle=is_sleep)
+            except Exception as e:
+                logging.warning(f"Error flushing turn coactivation in finish_thinking: {e}")
         self.check_cycle_completion()
 
     @with_agent_context
@@ -777,6 +786,8 @@ class AmityOrchestrator:
             function_name = call.name
             tool_name = function_name.split(
                 "_")[0] if "_" in function_name else function_name
+            command_name = function_name.split(
+                "_", 1)[1] if "_" in function_name else ""
             args = call.args or {}
 
             if len(args) == 1 and "text" in args:
@@ -788,22 +799,50 @@ class AmityOrchestrator:
 
             if args_str == "()":
                 log_msg = f"[Weight: {current_weight:.1f}] {function_name}()"
+                raw_call_text = f"{function_name}()"
             else:
                 log_msg = f"[Weight: {current_weight:.1f}] {function_name}: {args_str}"
+                raw_call_text = f"{function_name}: {args_str}"
 
             logging.getLogger(f"tool.{tool_name}").info(log_msg)
+
+            # Determine icon, color, and async status from tool object
+            tool_obj = self.cerebrum.tools.get(tool_name)
+            if not tool_obj:
+                from core.cerebrum import Tool
+                tool_cls = Tool.get_tool_class(tool_name)
+                icon = getattr(tool_cls, "icon", "🔧") if tool_cls else "🔧"
+                color = getattr(tool_cls, "color", "#888888") if tool_cls else "#888888"
+                is_async = False
+            else:
+                icon = getattr(tool_obj, "icon", "🔧")
+                color = getattr(tool_obj, "color", "#888888")
+                is_async = tool_obj.is_command_async(command_name, args)
+
+            import uuid
+            call_id = str(uuid.uuid4())[:8]
+
+            self.on_tool_started.emit(call_id, tool_name, icon, color, raw_call_text, is_async)
 
             executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
             executed_tools.append(executed_tool_sig)
             try:
-                skill_result = self.cerebrum.execute_tool_call(function_name, args)
+                skill_result = self.cerebrum.execute_tool_call(function_name, args, call_id=call_id)
                 if isinstance(skill_result, dict):
                     function_responses.append((function_name, skill_result))
                 else:
                     function_responses.append(
                         (function_name, {"result": str(skill_result)}))
+
+                # If async tool returned an immediate error, dismiss the pip
+                if is_async:
+                    result_str = str(skill_result)
+                    if result_str.startswith("Error:"):
+                        self.on_tool_finished.emit(call_id)
             except Exception as e:
                 function_responses.append((function_name, {"error": str(e)}))
+                if is_async:
+                    self.on_tool_finished.emit(call_id)
 
         self.on_tool_execution_finished(function_responses, executed_tools)
 
@@ -912,6 +951,14 @@ class AmityOrchestrator:
                 last_resp["result"] = f"{last_resp['result']}{budget_alert}"
                 function_responses[-1] = (last_name, last_resp)
             self.gemini_worker.send_function_responses(function_responses)
+
+        # Flush turn co-activation in morphological memory layer (§9.3)
+        if hasattr(self, 'mempalace_manager') and self.mempalace_manager:
+            try:
+                is_sleep = getattr(self, '_is_sleep_cycle', False)
+                self.mempalace_manager.flush_turn_coactivation(is_sleep_cycle=is_sleep)
+            except Exception as e:
+                logging.warning(f"Error flushing turn coactivation in orchestrator: {e}")
 
     @property
     def worker(self):
@@ -1041,7 +1088,7 @@ class AmityOrchestrator:
                     self.dispose_subagent(sid)
         threading.Thread(target=gc_loop, daemon=True).start()
 
-    def spawn_subagent(self, task_description, model_tier="light"):
+    def spawn_subagent(self, task_description, model_tier="light", call_id=None):
         if self.is_paused:
             return "Error: Agent is currently paused."
         if len(self.active_subagents) >= 6:
@@ -1058,6 +1105,8 @@ class AmityOrchestrator:
 
         self.active_subagents[sid] = worker
         self.subagent_last_activity[sid] = time.time()
+        if call_id:
+            self.subagent_call_ids[sid] = call_id
 
         worker.send_prompt(task_description)
         return f"Subagent {sid} spawned."
@@ -1076,6 +1125,9 @@ class AmityOrchestrator:
             del self.active_subagents[sid]
             if sid in self.subagent_last_activity:
                 del self.subagent_last_activity[sid]
+            cid = self.subagent_call_ids.pop(sid, None)
+            if cid:
+                self.on_tool_finished.emit(cid)
             return f"Subagent {sid} disposed."
         return f"Error: Subagent {sid} not found."
 
@@ -1096,6 +1148,9 @@ class AmityOrchestrator:
             return
 
         if text:
+            cid = self.subagent_call_ids.pop(sid, None)
+            if cid:
+                self.on_tool_finished.emit(cid)
             self.event_queue.append(
                 {"type": "pulse", "text": f"[System Feedback: Subagent {sid} finished - {text}]", "purpose": "Subagent task completed"})
             self.check_cycle_completion()
@@ -1128,6 +1183,9 @@ class AmityOrchestrator:
 
     @with_agent_context
     def handle_subagent_error(self, sid, error):
+        cid = self.subagent_call_ids.pop(sid, None)
+        if cid:
+            self.on_tool_finished.emit(cid)
         self.event_queue.append(
             {"type": "pulse", "text": f"[System Warning: Subagent {sid} encountered an error: {error}]", "purpose": "Subagent task error"})
         self.check_cycle_completion()

@@ -74,3 +74,18 @@ def get_backup_targets_file(agent_id: str) -> str:
     """Returns the path to the backup targets JSON file for a specific agent"""
     return os.path.join(get_base_dir_for(agent_id), "backup_targets.json")
 
+
+def get_browser_data_dir(agent_id: str) -> str:
+    """Returns the persistent browser profile directory for a specific agent"""
+    return os.path.join(get_base_dir_for(agent_id), "browser_data")
+
+
+def get_browser_cache_dir(agent_id: str) -> str:
+    """Returns the browser cache directory for a specific agent"""
+    return os.path.join(get_browser_data_dir(agent_id), "cache")
+
+
+def get_browser_download_dir(agent_name: str) -> str:
+    """Returns the default download directory for browser-initiated downloads"""
+    return os.path.expanduser(f"~/Downloads/{agent_name}")
+

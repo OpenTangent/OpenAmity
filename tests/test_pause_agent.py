@@ -205,7 +205,7 @@ def test_gui_pause_button_and_layout(qapp, temp_agent_dir):
     assert pause_idx == 0  # First item in footer
 
     # 2. Verify initial state (playing/active)
-    assert view.btn_pause.text() == "⏸"
+    assert view.btn_pause.text() == "❚❚"
     assert view.text_input.isEnabled() is True
 
     # 3. Simulate pausing
@@ -220,7 +220,7 @@ def test_gui_pause_button_and_layout(qapp, temp_agent_dir):
     # 4. Simulate unpausing
     orch.is_paused = False
     orch.on_paused_state_changed.emit(False)
-    assert view.btn_pause.text() == "⏸"
+    assert view.btn_pause.text() == "❚❚"
     assert view.text_input.isEnabled() is True
     assert view.btn_send.isEnabled() is True
     assert view.btn_mic.isEnabled() is True
@@ -236,7 +236,7 @@ def test_chatroom_view_does_not_have_pause_button(qapp, temp_agent_dir):
     for i in range(chatroom.footer_layout.count()):
         widget = chatroom.footer_layout.itemAt(i).widget()
         if widget and hasattr(widget, "text"):
-            assert widget.text() != "⏸" and widget.text() != "▶"
+            assert widget.text() != "❚❚" and widget.text() != "▶"
 
 
 def test_agent_tab_button_paused_indicator(qapp):

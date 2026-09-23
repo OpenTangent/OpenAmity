@@ -4,9 +4,13 @@ from core.mempalace_manager import MemPalaceManager
 
 class MemPalaceTool(Tool):
     name = "MemPalace"
+    icon = "🧠"
+    color = "#CD853F"
+    async_commands = []
     description = "Interface to the agent's MemPalace memory system."
     commands = ["search", "recall", "add_memory", "delete_memory",
-                "status", "add_short_term", "remove_short_term", "update_mirror", "apply_identity_delta"]
+                "status", "add_short_term", "remove_short_term", "update_mirror", "apply_identity_delta",
+                "graph_status", "link_setpoint"]
 
     def __init__(self, orchestrator=None):
         super().__init__(orchestrator)
@@ -130,6 +134,23 @@ class MemPalaceTool(Tool):
                 self.orchestrator.build_system_prompt()
             return res
 
+        elif command == "graph_status":
+            import json
+            return json.dumps(self.manager.get_graph_status(), indent=2)
+
+        elif command == "link_setpoint":
+            import json
+            goal_key = kwargs.get("goal_key") or (args[0] if args else "")
+            drawer_ids = kwargs.get("drawer_ids") or (args[1] if len(args) > 1 else [])
+            if not goal_key or not drawer_ids:
+                return "Error: goal_key and drawer_ids are required."
+            if isinstance(drawer_ids, str):
+                try:
+                    drawer_ids = json.loads(drawer_ids)
+                except Exception:
+                    drawer_ids = [d.strip() for d in drawer_ids.split(",") if d.strip()]
+            return self.manager.link_setpoint(goal_key, drawer_ids)
+
         return f"Unknown command: {command}"
 
     def get_tool_declarations(self) -> list:
@@ -248,6 +269,30 @@ class MemPalaceTool(Tool):
                         "rationale": {"type": "STRING", "description": "Explanation of the lived experience and conversational confirmation with the user that justified this evolution."}
                     },
                     "required": ["target_section", "delta_type", "content"]
+                }
+            },
+            {
+                "name": "MemPalace_graph_status",
+                "description": "Inspect the morphological memory graph topology: node count, edge count, clustering coefficient, and top conductive highways.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "MemPalace_link_setpoint",
+                "description": "Explicitly connect an aspiration or task goal setpoint to target memory drawer IDs.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "goal_key": {"type": "STRING", "description": "The aspiration or task ID (e.g. 'asp_123456' or 'tsk_abcdef')."},
+                        "drawer_ids": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "List of memory drawer IDs to couple to this goal setpoint."
+                        }
+                    },
+                    "required": ["goal_key", "drawer_ids"]
                 }
             }
         ]

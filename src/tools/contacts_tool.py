@@ -4,6 +4,9 @@ from core.address_book import AddressBookManager
 
 class ContactsTool(Tool):
     name = "Contacts"
+    icon = "👤"
+    color = "#009688"
+    async_commands = []
     description = "Manage and look up people in the agent's Address Book."
     commands = ["add_contact", "update_contact",
                 "delete_contact", "lookup_contact", "list_contacts"]

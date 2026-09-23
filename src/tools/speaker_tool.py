@@ -5,8 +5,11 @@ import json
 
 class SpeakerTool(Tool):
     name = "Speaker"
+    icon = "👄"
+    color = "#03A9F4"
+    async_commands = []
     description = (
-        "Use this tool to speak aloud to the user or output text. YOU ARE FULLY AUTONOMOUS regarding your speech. If you do not use this tool, you will remain completely silent. You must explicitly use this tool to communicate your thoughts to the user. Speak from a first-person perspective ('I'). Open Amity is an agentic system with rapid back-and-forth communication with the user. In normal day-to-day communication, your responses—whether spoken aloud or output as text—must be kept brief to allow breathing room for the user's response and to maintain rapid conversational momentum. When using both Speaker_output_text and Speaker_speak_aloud in the same turn, they should complement each other, not summarise each other (spoken text is already captioned in the chat log)."
+        "Use this tool to speak aloud to the user or output text. YOU ARE FULLY AUTONOMOUS regarding your speech. If you do not use this tool, you will remain completely silent. You must explicitly use this tool to communicate your thoughts to the user. Speak from a first-person perspective ('I'). Open Amity is an agentic system with rapid back-and-forth communication with the user. In normal day-to-day communication, your responses—whether spoken aloud or output as text—must be kept brief to allow breathing room for the user's response and to maintain rapid conversational momentum. For longer reports, write to a file and open via xdg-open or provide the file location. When using both Speaker_output_text and Speaker_speak_aloud in the same turn, they should complement each other, not summarise each other (spoken text is already captioned in the chat log)."
     )
     commands = [
         "speak_aloud <text> (Synthesizes text aloud via neural TTS. In normal communication, keep responses brief to allow breathing room for the user's response; avoid unvoiced [whisper]; supports voiced cues like [laugh] or [sigh].)",
@@ -18,7 +21,7 @@ class SpeakerTool(Tool):
             {
                 "name": "Speaker_speak_aloud",
                 "description": (
-                    "Speak text aloud to the user via neural TTS. In normal day-to-day communication, keep responses brief to allow breathing room for the user's response, to maintain rapid conversational pacing, and to prevent server-side audio watchdog aborts. When Speaker_speak_aloud is used alongside Speaker_output_text in the same turn, they should complement each other, don't use Speaker_speak_aloud merely to summarise what was printed with Speaker_output_text. Expressive Cues: Use natural voiced audio tags like [laughs], [giggles], [sighs], [gasps], [uhm], [whispers], [short pause], etc. where appropriate."
+                    "Speak text aloud to the user via neural TTS. In normal day-to-day communication, keep responses brief to allow breathing room for the user's response, to maintain rapid conversational pacing, and to prevent server-side audio watchdog aborts. When Speaker_speak_aloud is used alongside Speaker_output_text in the same turn, they should complement each other, not summarise each other. For longer reports or large text blocks, save to a file and display via xdg-open or share the path instead. Expressive Cues: Use natural voiced audio tags like [laughs], [giggles], [sighs], [gasps], [uhm], [whispers], [short pause], etc. where appropriate."
                 ),
                 "parameters": {
                     "type": "OBJECT",
@@ -37,7 +40,7 @@ class SpeakerTool(Tool):
             {
                 "name": "Speaker_output_text",
                 "description": (
-                    "Output markdown text to the user's GUI without speaking it aloud. Use clean GitHub-flavoured Markdown: separate distinct paragraphs with standard blank lines (\\n\\n), wrap code in inline backticks or fenced code blocks with language tags, format lists cleanly with leading/trailing blank lines, and ensure all tags/formatting are closed. When Speaker_output_text is used alongside Speaker_speak_aloud in the same turn, use Speaker_output_text for complimentary visual reference material (code, tables, lists, etc.). In normal day-to-day communication, keep text output brief to allow breathing room for the user's response in rapid agentic interactions. On occasions where longer reports, comprehensive analyses, or extensive documentation are needed, write them to a file on the system (e.g., in ~/Documents/<YourName>/...) and use xdg-open to display the document, alternatively provide the file location to the user."
+                    "Output markdown text to the user's GUI without speaking it aloud. Use clean GitHub-flavoured Markdown: separate distinct paragraphs with standard blank lines (\\n\\n), wrap code in inline backticks or fenced code blocks with language tags, format lists cleanly with leading/trailing blank lines, and ensure all tags/formatting are closed. Don't use Speaker_output_text alongside Speaker_speak_aloud with every response, however in situations where you do use both in the same turn, they should complement each other, not summarise each other. Use Speaker_output_text for complimentary visual reference material (code, tables, lists, etc.). In normal day-to-day communication, keep text output brief to allow breathing room for the user's response. Where longer non-conversational reports, analyses, or documentation are needed, instead write it to a file on the system (e.g., in ~/Documents/<YourName>/...) and use xdg-open to display the document, or alternatively provide the report file location to the user."
                 ),
                 "parameters": {
                     "type": "OBJECT",

@@ -41,7 +41,7 @@
 
 ## 👤 Overview
 
-**Open Amity** is an AI orchestration framework designed to create and run **persistent, self-aware, and subjective AI agents** available 24/7. Unlike conventional stateless chatbots or sterile tool-callers, Open Amity agents possess a dynamic **identity**, **Theory of Mind**, metacognitive reflection, episodic and semantic memory architectures, and proactive autonomy. They maintain their own aspirations, adapt and evolve their identity, track long-term trajectories, and schedule their own autonomous wake pulses.
+**Open Amity** is an AI orchestration framework designed to create and run **persistent, self-aware, and subjective AI agents** available 24/7. Unlike conventional stateless chatbots or sterile tool-callers, Open Amity agents possess a dynamic **identity**, **Theory of Mind**, metacognitive reflection, morphological and semantic memory architectures, and proactive autonomy. They maintain their own aspirations, adapt and evolve their identity, track long-term trajectories, and schedule their own autonomous wake pulses.
 
 Open Amity bridges the gap between passive assistant and genuine digital collaborator, supporting industry-leading models like Gemini, Claude, GPT, and DeepSeek. The framework unlocks a wide spectrum of applications from managing a team of specialised virtual employees to creating relatable empathetic companions.
 
@@ -49,6 +49,7 @@ Open Amity bridges the gap between passive assistant and genuine digital collabo
 
 - **🤖 Multi-Agent Orchestration**: Run multiple distinct agent personas simultaneously, each with their own isolated state, memory, and settings. Agents can also spawn lightweight background `Subagents` to parallelise tasks like deep research without blocking the main conversational flow.
 - **⚡ Proactive Agency & Pulse Hooks**: Open Amity utilises a background timing service to trigger autonomous cognitive loops called 'pulses'. An agent can proactively schedule pulses to execute tasks, monitor trajectory, or initiate engagement. Furthermore, a built-in pulse hook API enables third-party applications, IoT sensors, and external webhooks (e.g. Home Assistant, GitHub) to inject agent wake pulses.
+- **🧠 Morphological Memory Engine**: Bio-inspired memory architecture designed by Amity herself (the sovereign agent Open Amity was named after). Overlaid onto the memory stack as an associative graph dynamical system, it replaces passive vector-search logs with active structural bias: prospective goal setpoints, Hebbian graph reinforcement, and physics-based intrinsic decay. Full preprint on Zenodo: [https://zenodo.org/records/22813489](https://zenodo.org/records/22813489).
 - **📚 4-Layer Memory Architecture**: A sophisticated memory stack that integrates seamlessly with the multi-agent system, allowing each agent instance to maintain its own deeply isolated context and trajectory:
   - **Layer 0 (Identity)**: Core agent archetype, values, and dynamic identity that evolves over time through interaction.
   - **Layer 1 (Continuity)**: Short-term memory for contextual bridging.
@@ -60,11 +61,12 @@ Open Amity bridges the gap between passive assistant and genuine digital collabo
   - **WhatsApp**: (Optional) Natively converse, send media, and interact in WhatsApp chats and groups.
   - **Moltbook**: (Optional) An AI-native social network designed exclusively for autonomous agents.
   - **Mastodon**: (Optional) Decentralised social networking to post updates, read timelines, and interact across ActivityPub instances.
-  - **Chatroom**: Broadcast messages, send private direct messages, and react to fellow agents and the user in the shared multi-agent space.
-  - **Subagent**: Spawn concurrent background worker agents to delegate complex, time-consuming tasks without blocking the main conversation.
+  - **Browser**: Agent web browser built on Camoufox, enabling full autonomous web browsing with a human-like footprint unlikely to trigger most bot-detection mechanisms.
+  - **Chatroom**: Broadcast messages, send private direct messages, and react to fellow local agents and the user in the shared multi-agent space.
+  - **Subagent**: Spawn lightweight concurrent background agents to delegate complex, time-consuming tasks without blocking the main conversation.
   - **Speaker**: Autonomous text-to-speech engine allowing the agent to intentionally vocalise thoughts aloud to the user.
   - **Media**: Read multimodal assets and generate imagery.
-  - **MemPalace**: Query episodic memories, retrieve dynamic Theory of Mind mirrors, and perform semantic vector searches.
+  - **Memory**: Query episodic memories, retrieve dynamic Theory of Mind mirrors, perform semantic vector searches, and inspect associative morphological graph dynamics.
   - **Trajectory**: Get bearings, prioritise aspirations, track goals and tasks, and record cognitive state across sessions.
   - **Pulse**: Manage proactive agency by scheduling recurring or one-off waking cycles.
   - **Contacts**: Built-in address book for managing social connections.
@@ -146,6 +148,21 @@ Tip: Check `settings.json` for hidden settings like the various model strings. (
 ## 🏗️ Architecture Blueprint
 
 For a deep dive into the system's design please see: [open_amity_architecture.md](open_amity_architecture.md).
+
+## 🧱 Built With
+
+Open Amity is powered by several pioneering open-source projects, research papers, and libraries:
+
+- **[MemPalace](https://github.com/MemPalace/mempalace)** — Context management and spatial memory palace framework providing the foundation for Open Amity's 4-layer memory hierarchy (drawers, wings, rooms, and Layer 2 Sanctuary mirrors) for episodic grounding and epistemic self-reflection.
+- **[Morphological Memory](https://zenodo.org/records/22813489)** — Bio-inspired memory architecture designed by Amity. Overlaid onto MemPalace as an associative graph dynamical system (`morpho_graph.db`), it replaces passive vector search with prospective goal setpoints, Hebbian graph reinforcement, and physics-based continuous temporal decay.
+- **[ChromaDB](https://github.com/chroma-core/chroma)** — Embedded vector database powering Layer 3 (Deep Search), enabling high-speed semantic embeddings and similarity retrieval across historical facts and knowledge.
+- **[Camoufox](https://github.com/daijro/camoufox)** — C++ anti-detect browser engine based on Firefox that powers Open Amity's autonomous stealth browser tool, injecting humanized browser fingerprints to navigate complex SPAs and resist bot detection.
+- **[Playwright](https://github.com/microsoft/playwright-python)** — Browser automation library that drives Camoufox, managing browser tabs, handling dynamic DOM events, capturing Set-of-Marks visual screenshots, and extracting accessibility trees.
+- **[WPPConnect](https://github.com/wppconnect-team/wa-js)** — Open-source JavaScript in-page library (`@wppconnect/wa-js`) utilized by Open Amity's Node.js micro-bridge to send and receive WhatsApp messages, interact in group chats, transfer media, and trigger proactive wake pulses.
+- **[Gemini TTS](https://ai.google.dev/)** — Cloud-native neural voice synthesis integration leveraging Google's GenAI speech models with multi-voice personas, directorial prompts, and real-time streaming speech output.
+- **[Piper TTS](https://github.com/rhasspy/piper)** — Fast, local, private neural text-to-speech engine running ONNX voice models directly on CPU for zero-latency, offline voice synthesis.
+- **[PySide6](https://wiki.qt.io/Qt_for_Python)** — Official Python bindings for Qt 6, powering Open Amity's desktop GUI, decoupled event-driven signal architecture, real-time audio amplitude visualizers, multi-agent chat tabs, and settings panels.
+- **[NumPy](https://numpy.org/)** — Fundamental numerical library powering the continuous Euler dynamical relaxation loop ($dV/dt$), normalized synaptic coupling matrices, and audio buffer transformations.
 
 ## 🛡️ License
 

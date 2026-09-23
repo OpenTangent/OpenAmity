@@ -14,12 +14,14 @@ from gui.chat_formatter import (
 )
 from core.orchestrator import AmityOrchestrator
 from core.config_manager import ConfigManager
+from gui.tool_pips import ToolPipManager
 
 try:
-    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR
+    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR, MODERN_SCROLLBAR_STYLE
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
+    MODERN_SCROLLBAR_STYLE = ""
 
 
 class AgentView(QWidget):
@@ -28,6 +30,8 @@ class AgentView(QWidget):
     ui_amplitude_emitted = Signal(float)
     ui_paused_state_changed = Signal(bool)
     ui_pause_pending_changed = Signal(bool)
+    ui_tool_started = Signal(str, str, str, str, str, bool)
+    ui_tool_finished = Signal(str)
 
     def __init__(self, orchestrator: AmityOrchestrator, parent=None):
         super().__init__(parent)
@@ -61,17 +65,30 @@ class AgentView(QWidget):
         self.conversation_log.setOpenExternalLinks(True)
         self.main_layout.addWidget(self.conversation_log, 1)
 
+        # Floating Tool-Call Pip Manager
+        self.pip_manager = ToolPipManager(self.conversation_log, self)
+
         # Console Log
         self.console_log = QTextEdit()
         self.console_log.setReadOnly(True)
-        self.console_log.setStyleSheet(
-            "background-color: #000; color: #0F0; border: none; font-family: 'Ubuntu Mono'; font-size: 12px; padding: 10px;")
+        self.console_log.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #000;
+                color: #0F0;
+                border: none;
+                font-family: 'Ubuntu Mono';
+                font-size: 12px;
+                padding: 10px;
+            }}
+            {MODERN_SCROLLBAR_STYLE}
+        """)
         self.console_log.hide()
 
         # Footer
         self.footer_widget = QWidget()
+        self.footer_widget.setObjectName("footerWidget")
         self.footer_widget.setStyleSheet(
-            "background-color: #222; border-top: 1px solid #333;")
+            "QWidget#footerWidget { background-color: #222; border-top: 1px solid #333; }")
         self.footer_layout = QHBoxLayout(self.footer_widget)
         self.footer_layout.setContentsMargins(20, 10, 20, 10)
         self.footer_layout.setSpacing(10)
@@ -89,18 +106,20 @@ class AgentView(QWidget):
         self.text_input.textChanged.connect(self.orchestrator.user_interacted)
         self.footer_layout.addWidget(self.text_input, 1)
 
-        self.btn_send = QPushButton("Send")
+        self.btn_send = QPushButton("⌯⌲")
+        self.btn_send.setToolTip("Send")
         self.btn_send.setMinimumSize(80, 40)
         self.btn_send.clicked.connect(self.send_text_prompt)
         self.btn_send.setStyleSheet(
-            "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px;")
+            "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-bottom: 4px; } QPushButton:hover { background-color: #444; }")
         self.footer_layout.addWidget(self.btn_send)
 
-        self.btn_mic = QPushButton("🎤")
+        self.btn_mic = QPushButton("⏺")
+        self.btn_mic.setToolTip("Mic")
         self.btn_mic.setFixedSize(40, 40)
         self.btn_mic.clicked.connect(self.toggle_mic)
         self.btn_mic.setStyleSheet(
-            "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+            "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
         self.footer_layout.addWidget(self.btn_mic)
 
         self.btn_mute = QPushButton()
@@ -110,13 +129,15 @@ class AgentView(QWidget):
         is_muted = self.settings_manager.get("core.mute", False)
         self.btn_mute.setChecked(is_muted)
         if is_muted:
-            self.btn_mute.setText("🔇")
+            self.btn_mute.setText("🔇︎")
+            self.btn_mute.setToolTip("Unmute Agent")
             self.btn_mute.setStyleSheet(
-                "background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #2a2a2a; }")
         else:
-            self.btn_mute.setText("🔊")
+            self.btn_mute.setText("🔊︎")
+            self.btn_mute.setToolTip("Mute Agent")
             self.btn_mute.setStyleSheet(
-                "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
         self.footer_layout.addWidget(self.btn_mute)
 
         self.main_layout.addWidget(self.footer_widget)
@@ -137,6 +158,12 @@ class AgentView(QWidget):
         self.ui_pause_pending_changed.connect(self.set_pause_pending)
         self.orchestrator.on_pause_pending.connect(self.ui_pause_pending_changed.emit)
 
+        self.ui_tool_started.connect(self.pip_manager.add_pip)
+        self.orchestrator.on_tool_started.connect(self.ui_tool_started.emit)
+
+        self.ui_tool_finished.connect(self.pip_manager.complete_async_pip)
+        self.orchestrator.on_tool_finished.connect(self.ui_tool_finished.emit)
+
         self.set_paused_state(self.orchestrator.is_paused)
 
     def cleanup(self):
@@ -146,8 +173,17 @@ class AgentView(QWidget):
             self.orchestrator.on_amplitude_emitted.disconnect(self.ui_amplitude_emitted.emit)
             self.orchestrator.on_paused_state_changed.disconnect(self.ui_paused_state_changed.emit)
             self.orchestrator.on_pause_pending.disconnect(self.ui_pause_pending_changed.emit)
+            self.orchestrator.on_tool_started.disconnect(self.ui_tool_started.emit)
+            self.orchestrator.on_tool_finished.disconnect(self.ui_tool_finished.emit)
         except Exception:
             pass
+        if hasattr(self, 'pip_manager') and self.pip_manager:
+            self.pip_manager.clear()
+
+    def set_active_tab(self, is_selected: bool):
+        """Notifies pip manager of active tab selection state."""
+        if hasattr(self, 'pip_manager') and self.pip_manager:
+            self.pip_manager.set_active(is_selected)
 
     def toggle_pause(self):
         was_paused = getattr(self.orchestrator, 'is_paused', False)
@@ -169,20 +205,20 @@ class AgentView(QWidget):
             self.btn_pause.setText("▶")
             self.btn_pause.setToolTip("Resume Agent")
             self.btn_pause.setStyleSheet(
-                "QPushButton { background-color: #4a3b10; color: #FFD700; border: 1px solid #AA8800; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji; } QPushButton:hover { background-color: #5c4914; }"
+                "QPushButton { background-color: #4a3b10; color: #FFD700; border: 1px solid #AA8800; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #5c4914; }"
             )
             self.text_input.setEnabled(False)
-            self.text_input.setPlaceholderText("Agent is paused. Click ▶ to resume...")
+            self.text_input.setPlaceholderText("Agent is paused...")
             self.btn_send.setEnabled(False)
             self.btn_mic.setEnabled(False)
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
         else:
-            self.btn_pause.setText("⏸")
+            self.btn_pause.setText("❚❚")
             self.btn_pause.setToolTip("Pause Agent")
             self.btn_pause.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji; } QPushButton:hover { background-color: #444; }"
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 13px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
             )
             self.text_input.setPlaceholderText("Type a message...")
             if getattr(self.orchestrator, 'is_busy', False) is True or getattr(self.orchestrator, 'is_thinking', False) is True:
@@ -195,18 +231,20 @@ class AgentView(QWidget):
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
         if self.orchestrator.is_paused:
-            self.btn_mic.setText("🎤")
+            self.btn_mic.setText("⏺")
+            self.btn_mic.setToolTip("Mic")
             self.btn_mic.setStyleSheet(
-                "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
             return
 
         if busy:
-            self.btn_mic.setText("🟥")
+            self.btn_mic.setText("⏹")
+            self.btn_mic.setToolTip("Stop Agent")
             self.btn_mic.setStyleSheet(
-                "background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #CC0000; }")
 
             if speaking:
                 self.loading_bar.hide()
@@ -217,9 +255,10 @@ class AgentView(QWidget):
                 self.visualizer.hide()
                 self.loading_bar.show()
         else:
-            self.btn_mic.setText("🎤")
+            self.btn_mic.setText("⏺")
+            self.btn_mic.setToolTip("Mic")
             self.btn_mic.setStyleSheet(
-                "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
@@ -233,13 +272,15 @@ class AgentView(QWidget):
         self.settings_manager.set("core.mute", checked)
         self.settings_manager.save()
         if checked:
-            self.btn_mute.setText("🔇")
+            self.btn_mute.setText("🔇︎")
+            self.btn_mute.setToolTip("Unmute Agent")
             self.btn_mute.setStyleSheet(
-                "background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #2a2a2a; }")
         else:
-            self.btn_mute.setText("🔊")
+            self.btn_mute.setText("🔊︎")
+            self.btn_mute.setToolTip("Mute Agent")
             self.btn_mute.setStyleSheet(
-                "background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 18px; font-family: 'Ubuntu', 'Noto Color Emoji', 'Twemoji Mozilla', emoji;")
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
 
     def send_text_prompt(self):
         if self.orchestrator.is_paused:

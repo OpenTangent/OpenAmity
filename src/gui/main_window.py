@@ -13,10 +13,11 @@ from gui.agent_view import AgentView
 from gui.chatroom_view import ChatroomView
 
 try:
-    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR
+    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR, MODERN_SCROLLBAR_STYLE
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
+    MODERN_SCROLLBAR_STYLE = ""
 
 
 class AgentTabButton(QPushButton):
@@ -175,14 +176,25 @@ class AgentTabButton(QPushButton):
 
 class PromptTextEdit(QTextEdit):
     returnPressed = Signal()
+    MIN_HEIGHT = 45
+    MAX_HEIGHT = 240
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setPlaceholderText("Type a message...")
         self.setAcceptRichText(False)
-        self.setStyleSheet(
-            "background-color: #111; color: #FFF; border: 1px solid #444; padding: 10px; border-radius: 5px; font-size: 14px;")
-        self.setFixedHeight(45)
+        self.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #111;
+                color: #FFF;
+                border: 1px solid #444;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 14px;
+            }}
+            {MODERN_SCROLLBAR_STYLE}
+        """)
+        self.setFixedHeight(self.MIN_HEIGHT)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.textChanged.connect(self.adjust_height)
 
@@ -190,9 +202,9 @@ class PromptTextEdit(QTextEdit):
 
     def adjust_height(self):
         doc_height = int(self.document().size().height()) + 20
-        max_height = 120
+        max_height = self.MAX_HEIGHT
         new_height = min(doc_height, max_height)
-        new_height = max(45, new_height)
+        new_height = max(self.MIN_HEIGHT, new_height)
         self.setFixedHeight(new_height)
 
         if doc_height > max_height:
@@ -276,10 +288,11 @@ class MainWindow(QMainWindow):
         self.header_layout.addLayout(self.tabs_layout)
 
         # Persistent Chatroom Tab Button (Hidden if <= 1 agent)
-        self.btn_chatroom = QPushButton("👥 Chatroom")
+        self.btn_chatroom = QPushButton("🗫 Chatroom")
+        self.btn_chatroom.setToolTip("Chatroom")
         self.btn_chatroom.setFixedHeight(30)
         self.btn_chatroom.setStyleSheet(
-            "QPushButton { background-color: #222; color: #AAA; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; } QPushButton:hover { background-color: #333; color: #FFF; }")
+            "QPushButton { background-color: #222; color: #AAA; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #333; color: #FFF; }")
         self.btn_chatroom.clicked.connect(self.switch_to_chatroom)
         self.tabs_layout.addWidget(self.btn_chatroom)
 
@@ -314,7 +327,7 @@ class MainWindow(QMainWindow):
         for i, title in enumerate(agent_sections):
             action = QAction(title, self)
             action.triggered.connect(
-                lambda checked=False, idx=i: self.show_settings_section(idx))
+                lambda checked=False, idx=(i + 1): self.show_settings_section(idx))
             self.hamburger_menu.addAction(action)
             self.agent_menu_actions.append(action)
 
@@ -327,7 +340,7 @@ class MainWindow(QMainWindow):
 
         system_settings_action = QAction("System Settings", self)
         system_settings_action.triggered.connect(
-            lambda checked=False: self.show_settings_section(6))
+            lambda checked=False: self.show_settings_section(7))
         self.hamburger_menu.addAction(system_settings_action)
 
         exit_action = QAction("Exit", self)
@@ -408,6 +421,9 @@ class MainWindow(QMainWindow):
                 self.switch_to_agent(first_aid)
 
     def switch_to_chatroom(self):
+        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
+            self.settings_panel.save_settings()
+
         self.current_agent_id = "__chatroom__"
         self.agents_stack.setCurrentWidget(self.chatroom_view)
         self.consoles_stack.setCurrentWidget(self.chatroom_view.console_log)
@@ -420,11 +436,16 @@ class MainWindow(QMainWindow):
 
         # Highlight chatroom button
         self.btn_chatroom.setStyleSheet(
-            "QPushButton { background-color: #444; color: #FFF; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; }")
+            "QPushButton { background-color: #444; color: #FFF; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; }")
 
         # Unhighlight agent tab buttons
         for aid, btn in self.tab_buttons.items():
             btn.set_selected(False)
+
+        # Deactivate tool pips on all agent views while viewing chatroom
+        for aid, view in self.agent_views.items():
+            if hasattr(view, 'set_active_tab'):
+                view.set_active_tab(False)
 
         if not getattr(self.settings_panel, 'wizard_mode', False):
             self.hide_settings()
@@ -468,6 +489,7 @@ class MainWindow(QMainWindow):
 
         view = AgentView(orchestrator, self)
         self.agent_views[agent_id] = view
+        view.set_active_tab(agent_id == self.current_agent_id)
         self.agents_stack.addWidget(view)
         self.consoles_stack.addWidget(view.console_log)
 
@@ -491,6 +513,10 @@ class MainWindow(QMainWindow):
     def switch_to_agent(self, agent_id):
         if agent_id not in self.agent_views:
             return
+
+        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
+            self.settings_panel.save_settings()
+
         self.current_agent_id = agent_id
         self.agents_stack.setCurrentWidget(self.agent_views[agent_id])
         self.consoles_stack.setCurrentWidget(
@@ -504,10 +530,15 @@ class MainWindow(QMainWindow):
 
         # Update tab styles
         self.btn_chatroom.setStyleSheet(
-            "QPushButton { background-color: #222; color: #AAA; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; } QPushButton:hover { background-color: #333; color: #FFF; }")
+            "QPushButton { background-color: #222; color: #AAA; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #333; color: #FFF; }")
 
         for aid, btn in self.tab_buttons.items():
             btn.set_selected(aid == agent_id)
+
+        # Update tool pip active states across agent views
+        for aid, v in self.agent_views.items():
+            if hasattr(v, 'set_active_tab'):
+                v.set_active_tab(aid == agent_id)
 
         # Point settings panel to this agent's settings
         orchestrator = self.agent_views[agent_id].orchestrator
@@ -609,15 +640,11 @@ class MainWindow(QMainWindow):
 
     def on_wizard_finished(self):
         self.hide_settings()
-        target_aid = self.current_agent_id if self.current_agent_id in self.agent_views else (list(self.agent_views.keys())[0] if self.agent_views else None)
-        if target_aid:
-            orch = self.agent_views[target_aid].orchestrator
-            orch.restart_worker()
         self.update_tab_names()
 
     def on_settings_saved(self):
-        target_aid = self.current_agent_id if self.current_agent_id in self.agent_views else (list(self.agent_views.keys())[0] if self.agent_views else None)
-        if target_aid:
+        target_aid = getattr(self.settings_panel.settings, 'agent_id', None) or (self.current_agent_id if self.current_agent_id in self.agent_views else (list(self.agent_views.keys())[0] if self.agent_views else None))
+        if target_aid and target_aid in self.agent_views:
             orch = self.agent_views[target_aid].orchestrator
             orch.restart_worker()
         self.update_tab_names()
@@ -663,6 +690,9 @@ class MainWindow(QMainWindow):
         if self._shutting_down:
             event.accept()
             return
+
+        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
+            self.settings_panel.save_settings()
 
         logging.info("System: Shutting down all agents gracefully...")
         self._shutting_down = True

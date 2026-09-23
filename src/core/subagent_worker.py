@@ -37,16 +37,18 @@ class SubagentWorker:
 
         self.settings.get("core.low-token-mode", False)
         if self.model_tier == "standard":
-            model_key = "core.gemini.gemini-models"
+            model = self.settings.get("core.gemini.model", "")
+            if not model:
+                legacy = self.settings.get("core.gemini.gemini-models", ["gemini-3.8-flash"])
+                model = legacy[0] if isinstance(legacy, list) and legacy else "gemini-3.8-flash"
         else:
-            model_key = "core.gemini.light-models"
+            model = self.settings.get("core.gemini.light-model", "")
+            if not model:
+                legacy_l = self.settings.get("core.gemini.light-models", ["gemini-3.5-flash-lite"])
+                model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gemini-3.5-flash-lite"
 
-        self.thinking_models = self.settings.get(
-            model_key, ["gemini-3.1-flash-lite"])
-        if not isinstance(self.thinking_models, list):
-            self.thinking_models = [self.thinking_models]
-
-        self.current_model = self.thinking_models[0]
+        self.thinking_models = [model]
+        self.current_model = model
         self.thinker_chat = None
         self._abort_flag = False
         self._process_lock = threading.Lock()
@@ -79,9 +81,20 @@ class SubagentWorker:
                 tool_list.append(types.Tool(
                     function_declarations=func_declarations))
 
+        thinking_level = str(self.settings.get("core.gemini.thinking-level", "low")).lower()
+        budget_map = {"low": 1024, "medium": 4096, "high": 16384, "max": -1}
+        thinking_budget = budget_map.get(thinking_level, 1024)
+        thinking_config = None
+        if hasattr(types, 'ThinkingConfig'):
+            try:
+                thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+            except Exception:
+                thinking_config = None
+
         self.thinker_config = types.GenerateContentConfig(
             system_instruction=sys_instruct,
             tools=tool_list if tool_list else None,
+            thinking_config=thinking_config,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True)
         )

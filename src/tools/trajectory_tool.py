@@ -9,6 +9,9 @@ from core.file_utils import atomic_json_write
 
 class TrajectoryTool(Tool):
     name = "Trajectory"
+    icon = "🧭"
+    color = "#1ABC9C"
+    async_commands = []
     description = "Manage the agent's self-reflection, hierarchical aspirations (using short-term goals as milestones for long-term ones), and tasks."
     commands = ["get_bearings", "reflect_and_update_state",
                 "manage_aspirations", "manage_tasks"]
@@ -127,14 +130,15 @@ class TrajectoryTool(Tool):
         atomic_json_write(arch_file, archive)
 
     def execute(self, command: str, *args, **kwargs) -> str:
+        clean_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
         if command == "get_bearings":
-            return self._get_bearings(**kwargs)
+            return self._get_bearings(**clean_kwargs)
         elif command == "reflect_and_update_state":
-            return self._reflect_and_update_state(**kwargs)
+            return self._reflect_and_update_state(**clean_kwargs)
         elif command == "manage_aspirations":
-            return self._manage_aspirations(**kwargs)
+            return self._manage_aspirations(**clean_kwargs)
         elif command == "manage_tasks":
-            return self._manage_tasks(**kwargs)
+            return self._manage_tasks(**clean_kwargs)
         return f"Unknown command: {command}"
 
     def _format_time_elapsed(self, iso_str: str) -> str:
@@ -142,6 +146,8 @@ class TrajectoryTool(Tool):
             return "Unknown"
         try:
             dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
             days = (datetime.now() - dt).days
             if days == 0:
                 return "Today"
@@ -151,7 +157,7 @@ class TrajectoryTool(Tool):
         except:
             return "Unknown"
 
-    def _get_bearings(self) -> str:
+    def _get_bearings(self, **kwargs) -> str:
         try:
             from core.config_manager import ConfigManager
             cfg = getattr(self.orchestrator, 'config_manager', None) if self.orchestrator else None
@@ -287,7 +293,7 @@ class TrajectoryTool(Tool):
 
         return "\n".join(lines)
 
-    def _reflect_and_update_state(self, summary: str, perceived_state: str) -> str:
+    def _reflect_and_update_state(self, summary: str, perceived_state: str, **kwargs) -> str:
         data = self._load_data()
         data["last_reflection"] = {
             "timestamp": datetime.now().isoformat(),

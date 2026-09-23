@@ -14,6 +14,9 @@ import mimetypes
 
 class MediaSkill(Tool):
     name = "Media"
+    icon = "🖼️"
+    color = "#FF69B4"
+    async_commands = []
     description = "Allows the agent to explicitly read and append media files from the local file system, and generate images using a model."
     commands = ["read", "generate"]
 
@@ -80,7 +83,10 @@ class MediaSkill(Tool):
                         model=model_name,
                         contents=prompt,
                         config=types.GenerateContentConfig(
-                            response_modalities=[Modality.IMAGE]
+                            response_modalities=[Modality.IMAGE],
+                            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                                disable=True
+                            )
                         )
                     )
 

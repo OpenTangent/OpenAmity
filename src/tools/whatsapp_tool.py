@@ -8,6 +8,9 @@ from core.cache_manager import CacheManager
 
 class WhatsAppSkill(Tool):
     name = "WhatsApp"
+    icon = "💬"
+    color = "#25D366"
+    async_commands = []
     description = "Allows you to read and send WhatsApp messages. Note: If you encounter a protocol mismatch error, try WhatsApp_reset_connection to download the latest WPPConnect engine patch and restart the server."
     commands = [
         "unread (Fetch all unread messages)",
@@ -434,6 +437,9 @@ class WhatsAppSkill(Tool):
                                     )
                                 )
                             ),
+                            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                                disable=True
+                            ),
                         )
                     )
 
@@ -513,7 +519,9 @@ class WhatsAppSkill(Tool):
         return f"Unknown command: {command}"
 
     def shutdown(self):
-        self.daemon.stop()
+        if hasattr(self, 'daemon') and self.daemon:
+            self.daemon.stop()
 
     def __del__(self):
         self.shutdown()
+

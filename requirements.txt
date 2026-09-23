@@ -17,3 +17,4 @@ psutil
 ddgs
 anthropic
 openai
+camoufox[geoip]>=0.5.6

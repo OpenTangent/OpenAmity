@@ -23,13 +23,17 @@ def qapp():
 
 
 @pytest.fixture
-def temp_env():
+def temp_env(monkeypatch):
     temp_dir = tempfile.mkdtemp(prefix="openamity_sys_settings_test_")
     config_file = os.path.join(temp_dir, "config.json")
     agent_dir = os.path.join(temp_dir, "agents", "test_agent")
     os.makedirs(agent_dir, exist_ok=True)
     settings_file = os.path.join(agent_dir, "settings.json")
     env_file = os.path.join(agent_dir, ".env")
+
+    monkeypatch.setattr("config.paths.get_app_data_dir", lambda: temp_dir)
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: os.path.join(temp_dir, "agents", aid) if aid else os.path.join(temp_dir, "agents", "default"))
+    monkeypatch.setattr("config.paths.get_config_file", lambda: config_file)
 
     yield {
         "temp_dir": temp_dir,

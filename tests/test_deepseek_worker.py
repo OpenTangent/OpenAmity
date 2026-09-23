@@ -72,7 +72,7 @@ def test_deepseek_worker_start_stop_session(monkeypatch, tmp_path):
             tools=[{"name": "TestTool_test", "description": "A test tool", "parameters": {}}]
         )
         assert worker.running is True
-        assert worker.current_model == "deepseek-flash"
+        assert worker.current_model == "deepseek-v4-pro"
         assert len(worker.openai_tools) == 1
         assert "You are Amy." in worker.sys_instruct
         assert "CRITICAL INSTRUCTION" in worker.sys_instruct
@@ -145,11 +145,12 @@ def test_deepseek_worker_streaming_thought_and_tool_calls(monkeypatch, tmp_path)
         chunk4.choices[0].delta.tool_calls = [tc_delta2]
         chunk4.usage = None
 
-        # Chunk 5: usage
+        # Chunk 5: usage (completion_tokens prioritized over total_tokens)
         chunk5 = MagicMock()
         chunk5.choices = []
         chunk5.usage = MagicMock()
-        chunk5.usage.total_tokens = 50
+        chunk5.usage.completion_tokens = 30
+        chunk5.usage.total_tokens = 5000
 
         mock_stream = [chunk1, chunk2, chunk3, chunk4, chunk5]
         worker.client.chat.completions.create = MagicMock(return_value=mock_stream)
@@ -162,6 +163,8 @@ def test_deepseek_worker_streaming_thought_and_tool_calls(monkeypatch, tmp_path)
         worker.tokens_consumed.connect(lambda tok: received_tokens.append(tok))
 
         # Process thought synchronously for test
+        # "What's the weather in Tokyo?" is 27 chars -> int(27 / 4) = 6 input tokens
+        # Total tokens = 30 output + 6 input = 36
         worker._process_thought(prompt="What's the weather in Tokyo?")
 
         assert len(received_thought) == 1
@@ -171,7 +174,7 @@ def test_deepseek_worker_streaming_thought_and_tool_calls(monkeypatch, tmp_path)
         assert len(received_tools[0]) == 1
         assert received_tools[0][0].name == "Weather_check"
         assert received_tools[0][0].args == {"location": "Tokyo"}
-        assert received_tokens == [50]
+        assert received_tokens == [44]
 
         # Verify assistant message in history retains reasoning_content
         assert len(worker.history) == 2  # user + assistant
@@ -277,7 +280,7 @@ def test_orchestrator_deepseek_worker_init(monkeypatch, tmp_path):
     assert orch.gemini_worker.api_key == "sk-deepseek-orch-key"
     assert orch.gemini_worker.available is True
     assert orch.gemini_worker.running is True
-    assert orch.gemini_worker.current_model == "deepseek-flash"
+    assert orch.gemini_worker.current_model == "deepseek-v4-pro"
 
 
 def test_deepseek_worker_local_image_handling(monkeypatch, tmp_path):
@@ -434,16 +437,22 @@ def test_deepseek_worker_thinking_effort_kwargs(monkeypatch, tmp_path):
 
         worker.client.chat.completions.create = mock_create
 
-        # 1. Standard mode: extra_body={"thinking": {"type": "enabled"}}, reasoning_effort omitted (Finding H3)
+        # 1. Standard mode: model is deepseek-v4-pro, thinking-level defaults to "low" -> enabled
         worker._process_thought(prompt="Standard mode test")
-        assert captured_kwargs["model"] == "deepseek-flash"
+        assert captured_kwargs["model"] == "deepseek-v4-pro"
         assert "reasoning_effort" not in captured_kwargs
         assert captured_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
 
-        # 2. Low token mode: reasoning_effort still omitted
-        with patch.object(SettingsManager, "get", lambda self, key, default=None: True if key == "core.low-token-mode" else default):
-            worker._process_thought(prompt="Low token test")
+        # 2. Disabled thinking setting
+        with patch.object(SettingsManager, "get", lambda self, key, default=None: "off" if "thinking-level" in key else (False if "thinking" in key else default)):
+            worker._process_thought(prompt="Thinking disabled test")
             assert "reasoning_effort" not in captured_kwargs
+            assert captured_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+        # 3. Explicitly enabled thinking setting
+        with patch.object(SettingsManager, "get", lambda self, key, default=None: "high" if "thinking-level" in key else default):
+            worker._process_thought(prompt="Thinking enabled test")
+            assert captured_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
 def test_deepseek_worker_reconcile_unfulfilled_tool_calls(monkeypatch, tmp_path):
@@ -574,6 +583,45 @@ def test_deepseek_worker_reconcile_sanitizes_none_content(monkeypatch, tmp_path)
         worker._reconcile_tool_calls()
 
         assert worker.history[0]["content"] == ""
+
+
+def test_deepseek_worker_light_model_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-deepseek-test-key-12345"):
+        worker = DeepSeekWorker(agent_id="test_deepseek_agent")
+        worker.start_session(system_instruction="Test system prompt")
+        assert worker.current_model == "deepseek-v4-pro"
+        assert worker.light_model == "deepseek-flash"
+
+        attempted_models = []
+        fallback_chunk = MagicMock()
+        fallback_chunk.choices = [MagicMock()]
+        fallback_chunk.choices[0].delta = MagicMock()
+        fallback_chunk.choices[0].delta.content = "DeepSeek fallback succeeded"
+        fallback_chunk.choices[0].delta.reasoning_content = None
+        fallback_chunk.choices[0].delta.tool_calls = None
+        fallback_chunk.usage = None
+
+        def mock_create(**kwargs):
+            model = kwargs.get("model")
+            attempted_models.append(model)
+            if model == worker.primary_model:
+                raise Exception("Server error 503 Service Unavailable")
+            return [fallback_chunk]
+
+        worker.client.chat.completions.create = mock_create
+
+        emitted_thoughts = []
+        worker.thought_received.connect(lambda text, tools: emitted_thoughts.append(text))
+
+        worker._process_thought(prompt="Hello", image_path=None, yolo=False)
+
+        assert attempted_models == ["deepseek-v4-pro", "deepseek-flash"]
+        assert worker.current_model == "deepseek-flash"
+        assert len(emitted_thoughts) == 1
+        assert "DeepSeek fallback succeeded" in emitted_thoughts[0]
+
 
 
 

@@ -198,6 +198,10 @@ class PulseEngine:
     def calculate_next_recurrence(self, current_sched, recurrence, now, target_day=None):
         target_day = target_day if target_day is not None else current_sched.day
         next_time = current_sched
+        if next_time.tzinfo is not None:
+            next_time = next_time.astimezone().replace(tzinfo=None)
+        if now.tzinfo is not None:
+            now = now.astimezone().replace(tzinfo=None)
         while next_time <= now:
             if recurrence == 'daily':
                 next_time += timedelta(days=1)
@@ -217,6 +221,13 @@ class PulseEngine:
     def check_pulses(self):
         if getattr(self.orchestrator, 'is_paused', False):
             return
+
+        # Step morphological temporal decay on heartbeat (§4.2, §6.1.5, §9.5)
+        if hasattr(self.orchestrator, 'mempalace_manager') and self.orchestrator.mempalace_manager:
+            try:
+                self.orchestrator.mempalace_manager.step_temporal_decay()
+            except Exception as e:
+                logging.warning(f"PulseEngine: Error stepping temporal decay: {e}")
 
         # Allow pulses to enter the event queue normally regardless of idle/busy state
 
@@ -268,6 +279,8 @@ class PulseEngine:
             for p in pending:
                 p_id, title, context, sched_str, recurrence, has_run, p_type = p
                 sched = datetime.fromisoformat(sched_str)
+                if sched.tzinfo is not None:
+                    sched = sched.astimezone().replace(tzinfo=None)
 
                 if recurrence == 'none':
                     # Fire once-off pulse. It fires even if it was missed while offline.

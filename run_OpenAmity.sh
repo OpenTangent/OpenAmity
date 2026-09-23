@@ -15,6 +15,15 @@ if [ -n "$FLATPAK_ID" ]; then
             cp "/app/share/chroma_onnx/all-MiniLM-L6-v2/onnx.tar.gz" "$CHROMA_CACHE_DIR/onnx.tar.gz"
         fi
     fi
+
+    # Set Camoufox binary path if bundled
+    if [ -f "/app/share/camoufox/camoufox-bin" ]; then
+        export CAMOUFOX_BINARY_PATH="/app/share/camoufox/camoufox-bin"
+    elif [ -f "/app/share/camoufox/camoufox" ]; then
+        export CAMOUFOX_BINARY_PATH="/app/share/camoufox/camoufox"
+    elif [ -f "/app/share/camoufox/firefox" ]; then
+        export CAMOUFOX_BINARY_PATH="/app/share/camoufox/firefox"
+    fi
 else
     # Ensure we are in the project directory for local execution
     cd "$(dirname "$0")"

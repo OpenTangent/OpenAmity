@@ -132,7 +132,7 @@ def get_dark_palette() -> QPalette:
     palette.setColor(QPalette.WindowText, QColor(TEXT_PRIMARY))
     palette.setColor(QPalette.Base, QColor(BG_INPUT))
     palette.setColor(QPalette.AlternateBase, QColor(BG_CARD))
-    palette.setColor(QPalette.ToolTipBase, QColor("#ffffff"))
+    palette.setColor(QPalette.ToolTipBase, QColor("#2b2b2b"))
     palette.setColor(QPalette.ToolTipText, QColor("#ffffff"))
     palette.setColor(QPalette.Text, QColor(TEXT_PRIMARY))
     palette.setColor(QPalette.Button, QColor(BG_BUTTON))
@@ -158,36 +158,97 @@ def get_dark_palette() -> QPalette:
     return palette
 
 
+MODERN_SCROLLBAR_STYLE = """
+/* Standardized Modern Minimal Scrollbars */
+QScrollBar:vertical {
+    border: none;
+    background: transparent;
+    width: 8px;
+    margin: 0px;
+}
+QScrollBar::handle:vertical {
+    background-color: rgba(255, 255, 255, 0.2);
+    min-height: 24px;
+    border-radius: 3px;
+    margin: 1px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: rgba(255, 255, 255, 0.38);
+    margin: 1px;
+}
+QScrollBar::handle:vertical:pressed {
+    background-color: rgba(255, 255, 255, 0.55);
+    margin: 1px;
+}
+QScrollBar::handle:vertical:disabled {
+    background-color: transparent;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: transparent;
+    height: 0px;
+    width: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    border: none;
+    background: transparent;
+}
+
+QScrollBar:horizontal {
+    border: none;
+    background: transparent;
+    height: 8px;
+    margin: 0px;
+}
+QScrollBar::handle:horizontal {
+    background-color: rgba(255, 255, 255, 0.2);
+    min-width: 24px;
+    border-radius: 3px;
+    margin: 1px;
+}
+QScrollBar::handle:horizontal:hover {
+    background-color: rgba(255, 255, 255, 0.38);
+    margin: 1px;
+}
+QScrollBar::handle:horizontal:pressed {
+    background-color: rgba(255, 255, 255, 0.55);
+    margin: 1px;
+}
+QScrollBar::handle:horizontal:disabled {
+    background-color: transparent;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    border: none;
+    background: transparent;
+    height: 0px;
+    width: 0px;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    border: none;
+    background: transparent;
+}
+
+QScrollBar::corner {
+    background: transparent;
+    border: none;
+}
+"""
+
+
 def setup_app_theme(app: QApplication):
     """Applies the centralized Fusion style, dark palette, and modern scrollbars to the application."""
     fusion_style = QStyleFactory.create("Fusion")
     if fusion_style:
         app.setStyle(fusion_style)
     app.setPalette(get_dark_palette())
-    app.setStyleSheet("""
-        QScrollBar:vertical {
-            border: none;
-            background: transparent;
-            width: 14px;
-            margin: 0px 0px 0px 0px;
-        }
-        QScrollBar::handle:vertical {
-            background-color: rgba(100, 100, 100, 150);
-            min-height: 30px;
-            border-radius: 7px;
-            margin: 2px;
-        }
-        QScrollBar::handle:vertical:hover {
-            background-color: rgba(150, 150, 150, 200);
-            margin: 0px;
-        }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-            border: none;
-            background: none;
-            height: 0px;
-        }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-            background: none;
-        }
+    app.setStyleSheet(f"""
+        QToolTip {{
+            color: #ffffff;
+            background-color: #2b2b2b;
+            border: 1px solid #555555;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }}
+        {MODERN_SCROLLBAR_STYLE}
     """)
 

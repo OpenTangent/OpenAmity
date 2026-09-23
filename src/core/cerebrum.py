@@ -12,6 +12,75 @@ class Tool:
     name: str = "BaseSkill"
     description: str = "A generic tool."
     commands: List[str] = []  # List of command names this tool handles
+    icon: str = "🔧"
+    color: str = "#888888"
+    async_commands: List[str] = []
+
+    _tool_classes: Dict[str, Any] = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if hasattr(cls, "name") and cls.name != "BaseSkill":
+            Tool._tool_classes[cls.name] = cls
+            Tool._tool_classes[cls.__name__] = cls
+            # Register stripped versions (e.g. PulseTool -> Pulse)
+            clean_name = cls.name
+            if clean_name.endswith("Tool"):
+                Tool._tool_classes[clean_name[:-4]] = cls
+            elif clean_name.endswith("Skill"):
+                Tool._tool_classes[clean_name[:-5]] = cls
+
+    @classmethod
+    def discover_tool_classes(cls):
+        """Discovers tool classes from the tools directory if not yet loaded."""
+        src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        tools_dir = os.path.join(src_dir, "tools")
+        if not os.path.exists(tools_dir):
+            return
+        import sys
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        for filename in os.listdir(tools_dir):
+            if filename.endswith(".py") and not filename.startswith("__"):
+                module_name = f"tools.{filename[:-3]}"
+                try:
+                    importlib.import_module(module_name)
+                except Exception:
+                    pass
+
+    @classmethod
+    def get_tool_class(cls, name: str) -> Any:
+        if not name:
+            return None
+        clean = name
+        if clean.startswith("tool."):
+            clean = clean[5:]
+        if not cls._tool_classes:
+            cls.discover_tool_classes()
+        if clean in cls._tool_classes:
+            return cls._tool_classes[clean]
+        for k, v in cls._tool_classes.items():
+            if k.lower() == clean.lower():
+                return v
+        return None
+
+    @classmethod
+    def get_tool_color(cls, name: str) -> str:
+        tool_cls = cls.get_tool_class(name)
+        if tool_cls and hasattr(tool_cls, "color"):
+            return tool_cls.color
+        return "#888888"
+
+    @classmethod
+    def get_tool_icon(cls, name: str) -> str:
+        tool_cls = cls.get_tool_class(name)
+        if tool_cls and hasattr(tool_cls, "icon"):
+            return tool_cls.icon
+        return "🔧"
+
+    def is_command_async(self, command: str, args: dict = None) -> bool:
+        """Determines if a given command is executed as a background process."""
+        return command in self.async_commands
 
     def __init__(self, orchestrator=None):
         self.orchestrator = orchestrator
@@ -115,17 +184,31 @@ class Cerebrum:
         """Executes a command on a specific tool."""
         with self._tools_lock:
             tool = self.tools.get(skill_name)
+            if not tool:
+                for k, v in self.tools.items():
+                    if k.lower() == skill_name.lower():
+                        tool = v
+                        break
         if tool:
             return tool.execute(command, *args, **kwargs)
         return f"Error: Tool '{skill_name}' not found."
 
-    def execute_tool_call(self, function_name: str, args: dict) -> str:
+    def execute_tool_call(self, function_name: str, args: dict, call_id: str = None) -> str:
         """Routes a GenAI tool call directly to the correct skill."""
         if "_" in function_name:
             skill_name, command = function_name.split("_", 1)
+            call_kwargs = dict(args)
             try:
                 with self._tools_lock:
-                    return self.execute_command(skill_name, command, **args)
+                    tool = self.tools.get(skill_name)
+                    if not tool:
+                        for k, v in self.tools.items():
+                            if k.lower() == skill_name.lower():
+                                tool = v
+                                break
+                    if tool and call_id and tool.is_command_async(command, args):
+                        call_kwargs["_call_id"] = call_id
+                return self.execute_command(skill_name, command, **call_kwargs)
             except Exception as e:
                 logging.getLogger("core.Cerebrum").exception(f"Error executing tool '{function_name}'")
                 return f"Error executing '{function_name}': {type(e).__name__}: {str(e)}"

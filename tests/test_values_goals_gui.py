@@ -26,13 +26,17 @@ def qapp():
 
 
 @pytest.fixture
-def temp_env():
+def temp_env(monkeypatch):
     temp_dir = tempfile.mkdtemp(prefix="openamity_val_goals_test_")
     config_file = os.path.join(temp_dir, "config.json")
     agent_dir = os.path.join(temp_dir, "agents", "test_agent")
     os.makedirs(agent_dir, exist_ok=True)
     settings_file = os.path.join(agent_dir, "settings.json")
     env_file = os.path.join(agent_dir, ".env")
+
+    monkeypatch.setattr("config.paths.get_app_data_dir", lambda: temp_dir)
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: os.path.join(temp_dir, "agents", aid) if aid else os.path.join(temp_dir, "agents", "default"))
+    monkeypatch.setattr("config.paths.get_config_file", lambda: config_file)
 
     yield {
         "temp_dir": temp_dir,
@@ -195,3 +199,109 @@ def test_settings_panel_values_goals_integration(qapp, temp_env):
     assert sm.get("core.agent.overarching-goals") == []
     assert panel.ui_overarching_goals.count() == 0
     assert not panel.ui_overarching_goals.empty_label.isHidden()
+
+
+def test_typing_in_values_goals_does_not_save_until_close(qapp, temp_env):
+    initial_settings = {
+        "core": {
+            "agent": {
+                "name": "DeferredBot",
+                "core-values": ["Integrity"],
+                "overarching-goals": ["Help humans"]
+            }
+        }
+    }
+    with open(temp_env["settings_file"], "w") as f:
+        json.dump(initial_settings, f)
+
+    sm = SettingsManager(agent_id="test_agent")
+    sm.settings_file = temp_env["settings_file"]
+
+    panel = SettingsPanelWidget()
+    panel.load_settings(sm)
+
+    # Track settings_saved emissions
+    settings_saved_count = 0
+    def on_saved():
+        nonlocal settings_saved_count
+        settings_saved_count += 1
+    panel.settings_saved.connect(on_saved)
+
+    # Track close_requested emissions
+    close_requested_called = False
+    def on_close():
+        nonlocal close_requested_called
+        close_requested_called = True
+    panel.close_requested.connect(on_close)
+
+    # Add a new row to values and type character by character
+    row = panel.ui_core_values.add_item("")
+    for char in "Empirical Rigor":
+        row.text_edit.insertPlainText(char)
+
+    # Add a new row to goals and type character by character
+    goal_row = panel.ui_overarching_goals.add_item("")
+    for char in "Advance Research":
+        goal_row.text_edit.insertPlainText(char)
+
+    # Verify that typing characters did NOT emit settings_saved
+    assert settings_saved_count == 0
+    # Settings on disk/manager should NOT be committed yet
+    assert sm.get("core.agent.core-values") == ["Integrity"]
+    assert sm.get("core.agent.overarching-goals") == ["Help humans"]
+
+    # Now close the settings panel via the close button (request_close)
+    panel.request_close()
+
+    # Settings should now be committed and settings_saved emitted exactly once
+    assert close_requested_called is True
+    assert settings_saved_count == 1
+    assert "Empirical Rigor" in sm.get("core.agent.core-values")
+    assert "Advance Research" in sm.get("core.agent.overarching-goals")
+
+
+def test_on_save_clicked_commits_and_closes(qapp, temp_env):
+    initial_settings = {
+        "core": {
+            "agent": {
+                "name": "SaveBot",
+                "core-values": ["Patience"],
+                "overarching-goals": ["Listen carefully"]
+            }
+        }
+    }
+    with open(temp_env["settings_file"], "w") as f:
+        json.dump(initial_settings, f)
+
+    sm = SettingsManager(agent_id="test_agent")
+    sm.settings_file = temp_env["settings_file"]
+
+    panel = SettingsPanelWidget()
+    panel.load_settings(sm)
+
+    settings_saved_count = 0
+    panel.settings_saved.connect(lambda: globals().update(saved=True))
+    saved = False
+    def on_saved():
+        nonlocal saved
+        saved = True
+    panel.settings_saved.connect(on_saved)
+
+    closed = False
+    panel.close_requested.connect(lambda: globals().update(closed=True))
+    def on_closed():
+        nonlocal closed
+        closed = True
+    panel.close_requested.connect(on_closed)
+
+    # Edit value
+    panel.ui_core_values.rows[0].text_edit.setPlainText("Deep Patience")
+    assert not saved
+
+    # Click Save button
+    panel.on_save_clicked()
+
+    assert saved is True
+    assert closed is True
+    assert sm.get("core.agent.core-values") == ["Deep Patience"]
+

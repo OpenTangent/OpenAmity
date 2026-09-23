@@ -200,3 +200,34 @@ def test_tab_widths_remain_constant_on_selection(qapp, temp_environment):
 
     window.close()
 
+
+def test_switching_away_from_open_settings_commits_settings(qapp, temp_environment):
+    agent_manager = AgentManager()
+    aid1 = agent_manager.create_new_agent()
+    aid2 = agent_manager.create_new_agent()
+
+    with patch("gui.main_window.SpellCheckHighlighter"):
+        window = MainWindow(agent_manager)
+
+    window.switch_to_agent(aid1)
+    # Open settings section 1 (Values and Goals)
+    window.show_settings_section(1)
+    assert window.stacked_layout.currentIndex() == 1
+
+    # Modify values in the panel
+    window.settings_panel.ui_core_values.add_item("Courage")
+
+    # Settings should not be committed yet
+    sm1 = window.agent_views[aid1].settings_manager
+    assert "Courage" not in sm1.get("core.agent.core-values", [])
+
+    # Switch to aid2
+    window.switch_to_agent(aid2)
+
+    # Panel should be closed and aid1's settings committed
+    assert window.stacked_layout.currentIndex() == 0
+    assert "Courage" in sm1.get("core.agent.core-values", [])
+
+    window.close()
+
+

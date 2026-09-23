@@ -4,6 +4,7 @@ import logging
 import datetime
 import uuid
 import threading
+import hashlib
 from core.settings_manager import SettingsManager
 from core.file_utils import atomic_json_write
 
@@ -42,6 +43,13 @@ class MemPalaceManager:
         self.identity_path = os.path.join(self.palace_path, "identity.txt")
         self._sync_identity()
 
+        # Morphological Memory (MemPalace v2)
+        self._turn_touched = []
+        self.morpho_layer = None
+        self._load_morpho_settings()
+        if self._morpho_enabled:
+            self._init_morphological_layer()
+
         # Initialize the stack
         try:
             self.stack = MemoryStack(
@@ -76,6 +84,74 @@ class MemPalaceManager:
         # Ensure default short-term memory is seeded if not present
         self.initialize_short_term_memory()
 
+    def _load_morpho_settings(self):
+        settings = SettingsManager(agent_id=self.agent_id)
+        self._morpho_settings = settings.get("core.morphological_memory")
+        if self._morpho_settings is None:
+            self._morpho_settings = settings.get("core.morphological-memory")
+        if not isinstance(self._morpho_settings, dict):
+            self._morpho_settings = {}
+        self._morpho_enabled = self._morpho_settings.get("enabled", True)
+
+    def _get_collection(self, create: bool = False):
+        try:
+            from mempalace.palace import get_collection
+            return get_collection(self.palace_path, create=create)
+        except Exception as e:
+            logging.warning(f"Could not get palace collection: {e}")
+            return None
+
+    def _init_morphological_layer(self):
+        try:
+            from core.morphological_layer import MorphologicalMemoryLayer
+            self.morpho_layer = MorphologicalMemoryLayer(
+                palace_path=self.palace_path,
+                gamma=float(self._morpho_settings.get("gamma", 0.6)),
+                leak=float(self._morpho_settings.get("leak", 0.8)),
+                decay_rate=float(self._morpho_settings.get("decay_per_minute", 0.002)),
+                dissipation=float(self._morpho_settings.get("dissipation", 0.05)),
+                dt=float(self._morpho_settings.get("dt", 0.1)),
+                n_steps=int(self._morpho_settings.get("n_steps", 25)),
+                top_k=int(self._morpho_settings.get("top_k", 5)),
+                eta=float(self._morpho_settings.get("eta", 1.0)),
+                max_coactivation_set=int(self._morpho_settings.get("max_coactivation_set", 16)),
+            )
+            # Backfill migration (§9.2)
+            if self.morpho_layer.is_empty():
+                self._backfill_morphological_nodes()
+        except Exception as e:
+            logging.warning(f"Failed to initialize MorphologicalMemoryLayer: {e}", exc_info=True)
+            self.morpho_layer = None
+
+    def _backfill_morphological_nodes(self):
+        """Backfill existing ChromaDB drawers into morpho_nodes (§9.2)."""
+        if not self.morpho_layer:
+            return
+        try:
+            col = self._get_collection(create=False)
+            if col:
+                data = col.get(include=["metadatas"])
+                ids = data.get("ids") or []
+                metas = data.get("metadatas") or []
+                drawers = []
+                for did, meta in zip(ids, metas):
+                    meta = meta or {}
+                    w = meta.get("wing", "default")
+                    r = meta.get("room", "general")
+                    drawers.append((did, w, r))
+                if drawers:
+                    self.morpho_layer.register_drawers_batch(drawers)
+                logging.info(f"Backfill migration: registered {len(drawers)} existing ChromaDB drawers into morpho_nodes.")
+        except Exception as e:
+            logging.warning(f"Error during morphological backfill migration: {e}")
+
+    def touch_drawers(self, drawer_ids: list):
+        """Record touched drawer IDs in the current turn."""
+        with self._cache_lock:
+            for did in drawer_ids:
+                if did and did not in self._turn_touched:
+                    self._turn_touched.append(did)
+
     def reload_settings(self):
         """Reload settings and sync identity"""
         self._sync_identity()
@@ -83,6 +159,11 @@ class MemPalaceManager:
         self._short_term_cache = None
         if hasattr(self, 'stack') and hasattr(self.stack, 'l0'):
             self.stack.l0._text = None
+        self._load_morpho_settings()
+        if self._morpho_enabled and not self.morpho_layer:
+            self._init_morphological_layer()
+        elif not self._morpho_enabled:
+            self.morpho_layer = None
 
     def _sync_identity(self):
         """Convert soul_jar.json to a plain text identity.txt for MemPalace Layer 0"""
@@ -179,7 +260,7 @@ class MemPalaceManager:
             logging.error(f"Error syncing identity: {e}", exc_info=True)
 
     def wake_up(self, wing: str = None) -> str:
-        """Returns L0 + Self-Perception + Short-Term Context"""
+        """Returns L0 + Self-Perception + Short-Term Context + Morphological Prospective Context"""
         base_context = self.stack.l0.render()
 
         self_perception = self.get_self_perception()
@@ -199,15 +280,155 @@ class MemPalaceManager:
         if short_term:
             base_context += f"\n\n--- Short-Term Memory (Continuity) ---\n{short_term}\n"
 
+        # Morphological Memory (Prospective Attractors)
+        if self._morpho_enabled and self.morpho_layer:
+            try:
+                self.step_temporal_decay()
+                prospective_section = self._get_prospective_memory_context()
+                if prospective_section:
+                    base_context += f"\n\n{prospective_section}"
+            except Exception as e:
+                logging.warning(f"Error generating morphological prospective memories: {e}")
+
         return base_context
+
+    def _get_prospective_memory_context(self) -> str:
+        if not self._morpho_enabled or not self.morpho_layer:
+            return ""
+
+        try:
+            from config import paths
+            traj_path = os.path.join(paths.get_base_dir_for(self.agent_id), "trajectory.json")
+            if not os.path.exists(traj_path):
+                return ""
+
+            with open(traj_path, "r", encoding="utf-8") as f:
+                traj_data = json.load(f)
+
+            goals = []
+            aspirations = traj_data.get("aspirations", {})
+            for tier in ["short_term", "medium_term", "long_term"]:
+                for asp in aspirations.get(tier, []):
+                    if asp.get("status") == "active" and asp.get("description"):
+                        goals.append((asp.get("id", f"asp_{uuid.uuid4().hex[:6]}"), asp["description"]))
+
+            for task in traj_data.get("tasks", []):
+                if task.get("status") == "in_progress" and task.get("description"):
+                    goals.append((task.get("id", f"tsk_{uuid.uuid4().hex[:6]}"), task["description"]))
+
+            if not goals:
+                return ""
+
+            col = self._get_collection(create=False)
+            all_target_drawers = []
+
+            for goal_key, goal_text in goals:
+                text_hash = hashlib.sha1(goal_text.encode("utf-8")).hexdigest()
+                setpoint = self.morpho_layer.get_setpoint(goal_key)
+                if setpoint and setpoint.get("text_hash") == text_hash:
+                    target_drawers = setpoint.get("target_drawers", [])
+                else:
+                    matching_ids = []
+                    if col:
+                        try:
+                            q = col.query(query_texts=[goal_text], n_results=3, include=["distances"])
+                            ids_list = q.get("ids", [[]])
+                            dists_list = q.get("distances", [[]])
+                            if ids_list and ids_list[0] and dists_list and dists_list[0]:
+                                for did, dist in zip(ids_list[0], dists_list[0]):
+                                    if dist is not None and float(dist) < 0.45:
+                                        matching_ids.append(did)
+                        except Exception as qe:
+                            logging.warning(f"Error querying ChromaDB for goal setpoint: {qe}")
+
+                    self.morpho_layer.upsert_setpoint(goal_key, text_hash, matching_ids)
+                    updated_sp = self.morpho_layer.get_setpoint(goal_key)
+                    target_drawers = updated_sp.get("target_drawers", []) if updated_sp else matching_ids
+
+                all_target_drawers.extend(target_drawers)
+
+            all_target_drawers = list(dict.fromkeys(all_target_drawers))
+            if not all_target_drawers:
+                return ""
+
+            top_k = int(self._morpho_settings.get("top_k", 5))
+            results = self.morpho_layer.relax_setpoint(all_target_drawers, top_k=top_k)
+            if not results or not col:
+                return ""
+
+            lines = ["--- Morphological Memory (Prospective Attractors) ---"]
+            total_chars = 0
+            max_total_chars = 2400  # ~600 tokens per §9.4
+
+            for did, potential in results:
+                doc_text = ""
+                try:
+                    res = col.get(ids=[did], include=["documents"])
+                    docs = res.get("documents", [])
+                    if docs and docs[0]:
+                        doc_text = str(docs[0]).strip().replace("\n", " ")
+                except Exception as de:
+                    logging.warning(f"Error fetching document for prospective drawer {did}: {de}")
+                    continue
+
+                if not doc_text:
+                    continue
+
+                if len(doc_text) > 300:
+                    doc_text = doc_text[:297] + "..."
+
+                entry = f"[Drawer #{did}] {doc_text}"
+                if total_chars + len(entry) > max_total_chars and len(lines) > 1:
+                    break
+                lines.append(entry)
+                total_chars += len(entry)
+
+            if len(lines) <= 1:
+                return ""
+            return "\n".join(lines)
+        except Exception as e:
+            logging.warning(f"Error preparing prospective memory context: {e}", exc_info=True)
+            return ""
 
     def recall(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Returns L2 context"""
-        return self.stack.recall(wing=wing, room=room, n_results=n_results)
+        res = self.stack.recall(wing=wing, room=room, n_results=n_results)
+        if self._morpho_enabled and self.morpho_layer:
+            try:
+                col = self._get_collection(create=False)
+                if col:
+                    from mempalace.layers import build_where_filter
+                    where = build_where_filter(wing, room)
+                    kwargs = {"include": ["metadatas"], "limit": n_results}
+                    if where:
+                        kwargs["where"] = where
+                    g_res = col.get(**kwargs)
+                    ids = g_res.get("ids", [])
+                    if ids:
+                        self.touch_drawers(ids)
+            except Exception as me:
+                logging.warning(f"Morphological layer recall tracking failed: {me}")
+        return res
 
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Returns L3 deep search context"""
-        return self.stack.search(query=query, wing=wing, room=room, n_results=n_results)
+        res = self.stack.search(query=query, wing=wing, room=room, n_results=n_results)
+        if self._morpho_enabled and self.morpho_layer:
+            try:
+                col = self._get_collection(create=False)
+                if col:
+                    from mempalace.layers import build_where_filter
+                    where = build_where_filter(wing, room)
+                    kwargs = {"query_texts": [query], "n_results": n_results, "include": ["metadatas"]}
+                    if where:
+                        kwargs["where"] = where
+                    q_res = col.query(**kwargs)
+                    ids = q_res.get("ids", [[]])
+                    if ids and ids[0]:
+                        self.touch_drawers(ids[0])
+            except Exception as me:
+                logging.warning(f"Morphological layer search tracking failed: {me}")
+        return res
 
     def get_entity_context(self, entities: list) -> str:
         if not entities:
@@ -499,6 +720,14 @@ class MemPalaceManager:
                     source_file=source_file,
                     added_by="the_agent"
                 )
+                if isinstance(res, dict) and res.get("success") and res.get("drawer_id"):
+                    did = res["drawer_id"]
+                    if self._morpho_enabled and self.morpho_layer:
+                        try:
+                            self.morpho_layer.register_drawer(did, wing=wing, room=room)
+                        except Exception as me:
+                            logging.warning(f"Morphological layer failed to register drawer: {me}")
+                    self.touch_drawers([did])
                 return res
             except Exception as e:
                 logging.error(f"MemPalaceManager.add_memory error: {e}", exc_info=True)
@@ -511,6 +740,11 @@ class MemPalaceManager:
                 os.environ['MEMPALACE_PALACE_PATH'] = self.palace_path
                 from mempalace.mcp_server import tool_delete_drawer
                 res = tool_delete_drawer(drawer_id=drawer_id)
+                if self._morpho_enabled and self.morpho_layer:
+                    try:
+                        self.morpho_layer.remove_drawer(drawer_id=drawer_id)
+                    except Exception as me:
+                        logging.warning(f"Morphological layer failed to remove drawer: {me}")
                 return res
             except Exception as e:
                 logging.error(f"MemPalaceManager.delete_memory error: {e}", exc_info=True)
@@ -626,3 +860,57 @@ class MemPalaceManager:
 
         logging.info(f"Identity Delta applied successfully: {delta_type} {target_section} -> '{content}'")
         return f"Successfully applied identity delta to {target_section} ({delta_type}): '{content}'. Identity regenerated."
+
+    def flush_turn_coactivation(self, is_sleep_cycle: bool = False):
+        """
+        Flushes the current turn's touched drawers into the morphological Hebbian layer.
+        Per §9.3, sleep cycles bypass coactivation.
+        """
+        with self._cache_lock:
+            touched = list(self._turn_touched)
+            self._turn_touched.clear()
+
+        if is_sleep_cycle:
+            return
+
+        if not self._morpho_enabled or not self.morpho_layer:
+            return
+
+        try:
+            eta = float(self._morpho_settings.get("eta", 1.0))
+            self.morpho_layer.record_coactivation(touched, eta=eta)
+        except Exception as e:
+            logging.warning(f"Morphological layer error during flush_turn_coactivation: {e}")
+
+    def step_temporal_decay(self, elapsed_minutes: Optional[float] = None):
+        """Step intrinsic temporal decay in the morphological graph."""
+        if not self._morpho_enabled or not self.morpho_layer:
+            return
+        try:
+            self.morpho_layer.apply_decay(elapsed_minutes=elapsed_minutes)
+        except Exception as e:
+            logging.warning(f"Morphological layer error during step_temporal_decay: {e}")
+
+    def get_graph_status(self) -> dict:
+        """Inspect the morphological associative graph."""
+        if not self._morpho_enabled or not self.morpho_layer:
+            return {"error": "Morphological memory is disabled."}
+        try:
+            return self.morpho_layer.get_graph_status()
+        except Exception as e:
+            logging.warning(f"Error getting graph status: {e}")
+            return {"error": str(e)}
+
+    def link_setpoint(self, goal_key: str, drawer_ids: list) -> str:
+        """Link a goal setpoint anchor to target memory drawers."""
+        if not self._morpho_enabled or not self.morpho_layer:
+            return "Error: Morphological memory is disabled."
+        try:
+            if not isinstance(drawer_ids, list):
+                drawer_ids = [str(drawer_ids)]
+            self.morpho_layer.link_setpoint(goal_key, drawer_ids)
+            return f"Successfully linked setpoint '{goal_key}' to drawers {drawer_ids}."
+        except Exception as e:
+            logging.warning(f"Error linking setpoint: {e}")
+            return f"Error linking setpoint: {e}"
+

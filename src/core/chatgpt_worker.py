@@ -127,19 +127,19 @@ class ChatGptWorker:
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
+        primary_model = self.settings.get("core.chatgpt.model", "")
+        if not primary_model:
+            legacy = self.settings.get("core.chatgpt.chatgpt-models", ["gpt-6-astra"])
+            primary_model = legacy[0] if isinstance(legacy, list) and legacy else "gpt-6-astra"
 
-        # Load models from settings
-        light_models = self.settings.get(
-            "core.chatgpt.light-models", ["gpt-5.6-luna"])
-        chatgpt_models = self.settings.get(
-            "core.chatgpt.chatgpt-models", ["gpt-5.6-terra", "gpt-5.6-sol"])
+        light_model = self.settings.get("core.chatgpt.light-model", "")
+        if not light_model:
+            legacy_l = self.settings.get("core.chatgpt.light-models", ["gpt-6-luna"])
+            light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gpt-6-luna"
 
-        if not isinstance(light_models, list):
-            light_models = [light_models]
-        if not isinstance(chatgpt_models, list):
-            chatgpt_models = [chatgpt_models]
-
-        self.current_model = light_models[0] if is_low_token else chatgpt_models[0]
+        self.primary_model = primary_model
+        self.light_model = light_model
+        self.current_model = light_model if is_low_token else primary_model
 
         self.running = True
         logging.info(
@@ -315,126 +315,142 @@ class ChatGptWorker:
                 user_msg = {"role": "user", "content": content_blocks}
             self.history.append(user_msg)
 
-        try:
-            self._reconcile_tool_calls()
-            logging.debug(
-                f"Calling ChatGPT with message length {len(self.history)}...")
+        self._reconcile_tool_calls()
+        models_to_attempt = [self.current_model]
+        if self.current_model != self.light_model:
+            models_to_attempt.append(self.light_model)
 
-            messages = [{"role": "system", "content": self.sys_instruct or ""}] + self.history
+        for attempt_idx, model_name in enumerate(models_to_attempt):
+            try:
+                logging.debug(
+                    f"Calling ChatGPT with message length {len(self.history)} using model {model_name}...")
 
-            kwargs = {
-                "model": self.current_model,
-                "messages": messages,
-                "stream": True,
-                "stream_options": {"include_usage": True}
-            }
-            if self.openai_tools:
-                kwargs["tools"] = self.openai_tools
+                messages = [{"role": "system", "content": self.sys_instruct or ""}] + self.history
 
-            full_text = ""
-            tool_calls_data = {}
-            total_tokens = 0
+                kwargs = {
+                    "model": model_name,
+                    "messages": messages,
+                    "stream": True,
+                    "stream_options": {"include_usage": True}
+                }
+                thinking_level = str(self.settings.get("core.chatgpt.thinking-level", "low")).lower()
+                if thinking_level in ["low", "medium", "high"]:
+                    if any(prefix in model_name.lower() for prefix in ["o1", "o3", "gpt-6", "gpt-5"]):
+                        kwargs["reasoning_effort"] = thinking_level
 
-            stream = self.client.chat.completions.create(**kwargs)
-            for chunk in stream:
-                if getattr(self, '_abort_flag', False):
-                    self.is_processing = False
-                    return
+                if self.openai_tools:
+                    kwargs["tools"] = self.openai_tools
 
-                if getattr(chunk, 'usage', None):
-                    u = chunk.usage
-                    ct = getattr(u, 'completion_tokens', None)
-                    tt = getattr(u, 'total_tokens', None)
-                    if isinstance(tt, (int, float)) and tt > 0:
-                        total_usage_tokens = tt
-                    elif isinstance(ct, (int, float)) and ct > 0:
-                        output_tokens = ct
+                full_text = ""
+                tool_calls_data = {}
+                total_tokens = 0
 
-                if not chunk.choices:
+                stream = self.client.chat.completions.create(**kwargs)
+                for chunk in stream:
+                    if getattr(self, '_abort_flag', False):
+                        self.is_processing = False
+                        return
+
+                    if getattr(chunk, 'usage', None):
+                        u = chunk.usage
+                        ct = getattr(u, 'completion_tokens', None)
+                        tt = getattr(u, 'total_tokens', None)
+                        if isinstance(ct, (int, float)) and ct > 0:
+                            output_tokens = ct
+                        if isinstance(tt, (int, float)) and tt > 0:
+                            total_usage_tokens = tt
+
+                    if not chunk.choices:
+                        continue
+
+                    delta = chunk.choices[0].delta
+                    if getattr(delta, 'content', None):
+                        full_text += delta.content
+
+                    if getattr(delta, 'tool_calls', None):
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_data:
+                                tool_calls_data[idx] = {
+                                    "id": tc.id or "",
+                                    "name": (tc.function.name if tc.function and tc.function.name else ""),
+                                    "arguments": (tc.function.arguments if tc.function and tc.function.arguments else "")
+                                }
+                            else:
+                                if tc.id:
+                                    tool_calls_data[idx]["id"] += tc.id
+                                if tc.function:
+                                    if tc.function.name:
+                                        tool_calls_data[idx]["name"] += tc.function.name
+                                    if tc.function.arguments:
+                                        tool_calls_data[idx]["arguments"] += tc.function.arguments
+
+                final_tool_calls = []
+                function_calls = []
+
+                for idx in sorted(tool_calls_data.keys()):
+                    tc_item = tool_calls_data[idx]
+                    call_id = tc_item["id"] or f"call_{tc_item['name']}_{uuid.uuid4().hex[:8]}"
+                    raw_args = tc_item["arguments"]
+                    try:
+                        parsed_args = json.loads(raw_args) if raw_args else {}
+                    except Exception:
+                        parsed_args = {}
+
+                    final_tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc_item["name"],
+                            "arguments": raw_args
+                        }
+                    })
+                    function_calls.append(FunctionCallObject(tc_item["name"], parsed_args))
+
+                # Build assistant message
+                assistant_msg = {"role": "assistant"}
+                if final_tool_calls:
+                    assistant_msg["tool_calls"] = final_tool_calls
+                    assistant_msg["content"] = full_text if full_text else None
+                else:
+                    assistant_msg["content"] = full_text or ""
+
+                self.history.append(assistant_msg)
+                self.current_model = model_name
+
+                # Token tracking (excluding static system instruction and tool declarations)
+                tokens = 0
+                if 'output_tokens' in locals() and isinstance(output_tokens, (int, float)) and output_tokens > 0:
+                    est_input_chars = sum(len(str(p)) for p in content_blocks) if ('content_blocks' in locals() and content_blocks) else 0
+                    input_tokens = int(est_input_chars / 4)
+                    tokens = int(output_tokens) + input_tokens
+                elif 'total_usage_tokens' in locals() and isinstance(total_usage_tokens, (int, float)) and total_usage_tokens > 0:
+                    tokens = int(total_usage_tokens)
+                else:
+                    est_content_chars = sum(len(str(p)) for p in content_blocks) if ('content_blocks' in locals() and content_blocks) else 0
+                    tokens = int((est_content_chars + len(full_text)) / 4)
+
+                if tokens > 0 and hasattr(self, 'tokens_consumed'):
+                    self.tokens_consumed.emit(tokens)
+
+                logging.debug(
+                    f"About to emit thought_received. Text length: {len(full_text)}, Tools: {len(function_calls)}")
+                self.thought_received.emit(full_text, function_calls)
+                self.is_processing = False
+                return
+
+            except Exception as e:
+                is_last_attempt = (attempt_idx == len(models_to_attempt) - 1)
+                err_str = str(e)
+                if not is_last_attempt:
+                    logging.warning(
+                        f"ChatGPT model {model_name} failed: {err_str}. Falling back to light model {self.light_model}...")
                     continue
-
-                delta = chunk.choices[0].delta
-                if getattr(delta, 'content', None):
-                    full_text += delta.content
-
-                if getattr(delta, 'tool_calls', None):
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_data:
-                            tool_calls_data[idx] = {
-                                "id": tc.id or "",
-                                "name": (tc.function.name if tc.function and tc.function.name else ""),
-                                "arguments": (tc.function.arguments if tc.function and tc.function.arguments else "")
-                            }
-                        else:
-                            if tc.id:
-                                tool_calls_data[idx]["id"] += tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_data[idx]["name"] += tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_data[idx]["arguments"] += tc.function.arguments
-
-            final_tool_calls = []
-            function_calls = []
-
-            for idx in sorted(tool_calls_data.keys()):
-                tc_item = tool_calls_data[idx]
-                call_id = tc_item["id"] or f"call_{tc_item['name']}_{uuid.uuid4().hex[:8]}"
-                raw_args = tc_item["arguments"]
-                try:
-                    parsed_args = json.loads(raw_args) if raw_args else {}
-                except Exception:
-                    parsed_args = {}
-
-                final_tool_calls.append({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tc_item["name"],
-                        "arguments": raw_args
-                    }
-                })
-                function_calls.append(FunctionCallObject(tc_item["name"], parsed_args))
-
-            # Build assistant message
-            assistant_msg = {"role": "assistant"}
-            if final_tool_calls:
-                assistant_msg["tool_calls"] = final_tool_calls
-                assistant_msg["content"] = full_text if full_text else None
-            else:
-                assistant_msg["content"] = full_text or ""
-
-            self.history.append(assistant_msg)
-
-            # Token tracking (excluding static system instruction and tool declarations)
-            tokens = 0
-            if 'total_usage_tokens' in locals() and isinstance(total_usage_tokens, (int, float)) and total_usage_tokens > 0:
-                tokens = int(total_usage_tokens)
-            elif 'output_tokens' in locals() and isinstance(output_tokens, (int, float)) and output_tokens > 0:
-                est_input_chars = sum(len(str(p)) for p in content_blocks) if ('content_blocks' in locals() and content_blocks) else 0
-                input_tokens = int(est_input_chars / 4)
-                tokens = int(output_tokens) + input_tokens
-            else:
-                est_content_chars = sum(len(str(p)) for p in content_blocks) if ('content_blocks' in locals() and content_blocks) else 0
-                tokens = int((est_content_chars + len(full_text)) / 4)
-
-            if tokens > 0 and hasattr(self, 'tokens_consumed'):
-                self.tokens_consumed.emit(tokens)
-
-            logging.debug(
-                f"About to emit thought_received. Text length: {len(full_text)}, Tools: {len(function_calls)}")
-            self.thought_received.emit(full_text, function_calls)
-            self.is_processing = False
-            return
-
-        except Exception as e:
-            err_str = str(e)
-            logging.error(f"ChatGPT API Error: {err_str}", exc_info=True)
-            self.history = self.history[:history_snapshot_len]
-            self.error_occurred.emit(f"ChatGPT API Error: {err_str}")
-            self.is_processing = False
-            return
+                logging.error(f"ChatGPT API Error: {err_str}", exc_info=True)
+                self.history = self.history[:history_snapshot_len]
+                self.error_occurred.emit(f"ChatGPT API Error: {err_str}")
+                self.is_processing = False
+                return
 
     def reformulate_query(self, user_prompt: str, history: list) -> str:
         if not self.api_key or not history or not self.client:
@@ -448,14 +464,13 @@ class ChatGptWorker:
         prompt += f"\nUser's Latest Prompt: {user_prompt}\n\nRewritten Query:"
 
         try:
-            light_models = self.settings.get(
-                "core.chatgpt.light-models", ["gpt-5.6-luna"])
-            if not isinstance(light_models, list):
-                light_models = [light_models]
-            reformulator_model = light_models[0]
+            light_model = self.settings.get("core.chatgpt.light-model", "")
+            if not light_model:
+                legacy_l = self.settings.get("core.chatgpt.light-models", ["gpt-6-luna"])
+                light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gpt-6-luna"
 
             response = self.client.chat.completions.create(
-                model=reformulator_model,
+                model=light_model,
                 messages=[
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt}

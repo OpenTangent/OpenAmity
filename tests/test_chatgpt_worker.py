@@ -71,7 +71,7 @@ def test_chatgpt_worker_start_stop_session(monkeypatch, tmp_path):
             tools=[{"name": "TestTool_test", "description": "A test tool", "parameters": {}}]
         )
         assert worker.running is True
-        assert worker.current_model == "gpt-5.6-terra"
+        assert worker.current_model == "gpt-6-astra"
         assert len(worker.openai_tools) == 1
         assert "You are Amy." in worker.sys_instruct
         assert "CRITICAL INSTRUCTION" in worker.sys_instruct
@@ -83,7 +83,7 @@ def test_chatgpt_worker_start_stop_session(monkeypatch, tmp_path):
         # Test low-token model selection
         with patch.object(SettingsManager, "get", lambda self, key, default=None: True if key == "core.low-token-mode" else default):
             worker.start_session(system_instruction="Low token session")
-            assert worker.current_model == "gpt-5.6-luna"
+            assert worker.current_model == "gpt-6-luna"
             worker.stop_session()
 
 
@@ -300,5 +300,43 @@ def test_chatgpt_worker_reconcile_sanitizes_none_content(monkeypatch, tmp_path):
         worker._reconcile_tool_calls()
 
         assert worker.history[0]["content"] == ""
+
+
+def test_chatgpt_worker_light_model_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test prompt")
+        assert worker.current_model == "gpt-6-astra"
+        assert worker.light_model == "gpt-6-luna"
+
+        attempted_models = []
+        fallback_chunk = MagicMock()
+        fallback_chunk.choices = [MagicMock()]
+        fallback_chunk.choices[0].delta = MagicMock()
+        fallback_chunk.choices[0].delta.content = "ChatGPT fallback succeeded"
+        fallback_chunk.choices[0].delta.tool_calls = None
+        fallback_chunk.usage = None
+
+        def mock_create(**kwargs):
+            model = kwargs.get("model")
+            attempted_models.append(model)
+            if model == worker.primary_model:
+                raise Exception("Rate limit exceeded 429")
+            return [fallback_chunk]
+
+        worker.client.chat.completions.create = mock_create
+
+        emitted_thoughts = []
+        worker.thought_received.connect(lambda text, tools: emitted_thoughts.append(text))
+
+        worker._process_thought(prompt="Hello", image_path=None, yolo=False)
+
+        assert attempted_models == ["gpt-6-astra", "gpt-6-luna"]
+        assert worker.current_model == "gpt-6-luna"
+        assert len(emitted_thoughts) == 1
+        assert "ChatGPT fallback succeeded" in emitted_thoughts[0]
+
 
 

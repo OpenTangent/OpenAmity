@@ -163,9 +163,11 @@ class ApiKeyManager:
             if expires_at_str:
                 try:
                     exp_dt = datetime.fromisoformat(expires_at_str)
+                    if exp_dt.tzinfo is not None:
+                        exp_dt = exp_dt.astimezone().replace(tzinfo=None)
                     if exp_dt <= now:
                         return False, "INVALID_API_KEY", None
-                except ValueError:
+                except (ValueError, TypeError):
                     return False, "INVALID_API_KEY", None
 
             if required_scope:

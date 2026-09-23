@@ -124,19 +124,19 @@ class ClaudeWorker:
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
+        primary_model = self.settings.get("core.claude.model", "")
+        if not primary_model:
+            legacy = self.settings.get("core.claude.claude-models", ["claude-fable-5-1"])
+            primary_model = legacy[0] if isinstance(legacy, list) and legacy else "claude-fable-5-1"
 
-        # Load models from settings
-        light_models = self.settings.get(
-            "core.claude.light-models", ["claude-haiku-4-5"])
-        claude_models = self.settings.get(
-            "core.claude.claude-models", ["claude-fable-5-1", "claude-sonnet-5"])
+        light_model = self.settings.get("core.claude.light-model", "")
+        if not light_model:
+            legacy_l = self.settings.get("core.claude.light-models", ["claude-haiku-4-5"])
+            light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "claude-haiku-4-5"
 
-        if not isinstance(light_models, list):
-            light_models = [light_models]
-        if not isinstance(claude_models, list):
-            claude_models = [claude_models]
-
-        self.current_model = light_models[0] if is_low_token else claude_models[0]
+        self.primary_model = primary_model
+        self.light_model = light_model
+        self.current_model = light_model if is_low_token else primary_model
 
         self.running = True
         logging.info(
@@ -364,107 +364,125 @@ class ClaudeWorker:
             self.history.append(user_msg)
             self._reconcile_tool_calls()
 
-        try:
-            logging.debug(
-                f"Calling Claude with message length {len(self.history)}...")
+        models_to_attempt = [self.current_model]
+        if self.current_model != self.light_model:
+            models_to_attempt.append(self.light_model)
 
-            # Enable Anthropic Prompt Caching on system instructions
-            system_payload = [
-                {
-                    "type": "text",
-                    "text": self.sys_instruct or "",
-                    "cache_control": {"type": "ephemeral"}
+        for attempt_idx, model_name in enumerate(models_to_attempt):
+            try:
+                logging.debug(
+                    f"Calling Claude with message length {len(self.history)} using model {model_name}...")
+
+                # Enable Anthropic Prompt Caching on system instructions
+                system_payload = [
+                    {
+                        "type": "text",
+                        "text": self.sys_instruct or "",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+
+                # Configure adaptive thinking effort level
+                effort = self.settings.get("core.claude.thinking-level", "")
+                if not effort:
+                    effort = self.settings.get("core.claude.thinking-effort", "low")
+                effort = str(effort).lower()
+
+                kwargs = {
+                    "model": model_name,
+                    "system": system_payload,
+                    "messages": self.history,
+                    "max_tokens": 16384
                 }
-            ]
+                if effort in ["low", "medium", "high", "max"]:
+                    kwargs["output_config"] = {"effort": effort}
+                else:
+                    kwargs["thinking"] = {"type": "disabled"}
 
-            # Configure adaptive thinking effort level
-            effort = self.settings.get("core.claude.thinking-effort", "high")
+                # Enable Anthropic Prompt Caching on the full tool suite
+                if self.anthropic_tools:
+                    tools_payload = [dict(t) for t in self.anthropic_tools]
+                    tools_payload[-1]["cache_control"] = {"type": "ephemeral"}
+                    kwargs["tools"] = tools_payload
 
-            kwargs = {
-                "model": self.current_model,
-                "system": system_payload,
-                "messages": self.history,
-                "max_tokens": 16384,
-                "output_config": {"effort": effort}
-            }
+                full_text = ""
+                full_thinking = ""
+                function_calls = []
 
-            # Enable Anthropic Prompt Caching on the full tool suite
-            if self.anthropic_tools:
-                tools_payload = [dict(t) for t in self.anthropic_tools]
-                tools_payload[-1]["cache_control"] = {"type": "ephemeral"}
-                kwargs["tools"] = tools_payload
+                with self.client.messages.stream(**kwargs) as stream:
+                    for text_chunk in stream.text_stream:
+                        if getattr(self, '_abort_flag', False):
+                            self.is_processing = False
+                            return
+                        full_text += text_chunk
 
-            full_text = ""
-            full_thinking = ""
-            function_calls = []
+                    # We need to capture tool uses and thinking blocks from the final message
+                    message = stream.get_final_message()
 
-            with self.client.messages.stream(**kwargs) as stream:
-                for text_chunk in stream.text_stream:
-                    if getattr(self, '_abort_flag', False):
-                        self.is_processing = False
-                        return
-                    full_text += text_chunk
+                    # Append assistant message to history (preserves ThinkingBlock and ToolUseBlock)
+                    with self._history_lock:
+                        self.history.append(
+                            {"role": "assistant", "content": message.content})
 
-                # We need to capture tool uses and thinking blocks from the final message
-                message = stream.get_final_message()
+                    # Process blocks from message
+                    for block in message.content:
+                        b_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                        if b_type == "tool_use":
+                            name = getattr(block, "name", None) or (block.get("name") if isinstance(block, dict) else None)
+                            args = getattr(block, "input", None) or (block.get("input") if isinstance(block, dict) else {})
+                            function_calls.append(FunctionCallObject(name, args))
+                        elif b_type == "thinking":
+                            th_text = getattr(block, "thinking", None) or (block.get("thinking") if isinstance(block, dict) else "")
+                            if th_text:
+                                full_thinking += th_text
 
-                # Append assistant message to history (preserves ThinkingBlock and ToolUseBlock)
+                self.current_model = model_name
+
+                # Token tracking (excluding static system instruction, tool declarations, and prior history)
+                tokens = 0
+                if hasattr(message, 'usage') and message.usage:
+                    output_tokens = getattr(message.usage, 'output_tokens', 0) or 0
+                    est_input_chars = sum(len(str(p)) for p in content_blocks) if content_blocks else 0
+                    input_tokens = int(est_input_chars / 4)
+                    tokens = output_tokens + input_tokens
+                else:
+                    # Fallback character-based estimation (unlikely with current SDK)
+                    est_content_chars = sum(len(str(p)) for p in content_blocks) if content_blocks else 0
+                    thought_len = len(full_thinking) + len(full_text)
+                    tokens = int((est_content_chars + thought_len) / 4)
+
+                if tokens > 0 and hasattr(self, 'tokens_consumed'):
+                    self.tokens_consumed.emit(tokens)
+
+                # Determine combined thought output for the agent's internal monologue
+                emitted_thought = full_text
+                if full_thinking and full_text:
+                    emitted_thought = f"{full_thinking}\n\n{full_text}"
+                elif full_thinking and not full_text:
+                    emitted_thought = full_thinking
+
+                logging.debug(
+                    f"About to emit thought_received. Text length: {len(emitted_thought)}, Tools: {len(function_calls)}")
+                self.thought_received.emit(emitted_thought, function_calls)
+                self.is_processing = False
+                return
+
+            except Exception as e:
+                is_last_attempt = (attempt_idx == len(models_to_attempt) - 1)
+                err_str = str(e)
+                if not is_last_attempt:
+                    logging.warning(
+                        f"Claude model {model_name} failed: {err_str}. Falling back to light model {self.light_model}...")
+                    continue
+
+                # Roll back the unpaired user message to keep history valid
                 with self._history_lock:
-                    self.history.append(
-                        {"role": "assistant", "content": message.content})
-
-                # Process blocks from message
-                for block in message.content:
-                    b_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
-                    if b_type == "tool_use":
-                        name = getattr(block, "name", None) or (block.get("name") if isinstance(block, dict) else None)
-                        args = getattr(block, "input", None) or (block.get("input") if isinstance(block, dict) else {})
-                        function_calls.append(FunctionCallObject(name, args))
-                    elif b_type == "thinking":
-                        th_text = getattr(block, "thinking", None) or (block.get("thinking") if isinstance(block, dict) else "")
-                        if th_text:
-                            full_thinking += th_text
-
-            # Token tracking (input, output, and cache creation/read tokens)
-            tokens = 0
-            if hasattr(message, 'usage') and message.usage:
-                input_tokens = getattr(message.usage, 'input_tokens', 0) or 0
-                output_tokens = getattr(message.usage, 'output_tokens', 0) or 0
-                cache_read_tokens = getattr(message.usage, 'cache_read_input_tokens', 0) or 0
-                cache_creation_tokens = getattr(message.usage, 'cache_creation_input_tokens', 0) or 0
-                tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
-            else:
-                # Fallback character-based estimation (unlikely with current SDK)
-                est_content_chars = sum(len(str(p)) for p in content_blocks) if content_blocks else 0
-                thought_len = len(full_thinking) + len(full_text)
-                tokens = int((est_content_chars + thought_len) / 4)
-
-            if tokens > 0 and hasattr(self, 'tokens_consumed'):
-                self.tokens_consumed.emit(tokens)
-
-            # Determine combined thought output for the agent's internal monologue
-            emitted_thought = full_text
-            if full_thinking and full_text:
-                emitted_thought = f"{full_thinking}\n\n{full_text}"
-            elif full_thinking and not full_text:
-                emitted_thought = full_thinking
-
-            logging.debug(
-                f"About to emit thought_received. Text length: {len(emitted_thought)}, Tools: {len(function_calls)}")
-            self.thought_received.emit(emitted_thought, function_calls)
-            self.is_processing = False
-            return
-
-        except Exception as e:
-            # Roll back the unpaired user message to keep history valid
-            with self._history_lock:
-                if self.history and self.history[-1] is user_msg:
-                    self.history.pop()
-            err_str = str(e)
-            logging.error(f"Claude API Error: {err_str}", exc_info=True)
-            self.error_occurred.emit(f"Claude API Error: {err_str}")
-            self.is_processing = False
-            return
+                    if self.history and self.history[-1] is user_msg:
+                        self.history.pop()
+                logging.error(f"Claude API Error: {err_str}", exc_info=True)
+                self.error_occurred.emit(f"Claude API Error: {err_str}")
+                self.is_processing = False
+                return
 
     def reformulate_query(self, user_prompt: str, history: list) -> str:
         if not self.api_key or not history:
@@ -478,15 +496,14 @@ class ClaudeWorker:
         prompt += f"\nUser's Latest Prompt: {user_prompt}\n\nRewritten Query:"
 
         try:
-            # Use the first light model for fast, cheap tasks like query reformulation
-            light_models = self.settings.get(
-                "core.claude.light-models", ["claude-haiku-4-5"])
-            if not isinstance(light_models, list):
-                light_models = [light_models]
-            reformulator_model = light_models[0]
+            # Use light model for fast, cheap tasks like query reformulation
+            light_model = self.settings.get("core.claude.light-model", "")
+            if not light_model:
+                legacy_l = self.settings.get("core.claude.light-models", ["claude-haiku-4-5"])
+                light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "claude-haiku-4-5"
 
             response = self.client.messages.create(
-                model=reformulator_model,
+                model=light_model,
                 system=system_instruction,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=100

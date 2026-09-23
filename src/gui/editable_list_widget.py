@@ -10,7 +10,7 @@ try:
     from gui.theme import (
         PRIMARY_ACCENT_COLOR, BG_INPUT, BG_INPUT_FOCUS,
         BORDER_INPUT, BG_BUTTON, BG_BUTTON_HOVER,
-        BORDER_BUTTON, TEXT_PRIMARY, TEXT_MUTED
+        BORDER_BUTTON, TEXT_PRIMARY, TEXT_MUTED, MODERN_SCROLLBAR_STYLE
     )
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
@@ -22,6 +22,7 @@ except ImportError:
     BORDER_BUTTON = "#666666"
     TEXT_PRIMARY = "#eeeeee"
     TEXT_MUTED = "#aaaaaa"
+    MODERN_SCROLLBAR_STYLE = ""
 
 
 class ItemTextEdit(QPlainTextEdit):
@@ -54,6 +55,7 @@ class ItemTextEdit(QPlainTextEdit):
                 border: 1px solid {PRIMARY_ACCENT_COLOR};
                 background-color: {BG_INPUT_FOCUS};
             }}
+            {MODERN_SCROLLBAR_STYLE}
         """)
 
     def _on_text_changed(self):
@@ -275,7 +277,6 @@ class EditableItemListWidget(QWidget):
         row.delete_requested.connect(self._on_delete_row)
         row.return_pressed.connect(self._on_return_pressed)
         row.editing_finished.connect(lambda _: self.items_changed.emit())
-        row.text_changed.connect(lambda _: self.items_changed.emit())
 
         self.rows.append(row)
         self.rows_layout.addWidget(row)
@@ -349,7 +350,6 @@ class EditableItemListWidget(QWidget):
                 row.delete_requested.connect(self._on_delete_row)
                 row.return_pressed.connect(self._on_return_pressed)
                 row.editing_finished.connect(lambda _: self.items_changed.emit())
-                row.text_changed.connect(lambda _: self.items_changed.emit())
                 self.rows.append(row)
                 self.rows_layout.addWidget(row)
 

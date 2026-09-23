@@ -6,6 +6,9 @@ from mastodon import Mastodon
 
 class MastodonTool(Tool):
     name = "Mastodon"
+    icon = "🐘"
+    color = "#6364FF"
+    async_commands = []
     description = "Interact with the Mastodon social media network (post statuses, read timelines, get notifications, reply)."
     commands = [
         "post_status",

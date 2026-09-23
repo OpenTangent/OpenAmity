@@ -392,7 +392,7 @@ def create_agent_backup(
 
     # Discover candidate files first for accurate progress reporting
     # Directories and files to exclude from backups (transient caches, lock files, bulky node_modules and browser binaries)
-    EXCLUDED_DIR_NAMES = {"node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__"}
+    EXCLUDED_DIR_NAMES = {"node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__", "browser_data"}
     EXCLUDED_FILE_NAMES = {
         "SingletonLock", "SingletonCookie", "SingletonSocket",
         "daemon.pid", "daemon.port", ".last_engine_update"

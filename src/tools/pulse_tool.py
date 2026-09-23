@@ -7,7 +7,10 @@ from core.cerebrum import Tool
 
 
 class PulseTool(Tool):
-    name = "PulseTool"
+    name = "Pulse"
+    icon = "🫀"
+    color = "#673AB7"
+    async_commands = []
     description = "Allows you to manage your own Autonomy Pulses (your scheduled tasks and routines)."
     commands = ["add_pulse", "update_pulse", "view_agenda"]
 
@@ -102,17 +105,20 @@ class PulseTool(Tool):
         return conn
 
     def execute(self, command: str, *args, **kwargs) -> str:
+        clean_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
         if command == "add_pulse":
-            return self._add_pulse(**kwargs)
+            return self._add_pulse(**clean_kwargs)
         elif command in ["update_pulse", "manage_pulse"]:
-            return self._update_pulse(**kwargs)
+            return self._update_pulse(**clean_kwargs)
         elif command == "view_agenda":
-            return self._view_agenda(**kwargs)
+            return self._view_agenda(**clean_kwargs)
         return f"Unknown command: {command}"
 
     def _add_pulse(self, title: str, context: str, scheduled_time: str, recurrence: str, **kwargs) -> str:
         try:
-            datetime.fromisoformat(scheduled_time)
+            parsed_dt = datetime.fromisoformat(scheduled_time)
+            if parsed_dt.tzinfo is not None:
+                scheduled_time = parsed_dt.astimezone().replace(tzinfo=None).isoformat()
         except ValueError:
             return "Error: scheduled_time must be a valid ISO format string."
 
@@ -164,7 +170,9 @@ class PulseTool(Tool):
                     msg = f"Success: Recurring Pulse ID {pulse_id} permanently removed."
             elif action == 'snooze':
                 try:
-                    datetime.fromisoformat(new_time)
+                    parsed_dt = datetime.fromisoformat(new_time)
+                    if parsed_dt.tzinfo is not None:
+                        new_time = parsed_dt.astimezone().replace(tzinfo=None).isoformat()
                 except ValueError:
                     return "Error: new_time must be a valid ISO format string."
                 c.execute(
@@ -198,7 +206,7 @@ class PulseTool(Tool):
         else:
             return dt + timedelta(days=1)
 
-    def _view_agenda(self, days_ahead: int = 7) -> str:
+    def _view_agenda(self, days_ahead: int = 7, **kwargs) -> str:
         try:
             days_ahead = int(days_ahead)
         except (ValueError, TypeError):
@@ -225,11 +233,14 @@ class PulseTool(Tool):
             p_id, title, sched, rec, status = row
             try:
                 dt = datetime.fromisoformat(sched)
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone().replace(tzinfo=None)
             except Exception:
                 continue
 
             if rec == 'none':
-                items.append((dt, p_id, title, status, rec))
+                if (now - timedelta(minutes=15) <= dt <= end_date) or (status == 'pending' and dt <= end_date):
+                    items.append((dt, p_id, title, status, rec))
             else:
                 target_day = dt.day
                 curr = dt

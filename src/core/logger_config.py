@@ -71,6 +71,17 @@ class FileFormatter(BaseFormatter):
         return formatter.format(record)
 
 
+def hex_to_ansi(hex_color: str) -> str:
+    try:
+        clean = hex_color.lstrip("#")
+        if len(clean) == 6:
+            r, g, b = tuple(int(clean[i:i+2], 16) for i in (0, 2, 4))
+            return f"\x1b[38;2;{r};{g};{b}m"
+    except Exception:
+        pass
+    return "\x1b[38;2;136;136;136m"
+
+
 class ColorFormatter(BaseFormatter):
     grey = "\x1b[90m"
     white = "\x1b[97m"
@@ -80,19 +91,9 @@ class ColorFormatter(BaseFormatter):
     reset = "\x1b[0m"
 
     SECTION_COLORS = {
-        "tool.Contacts": "\x1b[38;2;0;150;136m",
-        "tool.DateTime": "\x1b[38;2;139;195;74m",
-        "tool.Email": "\x1b[38;2;65;105;225m",
-        "tool.Mastodon": "\x1b[38;2;99;100;255m",
-        "tool.Media": "\x1b[38;2;255;105;180m",
-        "tool.MemPalace": "\x1b[38;2;205;133;63m",
-        "tool.Moltbook": "\x1b[38;2;255;152;0m",
-        "tool.Pulse": "\x1b[38;2;103;58;183m",
-        "tool.Speaker": "\x1b[38;2;3;169;244m",
-        "tool.Terminal": "\x1b[38;2;243;156;18m",
-        "tool.Trajectory": "\x1b[38;2;26;188;156m",
-        "tool.WebSearch": "\x1b[38;2;0;188;212m",
-        "tool.WhatsApp": "\x1b[38;2;37;211;102m",
+        "core.TTS": "\x1b[38;2;128;128;0m",
+        "geminiworker": "\x1b[38;2;155;89;182m",
+        "agyworker": "\x1b[38;2;224;64;251m",
     }
 
     FALLBACK_PALETTE = [
@@ -111,6 +112,16 @@ class ColorFormatter(BaseFormatter):
     ]
 
     def get_section_color(self, source):
+        if source.startswith("tool."):
+            tool_name = source[5:]
+            try:
+                from core.cerebrum import Tool
+                tool_color = Tool.get_tool_color(tool_name)
+                if tool_color and tool_color != "#888888":
+                    return hex_to_ansi(tool_color)
+            except Exception:
+                pass
+
         if source in self.SECTION_COLORS:
             return self.SECTION_COLORS[source]
 

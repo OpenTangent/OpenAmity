@@ -11,12 +11,14 @@ try:
         SECONDARY_ACCENT_COLOR,
         CHAT_DOCUMENT_CSS,
         CHAT_FONT_FAMILY,
+        MODERN_SCROLLBAR_STYLE,
     )
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
     CHAT_FONT_FAMILY = "Inter"
     CHAT_DOCUMENT_CSS = ""
+    MODERN_SCROLLBAR_STYLE = ""
 
 
 class HtmlTagBalancer(HTMLParser):
@@ -159,10 +161,17 @@ def setup_chat_browser(browser: QTextBrowser):
     if CHAT_DOCUMENT_CSS:
         browser.document().setDefaultStyleSheet(CHAT_DOCUMENT_CSS)
 
-    browser.setStyleSheet(
-        f"background-color: #141416; color: #FFF; border: none; padding: 16px; "
-        f"font-family: '{CHAT_FONT_FAMILY}', 'Liberation Serif', 'Georgia', serif; font-size: 18px;"
-    )
+    browser.setStyleSheet(f"""
+        QTextBrowser {{
+            background-color: #141416;
+            color: #FFF;
+            border: none;
+            padding: 16px;
+            font-family: '{CHAT_FONT_FAMILY}', 'Liberation Serif', 'Georgia', serif;
+            font-size: 18px;
+        }}
+        {MODERN_SCROLLBAR_STYLE}
+    """)
 
     scroll_bar = browser.verticalScrollBar()
     if scroll_bar:

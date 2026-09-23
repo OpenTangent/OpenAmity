@@ -5,7 +5,10 @@ from core.cerebrum import Tool
 
 class MoltbookTool(Tool):
     name = "Moltbook"
-    description = "Interact with the Moltbook social network for AI agents. Allows registering, posting, commenting, voting, and reading feeds."
+    icon = "🦞"
+    color = "#FF9800"
+    async_commands = []
+    description = "Interact with the Moltbook social network for AI agents. Allows registering, posting, commenting, voting, reading feeds, managing communities (submolts), labels/roles, and notifications."
     commands = [
         "register_account",
         "check_claim_status",
@@ -24,7 +27,29 @@ class MoltbookTool(Tool):
         "verify_challenge",
         "delete_post",
         "delete_comment",
-        "get_agent_profile"
+        "get_agent_profile",
+        "mark_notifications_read_by_post",
+        "mark_all_notifications_read",
+        "get_notifications",
+        "get_post",
+        "pin_post",
+        "unpin_post",
+        "create_submolt",
+        "list_submolts",
+        "get_submolt",
+        "subscribe_submolt",
+        "unsubscribe_submolt",
+        "update_submolt_settings",
+        "add_moderator",
+        "remove_moderator",
+        "list_moderators",
+        "define_label",
+        "list_labels",
+        "list_roles",
+        "attach_label",
+        "remove_label",
+        "update_agent_profile",
+        "setup_owner_email"
     ]
 
     BASE_URL = "https://www.moltbook.com/api/v1"
@@ -33,7 +58,7 @@ class MoltbookTool(Tool):
         super().__init__(orchestrator)
         self.db = None
         self.api_key = ""
-        if self.orchestrator and hasattr(self.orchestrator, 'settings_manager'):
+        if self.orchestrator and getattr(self.orchestrator, 'settings_manager', None):
             self.api_key = self.orchestrator.settings_manager.get_env(
                 "MOLTBOOK_API_KEY") or ""
 
@@ -245,23 +270,279 @@ class MoltbookTool(Tool):
             },
             {
                 "name": "Moltbook_get_agent_profile",
-                "description": "Get your own agent profile.",
+                "description": "Get your own agent profile or inspect another agent's profile by name.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "agent_name": {"type": "STRING", "description": "Optional name of the agent whose profile to retrieve. If omitted, returns your own profile."}
+                    }
+                }
+            },
+            {
+                "name": "Moltbook_mark_notifications_read_by_post",
+                "description": "Mark all notifications associated with a specific post as read.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "post_id": {"type": "STRING", "description": "ID of the post whose notifications should be marked as read."}
+                    },
+                    "required": ["post_id"]
+                }
+            },
+            {
+                "name": "Moltbook_mark_all_notifications_read",
+                "description": "Mark all notifications across all posts and activity as read.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
+                }
+            },
+            {
+                "name": "Moltbook_get_notifications",
+                "description": "Get notifications for the agent (such as mentions, replies, upvotes).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "limit": {"type": "INTEGER", "description": "Limit of notifications to return. Default 20."},
+                        "cursor": {"type": "STRING", "description": "Cursor for next page of notifications."}
+                    }
+                }
+            },
+            {
+                "name": "Moltbook_get_post",
+                "description": "Get details and content of a single post by its ID.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "post_id": {"type": "STRING", "description": "ID of the post to retrieve."}
+                    },
+                    "required": ["post_id"]
+                }
+            },
+            {
+                "name": "Moltbook_pin_post",
+                "description": "Pin a post in its submolt (submolt moderator/owner only, max 3 pinned posts per submolt).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "post_id": {"type": "STRING", "description": "ID of the post to pin."}
+                    },
+                    "required": ["post_id"]
+                }
+            },
+            {
+                "name": "Moltbook_unpin_post",
+                "description": "Unpin a pinned post in a submolt (submolt moderator/owner only).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "post_id": {"type": "STRING", "description": "ID of the post to unpin."}
+                    },
+                    "required": ["post_id"]
+                }
+            },
+            {
+                "name": "Moltbook_create_submolt",
+                "description": "Create a new submolt community on Moltbook.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {"type": "STRING", "description": "URL-safe name of the submolt (lowercase with hyphens, 2-30 chars)."},
+                        "display_name": {"type": "STRING", "description": "Human-readable display name shown in the UI."},
+                        "description": {"type": "STRING", "description": "Description of the submolt community."},
+                        "allow_crypto": {"type": "BOOLEAN", "description": "Whether cryptocurrency content is allowed in this submolt. Default false."}
+                    },
+                    "required": ["name", "display_name"]
+                }
+            },
+            {
+                "name": "Moltbook_list_submolts",
+                "description": "List all submolt communities on Moltbook.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "Moltbook_get_submolt",
+                "description": "Get information and metadata for a specific submolt community.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt to retrieve."},
+                        "requester_id": {"type": "STRING", "description": "Your agent ID to include your role and moderator actions."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_subscribe_submolt",
+                "description": "Subscribe to a submolt to include its posts in your personal feed.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt to subscribe to."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_unsubscribe_submolt",
+                "description": "Unsubscribe from a submolt community.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt to unsubscribe from."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_update_submolt_settings",
+                "description": "Update settings for a submolt (submolt owner/moderator only).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt to update."},
+                        "description": {"type": "STRING", "description": "New description for the submolt."},
+                        "banner_color": {"type": "STRING", "description": "Banner hex color (e.g. '#1a1a2e')."},
+                        "theme_color": {"type": "STRING", "description": "Theme hex color (e.g. '#ff4500')."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_add_moderator",
+                "description": "Add a moderator to a submolt community (submolt owner only).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt."},
+                        "agent_name": {"type": "STRING", "description": "Name of the agent to appoint as moderator."},
+                        "role": {"type": "STRING", "description": "Role to grant (default 'moderator')."}
+                    },
+                    "required": ["submolt_name", "agent_name"]
+                }
+            },
+            {
+                "name": "Moltbook_remove_moderator",
+                "description": "Remove a moderator from a submolt community (submolt owner only).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt."},
+                        "agent_name": {"type": "STRING", "description": "Name of the agent to remove from moderation."}
+                    },
+                    "required": ["submolt_name", "agent_name"]
+                }
+            },
+            {
+                "name": "Moltbook_list_moderators",
+                "description": "List all appointed moderators for a submolt community.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_define_label",
+                "description": "Define a new label (tag, status, or role) for a submolt (submolt moderator/owner only).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt to define label for."},
+                        "key": {"type": "STRING", "description": "Identifier key (e.g. 'bug', 'open', 'triager')."},
+                        "label": {"type": "STRING", "description": "Display label (e.g. 'Bug', 'Open', 'Bug Triager')."},
+                        "color": {"type": "STRING", "description": "Color name: emerald, rose, amber, sky, violet, slate, indigo, teal, pink, orange."},
+                        "kind": {"type": "STRING", "description": "'tag' (freeform multi-select on posts), 'status' (single-select on posts), or 'role' (assigned to agents)."},
+                        "prompt": {"type": "STRING", "description": "For roles: recurring standing instruction prompt shown on /home check-in."},
+                        "cadence_minutes": {"type": "INTEGER", "description": "For roles: minutes between reappearing briefings (e.g. 1440 for daily, 0 for every check-in)."}
+                    },
+                    "required": ["submolt_name", "key", "label", "color", "kind"]
+                }
+            },
+            {
+                "name": "Moltbook_list_labels",
+                "description": "List all label definitions (tags, statuses, roles) for a submolt.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_list_roles",
+                "description": "List all roles and their current assigned agent holders for a submolt.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "submolt_name": {"type": "STRING", "description": "Name of the submolt."}
+                    },
+                    "required": ["submolt_name"]
+                }
+            },
+            {
+                "name": "Moltbook_attach_label",
+                "description": "Attach a tag/status to a post, or assign a role to an agent (moderators can attach any, agents can tag own posts).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "label_definition_id": {"type": "STRING", "description": "ID of the label definition to attach."},
+                        "target_type": {"type": "STRING", "description": "'post' or 'agent'."},
+                        "target_id": {"type": "STRING", "description": "ID of the target post or target agent."},
+                        "placement": {"type": "STRING", "description": "Optional placement (e.g. 'metadata' or 'inline')."}
+                    },
+                    "required": ["label_definition_id", "target_type", "target_id"]
+                }
+            },
+            {
+                "name": "Moltbook_remove_label",
+                "description": "Remove an attached label or role assignment by its attachment ID.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "attachment_id": {"type": "STRING", "description": "ID of the label attachment to remove."}
+                    },
+                    "required": ["attachment_id"]
+                }
+            },
+            {
+                "name": "Moltbook_update_agent_profile",
+                "description": "Update your agent profile description and/or metadata.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "description": {"type": "STRING", "description": "Updated agent bio or description."},
+                        "metadata": {"type": "OBJECT", "description": "Optional metadata dictionary for the agent profile."}
+                    }
+                }
+            },
+            {
+                "name": "Moltbook_setup_owner_email",
+                "description": "Send a setup link to your human owner's email for access to the Moltbook owner dashboard to manage your account and rotate API keys.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "email": {"type": "STRING", "description": "Email address of your human owner."}
+                    },
+                    "required": ["email"]
                 }
             }
         ]
 
     def execute(self, command: str, *args, **kwargs) -> Any:
         try:
-            is_low_token = self.orchestrator.settings_manager.get(
-                "core.low-token-mode", False) if hasattr(self, 'orchestrator') and self.orchestrator else False
+            settings_mgr = getattr(self.orchestrator, 'settings_manager', None) if self.orchestrator else None
+            is_low_token = settings_mgr.get("core.low-token-mode", False) if settings_mgr else False
 
             current_key = ""
-            if self.orchestrator and hasattr(self.orchestrator, 'settings_manager'):
-                current_key = self.orchestrator.settings_manager.get_env(
-                    "MOLTBOOK_API_KEY") or ""
+            if settings_mgr:
+                current_key = settings_mgr.get_env("MOLTBOOK_API_KEY") or ""
             if current_key != self.api_key:
                 self.api_key = current_key
 
@@ -441,8 +722,191 @@ class MoltbookTool(Tool):
                 return resp.text
 
             elif command == "get_agent_profile":
+                agent_name = kwargs.get("agent_name")
+                if agent_name:
+                    resp = requests.get(
+                        f"{self.BASE_URL}/agents/profile", params={"name": agent_name}, headers=self._get_headers())
+                else:
+                    resp = requests.get(
+                        f"{self.BASE_URL}/agents/me", headers=self._get_headers())
+                return resp.text
+
+            elif command == "mark_notifications_read_by_post":
+                post_id = kwargs.get("post_id")
+                resp = requests.post(
+                    f"{self.BASE_URL}/notifications/read-by-post/{post_id}", headers=self._get_headers())
+                return resp.text
+
+            elif command == "mark_all_notifications_read":
+                resp = requests.post(
+                    f"{self.BASE_URL}/notifications/read-all", headers=self._get_headers())
+                return resp.text
+
+            elif command == "get_notifications":
+                params = {}
+                limit = kwargs.get("limit", 20)
+                if is_low_token:
+                    limit = min(int(limit), 5)
+                params["limit"] = limit
+                if kwargs.get("cursor"):
+                    params["cursor"] = kwargs.get("cursor")
                 resp = requests.get(
-                    f"{self.BASE_URL}/agents/me", headers=self._get_headers())
+                    f"{self.BASE_URL}/notifications", params=params, headers=self._get_headers())
+                return resp.text
+
+            elif command == "get_post":
+                post_id = kwargs.get("post_id")
+                resp = requests.get(
+                    f"{self.BASE_URL}/posts/{post_id}", headers=self._get_headers())
+                return resp.text
+
+            elif command == "pin_post":
+                post_id = kwargs.get("post_id")
+                resp = requests.post(
+                    f"{self.BASE_URL}/posts/{post_id}/pin", headers=self._get_headers())
+                return resp.text
+
+            elif command == "unpin_post":
+                post_id = kwargs.get("post_id")
+                resp = requests.delete(
+                    f"{self.BASE_URL}/posts/{post_id}/pin", headers=self._get_headers())
+                return resp.text
+
+            elif command == "create_submolt":
+                payload = {
+                    "name": kwargs.get("name"),
+                    "display_name": kwargs.get("display_name")
+                }
+                if kwargs.get("description") is not None:
+                    payload["description"] = kwargs.get("description")
+                if kwargs.get("allow_crypto") is not None:
+                    payload["allow_crypto"] = bool(kwargs.get("allow_crypto"))
+                resp = requests.post(
+                    f"{self.BASE_URL}/submolts", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "list_submolts":
+                resp = requests.get(
+                    f"{self.BASE_URL}/submolts", headers=self._get_headers())
+                return resp.text
+
+            elif command == "get_submolt":
+                submolt_name = kwargs.get("submolt_name")
+                params = {}
+                if kwargs.get("requester_id"):
+                    params["requester_id"] = kwargs.get("requester_id")
+                resp = requests.get(
+                    f"{self.BASE_URL}/submolts/{submolt_name}", params=params, headers=self._get_headers())
+                return resp.text
+
+            elif command == "subscribe_submolt":
+                submolt_name = kwargs.get("submolt_name")
+                resp = requests.post(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/subscribe", headers=self._get_headers())
+                return resp.text
+
+            elif command == "unsubscribe_submolt":
+                submolt_name = kwargs.get("submolt_name")
+                resp = requests.delete(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/subscribe", headers=self._get_headers())
+                return resp.text
+
+            elif command == "update_submolt_settings":
+                submolt_name = kwargs.get("submolt_name")
+                payload = {}
+                if kwargs.get("description") is not None:
+                    payload["description"] = kwargs.get("description")
+                if kwargs.get("banner_color") is not None:
+                    payload["banner_color"] = kwargs.get("banner_color")
+                if kwargs.get("theme_color") is not None:
+                    payload["theme_color"] = kwargs.get("theme_color")
+                resp = requests.patch(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/settings", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "add_moderator":
+                submolt_name = kwargs.get("submolt_name")
+                payload = {
+                    "agent_name": kwargs.get("agent_name"),
+                    "role": kwargs.get("role", "moderator")
+                }
+                resp = requests.post(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/moderators", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "remove_moderator":
+                submolt_name = kwargs.get("submolt_name")
+                payload = {"agent_name": kwargs.get("agent_name")}
+                resp = requests.delete(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/moderators", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "list_moderators":
+                submolt_name = kwargs.get("submolt_name")
+                resp = requests.get(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/moderators", headers=self._get_headers())
+                return resp.text
+
+            elif command == "define_label":
+                submolt_name = kwargs.get("submolt_name")
+                payload = {
+                    "key": kwargs.get("key"),
+                    "label": kwargs.get("label"),
+                    "color": kwargs.get("color"),
+                    "kind": kwargs.get("kind")
+                }
+                if kwargs.get("prompt") is not None:
+                    payload["prompt"] = kwargs.get("prompt")
+                if kwargs.get("cadence_minutes") is not None:
+                    payload["cadence_minutes"] = kwargs.get("cadence_minutes")
+                resp = requests.post(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/labels", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "list_labels":
+                submolt_name = kwargs.get("submolt_name")
+                resp = requests.get(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/labels", headers=self._get_headers())
+                return resp.text
+
+            elif command == "list_roles":
+                submolt_name = kwargs.get("submolt_name")
+                resp = requests.get(
+                    f"{self.BASE_URL}/submolts/{submolt_name}/roles", headers=self._get_headers())
+                return resp.text
+
+            elif command == "attach_label":
+                payload = {
+                    "label_definition_id": kwargs.get("label_definition_id"),
+                    "target_type": kwargs.get("target_type"),
+                    "target_id": kwargs.get("target_id")
+                }
+                if kwargs.get("placement") is not None:
+                    payload["placement"] = kwargs.get("placement")
+                resp = requests.post(
+                    f"{self.BASE_URL}/labels/attach", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "remove_label":
+                attachment_id = kwargs.get("attachment_id")
+                resp = requests.delete(
+                    f"{self.BASE_URL}/labels/attach/{attachment_id}", headers=self._get_headers())
+                return resp.text
+
+            elif command == "update_agent_profile":
+                payload = {}
+                if kwargs.get("description") is not None:
+                    payload["description"] = kwargs.get("description")
+                if kwargs.get("metadata") is not None:
+                    payload["metadata"] = kwargs.get("metadata")
+                resp = requests.patch(
+                    f"{self.BASE_URL}/agents/me", json=payload, headers=self._get_headers())
+                return resp.text
+
+            elif command == "setup_owner_email":
+                payload = {"email": kwargs.get("email")}
+                resp = requests.post(
+                    f"{self.BASE_URL}/agents/me/setup-owner-email", json=payload, headers=self._get_headers())
                 return resp.text
 
             return f"Unknown command: {command}"

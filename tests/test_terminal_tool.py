@@ -59,11 +59,26 @@ def test_terminal_tool_declarations():
     names = [d["name"] for d in declarations]
     assert "Terminal_flag_for_backup" in names
     assert "flag_for_backup" in tool.commands
+    assert "Terminal_read_file" in names
+    assert "read_file" in tool.commands
 
     decl = next(d for d in declarations if d["name"] == "Terminal_flag_for_backup")
     props = decl["parameters"]["properties"]
     assert "path" in props
     assert "action" in props
+
+    read_decl = next(d for d in declarations if d["name"] == "Terminal_read_file")
+    read_props = read_decl["parameters"]["properties"]
+    assert "file_path" in read_props
+    assert "start_line" in read_props
+    assert "end_line" in read_props
+    assert "max_lines" in read_props
+    assert "show_line_numbers" in read_props
+    assert "query" in read_props
+    assert "context_lines" in read_props
+    assert "jump_to_match" in read_props
+    assert "max_line_length" in read_props
+    assert read_decl["parameters"]["required"] == ["file_path"]
 
 
 def test_flag_backup_add_and_list(test_env):
@@ -318,3 +333,324 @@ def test_backup_and_restore_with_flagged_files_and_directories(test_env):
     # Verify agent's backup targets file is restored
     restored_targets = load_backup_targets(details["agent_id"])
     assert len(restored_targets) == 2
+
+
+def test_terminal_read_file_basic(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    test_file = os.path.join(doc_dir, "sample.txt")
+    with open(test_file, "w", encoding="utf-8") as f:
+        f.write("line one\nline two\nline three\n")
+
+    res = tool.execute("read_file", file_path=test_file)
+    assert "=== File: " in res
+    assert "sample.txt" in res
+    assert "Lines 1-3 of 3" in res
+    assert "1 | line one" in res
+    assert "2 | line two" in res
+    assert "3 | line three" in res
+    assert "=== End of File (3 lines) ===" in res
+
+
+def test_terminal_read_file_slicing(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    test_file = os.path.join(doc_dir, "numbered.txt")
+    with open(test_file, "w", encoding="utf-8") as f:
+        for i in range(1, 21):
+            f.write(f"content line {i}\n")
+
+    res = tool.execute("read_file", file_path=test_file, start_line=5, end_line=8)
+    assert "Lines 5-8 of 20" in res
+    assert "5 | content line 5" in res
+    assert "8 | content line 8" in res
+    assert "content line 4" not in res
+    assert "content line 9" not in res
+    assert "... [12 more lines in file. Call Terminal_read_file with start_line=9 to continue reading]" in res
+
+
+def test_terminal_read_file_no_line_numbers(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    test_file = os.path.join(doc_dir, "plain.txt")
+    with open(test_file, "w", encoding="utf-8") as f:
+        f.write("hello world\nsecond line\n")
+
+    res = tool.execute("read_file", file_path=test_file, show_line_numbers=False)
+    assert "=== File: " in res
+    assert "1 |" not in res
+    assert "hello world" in res
+    assert "second line" in res
+
+
+def test_terminal_read_file_relative_and_tilde_paths(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents", "Nova")
+    os.makedirs(doc_dir, exist_ok=True)
+    test_file = os.path.join(doc_dir, "notes.md")
+    with open(test_file, "w", encoding="utf-8") as f:
+        f.write("# Notes\nImportant item\n")
+
+    # Relative path (relative to ~/Documents)
+    res_rel = tool.execute("read_file", file_path="Nova/notes.md")
+    assert "Lines 1-2 of 2" in res_rel
+    assert "1 | # Notes" in res_rel
+
+    # Tilde path
+    res_tilde = tool.execute("read_file", file_path="~/Documents/Nova/notes.md")
+    assert "Lines 1-2 of 2" in res_tilde
+    assert "1 | # Notes" in res_tilde
+
+
+def test_terminal_read_file_missing(test_env):
+    tool = TerminalSkill()
+    res = tool.execute("read_file", file_path="nonexistent_file.txt")
+    assert "Error: File not found at" in res
+    assert "nonexistent_file.txt" in res
+
+
+def test_terminal_read_file_directory(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    res = tool.execute("read_file", file_path=doc_dir)
+    assert "Error: Path" in res
+    assert "is a directory, not a regular file" in res
+    assert "Terminal_run" in res
+
+
+def test_terminal_read_file_binary(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    bin_file = os.path.join(doc_dir, "data.bin")
+    with open(bin_file, "wb") as f:
+        f.write(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+    res = tool.execute("read_file", file_path=bin_file)
+    assert "appears to be a binary file" in res
+    assert "Media_read" in res
+
+
+def test_terminal_read_file_empty(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    empty_file = os.path.join(doc_dir, "empty.txt")
+    with open(empty_file, "w") as f:
+        pass
+
+    res = tool.execute("read_file", file_path=empty_file)
+    assert "Empty file, 0 B" in res
+
+
+def test_terminal_read_file_start_line_beyond_total(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    short_file = os.path.join(doc_dir, "short.txt")
+    with open(short_file, "w") as f:
+        f.write("one\ntwo\nthree\n")
+
+    res = tool.execute("read_file", file_path=short_file, start_line=10)
+    assert "Notice: start_line 10 exceeds total file lines (3)" in res
+
+
+def test_terminal_read_file_invalid_end_line(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    test_file = os.path.join(doc_dir, "range.txt")
+    with open(test_file, "w") as f:
+        f.write("line 1\nline 2\n")
+
+    res = tool.execute("read_file", file_path=test_file, start_line=5, end_line=2)
+    assert "Error: end_line (2) cannot be less than start_line (5)" in res
+
+
+def test_terminal_read_file_low_token_mode(test_env):
+    am = AgentManager()
+    aid = am.create_new_agent()
+    orch = MockOrchestrator(aid)
+    orch.settings_manager.set("core.low-token-mode", True)
+    orch.settings_manager.save()
+    tool = TerminalSkill(orchestrator=orch)
+
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    big_file = os.path.join(doc_dir, "big.txt")
+    with open(big_file, "w") as f:
+        for i in range(1, 201):
+            f.write(f"line {i}\n")
+
+    # In low token mode, default max_lines is 100
+    res = tool.execute("read_file", file_path=big_file)
+    assert "Lines 1-100 of 200" in res
+    assert "100 | line 100" in res
+    assert "101 | line 101" not in res
+    assert "... [100 more lines in file. Call Terminal_read_file with start_line=101 to continue reading]" in res
+
+
+def test_terminal_read_file_character_truncation(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    huge_line_file = os.path.join(doc_dir, "huge_line.txt")
+    with open(huge_line_file, "w") as f:
+        # Write 2 lines each with 20000 characters
+        f.write("A" * 20000 + "\n")
+        f.write("B" * 20000 + "\n")
+
+    res = tool.execute("read_file", file_path=huge_line_file)
+    assert "Output truncated at 30000 characters limit" in res
+    assert "Call Terminal_read_file with start_line=" in res
+
+
+def test_terminal_read_file_encoding_fallback(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    non_utf8_file = os.path.join(doc_dir, "non_utf8.txt")
+    with open(non_utf8_file, "wb") as f:
+        f.write(b"Hello \xe9\xff World\nSecond line\n")
+
+    res = tool.execute("read_file", file_path=non_utf8_file)
+    assert "Lines 1-2 of 2" in res
+    assert "Hello " in res
+    assert "Second line" in res
+
+
+def test_cerebrum_executes_terminal_read_file(test_env):
+    from core.cerebrum import Cerebrum
+    cerebrum = Cerebrum()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "cerebrum_test.txt")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        f.write("routed successfully\nsecond line\n")
+
+    result = cerebrum.execute_tool_call("Terminal_read_file", {"file_path": sample_file})
+    assert "routed successfully" in result
+    assert "1 | routed successfully" in result
+    assert "Lines 1-2 of 2" in result
+
+
+def test_terminal_read_file_query_search(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "large_doc.txt")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        for i in range(1, 51):
+            if i == 25:
+                f.write("def TARGET_FUNCTION():\n")
+            else:
+                f.write(f"line content {i}\n")
+
+    res = tool.execute("read_file", file_path=sample_file, query="target_function", context_lines=2)
+    assert "Found 1 match for query 'target_function' at line [25]" in res
+    assert "23 | line content 23" in res
+    assert "24 | line content 24" in res
+    assert "25 > def TARGET_FUNCTION():" in res
+    assert "26 | line content 26" in res
+    assert "27 | line content 27" in res
+    assert "line content 22" not in res
+    assert "line content 28" not in res
+    assert "... [To read continuously around any match, call Terminal_read_file with start_line=<line_number>]" in res
+
+
+def test_terminal_read_file_query_multiple_matches_and_hunks(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "multi_matches.txt")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        for i in range(1, 51):
+            if i in (10, 40):
+                f.write(f"KEYWORD match at {i}\n")
+            else:
+                f.write(f"regular line {i}\n")
+
+    res = tool.execute("read_file", file_path=sample_file, query="KEYWORD", context_lines=2)
+    assert "Found 2 matches for query 'KEYWORD' at lines [10, 40]" in res
+    assert "10 > KEYWORD match at 10" in res
+    assert "40 > KEYWORD match at 40" in res
+    assert "---" in res  # Non-contiguous hunks separated by separator
+
+
+def test_terminal_read_file_query_no_matches(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "search_empty.txt")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        f.write("alpha\nbeta\ngamma\n")
+
+    res = tool.execute("read_file", file_path=sample_file, query="nonexistent_pattern")
+    assert "Notice: No matches found for query 'nonexistent_pattern' in 3 lines." in res
+
+
+def test_terminal_read_file_query_jump_to_match(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "jump_file.txt")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        for i in range(1, 61):
+            if i == 35:
+                f.write("ANCHOR_HERE: section start\n")
+            else:
+                f.write(f"data line {i}\n")
+
+    res = tool.execute("read_file", file_path=sample_file, query="ANCHOR_HERE", jump_to_match=True, max_lines=5)
+    assert "Jumped to first match for 'ANCHOR_HERE' at line 35" in res
+    assert "Lines 35-39 of 60" in res
+    assert "35 > ANCHOR_HERE: section start" in res
+    assert "36 | data line 36" in res
+    assert "data line 34" not in res
+
+
+def test_terminal_read_file_max_line_length(test_env):
+    tool = TerminalSkill()
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "wide_lines.txt")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        f.write("short line\n")
+        f.write("X" * 1500 + "\n")
+        f.write("another short line\n")
+
+    res = tool.execute("read_file", file_path=sample_file, max_line_length=100)
+    assert "short line" in res
+    assert " ... [line truncated]" in res
+    assert "another short line" in res
+    # Ensure line 2 is truncated to 100 characters plus indicator
+    truncated_indicator = "X" * 100 + " ... [line truncated]"
+    assert truncated_indicator in res
+
+
+def test_terminal_read_file_max_line_length_in_low_token_mode(test_env):
+    am = AgentManager()
+    aid = am.create_new_agent()
+    orch = MockOrchestrator(aid)
+    orch.settings_manager.set("core.low-token-mode", True)
+    orch.settings_manager.save()
+    tool = TerminalSkill(orchestrator=orch)
+
+    doc_dir = os.path.join(test_env["home"], "Documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    sample_file = os.path.join(doc_dir, "minified.json")
+    with open(sample_file, "w", encoding="utf-8") as f:
+        f.write('{"data": "' + 'A' * 1000 + '"}\n')
+
+    # In low token mode, max_line_length defaults to 300
+    res = tool.execute("read_file", file_path=sample_file)
+    assert " ... [line truncated]" in res
+    expected_prefix = '{"data": "' + 'A' * 289  # 11 chars in prefix + 289 = 300
+    assert expected_prefix in res
+
+
+

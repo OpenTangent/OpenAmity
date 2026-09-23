@@ -6,6 +6,9 @@ from core.cerebrum import Tool
 
 class DateTimeSkill(Tool):
     name = "DateTime"
+    icon = "🕒"
+    color = "#8BC34A"
+    async_commands = []
     description = "Provides date and time information."
     commands = ["datetime"]
 

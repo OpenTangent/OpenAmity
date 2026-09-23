@@ -401,6 +401,10 @@ def test_stream_gemini_attempt_full_playback(temp_agent_dir):
     assert mock_process.wait.called
     # Ensure process.kill was NOT called during successful stream
     assert not mock_process.kill.called
+    # Ensure automatic function calling is explicitly disabled on the config
+    call_kwargs = mock_client.models.generate_content_stream.call_args.kwargs
+    assert call_kwargs["config"].automatic_function_calling is not None
+    assert call_kwargs["config"].automatic_function_calling.disable is True
 
 
 def test_stream_gemini_attempt_kills_process_on_stream_error(temp_agent_dir):

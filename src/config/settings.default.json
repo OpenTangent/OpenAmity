@@ -6,9 +6,12 @@
     "whatsapp-auto-update-engine": true,
     "low-token-mode": false,
     "gemini": {
+      "model": "gemini-3.8-flash",
+      "light-model": "gemini-3.5-flash-lite",
+      "thinking-level": "low",
       "gemini-models": [
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest"
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite"
       ],
       "light-models": [
         "gemini-3.5-flash-lite",
@@ -24,10 +27,12 @@
       ]
     },
     "claude": {
+      "model": "claude-fable-5-1",
+      "light-model": "claude-haiku-4-5",
+      "thinking-level": "low",
       "claude-models": [
         "claude-fable-5-1",
-        "claude-sonnet-5",
-        "claude-opus-5"
+        "claude-haiku-4-5"
       ],
       "light-models": [
         "claude-haiku-4-5",
@@ -35,18 +40,24 @@
       ]
     },
     "chatgpt": {
+      "model": "gpt-6-astra",
+      "light-model": "gpt-6-luna",
+      "thinking-level": "low",
       "chatgpt-models": [
-        "gpt-5.6-terra",
-        "gpt-5.6-sol"
+        "gpt-6-astra",
+        "gpt-6-luna"
       ],
       "light-models": [
-        "gpt-5.6-luna"
+        "gpt-6-luna"
       ]
     },
     "deepseek": {
+      "model": "deepseek-v4-pro",
+      "light-model": "deepseek-flash",
+      "thinking-level": "low",
       "deepseek-models": [
-        "deepseek-flash",
-        "deepseek-v4-flash"
+        "deepseek-v4-pro",
+        "deepseek-flash"
       ],
       "light-models": [
         "deepseek-flash",
@@ -55,9 +66,12 @@
     },
     "antigravity": {
       "agy-mode": false,
+      "model": "Gemini 3.8 Flash (High)",
+      "light-model": "Gemini 3.5 Flash (High)",
+      "thinking-level": "low",
       "agy-models": [
-        "Gemini 3.5 Flash (High)",
-        "Gemini 3.1 Pro (High)"
+        "Gemini 3.8 Flash (High)",
+        "Gemini 3.5 Flash (High)"
       ]
     },
     "agent": {
@@ -108,6 +122,18 @@
       "max-recording-time": 60,
       "silence-timeout": 3.0
     },
+    "morphological_memory": {
+      "enabled": true,
+      "top_k": 5,
+      "eta": 1.0,
+      "decay_per_minute": 0.002,
+      "max_coactivation_set": 16,
+      "gamma": 0.6,
+      "leak": 0.8,
+      "dissipation": 0.05,
+      "dt": 0.1,
+      "n_steps": 25
+    },
     "somatic": {
       "cognitive-budget": 10000,
       "decay-per-minute": 500,
@@ -125,6 +151,19 @@
       "retention-days": 7,
       "show-debug": false
     },
+    "browser": {
+      "headless": true,
+      "humanize": true,
+      "idle-timeout-minutes": 5,
+      "page-timeout-seconds": 30,
+      "action-timeout-seconds": 4,
+      "block-ads": true,
+      "auto-dismiss-cookies": true,
+      "default-viewport-width": 1280,
+      "default-viewport-height": 800,
+      "screenshot-max-dimension": 1024,
+      "max-accessibility-nodes": 150
+    },
     "tools": {
       "datetime": true,
       "contacts": true,
@@ -141,7 +180,8 @@
       "subagent": true,
       "system": true,
       "websearch": true,
-      "media": true
+      "media": true,
+      "browser": true
     }
   }
 }

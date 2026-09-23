@@ -4,6 +4,9 @@ from core.cerebrum import Tool
 
 class SubagentSkill(Tool):
     name = "Subagent"
+    icon = "🤖"
+    color = "#E040FB"
+    async_commands = ["spawn"]
     description = "Delegate background tasks to LLM subagents. Subagents run in a separate thread, do not share context, and are not persistent. They default to cheap 'light' models. Use this to parallelize research or offload isolated thinking. When a subagent finishes, its response will be added to your context via a [System Feedback] message. Subagents only have access to DateTime and WebSearch tools."
     commands = ["spawn", "message", "dispose", "status"]
 
@@ -19,9 +22,10 @@ class SubagentSkill(Tool):
         if command == "spawn":
             task = kwargs.get("task_description")
             model_tier = kwargs.get("model_tier", "light")
+            call_id = kwargs.get("_call_id")
             if not task:
                 return "Error: task_description is required."
-            return self.orchestrator.spawn_subagent(task, model_tier)
+            return self.orchestrator.spawn_subagent(task, model_tier, call_id=call_id)
 
         elif command == "message":
             sid = kwargs.get("subagent_id")

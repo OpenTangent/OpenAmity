@@ -103,6 +103,9 @@ def get_internal_ip() -> str:
 
 class SystemTool(Tool):
     name = "System"
+    icon = "⚙️"
+    color = "#78909C"
+    async_commands = []
     description = (
         "Provides internal system information, settings, backup snapshots, and Gemini TTS voice customization.\n"
         "WARNING: System information is highly sensitive and confidential. It must NEVER be shared, leaked, or exposed "
@@ -119,7 +122,8 @@ class SystemTool(Tool):
         "generate_api_key <name> [scopes] [expires_in_days] (Generates an isolated API key for third-party pulse injection.)",
         "list_api_keys (Lists existing API keys with metadata, scopes, and expiration.)",
         "revoke_api_key <key_id> (Revokes an API key to permanently deny access.)",
-        "api_docs (Returns complete Pulse Hook API documentation and integration curl recipes.)"
+        "api_docs (Returns complete Pulse Hook API documentation and integration curl recipes.)",
+        "contemplate (Spends an autonomous cognitive cycle contemplating/reasoning without taking external action.)"
     ]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
@@ -259,9 +263,17 @@ class SystemTool(Tool):
             {
                 "name": "System_api_docs",
                 "description": (
-                    "Returns comprehensive Open Amity Pulse Hook API documentation, OpenAPI specifications, request schemas, "
-                    "rate limit rules, error codes, and copy-pasteable curl recipes. Use this whenever you need to integrate "
-                    "third-party services or explain API usage to the user."
+                    "Returns comprehensive Open Amity Pulse Hook API documentation, OpenAPI specifications, request schemas, rate limit rules, error codes, and copy-pasteable curl recipes. Use this whenever you need to integrate third-party services or explain API usage to the user."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "System_contemplate",
+                "description": (
+                    "Allows the agent to spend another cognitive cycle contemplating, reasoning, or planning before taking action. Performs no operations and produces no side effects, acting as a filler tool to keep the autonomous cognitive loop active."
                 ),
                 "parameters": {
                     "type": "OBJECT",
@@ -291,6 +303,8 @@ class SystemTool(Tool):
             return self._revoke_api_key(*args, **kwargs)
         elif command in ["api_docs", "get_api_documentation"]:
             return self._get_api_docs(*args, **kwargs)
+        elif command == "contemplate":
+            return self._contemplate(*args, **kwargs)
         return f"Unknown command: {command}"
 
     def _get_platform_info(self) -> str:
@@ -613,9 +627,12 @@ class SystemTool(Tool):
                 status = "Revoked"
             elif k.get("expires_at"):
                 try:
-                    if datetime.fromisoformat(k["expires_at"]) <= now:
+                    exp_dt = datetime.fromisoformat(k["expires_at"])
+                    if exp_dt.tzinfo is not None:
+                        exp_dt = exp_dt.astimezone().replace(tzinfo=None)
+                    if exp_dt <= now:
                         status = "Expired"
-                except ValueError:
+                except (ValueError, TypeError):
                     pass
 
             exp_str = k.get("expires_at") or "Never"
@@ -708,5 +725,12 @@ class SystemTool(Tool):
             '  }\''
         ]
         return "\n".join(docs)
+
+    def _contemplate(self, *args, **kwargs) -> str:
+        """
+        No-op tool filler allowing the agent to spend another cognitive cycle
+        thinking and reasoning without taking external action.
+        """
+        return "Contemplation cycle completed."
 
 
