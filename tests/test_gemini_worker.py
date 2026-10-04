@@ -242,4 +242,138 @@ def test_gemini_worker_reformulator_afc_disabled(monkeypatch, tmp_path):
             assert config.automatic_function_calling.disable is True
 
 
+def test_gemini_worker_503_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path / (aid or "default")))
+    with patch.object(SettingsManager, "get_env", return_value="test_key_12345"):
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value = mock_client
+
+            worker = GeminiWorker(agent_id="test_gemini_503_fallback")
+            worker.start_session("Test instructions", tools=[])
+            assert worker.current_model == "gemini-3.8-flash"
+            assert worker.light_model == "gemini-3.5-flash-lite"
+
+            primary_chat = MagicMock()
+            primary_chat.get_history.return_value = []
+
+            # Simulate 503 UNAVAILABLE ServerError from primary model
+            def fail_send_message_stream(msg):
+                raise Exception("503 UNAVAILABLE. {'error': {'code': 503, 'message': 'The service is currently unavailable.', 'status': 'UNAVAILABLE'}}")
+            primary_chat.send_message_stream = fail_send_message_stream
+
+            fallback_chat = MagicMock()
+            chunk = MagicMock()
+            chunk.parts = [MagicMock(text="Response from light model after 503.")]
+            chunk.function_calls = []
+            chunk.usage_metadata = None
+            fallback_chat.send_message_stream.return_value = [chunk]
+
+            def mock_create_chat(model, config, history=None):
+                if model == worker.light_model:
+                    return fallback_chat
+                return primary_chat
+
+            mock_client.chats.create.side_effect = mock_create_chat
+            worker.thinker_chat = primary_chat
+
+            emitted_thoughts = []
+            worker.thought_received.connect(lambda text, tools: emitted_thoughts.append(text))
+
+            worker._process_thought(prompt="Test prompt", image_path=None, yolo=False)
+
+            # Fallback must succeed without UnboundLocalError
+            assert worker.current_model == "gemini-3.5-flash-lite"
+            assert len(emitted_thoughts) == 1
+            assert emitted_thoughts[0] == "Response from light model after 503."
+            assert worker.is_processing is False
+
+
+def test_gemini_worker_503_last_model_error(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path / (aid or "default")))
+    with patch.object(SettingsManager, "get_env", return_value="test_key_12345"):
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value = mock_client
+
+            worker = GeminiWorker(agent_id="test_gemini_503_last")
+            worker.start_session("Test instructions", tools=[])
+
+            primary_chat = MagicMock()
+            primary_chat.get_history.return_value = []
+            fallback_chat = MagicMock()
+            fallback_chat.get_history.return_value = []
+
+            # Both models fail with 503
+            def fail_send_message_stream(msg):
+                raise Exception("503 UNAVAILABLE. {'error': {'code': 503, 'message': 'The service is currently unavailable.', 'status': 'UNAVAILABLE'}}")
+
+            primary_chat.send_message_stream = fail_send_message_stream
+            fallback_chat.send_message_stream = fail_send_message_stream
+
+            def mock_create_chat(model, config, history=None):
+                if model == worker.light_model:
+                    return fallback_chat
+                return primary_chat
+
+            mock_client.chats.create.side_effect = mock_create_chat
+            worker.thinker_chat = primary_chat
+
+            emitted_errors = []
+            worker.error_occurred.connect(lambda err: emitted_errors.append(err))
+
+            worker._process_thought(prompt="Test prompt", image_path=None, yolo=False)
+
+            assert len(emitted_errors) == 1
+            assert "peak capacity (500/503)" in emitted_errors[0]
+            assert worker.is_processing is False
+
+
+def test_gemini_worker_process_thought_uncaught_exception_recovery(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path / (aid or "default")))
+    with patch.object(SettingsManager, "get_env", return_value="test_key_12345"):
+        with patch("google.genai.Client"):
+            worker = GeminiWorker(agent_id="test_gemini_uncaught")
+            worker.start_session("Test instructions", tools=[])
+            worker.is_processing = True
+
+            emitted_errors = []
+            worker.error_occurred.connect(lambda err: emitted_errors.append(err))
+
+            # Simulate unexpected bug inside _process_thought_locked
+            with patch.object(worker, "_process_thought_locked", side_effect=RuntimeError("Unexpected glitch")):
+                worker._process_thought(prompt="Hello", image_path=None, yolo=False)
+
+            assert worker.is_processing is False
+            assert len(emitted_errors) == 1
+            assert "Gemini Worker Error: Unexpected glitch" in emitted_errors[0]
+
+
+def test_subagent_worker_send_function_responses_strips_media(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path / (aid or "default")))
+    with patch.object(SettingsManager, "get_env", return_value="test_key_12345"):
+        with patch("google.genai.Client"):
+            from core.subagent_worker import SubagentWorker
+            orch = MagicMock()
+            orch.agent_id = "test_gemini"
+            orch.cerebrum.tools = {}
+            worker = SubagentWorker(subagent_id="test_sub_media", orchestrator=orch)
+            worker.available = True
+            worker.thinker_chat = MagicMock()
+
+            with patch("threading.Thread"), \
+                 patch("google.genai.types.Part.from_function_response") as mock_from_fn:
+                mock_from_fn.side_effect = lambda name, response: (name, response)
+                worker.send_function_responses([
+                    ("Media_generate", {"result": "ok", "media": ["/path/to/img.jpg"]})
+                ])
+                assert mock_from_fn.called
+                call_args = mock_from_fn.call_args[1]
+                assert call_args["name"] == "Media_generate"
+                assert "media" not in call_args["response"]
+                assert call_args["response"]["result"] == "ok"
+
+
+
+
 

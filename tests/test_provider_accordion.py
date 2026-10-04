@@ -22,11 +22,15 @@ def qapp():
 def test_provider_accordion_initial_state(qapp):
     panel = SettingsPanelWidget()
     assert hasattr(panel, "provider_cards")
-    expected_providers = ["gemini", "claude", "chatgpt", "deepseek"]
+    expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]
     assert "antigravity" not in panel.provider_cards
     for pid in expected_providers:
         assert pid in panel.provider_cards
-        assert isinstance(panel.provider_cards[pid], ProviderAccordionCard)
+    # OpenRouter card must be first in the list on the Provider Setup panel
+    cards = panel.findChildren(ProviderAccordionCard)
+    assert len(cards) == 5
+    assert cards[0].provider_id == "openrouter"
+    assert [c.provider_id for c in cards] == ["openrouter", "gemini", "claude", "chatgpt", "deepseek"]
 
     # Initial default is Gemini selected
     assert panel.provider_cards["gemini"].is_expanded is True
@@ -35,7 +39,7 @@ def test_provider_accordion_initial_state(qapp):
     assert panel.ui_use_gemini_api.isChecked() is True
 
     # Other cards must be collapsed down to a single line
-    for pid in ["claude", "chatgpt", "deepseek"]:
+    for pid in ["claude", "chatgpt", "deepseek", "openrouter"]:
         card = panel.provider_cards[pid]
         assert card.is_expanded is False
         assert card.header_widget.badge.isHidden()
@@ -74,6 +78,18 @@ def test_provider_accordion_click_to_select(qapp):
     assert panel.provider_cards["claude"].header_widget.badge.isHidden()
     assert panel.provider_cards["claude"].body_widget.isHidden()
 
+    # Click on OpenRouter card
+    panel.provider_cards["openrouter"].clicked.emit()
+
+    assert panel.provider_cards["openrouter"].is_expanded is True
+    assert not panel.provider_cards["openrouter"].header_widget.badge.isHidden()
+    assert not panel.provider_cards["openrouter"].body_widget.isHidden()
+    assert panel.ui_use_openrouter_api.isChecked() is True
+
+    assert panel.provider_cards["deepseek"].is_expanded is False
+    assert panel.provider_cards["deepseek"].header_widget.badge.isHidden()
+    assert panel.provider_cards["deepseek"].body_widget.isHidden()
+
     panel.deleteLater()
 
 
@@ -97,7 +113,7 @@ def test_provider_accordion_load_settings_synchronization(qapp, tmp_path, monkey
     assert not panel.provider_cards["chatgpt"].header_widget.badge.isHidden()
     assert panel.ui_use_chatgpt_api.isChecked() is True
 
-    for pid in ["gemini", "claude", "deepseek"]:
+    for pid in ["gemini", "claude", "deepseek", "openrouter"]:
         assert panel.provider_cards[pid].is_expanded is False
         assert panel.provider_cards[pid].header_widget.badge.isHidden()
 
@@ -110,7 +126,7 @@ def test_provider_accordion_load_settings_synchronization(qapp, tmp_path, monkey
     assert "antigravity" not in panel.provider_cards
     assert panel.ui_agy_mode.isChecked() is True
     assert panel.provider_cards["chatgpt"].is_expanded is False
-    for pid in ["gemini", "claude", "chatgpt", "deepseek"]:
+    for pid in ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]:
         assert panel.provider_cards[pid].is_expanded is False
 
     panel.deleteLater()

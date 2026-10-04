@@ -36,7 +36,7 @@ tier_1_goals:
     - id: "INV-MEM-02"
       rule: "Epistemic Mirror Integrity: Every Theory of Mind record must retain confidence scores (0.0 <= c <= 1.0), provenance classification, historical audit logs, and dialectical contradiction references."
     - id: "INV-COG-01"
-      rule: "Cognitive Budget Upper Bound: Sequential tool-use chains must calculate escalating task weight; when reaching maximum cognitive budget or duplicate action thresholds (>= 3), the Orchestrator must unconditionally terminate the loop."
+      rule: "Fatigue Limit Upper Bound: Agent execution tracks session token consumption against the token usage limit; when reaching 100% fatigue (session tokens >= token_usage_limit) or duplicate action thresholds (>= 3), the Orchestrator must unconditionally terminate active execution and trigger an emergency sleep consolidation cycle."
     - id: "INV-COG-02"
       rule: "Autonomous Tool Call Reconciliation: When a cognitive loop is terminated early or interrupted, synthetic cancellation responses must be dispatched for pending tool calls to prevent LLM schema contract corruption."
     - id: "INV-AUT-01"
@@ -147,7 +147,7 @@ tier_2_interactions:
 
   workflows:
     - name: "Agent Conversational & Tool Execution Loop"
-      intent: "Orchestrate agent cognition, multi-tool batched execution, budget tracking, and voice synthesis."
+      intent: "Orchestrate agent cognition, multi-tool batched execution, fatigue tracking, and voice synthesis."
       initial_state: "IDLE"
       states:
         - name: "IDLE"
@@ -186,13 +186,13 @@ tier_2_interactions:
           description: "Dispatching and executing batched tool calls asynchronously via Cerebrum."
           transitions:
             - trigger: "tools.batch_completed"
-              guard: "current_task_weight < max_cognitive_budget and duplicate_count < 3"
+              guard: "current_fatigue < 1.0 and duplicate_count < 3"
               target: "THINKING"
-              action: "increment_task_weight; check_hysteresis_alerts; send_tool_responses"
+              action: "accumulate_fatigue_tokens; check_hysteresis_alerts; send_tool_responses"
             - trigger: "tools.batch_completed"
-              guard: "current_task_weight >= max_cognitive_budget or duplicate_count >= 3"
+              guard: "current_fatigue >= 1.0 or duplicate_count >= 3"
               target: "LOOP_TERMINATED"
-              action: "reconcile_pending_tools; handle_speech_exhaustion_notice"
+              action: "reconcile_pending_tools; trigger_emergency_sleep_cycle"
             - trigger: "speaker.speak_aloud_invoked"
               guard: "true"
               target: "SYNTHESIZING_SPEECH"
@@ -215,7 +215,7 @@ tier_2_interactions:
               action: "process_next_speech_item"
 
         - name: "LOOP_TERMINATED"
-          description: "Safety circuit broken due to cognitive budget exhaustion or duplicate loop detection."
+          description: "Safety circuit broken due to fatigue limit exhaustion (100%) or duplicate loop detection."
           transitions:
             - trigger: "system.cycle_concluded"
               guard: "true"
@@ -436,13 +436,13 @@ tier_3_topology:
           type: "Enum"
           constraints: "One of [piper, gemini]"
           nullable: false
-        cognitive_budget:
+        token_usage_limit:
           type: "Integer"
-          constraints: "Positive integer, typically 10000"
+          constraints: "Positive integer, default 400000 (range 50000-2000000)"
           nullable: false
         low_token_mode:
           type: "Boolean"
-          constraints: "Halves budget and disables media attachments"
+          constraints: "Halves token usage limit and disables media attachments"
           nullable: false
       relations:
         - type: "one_to_one"
@@ -668,13 +668,17 @@ tier_3_topology:
     TrajectoryLedger:
       description: "Actionable aspirations and somatic tracking ledger (trajectory.json & somatic_state.json)."
       fields:
-        current_task_weight:
-          type: "Float"
-          constraints: "Task weight accumulated during sequential tool turns"
+        session_fatigue_tokens:
+          type: "Integer"
+          constraints: "Tokens accumulated during session across interaction turns"
           nullable: false
-        max_weight:
+        token_usage_limit:
+          type: "Integer"
+          constraints: "Configured fatigue token ceiling"
+          nullable: false
+        fatigue:
           type: "Float"
-          constraints: "Maximum allowable task weight ceiling"
+          constraints: "Current fatigue ratio (0.0 to 1.0)"
           nullable: false
         short_term_aspirations:
           type: "Array"
@@ -773,10 +777,9 @@ tier_3_topology:
                   "somatic": {
                     "type": "object",
                     "properties": {
+                      "token-usage-limit": { "type": "number" },
                       "cognitive-budget": { "type": "number" },
-                      "decay-per-minute": { "type": "number" },
-                      "tool-cost": { "type": "number" },
-                      "exponential-factor": { "type": "number" }
+                      "session-token-cap": { "type": "number" }
                     }
                   },
                   "tools": { "type": "object" }
@@ -1030,7 +1033,7 @@ verification_vectors:
     preconditions:
       files:
         - path: "/tmp/openamity_test/agents/agent-1/settings.json"
-          content: "{\"core\": {\"paused\": false, \"agent\": {\"name\": \"Amy\"}, \"somatic\": {\"cognitive-budget\": 10000}}}"
+          content: "{\"core\": {\"paused\": false, \"agent\": {\"name\": \"Amy\"}, \"somatic\": {\"token-usage-limit\": 400000}}}"
       state:
         entity: "AgentInstance"
         attribute: "is_paused"
@@ -1059,16 +1062,16 @@ verification_vectors:
         expected: true
 
   - id: "VEC-002"
-    scenario: "Cognitive Budget Escalates and Terminates Loop Upon Reaching Weight Limit"
+    scenario: "Fatigue Limit Escalates and Breaks Execution to Trigger Sleep Upon Reaching 100%"
     type: "behavioral"
     preconditions:
       files:
         - path: "/tmp/openamity_test/agents/agent-1/somatic_state.json"
-          content: "{\"current_task_weight\": 9800.0, \"max_weight\": 10000.0}"
+          content: "{\"session_fatigue_tokens\": 399500, \"token_usage_limit\": 400000, \"fatigue\": 0.99875}"
       state:
         entity: "TrajectoryLedger"
-        attribute: "current_task_weight"
-        value: 9800.0
+        attribute: "fatigue"
+        value: 0.99875
     actions:
       - step: 1
         type: "input"
@@ -1080,9 +1083,9 @@ verification_vectors:
         operator: "equals"
         expected: false
       - check: "state"
-        target: "orchestrator.current_task_weight"
+        target: "orchestrator.fatigue"
         operator: "gte"
-        expected: 10000.0
+        expected: 1.0
       - check: "invariant"
         target: "INV-COG-01"
         operator: "invariant_held"

@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from core.whatsapp_daemon import WhatsAppDaemon
 
+pytestmark = [pytest.mark.integration]
+
 
 @pytest.fixture
 def temp_agent_environment(monkeypatch):

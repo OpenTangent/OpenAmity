@@ -26,7 +26,10 @@ class PulseEngine:
         self.db_path = os.path.join(
             paths.get_base_dir_for(self.agent_id), "pulses.db")
 
-        self.settings_manager = SettingsManager(agent_id=self.agent_id)
+        if hasattr(orchestrator, 'settings_manager') and orchestrator.settings_manager:
+            self.settings_manager = orchestrator.settings_manager
+        else:
+            self.settings_manager = SettingsManager(agent_id=self.agent_id)
         self.address_book_manager = AddressBookManager(agent_id=self.agent_id)
         self.last_interaction_time = time.time()
         self._last_unpause_time = 0.0
@@ -243,16 +246,14 @@ class PulseEngine:
                 "core.auto-pulse.last-sleep-cycle", 0)
             time_since_sleep = time.time() - last_sleep
             if time_since_sleep >= (15 * 60):  # 15 minutes absolute rate limit
-                # Either critical fatigue (>= 0.95) OR long interval (8 hours) with sufficient fatigue (>= 0.25)
-                should_sleep = (fatigue >= 0.95) or (time_since_sleep > (8 * 60 * 60) and fatigue >= 0.25)
+                # Either critical fatigue (>= 1.0) OR long interval (8 hours) with sufficient fatigue (>= 0.25)
+                should_sleep = (fatigue >= 1.0) or (time_since_sleep > (8 * 60 * 60) and fatigue >= 0.25)
                 if should_sleep:
                     self.settings_manager.set(
                         "core.auto-pulse.last-sleep-cycle", time.time())
+                    if hasattr(self.orchestrator, 'is_paused'):
+                        self.settings_manager.set("core.paused", getattr(self.orchestrator, 'is_paused', False))
                     self.settings_manager.save()
-
-                    # Reset fatigue since we are consolidating
-                    if hasattr(self.orchestrator, 'session_fatigue_tokens'):
-                        self.orchestrator.session_fatigue_tokens = 0
 
                     title = "Sleep Cycle (Memory Consolidation)"
                     context = (
@@ -262,6 +263,7 @@ class PulseEngine:
                         "2. Subjective Synthesis: Reflect on what this day meant—how your character developed, lessons learned from errors or friction, and how your priorities or mirrors should adjust.\n"
                         "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
                         "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
+                        "Use only MemPalace, Trajectory, or Pulse tools to record your insights. "
                         "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
                     )
                     self.fire_pulse(title, context, "sleep_cycle")

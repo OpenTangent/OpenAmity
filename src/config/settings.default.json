@@ -18,8 +18,9 @@
         "gemini-3.1-flash-lite"
       ],
       "voice-models": [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.1-flash-tts-preview"
       ],
       "image-models": [
         "gemini-3.1-flash-image",
@@ -64,6 +65,27 @@
         "deepseek-v4-flash"
       ]
     },
+    "openrouter": {
+      "model": "MiMo-V2.6-Pro",
+      "light-model": "gpt-6-luna",
+      "thinking-level": "low",
+      "openrouter-models": [
+        "MiMo-V2.6-Pro",
+        "xiaomi/mimo-v2.6-pro",
+        "openai/gpt-6-astra",
+        "anthropic/claude-3.7-sonnet",
+        "openai/gpt-4o",
+        "deepseek/deepseek-r1",
+        "openrouter/auto"
+      ],
+      "light-models": [
+        "gpt-6-luna",
+        "openai/gpt-6-luna",
+        "openai/gpt-4o-mini",
+        "anthropic/claude-3.5-haiku",
+        "openrouter/free"
+      ]
+    },
     "antigravity": {
       "agy-mode": false,
       "model": "Gemini 3.8 Flash (High)",
@@ -103,6 +125,8 @@
         "style": "Warm & Empathetic",
         "custom-accent": "",
         "custom-style": "",
+        "voice-selection-mode": "auto",
+        "custom-voice-id": "",
         "allow-agent-override": true,
         "override-prompt": false,
         "custom-prompt": "",
@@ -116,6 +140,29 @@
       "piper": {
         "prefer-piper": true,
         "model-name-piper": "en_GB-cori-high"
+      }
+    },
+    "media": {
+      "image-provider": "",
+      "gemini": {
+        "model": "gemini-3.1-flash-image",
+        "models": [
+          "gemini-3.1-flash-image",
+          "gemini-3-pro-image"
+        ]
+      },
+      "openrouter": {
+        "model": "bytedance-seed/seedream-4.5",
+        "models": [
+          "bytedance-seed/seedream-4.5",
+          "black-forest-labs/flux-1.1-pro",
+          "black-forest-labs/flux-1-schnell",
+          "black-forest-labs/flux-1-dev",
+          "stabilityai/stable-diffusion-3.5-large",
+          "stabilityai/stable-diffusion-3-medium",
+          "google/imagen-3",
+          "recraft/recraft-v3"
+        ]
       }
     },
     "audio": {
@@ -135,11 +182,8 @@
       "n_steps": 25
     },
     "somatic": {
-      "cognitive-budget": 10000,
-      "decay-per-minute": 500,
-      "tool-cost": 2,
-      "exponential-factor": 1.2,
-      "session-token-cap": 500000
+      "token-usage-limit": 400000,
+      "session-token-cap": 400000
     },
     "auto-pulse": {
       "whitelist": [],
@@ -165,10 +209,10 @@
       "max-accessibility-nodes": 150
     },
     "tools": {
-      "datetime": true,
       "contacts": true,
       "chatroom": true,
       "email": false,
+      "email_archive_local": true,
       "mempalace": true,
       "pulsetool": true,
       "speaker": true,

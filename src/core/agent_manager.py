@@ -130,6 +130,8 @@ class AgentManager:
             except Exception as e:
                 logging.error(
                     f"AgentManager: Error deleting agent directory {agent_dir}: {e}", exc_info=True)
+        from core.settings_manager import SettingsManager
+        SettingsManager.remove_instance(agent_id)
 
     def get_orchestrator(self, agent_id: str):
         return self.orchestrators.get(agent_id)

@@ -18,6 +18,8 @@ from core.hook_server import HookServer
 from core.api_key_manager import ApiKeyManager
 from core.uid_generator import generate_agent_uid
 
+pytestmark = [pytest.mark.integration]
+
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

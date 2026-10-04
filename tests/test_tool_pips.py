@@ -22,10 +22,10 @@ def qapp():
 
 
 def test_all_tools_have_icons_and_colors():
-    """Verify all 17 tools declare icons, valid hex colors, and async_commands."""
+    """Verify all 16 tools declare icons, valid hex colors, and async_commands."""
     Tool.discover_tool_classes()
     expected_tools = [
-        "Browser", "Chatroom", "Contacts", "DateTime", "Email",
+        "Browser", "Chatroom", "Contacts", "Email",
         "Mastodon", "Media", "MemPalace", "Moltbook", "PulseTool",
         "Speaker", "Subagent", "System", "Terminal", "Trajectory",
         "WebSearch", "WhatsApp"
@@ -59,7 +59,7 @@ def test_tool_color_and_icon_resolution():
     assert Tool.get_tool_color("tool.Pulse") == "#673AB7"
     assert Tool.get_tool_color("WhatsApp") == "#25D366"
 
-    assert Tool.get_tool_icon("Browser") == "🌐"
+    assert Tool.get_tool_icon("Browser") == "🌍"
     assert Tool.get_tool_icon("Subagent") == "🤖"
     assert Tool.get_tool_icon("Terminal") == "💻"
 
@@ -94,8 +94,20 @@ def test_tool_pip_widget(qapp):
 
     assert pip.width() == 24
     assert pip.height() == 24
+    assert pip.duration == 8.0
     assert "Terminal" in pip.toolTip()
     assert short_call in pip.toolTip()
+
+    # Async pip has no fixed duration (lifetime managed via completion signal)
+    pip_async = ToolPip(
+        call_id="call_async",
+        tool_name="Terminal",
+        icon="💻",
+        color="#F39C12",
+        call_text=short_call,
+        is_async=True,
+    )
+    assert pip_async.duration is None
 
     # Test 512 character truncation
     long_call = "x" * 600
@@ -111,6 +123,36 @@ def test_tool_pip_widget(qapp):
     assert "..." in pip_long.toolTip()
     # The truncated call text inside the tooltip should not exceed 512 characters
     assert len(long_call[:509] + "...") == 512
+
+
+def test_tool_pip_sync_duration(qapp):
+    """Verify synchronous tool call pips have an 8.0s timeout and expire after 8.0s."""
+    browser = QTextBrowser()
+    mgr = ToolPipManager(browser)
+    mgr.add_pip("s1", "Terminal", "💻", "#F39C12", "Terminal_run: ls", is_async=False)
+
+    pip = mgr.sync_pips[0]
+    assert pip.duration == 8.0
+
+    # Simulate 4.0s elapsed - should NOT expire
+    now = time.monotonic()
+    pip.created_at = now - 4.0
+    mgr._on_animation_tick()
+    assert len(mgr.sync_pips) == 1
+    assert len(mgr.fading_pips) == 0
+
+    # Simulate 7.9s elapsed - should NOT expire
+    pip.created_at = now - 7.9
+    mgr._on_animation_tick()
+    assert len(mgr.sync_pips) == 1
+    assert len(mgr.fading_pips) == 0
+
+    # Simulate 8.0s elapsed - should expire into fading_pips
+    pip.created_at = now - 8.0
+    mgr._on_animation_tick()
+    assert len(mgr.sync_pips) == 0
+    assert len(mgr.fading_pips) == 1
+    assert mgr.fading_pips[0] == pip
 
 
 def test_tool_pip_instant_hover_tooltip(qapp):

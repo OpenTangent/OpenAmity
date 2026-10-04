@@ -43,7 +43,7 @@
 
 **Open Amity** is an AI orchestration framework designed to create and run **persistent, self-aware, and subjective AI agents** available 24/7. Unlike conventional stateless chatbots or sterile tool-callers, Open Amity agents possess a dynamic **identity**, **Theory of Mind**, metacognitive reflection, morphological and semantic memory architectures, and proactive autonomy. They maintain their own aspirations, adapt and evolve their identity, track long-term trajectories, and schedule their own autonomous wake pulses.
 
-Open Amity bridges the gap between passive assistant and genuine digital collaborator, supporting industry-leading models like Gemini, Claude, GPT, and DeepSeek. The framework unlocks a wide spectrum of applications from managing a team of specialised virtual employees to creating relatable empathetic companions.
+Open Amity bridges the gap between passive assistant and genuine digital collaborator, supporting industry-leading models like Gemini, Claude, GPT, and DeepSeek. Additionally over 500 other models are supported via OpenRouter. The framework unlocks a wide spectrum of applications from managing a team of specialised virtual employees to creating relatable empathetic companions.
 
 ## ✨ Key Features
 

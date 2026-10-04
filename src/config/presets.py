@@ -48,7 +48,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Sulafat",
             "gemini_prompt_profile": "A serene, youthful South African female voice. Her tone is calm, clear, and deeply intelligent."
         },
-        "cognitive_budget": 10000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 24,
         "low_token_mode": False
     },
@@ -86,7 +87,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Puck",
             "gemini_prompt_profile": "A crisp, confident, and professional neutral American voice. Highly articulate with an efficient, measured delivery."
         },
-        "cognitive_budget": 12000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 32,
         "low_token_mode": False
     },
@@ -125,7 +127,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Aoede",
             "gemini_prompt_profile": "A poised, intellectual British RP female voice. Clear, deliberate, and precise with an inquisitive academic cadence."
         },
-        "cognitive_budget": 15000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 48,
         "low_token_mode": False
     },
@@ -164,7 +167,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Fenrir",
             "gemini_prompt_profile": "A patient, warm, and resonant British male voice. Speaks with a steady, encouraging cadence that instills confidence and invites reflection."
         },
-        "cognitive_budget": 10000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 32,
         "low_token_mode": False
     },
@@ -203,7 +207,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Kore",
             "gemini_prompt_profile": "A lyrical, expressive, and slightly whimsical Irish voice. Full of warmth, curiosity, and dynamic emotional range."
         },
-        "cognitive_budget": 12000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 32,
         "low_token_mode": False
     },
@@ -242,7 +247,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Sulafat",
             "gemini_prompt_profile": "A contemporary, polished London female voice. Confident, charismatic, and engaging with a natural conversational flow."
         },
-        "cognitive_budget": 10000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 24,
         "low_token_mode": False
     },
@@ -281,7 +287,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Fenrir",
             "gemini_prompt_profile": "A deep, authoritative, and steady American male voice. Calm, analytical, and deliberate, projecting technical mastery without pretense."
         },
-        "cognitive_budget": 14000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 32,
         "low_token_mode": False
     },
@@ -319,7 +326,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini_model_name": "Aoede",
             "gemini_prompt_profile": "An upbeat, warm, and authentic Australian female voice. Radiates genuine enthusiasm, positive encouragement, and grounded empathy."
         },
-        "cognitive_budget": 10000,
+        "token_usage_limit": 400000,
+        "cognitive_budget": 400000,
         "max_memories": 24,
         "low_token_mode": False
     }

@@ -403,16 +403,30 @@ class WhatsAppSkill(Tool):
 
                 settings = self.orchestrator.settings_manager if hasattr(
                     self, 'orchestrator') and self.orchestrator else None
+                from core.audio_output import (
+                    normalize_gemini_voice_models,
+                    build_gemini_tts_style,
+                    build_gemini_tts_payload,
+                    resolve_base_voice
+                )
                 if settings:
-                    voice = settings.get(
-                        "core.tts.gemini.model-name", "Achernar")
-                    voice_prompt = settings.get(
-                        "core.tts.gemini.prompt.profile", "")
+                    voice_mode = settings.get("core.tts.gemini.voice-selection-mode", "auto")
+                    if voice_mode == "custom_voice_id":
+                        voice = settings.get("core.tts.gemini.custom-voice-id", "") or settings.get("core.tts.gemini.model-name", "Achernar")
+                    elif voice_mode == "prebuilt":
+                        voice = settings.get("core.tts.gemini.model-name", "Achernar")
+                    else:
+                        gender = settings.get("core.tts.gemini.gender", "Female")
+                        age = settings.get("core.tts.gemini.age", "Young Adult")
+                        style = settings.get("core.tts.gemini.style", "Warm & Empathetic")
+                        voice = resolve_base_voice(gender, age, style)
+                    voice_prompt = settings.get("core.tts.gemini.prompt.profile", "")
+                    api_key = settings.get_env("GEMINI_TTS_API_KEY") or settings.get_env("GEMINI_API_KEY")
                 else:
                     voice = "Achernar"
                     voice_prompt = ""
+                    api_key = None
 
-                from core.audio_output import normalize_gemini_voice_models
                 gemini_settings = settings.get(
                     "core.gemini", {}) if settings else {}
                 voice_models = normalize_gemini_voice_models(gemini_settings.get("voice-models"))
@@ -423,19 +437,27 @@ class WhatsAppSkill(Tool):
                 temp_ogg = temp_wav.replace(".wav", ".ogg")
 
                 try:
-                    client = genai.Client()
-                    full_text = f"{voice_prompt}{message}"
+                    client = genai.Client(api_key=api_key) if api_key else genai.Client()
+                    agent_id = getattr(self.orchestrator, 'agent_id', None) if hasattr(self, 'orchestrator') and self.orchestrator else None
+                    contents_payload = build_gemini_tts_payload(
+                        model=model_name,
+                        settings=settings,
+                        agent_id=agent_id,
+                        text=message
+                    )
+
+                    if voice.startswith("voice_"):
+                        v_cfg = types.VoiceConfig(voice=voice)
+                    else:
+                        v_cfg = types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))
+
                     response = client.models.generate_content(
                         model=model_name,
-                        contents=full_text,
+                        contents=contents_payload,
                         config=types.GenerateContentConfig(
                             response_modalities=["AUDIO"],
                             speech_config=types.SpeechConfig(
-                                voice_config=types.VoiceConfig(
-                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                        voice_name=voice,
-                                    )
-                                )
+                                voice_config=v_cfg
                             ),
                             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                                 disable=True
@@ -447,9 +469,15 @@ class WhatsAppSkill(Tool):
                     with open(temp_wav, "wb") as f:
                         f.write(audio_data)
 
+                    if audio_data.startswith(b"RIFF"):
+                        # Proper WAV container returned - ffmpeg auto-detects header
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", temp_wav, "-c:a", "libopus", temp_ogg]
+                    else:
+                        # Raw PCM stream
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", temp_wav, "-c:a", "libopus", temp_ogg]
+
                     subprocess.run(
-                        ["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac",
-                            "1", "-i", temp_wav, "-c:a", "libopus", temp_ogg],
+                        ffmpeg_cmd,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )

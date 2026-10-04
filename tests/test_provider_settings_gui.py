@@ -25,7 +25,7 @@ def qapp():
 
 def test_provider_models_structure():
     """Verify PROVIDER_MODELS structure, keys, and Custom... terminating entry."""
-    expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "antigravity"]
+    expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "openrouter", "antigravity"]
     for prov in expected_providers:
         assert prov in PROVIDER_MODELS, f"Provider {prov} missing in PROVIDER_MODELS"
         assert "models" in PROVIDER_MODELS[prov]
@@ -53,7 +53,7 @@ def test_provider_gui_controls_exist(qapp, monkeypatch, tmp_path):
     widget = SettingsPanelWidget()
     widget.load_settings(settings_manager=sm)
 
-    expected_providers = ["gemini", "claude", "chatgpt", "deepseek"]
+    expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]
     for prov in expected_providers:
         model_combo = getattr(widget, f"ui_{prov}_model", None)
         model_custom = getattr(widget, f"ui_{prov}_custom_model", None)

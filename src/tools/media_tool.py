@@ -4,12 +4,17 @@ import datetime
 from io import BytesIO
 from typing import List, Dict, Any
 from core.cerebrum import Tool
-from config.paths import get_agent_data_dir
+from config.paths import get_agent_data_dir, get_generated_media_dir
+from core.cache_manager import CacheManager
 from google import genai
 from google.genai import types
 from google.genai.types import Modality
 from PIL import Image
 import mimetypes
+import json
+import base64
+import urllib.request
+
 
 
 class MediaSkill(Tool):
@@ -38,7 +43,7 @@ class MediaSkill(Tool):
             },
             {
                 "name": "Media_generate",
-                "description": "Generates an image from a prompt and places it in a launchpad directory. IMPORTANT: You must take action to use the image after generating it (e.g., displaying it via xdg-open in the terminal, sending via WhatsApp, or saving to ~/Pictures/<YourName>/).",
+                "description": "Generates an image from a prompt and places it in a temporary 24-hour cache directory. IMPORTANT: Generated images are automatically deleted from the cache after 24 hours. You must take action to use the image before it expires (e.g., saving permanently to ~/Pictures/<YourName>/, sending via socials/email, uploading to a website, or displaying via xdg-open).",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -51,6 +56,32 @@ class MediaSkill(Tool):
                 }
             }
         ]
+
+    def _save_generated_image(self, image: Image.Image) -> Dict[str, Any]:
+        if not (self.orchestrator and getattr(self.orchestrator, 'agent_id', None)):
+            return {"result": "Error: agent_id is required to generate media."}
+
+        save_dir = get_generated_media_dir(self.orchestrator.agent_id)
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Automatically prune files older than 24 hours
+        try:
+            CacheManager.clear_expired(save_dir, max_age_days=1.0)
+        except Exception as e:
+            logging.warning(f"Failed to clear expired media cache: {e}")
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = os.path.join(save_dir, f"generated_image_{timestamp}.jpg")
+        image.save(file_path, format="JPEG")
+
+        return {
+            "result": (
+                f"Successfully generated and saved image to cache at {file_path}. "
+                "Note: Generated images are temporary and will be deleted after 24 hours. "
+                "Be sure to use the image (save to permanent user storage, send via social tools, or upload) before it expires."
+            ),
+            "media": [file_path]
+        }
 
     def execute(self, command: str, *args, **kwargs) -> Any:
         is_low_token = self.orchestrator.settings_manager.get(
@@ -65,69 +96,125 @@ class MediaSkill(Tool):
                 return {"result": "Error: Missing prompt parameter."}
 
             settings = self.orchestrator.settings_manager if self.orchestrator else None
-            api_key = settings.get_env("GEMINI_API_KEY")
-            if not api_key:
-                return {"result": "Error: GEMINI_API_KEY is not set."}
+            image_provider = settings.get("core.media.image-provider") if settings else None
+            if not image_provider:
+                return {
+                    "result": "Error: An image generation provider has not been set up. Please select an image provider (Gemini or OpenRouter) and configure an API key in the Media Provider settings."
+                }
 
-            image_models = settings.get(
-                "core.gemini.image-models", ["gemini-3.1-flash-image"])
-            if not isinstance(image_models, list):
-                image_models = [image_models]
+            if image_provider == "gemini":
+                api_key = (
+                    settings.get_env("GEMINI_IMAGE_API_KEY") or
+                    settings.get_env("GEMINI_API_KEY") or
+                    settings.get_env("GEMINI_TTS_API_KEY")
+                ) if settings else None
+                if not api_key or not api_key.strip():
+                    return {
+                        "result": "Error: An image generation provider has not been set up (no API key configured for Gemini). Please add an API key in the Media Provider settings."
+                    }
+                api_key = api_key.strip()
 
-            client = genai.Client(api_key=api_key)
-            last_error = None
+                model_setting = settings.get("core.media.gemini.model") or settings.get(
+                    "core.gemini.image-models", ["gemini-3.1-flash-image"])
+                image_models = [model_setting] if isinstance(model_setting, str) else model_setting
 
-            for model_name in image_models:
-                try:
-                    result = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_modalities=[Modality.IMAGE],
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                                disable=True
+                client = genai.Client(api_key=api_key)
+                last_error = None
+
+                for model_name in image_models:
+                    try:
+                        result = client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                response_modalities=[Modality.IMAGE],
+                                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                                    disable=True
+                                )
                             )
                         )
-                    )
 
-                    if not result.candidates or not result.candidates[0].content.parts:
-                        last_error = f"Model {model_name} returned no image parts."
-                        continue
+                        if not result.candidates or not result.candidates[0].content.parts:
+                            last_error = f"Model {model_name} returned no image parts."
+                            continue
 
-                    generated_image_bytes = None
-                    for part in result.candidates[0].content.parts:
-                        if part.inline_data:
-                            generated_image_bytes = part.inline_data.data
-                            break
+                        generated_image_bytes = None
+                        for part in result.candidates[0].content.parts:
+                            if part.inline_data:
+                                generated_image_bytes = part.inline_data.data
+                                break
 
-                    if not generated_image_bytes:
-                        last_error = f"Model {model_name} returned no inline image data."
-                        continue
+                        if not generated_image_bytes:
+                            last_error = f"Model {model_name} returned no inline image data."
+                            continue
 
-                    image = Image.open(BytesIO(generated_image_bytes))
+                        image = Image.open(BytesIO(generated_image_bytes))
 
-                    if not (self.orchestrator and getattr(self.orchestrator, 'agent_id', None)):
-                        return {"result": "Error: agent_id is required to generate media."}
+                        return self._save_generated_image(image)
+                    except Exception as e:
+                        logging.warning(
+                            f"Failed to generate image with {model_name}: {e}")
+                        last_error = str(e)
 
-                    save_dir = os.path.join(get_agent_data_dir(
-                        self.orchestrator.agent_id), "generated_media")
-                    os.makedirs(save_dir, exist_ok=True)
+                return {"result": f"Error: All image models failed. Last error: {last_error}"}
 
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    file_path = os.path.join(
-                        save_dir, f"generated_image_{timestamp}.jpg")
-                    image.save(file_path, format="JPEG")
-
+            elif image_provider == "openrouter":
+                api_key = (
+                    settings.get_env("OPENROUTER_IMAGE_API_KEY") or
+                    settings.get_env("OPENROUTER_API_KEY")
+                ) if settings else None
+                if not api_key or not api_key.strip():
                     return {
-                        "result": f"Successfully generated and saved image to {file_path}. Please decide what to do with it next.",
-                        "media": [file_path]
+                        "result": "Error: An image generation provider has not been set up (no API key configured for OpenRouter). Please add an API key in the Media Provider settings."
                     }
-                except Exception as e:
-                    logging.warning(
-                        f"Failed to generate image with {model_name}: {e}")
-                    last_error = str(e)
+                api_key = api_key.strip()
 
-            return {"result": f"Error: All image models failed. Last error: {last_error}"}
+                model_name = settings.get("core.media.openrouter.model", "bytedance-seed/seedream-4.5")
+                headers = {
+                    "Authorization": f"Bearer {api_key.strip()}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "OpenAmity",
+                    "HTTP-Referer": "https://github.com/OpenTangent/OpenAmity",
+                    "X-Title": "Open Amity"
+                }
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt
+                }
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/images",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        items = data.get("data", [])
+                        if not items or not isinstance(items, list):
+                            return {"result": f"Error: OpenRouter image generation returned no data. Response: {data}"}
+
+                        first = items[0]
+                        image_bytes = None
+                        if "b64_json" in first and first["b64_json"]:
+                            image_bytes = base64.b64decode(first["b64_json"])
+                        elif "url" in first and first["url"]:
+                            img_req = urllib.request.Request(first["url"], headers={"User-Agent": "OpenAmity"})
+                            with urllib.request.urlopen(img_req, timeout=30) as img_resp:
+                                image_bytes = img_resp.read()
+
+                        if not image_bytes:
+                            return {"result": "Error: OpenRouter returned no image data (neither b64_json nor url)."}
+
+                        image = Image.open(BytesIO(image_bytes))
+
+                        return self._save_generated_image(image)
+                except Exception as e:
+                    logging.warning(f"Failed to generate image with OpenRouter ({model_name}): {e}")
+                    return {"result": f"Error generating image with OpenRouter ({model_name}): {e}"}
+
+            else:
+                return {"result": f"Error: An image generation provider has not been set up (unsupported provider: {image_provider})."}
 
         if command != "read":
             return {"result": f"Unknown command: {command}"}

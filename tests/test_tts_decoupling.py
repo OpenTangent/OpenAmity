@@ -219,7 +219,8 @@ def test_gemini_tts_consecutive_failures_emit_system_notice(temp_agent_dir):
          patch("time.sleep"):
         worker._stream_and_play_gemini(api_key="valid-tts-key")
 
-    assert attempt_count == 2
+    # 3 models in default fallback cascade (3.8-flash -> 3.8-flash-lite -> 3.1-flash)
+    assert attempt_count == 3
     assert len(error_calls) == 1
     assert "Gemini voice synthesis" in error_calls[0]
     assert "[System:" in error_calls[0]
@@ -306,7 +307,7 @@ def test_system_tool_set_custom_voice_and_reset(temp_agent_dir):
         custom_prompt="# AUDIO PROFILE: Autonomous Agent\nSpeak enthusiastically.",
         voice_model="Achernar"
     )
-    assert "Custom voice prompt successfully activated" in res
+    assert "Custom voice" in res and "successfully activated" in res
     assert sm.get("core.tts.gemini.override-prompt") is True
     assert sm.get("core.tts.gemini.custom-prompt") == "# AUDIO PROFILE: Autonomous Agent\nSpeak enthusiastically."
     assert sm.get("core.tts.gemini.model-name") == "Achernar"
@@ -482,8 +483,8 @@ def test_stream_gemini_attempt_raises_on_safety_abort(temp_agent_dir):
 def test_stream_and_play_gemini_falls_back_to_next_model(temp_agent_dir):
     worker = TTSWorker("Test monologue")
     worker.settings.set("core.gemini.voice-models", [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.1-flash-tts-preview"
     ])
     worker.settings.set("core.tts.provider", "gemini")
     worker.settings.save()
@@ -504,42 +505,45 @@ def test_stream_and_play_gemini_falls_back_to_next_model(temp_agent_dir):
         worker._stream_and_play_gemini()
 
     assert attempts_called_with_models == [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
 
 
 def test_normalize_gemini_voice_models():
     from core.audio_output import normalize_gemini_voice_models
 
-    # Normalizes legacy flash-lite TTS models
+    # Normalizes legacy 3.1 and strips 2.5 TTS models, ensuring 3.8 is primary and 3.1 is fallback
     legacy_list = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-lite-preview-tts"]
     assert normalize_gemini_voice_models(legacy_list) == [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
 
-    # Appends fallback model when omitted
+    # Appends fallback model when omitted and ensures 3.8 is primary
     single_list = ["gemini-3.1-flash-tts-preview"]
     assert normalize_gemini_voice_models(single_list) == [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
 
-    # Deduplicates
+    # Strips 2.5 models and ensures 3.8 is primary and 3.1 is fallback
     dup_list = ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-lite-preview-tts"]
     assert normalize_gemini_voice_models(dup_list) == [
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
 
     # Default fallback on empty or None
     assert normalize_gemini_voice_models([]) == [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
     assert normalize_gemini_voice_models(None) == [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
 
 
@@ -567,8 +571,8 @@ def test_stream_and_play_gemini_normalizes_legacy_model(temp_agent_dir):
         worker._stream_and_play_gemini()
 
     assert attempts_called_with_models == [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts"
+        "gemini-3.8-flash-tts",
+        "gemini-3.1-flash-tts-preview"
     ]
 
 
@@ -583,6 +587,288 @@ def test_tts_amplitude_single_byte_chunk_safety(temp_agent_dir):
     samples = len(data) // 2
     # Verify samples is 0 and guarding with samples > 0 prevents division by zero
     assert samples == 0
+
+
+def test_gemini_38_payload_structure(temp_agent_dir):
+    from core.audio_output import build_gemini_tts_payload, build_gemini_tts_style
+    from google.genai import types
+
+    sm = SettingsManager()
+    sm.set("core.agent.name", "Nova")
+    sm.set("core.tts.gemini.accent", "South African")
+    sm.set("core.tts.gemini.style", "Warm & Empathetic")
+    sm.save()
+
+    style_directive = build_gemini_tts_style(sm)
+    assert "South African" in style_directive
+    assert "warm and empathetic" in style_directive
+
+    # For gemini-3.8-flash-tts, payload MUST be a list containing types.Content with speech_metadata
+    payload_38 = build_gemini_tts_payload("gemini-3.8-flash-tts", sm, "agent-1", "I am speaking <laugh> naturally.")
+    assert isinstance(payload_38, list)
+    assert len(payload_38) == 1
+    content = payload_38[0]
+    assert isinstance(content, types.Content)
+    assert len(content.parts) == 1
+    part = content.parts[0]
+    assert part.text == "I am speaking <laugh> naturally."  # Verbatim text preserved!
+    assert part.speech_metadata is not None
+    assert part.speech_metadata.style == style_directive
+
+    # For legacy fallback gemini-3.1-flash-tts-preview, payload MUST be a string with prompt prepended
+    payload_31 = build_gemini_tts_payload("gemini-3.1-flash-tts-preview", sm, "agent-1", "I am speaking naturally.")
+    assert isinstance(payload_31, str)
+    assert "Read the following transcript aloud as Nova" in payload_31
+    assert "I am speaking naturally." in payload_31
+
+    # Any legacy 2.5 request is aliased to 3.1 and also receives prompt preamble
+    payload_25 = build_gemini_tts_payload("gemini-2.5-flash-preview-tts", sm, "agent-1", "I am speaking naturally.")
+    assert isinstance(payload_25, str)
+    assert "Read the following transcript aloud as Nova" in payload_25
+
+
+def test_gemini_38_voice_selection_modes(temp_agent_dir):
+    from google.genai import types
+
+    # 1. Custom Voice ID mode
+    sm = SettingsManager()
+    sm.set("core.tts.gemini.voice-selection-mode", "custom_voice_id")
+    sm.set("core.tts.gemini.custom-voice-id", "voice_replicated_abc123")
+    sm.save()
+
+    worker = TTSWorker("Testing custom voice id")
+    mock_client = MagicMock()
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_popen.return_value = mock_proc
+        worker._stream_gemini_attempt(mock_client, "Hello")
+
+    call_kwargs = mock_client.models.generate_content_stream.call_args.kwargs
+    sp_cfg = call_kwargs["config"].speech_config
+    assert sp_cfg.voice_config.voice == "voice_replicated_abc123"
+
+    # 2. Prebuilt voice mode
+    sm.set("core.tts.gemini.voice-selection-mode", "prebuilt")
+    sm.set("core.tts.gemini.model-name", "Puck")
+    sm.save()
+
+    worker2 = TTSWorker("Testing prebuilt voice")
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_popen.return_value = mock_proc
+        worker2._stream_gemini_attempt(mock_client, "Hello")
+
+    call_kwargs2 = mock_client.models.generate_content_stream.call_args.kwargs
+    sp_cfg2 = call_kwargs2["config"].speech_config
+    assert sp_cfg2.voice_config.prebuilt_voice_config is not None
+    assert sp_cfg2.voice_config.prebuilt_voice_config.voice_name == "Puck"
+
+
+def test_gemini_38_three_tier_fallback_cascade(temp_agent_dir):
+    worker = TTSWorker("Testing 3-tier fallback")
+    worker.settings.set("core.tts.provider", "gemini")
+    worker.settings.save()
+
+    attempted_models = []
+    def fake_stream(client, payload):
+        attempted_models.append(worker.model)
+        if len(attempted_models) < 3:
+            raise RuntimeError(f"Simulated failure on {worker.model}")
+
+    worker._stream_gemini_attempt = fake_stream
+
+    with patch("core.audio_output.genai.Client"), \
+         patch.object(worker.settings, "get_env", return_value="fake-api-key"), \
+         patch("time.sleep"):
+        worker._stream_and_play_gemini()
+
+    assert attempted_models == [
+        "gemini-3.8-flash-tts",
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.1-flash-tts-preview"
+    ]
+
+
+def test_settings_panel_gemini_38_voice_selector_and_custom_id(qapp, temp_agent_dir):
+    panel = SettingsPanelWidget()
+    sm = SettingsManager()
+    panel.load_settings(sm)
+
+    assert hasattr(panel, "ui_tts_base_voice")
+    assert hasattr(panel, "ui_tts_play_sample_btn")
+    assert hasattr(panel, "ui_tts_custom_voice_id")
+
+    # Check that selector contains "auto", all 30 prebuilts, and "custom_voice_id" (total 32 items)
+    assert panel.ui_tts_base_voice.count() == 32
+    assert panel.ui_tts_base_voice.itemData(0) == "auto"
+    assert panel.ui_tts_base_voice.itemData(panel.ui_tts_base_voice.count() - 1) == "custom_voice_id"
+
+    # Selecting custom_voice_id makes custom ID line edit unhidden
+    custom_idx = panel.ui_tts_base_voice.findData("custom_voice_id")
+    panel.ui_tts_base_voice.setCurrentIndex(custom_idx)
+    assert not panel.ui_tts_custom_voice_id.isHidden()
+
+    panel.ui_tts_custom_voice_id.setText("voice_test_design_xyz")
+    panel.save_settings()
+
+    assert sm.get("core.tts.gemini.voice-selection-mode") == "custom_voice_id"
+    assert sm.get("core.tts.gemini.custom-voice-id") == "voice_test_design_xyz"
+    assert sm.get("core.tts.gemini.model-name") == "voice_test_design_xyz"
+
+    # Reload into new panel and check state
+    panel2 = SettingsPanelWidget()
+    panel2.load_settings(sm)
+    assert panel2.ui_tts_base_voice.currentData() == "custom_voice_id"
+    assert panel2.ui_tts_custom_voice_id.text() == "voice_test_design_xyz"
+    assert not panel2.ui_tts_custom_voice_id.isHidden()
+
+    # Switch to prebuilt voice
+    puck_idx = panel2.ui_tts_base_voice.findData("Puck")
+    panel2.ui_tts_base_voice.setCurrentIndex(puck_idx)
+    assert panel2.ui_tts_custom_voice_id.isHidden()
+
+    # Prebuilt selection automatically synchronizes character profile fields
+    assert panel2.ui_tts_gender.currentText() == "Male"
+    assert "Young Adult" in panel2.ui_tts_age.currentText()
+    assert panel2.ui_tts_style.currentText() == "Cheerful & Energetic"
+
+    panel2.save_settings()
+
+    assert sm.get("core.tts.gemini.voice-selection-mode") == "prebuilt"
+    assert sm.get("core.tts.gemini.model-name") == "Puck"
+    assert sm.get("core.tts.gemini.gender") == "Male"
+    assert sm.get("core.tts.gemini.style") == "Cheerful & Energetic"
+
+
+def test_voice_to_character_profile_catalog():
+    from core.audio_output import GEMINI_VOICES, voice_to_character_profile
+
+    assert len(GEMINI_VOICES) == 30
+    for voice_name in GEMINI_VOICES:
+        profile = voice_to_character_profile(voice_name)
+        assert "gender" in profile
+        assert profile["gender"] in ("Female", "Male", "Non-binary / Neutral")
+        assert "age" in profile
+        assert profile["age"] in (
+            "Young Adult (20s - 30s)",
+            "Youthful (18 - 25)",
+            "Adult (30s - 50s)",
+            "Mature / Senior (50+)"
+        )
+        assert "style" in profile
+        assert profile["style"] in (
+            "Warm & Empathetic",
+            "Calm & Analytical",
+            "Cheerful & Energetic",
+            "Casual & Playful",
+            "Professional & Informative",
+            "Vibrant & Sassy",
+            "Gentle & Serene"
+        )
+
+    # Specific assertions for notable voices
+    assert voice_to_character_profile("Leda")["age"] == "Youthful (18 - 25)"
+    assert voice_to_character_profile("Gacrux")["age"] == "Mature / Senior (50+)"
+    assert voice_to_character_profile("Iapetus")["gender"] == "Non-binary / Neutral"
+    assert voice_to_character_profile("Algieba")["gender"] == "Non-binary / Neutral"
+    assert voice_to_character_profile("Sulafat")["style"] == "Warm & Empathetic"
+    assert voice_to_character_profile("Sadachbia")["style"] == "Vibrant & Sassy"
+
+
+def test_settings_panel_prebuilt_voice_sync(qapp, temp_agent_dir):
+    panel = SettingsPanelWidget()
+    sm = SettingsManager()
+    panel.load_settings(sm)
+
+    # Select Leda -> female youthful cheerful
+    leda_idx = panel.ui_tts_base_voice.findData("Leda")
+    panel.ui_tts_base_voice.setCurrentIndex(leda_idx)
+    assert panel.ui_tts_gender.currentText() == "Female"
+    assert "Youthful" in panel.ui_tts_age.currentText()
+    assert panel.ui_tts_style.currentText() == "Cheerful & Energetic"
+
+    # Select Gacrux -> male mature
+    gacrux_idx = panel.ui_tts_base_voice.findData("Gacrux")
+    panel.ui_tts_base_voice.setCurrentIndex(gacrux_idx)
+    assert panel.ui_tts_gender.currentText() == "Male"
+    assert "Mature" in panel.ui_tts_age.currentText()
+
+    # Select Algieba -> non-binary / neutral gentle & serene
+    algieba_idx = panel.ui_tts_base_voice.findData("Algieba")
+    panel.ui_tts_base_voice.setCurrentIndex(algieba_idx)
+    assert panel.ui_tts_gender.currentText() == "Non-binary / Neutral"
+    assert panel.ui_tts_style.currentText() == "Gentle & Serene"
+
+
+def test_voice_sample_preview_threading_and_signals(qapp, temp_agent_dir):
+    panel = SettingsPanelWidget()
+    sm = SettingsManager()
+    sm.set_env("GEMINI_API_KEY", "mock-api-key")
+    panel.load_settings(sm)
+
+    # Mock synthesize_voice_sample
+    fake_wav_data = b"RIFFmockwavheaderanddata"
+    ready_called = []
+    failed_called = []
+
+    panel.sample_synth_ready.connect(lambda p: ready_called.append(p))
+    panel.sample_synth_failed.connect(lambda: failed_called.append(True))
+
+    with patch("core.audio_output.synthesize_voice_sample", return_value=fake_wav_data), \
+         patch.object(panel, "_play_temp_sample_file") as mock_play:
+
+        auto_idx = panel.ui_tts_base_voice.findData("auto")
+        panel.ui_tts_base_voice.setCurrentIndex(auto_idx)
+        panel._on_play_voice_sample()
+
+        # Wait briefly for thread to emit signal
+        import time
+        for _ in range(50):
+            qapp.processEvents()
+            if ready_called:
+                break
+            time.sleep(0.02)
+
+        assert len(ready_called) == 1
+        assert os.path.exists(ready_called[0])
+        # Verify cleanup works
+        panel._cleanup_temp_samples()
+        assert not os.path.exists(ready_called[0])
+
+
+def test_voice_sample_preview_failure_resets_button(qapp, temp_agent_dir):
+    panel = SettingsPanelWidget()
+    sm = SettingsManager()
+    sm.set_env("GEMINI_API_KEY", "mock-api-key")
+    panel.load_settings(sm)
+
+    failed_called = []
+    panel.sample_synth_failed.connect(lambda: failed_called.append(True))
+
+    with patch("core.audio_output.synthesize_voice_sample", side_effect=RuntimeError("API quota exceeded")):
+        auto_idx = panel.ui_tts_base_voice.findData("auto")
+        panel.ui_tts_base_voice.setCurrentIndex(auto_idx)
+        panel._on_play_voice_sample()
+
+        import time
+        for _ in range(50):
+            qapp.processEvents()
+            if failed_called:
+                break
+            time.sleep(0.02)
+
+        assert len(failed_called) == 1
+        assert panel.ui_tts_play_sample_btn.text() == "▶ Play Sample"
+        assert panel.ui_tts_play_sample_btn.isEnabled()
+
+
+def test_silence_ffmpeg_logs_runs_cleanly():
+    from core.audio_output import silence_ffmpeg_logs
+    # Ensure calling silence_ffmpeg_logs does not raise exceptions
+    silence_ffmpeg_logs()
+
 
 
 

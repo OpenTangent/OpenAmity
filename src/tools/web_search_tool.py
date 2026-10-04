@@ -5,10 +5,17 @@ from typing import List, Dict, Any
 from core.cerebrum import Tool
 from config import paths
 from core.cache_manager import CacheManager
+from core.logger_config import agent_id_var, set_active_websearch_agent_id
 try:
     from ddgs import DDGS
+    from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
 except ImportError:
     DDGS = None
+    DDGSException = Exception
+    RatelimitException = Exception
+    TimeoutException = Exception
+
+logger = logging.getLogger("tool.WebSearch")
 
 
 class WebSearchSkill(Tool):
@@ -78,6 +85,17 @@ class WebSearchSkill(Tool):
         ]
 
     def execute(self, command: str, *args, **kwargs) -> Any:
+        agent_id = self.orchestrator.agent_id if self.orchestrator else None
+        if agent_id:
+            agent_id_var.set(agent_id)
+            set_active_websearch_agent_id(agent_id)
+
+        try:
+            return self._execute_internal(command, *args, **kwargs)
+        finally:
+            set_active_websearch_agent_id(None)
+
+    def _execute_internal(self, command: str, *args, **kwargs) -> Any:
         # Before any command, do a quick cleanup of old cached files
         CacheManager.clear_expired(self.cache_dir, max_age_days=1.0)
 
@@ -100,6 +118,7 @@ class WebSearchSkill(Tool):
                     results = list(ddgs.text(query, max_results=max_results))
 
                 if not results:
+                    logger.info(f"WebSearch (search): No results found for query '{query}'")
                     return f"No results found for query: {query}"
 
                 output = f"Search Results for '{query}':\n\n"
@@ -108,8 +127,27 @@ class WebSearchSkill(Tool):
                     output += f"   URL: {r.get('href', 'No URL')}\n"
                     output += f"   Snippet: {r.get('body', 'No Snippet')}\n\n"
                 return output
-            except Exception as e:
-                logging.error(f"WebSearch (search) error: {e}", exc_info=True)
+            except (DDGSException, Exception) as e:
+                err_msg = str(e).strip()
+                err_lower = err_msg.lower()
+
+                # Benign zero results (DDGS raises DDGSException("No results found."))
+                if "no results found" in err_lower or not err_msg or err_msg == "None":
+                    logger.info(f"WebSearch (search): No results found for query '{query}'")
+                    return f"No results found for query: {query}"
+
+                # Rate limiting
+                if isinstance(e, RatelimitException) or "rate limit" in err_lower or "429" in err_lower:
+                    logger.warning(f"WebSearch (search) rate limited for query '{query}': {e}")
+                    return f"Search rate limit reached while searching for '{query}'. Please wait a moment before trying again."
+
+                # Timeouts
+                if isinstance(e, TimeoutException) or "timed out" in err_lower or "timeout" in err_lower:
+                    logger.warning(f"WebSearch (search) timed out for query '{query}': {e}")
+                    return f"Search timed out for query: {query}. The search service may be slow or temporarily unavailable."
+
+                # Genuine unexpected exceptions
+                logger.error(f"WebSearch (search) error: {e}", exc_info=True)
                 return f"An error occurred during search: {e}"
 
         elif command == "view_page":
@@ -124,8 +162,12 @@ class WebSearchSkill(Tool):
                 response = requests.get(jina_url, headers=headers, timeout=15)
                 response.raise_for_status()
                 return response.text
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"WebSearch (view_page) failed to fetch {url}: {e}")
+                return f"Failed to fetch page {url}: {e}"
             except Exception as e:
-                logging.error(
+                logger.error(
                     f"WebSearch (view_page) error: {e}", exc_info=True)
                 return f"Failed to fetch page {url}: {e}"
 
@@ -164,8 +206,12 @@ class WebSearchSkill(Tool):
                     "result": f"Image downloaded successfully from {url}.",
                     "media": [filepath]
                 }
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"WebSearch (download_image) failed to download {url}: {e}")
+                return f"Failed to download image {url}: {e}"
             except Exception as e:
-                logging.error(
+                logger.error(
                     f"WebSearch (download_image) error: {e}", exc_info=True)
                 return f"Failed to download image {url}: {e}"
 

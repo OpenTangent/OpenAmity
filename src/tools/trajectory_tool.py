@@ -195,22 +195,29 @@ class TrajectoryTool(Tool):
             if os.path.exists(state_path):
                 with open(state_path, "r") as f:
                     somatic = json.load(f)
-                    current_weight = somatic.get("current_task_weight", 0)
-                    max_weight = somatic.get("max_weight", 1000)
-                    percent = (current_weight / max_weight) * \
-                        100 if max_weight else 0
+                    session_tokens = int(somatic.get("session_fatigue_tokens", somatic.get("current_task_weight", 0)))
+                    token_limit = int(somatic.get("token_limit", somatic.get("max_weight", 400000)))
+                    percent = (session_tokens / token_limit) * 100.0 if token_limit else 0.0
 
-                    state_desc = "Low (Unrestricted)"
-                    if percent >= 50:
-                        state_desc = "High (Completion Phase - Overwhelmed/Fatigued)"
+                    if percent >= 90:
+                        state_desc = "Critical (Near Absolute Limit - Must End Cognition & Sleep)"
+                    elif percent >= 50:
+                        state_desc = "High (Fatigued - Consider Deferring Work via Scheduled Pulses)"
                     elif percent >= 25:
-                        state_desc = "Moderate (Conservation Phase - Nearing capacity)"
+                        state_desc = "Moderate (Noticeable Fatigue Accumulating)"
+                    else:
+                        state_desc = "Low (Refreshed & Energetic)"
 
-                    somatic_state_text = f"\n--- Somatic (Physiological) Feedback ---\nCognitive Budget Task Weight: {current_weight:.1f}/{max_weight} ({percent:.1f}%)\nCurrent State: {state_desc}\n"
+                    somatic_state_text = f"\n--- Somatic (Physiological) Feedback ---\nFatigue: {session_tokens:,}/{token_limit:,} tokens ({percent:.1f}%)\nCurrent State: {state_desc}\n"
         except Exception:
             pass
 
+        now = datetime.now().astimezone()
+        tz_str = f" ({now.tzname()})" if now.tzname() else ""
+        datetime_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
+
         lines = ["=== THE AGENT'S CURRENT BEARING ==="]
+        lines.append(f"Current Date & Time: {datetime_str}\n")
         if user_details_text:
             lines.append(user_details_text.strip())
             lines.append("")
@@ -473,7 +480,7 @@ class TrajectoryTool(Tool):
         return [
             {
                 "name": "Trajectory_get_bearings",
-                "description": "Read your current trajectory state, self-perception, aspirations (ordered by priority), and pending tasks. Includes dependencies and stale duration.",
+                "description": "Read your current local date and time, user details, somatic feedback (fatigue), self-perception, aspirations (ordered by priority), and pending tasks. Includes dependencies and stale duration.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}

@@ -264,6 +264,11 @@ class MemPalaceManager:
         """Returns L0 + Self-Perception + Short-Term Context + Morphological Prospective Context"""
         base_context = self.stack.l0.render()
 
+        now = datetime.datetime.now().astimezone()
+        tz_str = f" ({now.tzname()})" if now.tzname() else ""
+        current_time_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
+        base_context += f"\n\n[Wake Context: Current Date & Time is {current_time_str}]"
+
         self_perception = self.get_self_perception()
         if self_perception:
             base_context += f"\n\n{self_perception}"

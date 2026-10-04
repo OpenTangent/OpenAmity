@@ -177,10 +177,15 @@ class ChatGptWorker:
         self._abort_flag = False
         self.is_processing = True
 
+        attached_media = []
         for name, response in responses:
             clean_resp = dict(response) if isinstance(response, dict) else {"result": str(response)}
             if 'media' in clean_resp:
-                del clean_resp['media']
+                media_val = clean_resp.pop('media')
+                if isinstance(media_val, list):
+                    attached_media.extend(media_val)
+                elif isinstance(media_val, str):
+                    attached_media.append(media_val)
 
             tool_call_id = None
             for msg in reversed(self.history):
@@ -205,6 +210,43 @@ class ChatGptWorker:
                 "tool_call_id": tool_call_id,
                 "content": json.dumps(clean_resp)
             })
+
+        if attached_media:
+            is_low_token = self.settings.get("core.low-token-mode", False)
+            if is_low_token:
+                self.history.append({
+                    "role": "user",
+                    "content": "[Tool media attachments skipped: Low Token Mode is active]"
+                })
+            else:
+                user_content_blocks = [
+                    {"type": "text", "text": "[Attached media from tool execution]:"}
+                ]
+                for m_path in attached_media:
+                    try:
+                        import os
+                        import mimetypes
+                        import base64
+                        exp_path = os.path.expanduser(m_path)
+                        mime_type, _ = mimetypes.guess_type(exp_path)
+                        with open(exp_path, "rb") as image_file:
+                            image_data = base64.b64encode(image_file.read()).decode("utf-8")
+                        user_content_blocks.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type or 'image/jpeg'};base64,{image_data}"
+                            }
+                        })
+                    except Exception as e:
+                        logging.warning(f"Failed to attach tool media for ChatGPT {m_path}: {e}")
+                        user_content_blocks.append({
+                            "type": "text",
+                            "text": f"[Error attaching media {m_path}: {e}]"
+                        })
+                self.history.append({
+                    "role": "user",
+                    "content": user_content_blocks
+                })
 
         threading.Thread(target=self._process_thought, args=(
             None, None, False, None), daemon=True).start()

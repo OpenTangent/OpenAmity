@@ -1,6 +1,6 @@
 # Centralised theme settings for the GUI
 from PySide6.QtGui import QPalette, QColor
-from PySide6.QtWidgets import QApplication, QStyleFactory
+from PySide6.QtWidgets import QApplication, QStyleFactory, QStyle, QProxyStyle
 from PySide6.QtCore import Qt
 
 PRIMARY_ACCENT_COLOR = "#a12924"
@@ -160,86 +160,115 @@ def get_dark_palette() -> QPalette:
 
 MODERN_SCROLLBAR_STYLE = """
 /* Standardized Modern Minimal Scrollbars */
-QScrollBar:vertical {
+QScrollBar:vertical,
+QComboBox QAbstractItemView QScrollBar:vertical {
     border: none;
     background: transparent;
     width: 8px;
     margin: 0px;
 }
-QScrollBar::handle:vertical {
+QScrollBar::handle:vertical,
+QComboBox QAbstractItemView QScrollBar::handle:vertical {
     background-color: rgba(255, 255, 255, 0.2);
     min-height: 24px;
     border-radius: 3px;
     margin: 1px;
 }
-QScrollBar::handle:vertical:hover {
+QScrollBar::handle:vertical:hover,
+QComboBox QAbstractItemView QScrollBar::handle:vertical:hover {
     background-color: rgba(255, 255, 255, 0.38);
     margin: 1px;
 }
-QScrollBar::handle:vertical:pressed {
+QScrollBar::handle:vertical:pressed,
+QComboBox QAbstractItemView QScrollBar::handle:vertical:pressed {
     background-color: rgba(255, 255, 255, 0.55);
     margin: 1px;
 }
-QScrollBar::handle:vertical:disabled {
+QScrollBar::handle:vertical:disabled,
+QComboBox QAbstractItemView QScrollBar::handle:vertical:disabled {
     background-color: transparent;
 }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QComboBox QAbstractItemView QScrollBar::add-line:vertical, QComboBox QAbstractItemView QScrollBar::sub-line:vertical {
     border: none;
     background: transparent;
     height: 0px;
     width: 0px;
 }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+QComboBox QAbstractItemView QScrollBar::add-page:vertical, QComboBox QAbstractItemView QScrollBar::sub-page:vertical {
     border: none;
     background: transparent;
 }
 
-QScrollBar:horizontal {
+QScrollBar:horizontal,
+QComboBox QAbstractItemView QScrollBar:horizontal {
     border: none;
     background: transparent;
     height: 8px;
     margin: 0px;
 }
-QScrollBar::handle:horizontal {
+QScrollBar::handle:horizontal,
+QComboBox QAbstractItemView QScrollBar::handle:horizontal {
     background-color: rgba(255, 255, 255, 0.2);
     min-width: 24px;
     border-radius: 3px;
     margin: 1px;
 }
-QScrollBar::handle:horizontal:hover {
+QScrollBar::handle:horizontal:hover,
+QComboBox QAbstractItemView QScrollBar::handle:horizontal:hover {
     background-color: rgba(255, 255, 255, 0.38);
     margin: 1px;
 }
-QScrollBar::handle:horizontal:pressed {
+QScrollBar::handle:horizontal:pressed,
+QComboBox QAbstractItemView QScrollBar::handle:horizontal:pressed {
     background-color: rgba(255, 255, 255, 0.55);
     margin: 1px;
 }
-QScrollBar::handle:horizontal:disabled {
+QScrollBar::handle:horizontal:disabled,
+QComboBox QAbstractItemView QScrollBar::handle:horizontal:disabled {
     background-color: transparent;
 }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QComboBox QAbstractItemView QScrollBar::add-line:horizontal, QComboBox QAbstractItemView QScrollBar::sub-line:horizontal {
     border: none;
     background: transparent;
     height: 0px;
     width: 0px;
 }
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal,
+QComboBox QAbstractItemView QScrollBar::add-page:horizontal, QComboBox QAbstractItemView QScrollBar::sub-page:horizontal {
     border: none;
     background: transparent;
 }
 
-QScrollBar::corner {
+QScrollBar::corner,
+QComboBox QAbstractItemView QScrollBar::corner {
     background: transparent;
     border: none;
 }
 """
 
 
+class OpenAmityProxyStyle(QProxyStyle):
+    """
+    Standard Open Amity proxy style ensuring consistent cross-platform behavior:
+    - Overrides SH_ComboBox_Popup to 0 so QComboBox dropdowns render as standard popup lists
+      with a visible scrollbar rather than full-screen scroller menus with hover-scroll buttons.
+    """
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.SH_ComboBox_Popup:
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
+
+
 def setup_app_theme(app: QApplication):
     """Applies the centralized Fusion style, dark palette, and modern scrollbars to the application."""
     fusion_style = QStyleFactory.create("Fusion")
     if fusion_style:
-        app.setStyle(fusion_style)
+        app.setStyle(OpenAmityProxyStyle(fusion_style))
+    else:
+        app.setStyle(OpenAmityProxyStyle())
     app.setPalette(get_dark_palette())
     app.setStyleSheet(f"""
         QToolTip {{
@@ -248,6 +277,17 @@ def setup_app_theme(app: QApplication):
             border: 1px solid #555555;
             padding: 4px 8px;
             border-radius: 4px;
+        }}
+        QComboBox QAbstractItemView {{
+            max-height: 650px;
+        }}
+        QComboBoxPrivateScroller {{
+            height: 0px;
+            min-height: 0px;
+            max-height: 0px;
+            width: 0px;
+            border: none;
+            background: transparent;
         }}
         {MODERN_SCROLLBAR_STYLE}
     """)

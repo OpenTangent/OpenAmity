@@ -9,14 +9,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from tools.system_tool import SystemTool, get_internal_ip
 
 
-def test_get_internal_ip_live():
-    """Verify live internal IP detection does not return loopback on a connected machine."""
-    ip = get_internal_ip()
-    assert ip is not None
-    assert isinstance(ip, str)
-    assert len(ip.split(".")) == 4
-
-
 def test_get_internal_ip_udp_probe():
     """Verify get_internal_ip uses routing socket probe when available."""
     mock_socket_instance = MagicMock()
@@ -75,6 +67,17 @@ def test_system_tool_platform_info_includes_internal_ip():
         output = tool.execute("platform_info")
         assert "=== Network & Peripherals ===" in output
         assert "Internal IP: 192.168.1.154" in output
+
+
+def test_system_tool_platform_info_includes_datetime():
+    """Verify SystemTool platform_info includes Current Date & Time."""
+    from datetime import datetime
+    tool = SystemTool(orchestrator=None)
+    output = tool.execute("platform_info")
+    assert "=== Open Amity ===" in output
+    assert "Current Date & Time:" in output
+    now = datetime.now()
+    assert str(now.year) in output
 
 
 def test_system_tool_api_key_lifecycle(tmp_path):

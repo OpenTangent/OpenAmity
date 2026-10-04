@@ -37,7 +37,9 @@ def temp_agent_dir(monkeypatch):
                         lambda aid: os.path.join(temp_dir, "agents", aid, "mempalace") if aid else os.path.join(temp_dir, "agents", "default", "mempalace"))
     monkeypatch.setattr("config.paths.get_chatroom_dir", lambda: os.path.join(temp_dir, "chatroom"))
 
+    SettingsManager.clear_instances()
     yield temp_dir
+    SettingsManager.clear_instances()
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -254,3 +256,223 @@ def test_agent_tab_button_paused_indicator(qapp):
 
     btn.set_paused(False)
     assert btn.is_paused is False
+
+
+def test_pulse_engine_shares_orchestrator_settings_manager(temp_agent_dir):
+    orch = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch.agent_id = "test_shared_sm"
+    orch.settings_manager = SettingsManager(agent_id="test_shared_sm")
+    orch.is_paused = False
+    orch.on_paused_state_changed = MagicMock()
+
+    pe = PulseEngine(orch)
+    assert pe.settings_manager is orch.settings_manager
+
+    # Changing paused on orchestrator settings reflects immediately in pulse_engine
+    orch.settings_manager.set("core.paused", True)
+    assert pe.settings_manager.get("core.paused") is True
+
+    orch.settings_manager.set("core.paused", False)
+    assert pe.settings_manager.get("core.paused") is False
+
+
+def test_unpaused_agent_persisted_across_shutdown_and_restart(temp_agent_dir):
+    """
+    Ensures that when a previously paused agent is unpaused and active for hours
+    (accumulating contextual fatigue), shutdown consolidation does not revert
+    core.paused back to True, and restarting the agent keeps it unpaused.
+    """
+    # 1. Agent starts paused in settings
+    sm = SettingsManager(agent_id="agent_persist_test")
+    sm.set("core.paused", True)
+    sm.save()
+
+    # 2. Start orchestrator
+    orch = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch.agent_id = "agent_persist_test"
+    orch.settings_manager = sm
+    orch.is_paused = sm.get("core.paused", False)
+    assert orch.is_paused is True
+
+    orch._pausing_in_progress = False
+    orch.is_busy = False
+    orch.is_thinking = False
+    orch.active_subagents = {}
+    orch.recent_history = []
+    orch.speech_queue = []
+    orch.event_queue = []
+    orch.session_fatigue_tokens = 0
+    orch.on_paused_state_changed = MagicMock()
+    orch.on_pause_pending = MagicMock()
+    orch.set_busy_state = MagicMock()
+    orch.stop_all_processing = MagicMock()
+    orch.append_to_conversation = MagicMock()
+    orch.build_system_prompt = MagicMock()
+    orch.system_prompt = "Test System Prompt"
+    orch.cerebrum = MagicMock()
+    orch.cerebrum.get_all_tool_declarations.return_value = []
+    orch.gemini_worker = MagicMock()
+    orch.pulse_engine = PulseEngine(orch)
+
+    # 3. Unpause agent
+    orch.set_paused(False)
+    assert orch.is_paused is False
+    assert sm.get("core.paused") is False
+
+    # 4. Agent is active for hours -> fatigue builds up
+    orch.session_fatigue_tokens = 60000
+    orch.get_fatigue = MagicMock(return_value=0.25)  # >= 0.02
+
+    # 5. Shutdown with force_sleep=True (graceful consolidation on shutdown)
+    orch.shutdown(force_sleep=True)
+
+    # 6. Verify settings.json on disk has core.paused == False
+    assert sm.get("core.paused") is False
+
+    # 7. Start a fresh orchestrator instance as on app restart
+    SettingsManager.clear_instances()
+    sm_reloaded = SettingsManager(agent_id="agent_persist_test")
+    assert sm_reloaded.get("core.paused") is False
+
+    orch_restart = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch_restart.agent_id = "agent_persist_test"
+    orch_restart.settings_manager = sm_reloaded
+    orch_restart.is_paused = sm_reloaded.get("core.paused", False)
+
+    assert orch_restart.is_paused is False
+
+
+def test_paused_agent_persisted_across_shutdown_and_restart(temp_agent_dir):
+    """
+    Ensures that when an agent is paused, shutting down and restarting keeps it paused.
+    """
+    sm = SettingsManager(agent_id="agent_paused_persist_test")
+    sm.set("core.paused", False)
+    sm.save()
+
+    orch = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch.agent_id = "agent_paused_persist_test"
+    orch.settings_manager = sm
+    orch.is_paused = False
+    orch._pausing_in_progress = False
+    orch.is_busy = False
+    orch.is_thinking = False
+    orch.active_subagents = {}
+    orch.recent_history = []
+    orch.speech_queue = []
+    orch.event_queue = []
+    orch.session_fatigue_tokens = 0
+    orch.on_paused_state_changed = MagicMock()
+    orch.on_pause_pending = MagicMock()
+    orch.set_busy_state = MagicMock()
+    orch.stop_all_processing = MagicMock()
+    orch.append_to_conversation = MagicMock()
+    orch.build_system_prompt = MagicMock()
+    orch.cerebrum = MagicMock()
+    orch.gemini_worker = MagicMock()
+    orch.get_fatigue = MagicMock(return_value=0.0)
+    orch.pulse_engine = PulseEngine(orch)
+
+    # Pause agent
+    orch.set_paused(True)
+    assert orch.is_paused is True
+    assert sm.get("core.paused") is True
+
+    # Shutdown
+    orch.shutdown(force_sleep=False)
+    assert sm.get("core.paused") is True
+
+    # Restart
+    SettingsManager.clear_instances()
+    sm_reloaded = SettingsManager(agent_id="agent_paused_persist_test")
+    assert sm_reloaded.get("core.paused") is True
+
+    orch_restart = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch_restart.agent_id = "agent_paused_persist_test"
+    orch_restart.settings_manager = sm_reloaded
+    orch_restart.is_paused = sm_reloaded.get("core.paused", False)
+
+    assert orch_restart.is_paused is True
+
+
+def test_restored_agent_backup_and_pause_persistence(temp_agent_dir):
+    """
+    Verifies that when a previously paused agent is backed up, restored, and unpaused,
+    and active for hours, shutting down and restarting preserves the unpaused state.
+    """
+    from core.backup_manager import create_agent_backup, restore_agent_backup
+    from core.agent_manager import AgentManager
+
+    agent_id = "test_restore_agent"
+    am = AgentManager()
+    am.create_agent(agent_id)
+
+    sm = SettingsManager(agent_id=agent_id)
+    sm.set("core.paused", True)
+    sm.save()
+
+    # Create backup while paused
+    backup_file = create_agent_backup(agent_id, agent_manager=am)
+    assert os.path.exists(backup_file)
+
+    # Restore backup
+    success, msg, details = restore_agent_backup(backup_file, agent_manager=am)
+    assert success is True
+
+    # Start restored orchestrator
+    restored_id = details["agent_id"]
+    sm_restored = SettingsManager(agent_id=restored_id)
+    assert sm_restored.get("core.paused") is True
+
+    orch = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch.agent_id = restored_id
+    orch.settings_manager = sm_restored
+    orch.is_paused = sm_restored.get("core.paused", False)
+    orch._pausing_in_progress = False
+    orch.is_busy = False
+    orch.is_thinking = False
+    orch.active_subagents = {}
+    orch.recent_history = []
+    orch.speech_queue = []
+    orch.event_queue = []
+    orch.session_fatigue_tokens = 0
+    orch.on_paused_state_changed = MagicMock()
+    orch.on_pause_pending = MagicMock()
+    orch.set_busy_state = MagicMock()
+    orch.stop_all_processing = MagicMock()
+    orch.append_to_conversation = MagicMock()
+    orch.build_system_prompt = MagicMock()
+    orch.system_prompt = "Restored Prompt"
+    orch.cerebrum = MagicMock()
+    orch.cerebrum.get_all_tool_declarations.return_value = []
+    orch.gemini_worker = MagicMock()
+    orch.pulse_engine = PulseEngine(orch)
+
+    # Agent is unpaused / restored to online
+    orch.set_paused(False)
+    assert orch.is_paused is False
+    assert sm_restored.get("core.paused") is False
+
+    # Active for hours -> fatigue
+    orch.session_fatigue_tokens = 80000
+    orch.get_fatigue = MagicMock(return_value=0.30)
+
+    # Shutdown with memory consolidation
+    orch.shutdown(force_sleep=True)
+
+    # Verify settings on disk preserved False
+    assert sm_restored.get("core.paused") is False
+
+    # Simulate app restart
+    SettingsManager.clear_instances()
+    sm_restart = SettingsManager(agent_id=restored_id)
+    assert sm_restart.get("core.paused") is False
+
+    orch_restarted = AmityOrchestrator.__new__(AmityOrchestrator)
+    orch_restarted.agent_id = restored_id
+    orch_restarted.settings_manager = sm_restart
+    orch_restarted.is_paused = sm_restart.get("core.paused", False)
+
+    assert orch_restarted.is_paused is False
+
+

@@ -251,8 +251,10 @@ class MainWindow(QMainWindow):
         self.stdout_logger.new_message.connect(self.append_to_agent_console)
         self.stderr_logger.new_message.connect(self.append_to_agent_console)
 
+        from core.logger_config import VerbosityFilter
         self.qt_logger = QtLoggingHandler()
         self.qt_logger.setLevel(logging.INFO)
+        self.qt_logger.addFilter(VerbosityFilter())
 
         self.qt_logger.signals.new_message.connect(
             self.append_to_agent_console)
@@ -316,10 +318,11 @@ class MainWindow(QMainWindow):
 
         self.agent_menu_actions = []
         agent_sections = [
+            "Cognitive Provider",
             "Basic Agent Settings",
             "Agent Values and Goals",
             "Agent Voice",
-            "Provider Setup",
+            "Media Provider",
             "Social Accounts",
             "Other Agent Settings"
         ]
@@ -340,7 +343,7 @@ class MainWindow(QMainWindow):
 
         system_settings_action = QAction("System Settings", self)
         system_settings_action.triggered.connect(
-            lambda checked=False: self.show_settings_section(7))
+            lambda checked=False: self.show_settings_section(8))
         self.hamburger_menu.addAction(system_settings_action)
 
         exit_action = QAction("Exit", self)
@@ -672,8 +675,9 @@ class MainWindow(QMainWindow):
             new_orch.on_paused_state_changed.connect(
                 lambda paused, aid=agent_id: self.ui_agent_paused_state_changed.emit(aid, paused)
             )
-            if hasattr(new_orch, 'pulse_engine') and hasattr(new_orch.pulse_engine, 'notify_unpaused'):
-                new_orch.pulse_engine.notify_unpaused()
+            if not getattr(new_orch, 'is_paused', False):
+                if hasattr(new_orch, 'pulse_engine') and hasattr(new_orch.pulse_engine, 'notify_unpaused'):
+                    new_orch.pulse_engine.notify_unpaused()
 
             if agent_id in self.tab_buttons:
                 self.tab_buttons[agent_id].set_paused(getattr(new_orch, 'is_paused', False))

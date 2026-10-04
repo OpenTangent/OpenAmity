@@ -2,18 +2,25 @@ import requests
 import io
 import os
 import threading
+import logging
 import qrcode
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton,
                                QLabel, QLineEdit, QTextEdit, QComboBox, QCheckBox,
                                QRadioButton, QButtonGroup, QStackedWidget, QListWidget, QInputDialog, QSlider,
                                QSpinBox, QScrollArea, QFrame, QFileDialog, QMessageBox, QDialog,
                                QProgressBar)
-from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QThread
+from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QThread, QUrl
 from PySide6.QtGui import QPixmap, QImage
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    HAS_QT_MULTIMEDIA = True
+except ImportError:
+    HAS_QT_MULTIMEDIA = False
 
 import smtplib
 import imaplib
 import ssl
+import json
 
 from core.email_auth import execute_desktop_oauth_flow, exchange_authorization_code
 from core.config_manager import ConfigManager
@@ -124,6 +131,39 @@ PROVIDER_MODELS = {
         ],
         "default_model": "deepseek-v4-pro",
         "default_light_model": "deepseek-flash"
+    },
+    "openrouter": {
+        "models": [
+            "MiMo-V2.6-Pro",
+            "xiaomi/mimo-v2.6-pro",
+            "openai/gpt-6-astra",
+            "anthropic/claude-3.7-sonnet",
+            "anthropic/claude-3.5-sonnet",
+            "openai/gpt-4o",
+            "openai/o3-mini",
+            "deepseek/deepseek-r1",
+            "deepseek/deepseek-chat",
+            "google/gemini-2.5-pro",
+            "google/gemini-2.5-flash",
+            "meta-llama/llama-3.3-70b-instruct",
+            "qwen/qwen-2.5-72b-instruct",
+            "openrouter/auto",
+            "Custom..."
+        ],
+        "light_models": [
+            "gpt-6-luna",
+            "openai/gpt-6-luna",
+            "openai/gpt-4o-mini",
+            "anthropic/claude-3.5-haiku",
+            "google/gemini-2.5-flash",
+            "deepseek/deepseek-chat",
+            "meta-llama/llama-3.1-8b-instruct",
+            "qwen/qwen-2.5-7b-instruct",
+            "openrouter/free",
+            "Custom..."
+        ],
+        "default_model": "MiMo-V2.6-Pro",
+        "default_light_model": "gpt-6-luna"
     },
     "antigravity": {
         "models": [
@@ -840,6 +880,22 @@ class SocialAccordionCard(AccordionCard):
             self.header_widget.setToolTip(f"Click to activate {self.title_text}")
 
 
+class MediaAccordionCard(AccordionCard):
+    """Accordion card representing an image/media provider configuration with zero-or-one selection."""
+
+    def __init__(self, media_provider_id: str, title: str, parent=None):
+        super().__init__(card_id=media_provider_id, title=title, parent=parent, badge_text="✓ Selected")
+
+    def set_expanded(self, expanded: bool):
+        super().set_expanded(expanded)
+        self.header_widget.setCursor(Qt.PointingHandCursor)
+        if expanded:
+            self.header_widget.setToolTip(f"Click header to deselect {self.title_text}")
+        else:
+            self.setToolTip(f"Click to select {self.title_text}")
+            self.header_widget.setToolTip(f"Click to select {self.title_text}")
+
+
 class SettingsPanelWidget(QWidget):
     close_requested = Signal()
     wizard_finished = Signal()
@@ -847,12 +903,24 @@ class SettingsPanelWidget(QWidget):
     oauth_finished = Signal(bool, str, str)
     agent_restored = Signal(str, bool)
     whatsapp_status_updated = Signal(str, str)
+    sample_synth_ready = Signal(str)
+    sample_synth_failed = Signal()
+    openrouter_models_fetched = Signal(object, object)
+    openrouter_image_models_fetched = Signal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.wizard_mode = False
         self.oauth_finished.connect(self._handle_oauth_result)
         self.whatsapp_status_updated.connect(self._on_whatsapp_status_updated)
+        self.sample_synth_ready.connect(self._play_temp_sample_file)
+        self.sample_synth_failed.connect(self._reset_play_sample_btn)
+        self.openrouter_models_fetched.connect(self._on_openrouter_models_fetched)
+        self.openrouter_image_models_fetched.connect(self._on_openrouter_image_models_fetched)
+        self._openrouter_models_list = self._load_cached_openrouter_models()
+        self._openrouter_light_models_list = list(self._openrouter_models_list)
+        self._openrouter_image_models_list = self._load_cached_openrouter_image_models()
+        self._temp_sample_files = []
         self._whatsapp_polling = False
         self.current_section_index = 0
         self.settings = None
@@ -865,8 +933,13 @@ class SettingsPanelWidget(QWidget):
         self.back_buttons = []
         self.preset_cards = {}
         self.voice_cards = {}
+        self.media_cards = {}
         self.social_cards = {}
         self.selected_preset_id = "amy"
+        self.selected_media_provider = ""
+        self._last_synced_gemini_voice_key = ""
+        self._last_synced_gemini_key = ""
+        self._last_synced_openrouter_key = ""
 
         self.whatsapp_timer = QTimer(self)
         self.whatsapp_timer.timeout.connect(self.poll_whatsapp_status)
@@ -904,8 +977,8 @@ class SettingsPanelWidget(QWidget):
             self.ui_qr_code.setText("[WhatsApp Bridge Not Running]")
 
     def poll_whatsapp_status(self):
-        # Only poll if the current tab is Social Accounts (index 5)
-        if self.stack.currentIndex() != 5:
+        # Only poll if the current tab is Social Accounts (index 6)
+        if self.stack.currentIndex() != 6:
             return
 
         if not hasattr(self, 'ui_use_whatsapp') or not self.ui_use_whatsapp.isChecked():
@@ -1048,6 +1121,15 @@ class SettingsPanelWidget(QWidget):
                 color: #FFF;
                 selection-background-color: #4a4a4a;
                 border: 1px solid #555;
+                max-height: 650px;
+            }}
+            QComboBoxPrivateScroller {{
+                height: 0px;
+                min-height: 0px;
+                max-height: 0px;
+                width: 0px;
+                border: none;
+                background: transparent;
             }}
             {MODERN_SCROLLBAR_STYLE}
         """)
@@ -1062,10 +1144,11 @@ class SettingsPanelWidget(QWidget):
 
         # Build Panels
         self.build_agent_presets()
+        self.build_cognitive_provider()
         self.build_basic_agent_settings()
         self.build_agent_values_goals()
         self.build_agent_voice()
-        self.build_provider_setup()
+        self.build_media_provider()
         self.build_social_accounts()
         self.build_other_agent_settings()
         self.build_system_settings()
@@ -1076,12 +1159,28 @@ class SettingsPanelWidget(QWidget):
         # Select initial default preset
         self.select_preset(self.selected_preset_id, populate_ui=True)
 
+    def configure_combobox(self, combo):
+        """Ensures combobox popups display ~25 items max and use modern minimal scrollbars without hover-scroll buttons."""
+        if not combo:
+            return
+        combo.setMaxVisibleItems(25)
+        if combo.view():
+            combo.view().setMaximumHeight(650)
+            combo.view().setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            combo.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            if combo.view().verticalScrollBar():
+                combo.view().verticalScrollBar().setStyleSheet(MODERN_SCROLLBAR_STYLE)
+            if combo.view().horizontalScrollBar():
+                combo.view().horizontalScrollBar().setStyleSheet(MODERN_SCROLLBAR_STYLE)
+
     def disable_scroll_wheel_recursively(self, widget):
         from PySide6.QtWidgets import QComboBox, QSpinBox, QSlider
         for w_type in (QComboBox, QSpinBox, QSlider):
             for child in widget.findChildren(w_type):
                 child.wheelEvent = lambda event: event.ignore()
                 child.setFocusPolicy(Qt.StrongFocus)
+                if isinstance(child, QComboBox):
+                    self.configure_combobox(child)
 
     def create_panel_container(self, title):
         container = QWidget()
@@ -1250,12 +1349,21 @@ class SettingsPanelWidget(QWidget):
         if hasattr(self, 'ui_voice'):
             self.ui_voice.setText(voice.get("gemini_model_name", "Sulafat"))
 
+        if hasattr(self, 'ui_tts_base_voice'):
+            for i in range(self.ui_tts_base_voice.count()):
+                if self.ui_tts_base_voice.itemData(i) == "auto":
+                    self.ui_tts_base_voice.setCurrentIndex(i)
+                    break
+        if hasattr(self, 'ui_tts_custom_voice_id'):
+            self.ui_tts_custom_voice_id.setText("")
+            self.ui_tts_custom_voice_id.setVisible(False)
+
         # Other Agent Settings
         if hasattr(self, 'ui_agency_limit'):
-            limit = preset.get("cognitive_budget", 10000)
+            limit = preset.get("token_usage_limit", preset.get("cognitive_budget", 400000))
             self.ui_agency_limit.setValue(limit)
             if hasattr(self, 'ui_agency_limit_val'):
-                self.ui_agency_limit_val.setText(str(limit))
+                self.ui_agency_limit_val.setText(f"{limit:,} tokens")
 
         if hasattr(self, 'ui_max_memories'):
             self.ui_max_memories.setValue(preset.get("max_memories", 24))
@@ -1403,10 +1511,18 @@ class SettingsPanelWidget(QWidget):
 
         # 2. Gemini TTS (Cloud)
         card_gemini = VoiceAccordionCard("gemini", "Gemini TTS Setup (Cloud)", self)
+
+        # 1. API Key is the FIRST field on the card
+        card_gemini.body_layout.addWidget(QLabel("Gemini API Key (for TTS):"))
+        self.ui_gemini_tts_api_key = QLineEdit()
+        self.ui_gemini_tts_api_key.setEchoMode(QLineEdit.Password)
+        self.ui_gemini_tts_api_key.setPlaceholderText("Paste Gemini API Key for TTS...")
+        self.ui_gemini_tts_api_key.textChanged.connect(self._sync_gemini_key_to_media)
+        card_gemini.body_layout.addWidget(self.ui_gemini_tts_api_key)
+
         guide_gemini = QLabel(
-            "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>"
-            "2. Sign in with your Google Account.<br>"
-            "3. Click 'Get API key' and paste it below.<br><br>"
+            "Powered by <b>Gemini 3.8 Flash TTS</b> (High Fidelity). "
+            "Get an API key from <a href='https://aistudio.google.com/'>Google AI Studio</a>.<br>"
             "<i>Note: This Gemini API key is dedicated to speech synthesis. Any cognitive worker "
             "(Claude, ChatGPT, DeepSeek, Antigravity, or Gemini) can vocalize using high-quality Gemini TTS when configured here.</i>")
         guide_gemini.setTextFormat(Qt.RichText)
@@ -1416,15 +1532,39 @@ class SettingsPanelWidget(QWidget):
         guide_gemini.setStyleSheet("background-color: transparent;")
         card_gemini.body_layout.addWidget(guide_gemini)
 
-        card_gemini.body_layout.addWidget(QLabel("Gemini API Key (for TTS):"))
-        self.ui_gemini_tts_api_key = QLineEdit()
-        self.ui_gemini_tts_api_key.setEchoMode(QLineEdit.Password)
-        self.ui_gemini_tts_api_key.setPlaceholderText("Paste Gemini API Key for TTS...")
-        card_gemini.body_layout.addWidget(self.ui_gemini_tts_api_key)
+        card_gemini.body_layout.addSpacing(6)
+
+        # 2. Voice Selection with Play Sample Button
+        lbl_voice_sec = QLabel("<b>Voice Selection & Audition</b>")
+        lbl_voice_sec.setStyleSheet("background-color: transparent; font-size: 14px;")
+        card_gemini.body_layout.addWidget(lbl_voice_sec)
+
+        voice_row = QHBoxLayout()
+        self.ui_tts_base_voice = QComboBox()
+        self.ui_tts_base_voice.addItem("Auto-match from Character Profile (Recommended)", "auto")
+
+        from core.audio_output import GEMINI_VOICES
+        for v_name, v_info in GEMINI_VOICES.items():
+            g = v_info.get("gender", "")
+            d = v_info.get("description", "")
+            self.ui_tts_base_voice.addItem(f"{v_name} ({g}, {d})", v_name)
+        self.ui_tts_base_voice.addItem("Custom Voice ID (Google AI Studio)...", "custom_voice_id")
+        voice_row.addWidget(self.ui_tts_base_voice, stretch=1)
+
+        self.ui_tts_play_sample_btn = QPushButton("▶ Play Sample")
+        self.ui_tts_play_sample_btn.setToolTip("Listen to an audio preview of this voice")
+        self.ui_tts_play_sample_btn.setFixedWidth(130)
+        voice_row.addWidget(self.ui_tts_play_sample_btn)
+        card_gemini.body_layout.addLayout(voice_row)
+
+        self.ui_tts_custom_voice_id = QLineEdit()
+        self.ui_tts_custom_voice_id.setPlaceholderText("Enter Custom Voice Design or Replication ID (e.g. voice_abc123)...")
+        self.ui_tts_custom_voice_id.setVisible(False)
+        card_gemini.body_layout.addWidget(self.ui_tts_custom_voice_id)
 
         card_gemini.body_layout.addSpacing(6)
 
-        # Voice Character Configuration: Gender, Age, Accent, Style
+        # 3. Voice Character Configuration: Gender, Age, Accent, Style
         lbl_char = QLabel("<b>Voice Character Configuration</b>")
         lbl_char.setStyleSheet("background-color: transparent; font-size: 14px;")
         card_gemini.body_layout.addWidget(lbl_char)
@@ -1485,15 +1625,21 @@ class SettingsPanelWidget(QWidget):
 
         card_gemini.body_layout.addSpacing(6)
 
+        card_gemini.body_layout.addWidget(self.create_tip(
+            "<b>Expressive Acting Cues:</b> Gemini 3.8 Flash TTS natively responds to conversational acting cues! "
+            "Agents can use inline angle-bracket tags like <code>&lt;laugh&gt;</code>, <code>&lt;sigh&gt;</code>, "
+            "<code>&lt;gasp&gt;</code>, <code>&lt;cough&gt;</code>, <code>&lt;whisper&gt;</code>, and <code>&lt;short pause&gt;</code>."
+        ))
+
         self.ui_tts_allow_agent_override = QCheckBox("Allow agent to set their own voice")
         self.ui_tts_allow_agent_override.setChecked(True)
         card_gemini.body_layout.addWidget(self.ui_tts_allow_agent_override)
         card_gemini.body_layout.addWidget(self.create_tip(
-            "Enables the agent to autonomously update their directorial voice prompt using the System tool."
+            "Enables the agent to autonomously update their delivery style and base voice using the System tool."
         ))
 
         card_gemini.body_layout.addWidget(self.create_tip(
-            "Preview Gemini's 30 prebuilt voices at: <a href='https://aistudio.google.com/generate-speech'>Google AI Studio Voice Library</a>. "
+            "Explore Gemini's 30 prebuilt voices or design custom voices at: <a href='https://aistudio.google.com/generate-speech'>Google AI Studio Voice Library</a>. "
             "For full directorial script control, toggle override-prompt in settings.json."
         ))
 
@@ -1515,6 +1661,8 @@ class SettingsPanelWidget(QWidget):
 
         self.ui_tts_accent.currentTextChanged.connect(self._on_tts_accent_changed)
         self.ui_tts_style.currentTextChanged.connect(self._on_tts_style_changed)
+        self.ui_tts_base_voice.currentIndexChanged.connect(self._on_tts_base_voice_changed)
+        self.ui_tts_play_sample_btn.clicked.connect(self._on_play_voice_sample)
 
         main_layout.addStretch()
 
@@ -1530,20 +1678,201 @@ class SettingsPanelWidget(QWidget):
     def _on_tts_style_changed(self, text):
         self.ui_tts_custom_style.setVisible(text == "Custom...")
 
-    def build_provider_setup(self):
-        panel, main_layout, _ = self.create_panel_container("Provider Setup")
+    def _init_audio_sample_player(self):
+        try:
+            from core.audio_output import silence_ffmpeg_logs
+            silence_ffmpeg_logs()
+        except Exception:
+            pass
+
+        if not hasattr(self, '_sample_player'):
+            self._sample_player = None
+            self._audio_output = None
+            self._is_preview_playing = False
+        if not hasattr(self, '_temp_sample_files'):
+            self._temp_sample_files = []
+        if HAS_QT_MULTIMEDIA and self._sample_player is None:
+            try:
+                self._sample_player = QMediaPlayer(self)
+                self._audio_output = QAudioOutput(self)
+                self._audio_output.setVolume(1.0)
+                self._sample_player.setAudioOutput(self._audio_output)
+                self._sample_player.playbackStateChanged.connect(self._on_sample_playback_state_changed)
+            except Exception as e:
+                import logging
+                logging.getLogger("gui.SettingsPanel").warning(f"Could not initialize QMediaPlayer: {e}")
+
+    def _on_sample_playback_state_changed(self, state):
+        if hasattr(self, 'ui_tts_play_sample_btn'):
+            if HAS_QT_MULTIMEDIA and state == QMediaPlayer.StoppedState:
+                self.ui_tts_play_sample_btn.setText("▶ Play Sample")
+                self._is_preview_playing = False
+                self._cleanup_temp_samples()
+
+    def _cleanup_temp_samples(self):
+        if hasattr(self, '_temp_sample_files') and self._temp_sample_files:
+            import os
+            remaining = []
+            for path in self._temp_sample_files:
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except Exception:
+                    remaining.append(path)
+            self._temp_sample_files = remaining
+
+    def _play_sample_url(self, url):
+        self._init_audio_sample_player()
+        if self._sample_player:
+            self._sample_player.setSource(url)
+            self._sample_player.play()
+            self._is_preview_playing = True
+            self.ui_tts_play_sample_btn.setText("⏹ Stop")
+            self.ui_tts_play_sample_btn.setEnabled(True)
+        else:
+            try:
+                import subprocess
+                subprocess.Popen(["ffplay", "-nodisp", "-autoexit", url.toLocalFile()],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.ui_tts_play_sample_btn.setText("⏹ Stop")
+                self._is_preview_playing = True
+                QTimer.singleShot(3000, self._reset_play_sample_btn)
+            except Exception:
+                self._reset_play_sample_btn()
+
+    def _play_temp_sample_file(self, tmp_path):
+        self._play_sample_url(QUrl.fromLocalFile(tmp_path))
+
+    def _reset_play_sample_btn(self):
+        if hasattr(self, 'ui_tts_play_sample_btn'):
+            self.ui_tts_play_sample_btn.setText("▶ Play Sample")
+            self.ui_tts_play_sample_btn.setEnabled(True)
+        self._is_preview_playing = False
+
+    def _on_tts_base_voice_changed(self, index):
+        if hasattr(self, 'ui_tts_base_voice') and hasattr(self, 'ui_tts_custom_voice_id'):
+            choice = self.ui_tts_base_voice.currentData()
+            self.ui_tts_custom_voice_id.setVisible(choice == "custom_voice_id")
+            if getattr(self, '_is_preview_playing', False) and getattr(self, '_sample_player', None):
+                self._sample_player.stop()
+                self._reset_play_sample_btn()
+
+            from core.audio_output import GEMINI_VOICES, voice_to_character_profile
+            if not getattr(self, '_is_loading', False) and choice and choice in GEMINI_VOICES:
+                prof = voice_to_character_profile(choice)
+                if prof:
+                    if hasattr(self, 'ui_tts_gender') and "gender" in prof:
+                        g_idx = self.ui_tts_gender.findText(prof["gender"])
+                        if g_idx >= 0:
+                            self.ui_tts_gender.setCurrentIndex(g_idx)
+                    if hasattr(self, 'ui_tts_age') and "age" in prof:
+                        a_idx = self.ui_tts_age.findText(prof["age"])
+                        if a_idx >= 0:
+                            self.ui_tts_age.setCurrentIndex(a_idx)
+                    if hasattr(self, 'ui_tts_style') and "style" in prof:
+                        s_idx = self.ui_tts_style.findText(prof["style"])
+                        if s_idx >= 0:
+                            self.ui_tts_style.setCurrentIndex(s_idx)
+                        if hasattr(self, 'ui_tts_custom_style'):
+                            self.ui_tts_custom_style.setVisible(False)
+                            self.ui_tts_custom_style.clear()
+                    if hasattr(self, 'ui_voice'):
+                        self.ui_voice.setText(choice)
+
+    def _on_play_voice_sample(self):
+        self._init_audio_sample_player()
+        if getattr(self, '_is_preview_playing', False):
+            if getattr(self, '_sample_player', None):
+                self._sample_player.stop()
+            self._reset_play_sample_btn()
+            return
+
+        choice = self.ui_tts_base_voice.currentData()
+        from pathlib import Path
+        assets_dir = Path(__file__).resolve().parent.parent / "assets" / "audio" / "voices"
+
+        if choice and choice not in ("auto", "custom_voice_id"):
+            sample_file = assets_dir / f"{choice}.ogg"
+            if sample_file.exists():
+                self._play_sample_url(QUrl.fromLocalFile(str(sample_file)))
+                return
+
+        api_key = self.ui_gemini_tts_api_key.text().strip()
+        if not api_key and hasattr(self, 'settings') and self.settings:
+            api_key = self.settings.get_env("GEMINI_TTS_API_KEY") or self.settings.get_env("GEMINI_API_KEY")
+
+        if not api_key:
+            if choice == "custom_voice_id":
+                QMessageBox.information(self, "API Key Required", "Please enter a Gemini API Key above to audition a custom voice ID.")
+            else:
+                QMessageBox.information(self, "API Key Required", "Please enter a Gemini API Key above to audition your auto-matched character profile.")
+            return
+
+        if choice == "custom_voice_id":
+            target_voice = self.ui_tts_custom_voice_id.text().strip()
+            if not target_voice:
+                QMessageBox.information(self, "Custom Voice ID Required", "Please enter a valid Voice Design or Replication ID (e.g. voice_abc123).")
+                return
+            style_str = "warm and natural"
+        elif choice == "auto":
+            from core.audio_output import resolve_base_voice
+            gender_txt = self.ui_tts_gender.currentText()
+            gender_val = "Female" if "Female" in gender_txt else ("Male" if "Male" in gender_txt else "Non-binary")
+            age_val = self.ui_tts_age.currentText().split("(")[0].strip()
+            style_val = self.ui_tts_custom_style.text().strip() if self.ui_tts_style.currentText() == "Custom..." else self.ui_tts_style.currentText()
+            accent_val = self.ui_tts_custom_accent.text().strip() if self.ui_tts_accent.currentText() == "Custom..." else self.ui_tts_accent.currentText()
+            target_voice = resolve_base_voice(gender_val, age_val, style_val)
+            style_str = f"natural {accent_val} accent, {style_val.lower()} tone with clear articulation and natural pacing"
+        else:
+            target_voice = choice
+            style_str = "warm and clear"
+
+        self.ui_tts_play_sample_btn.setText("⏳ Loading...")
+        self.ui_tts_play_sample_btn.setEnabled(False)
+
+        def synth_worker():
+            from core.audio_output import synthesize_voice_sample
+            try:
+                audio_bytes = synthesize_voice_sample(
+                    api_key=api_key,
+                    voice_name=target_voice,
+                    style=style_str,
+                    text=f"Hello, this is a preview of the {target_voice} voice."
+                )
+                if audio_bytes:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp.write(audio_bytes)
+                        tmp_path = tmp.name
+                    if hasattr(self, '_temp_sample_files'):
+                        self._temp_sample_files.append(tmp_path)
+                    self.sample_synth_ready.emit(tmp_path)
+                else:
+                    self.sample_synth_failed.emit()
+            except Exception as e:
+                import logging
+                logging.getLogger("gui.SettingsPanel").warning(f"Voice preview failed: {e}")
+                self.sample_synth_failed.emit()
+
+        t = threading.Thread(target=synth_worker, daemon=True)
+        t.start()
+
+    def build_cognitive_provider(self):
+        panel, main_layout, _ = self.create_panel_container("Cognitive Provider")
 
         # Compatibility radio buttons (kept hidden from layout, grouped for exclusivity)
         self.ui_use_gemini_api = QRadioButton("Use Gemini API", self)
         self.ui_use_claude_api = QRadioButton("Use Claude API", self)
         self.ui_use_chatgpt_api = QRadioButton("Use ChatGPT API", self)
         self.ui_use_deepseek_api = QRadioButton("Use DeepSeek API", self)
+        self.ui_use_openrouter_api = QRadioButton("Use OpenRouter API", self)
         self.ui_agy_mode = QRadioButton("Use Antigravity", self)
 
         self.ui_use_gemini_api.setVisible(False)
         self.ui_use_claude_api.setVisible(False)
         self.ui_use_chatgpt_api.setVisible(False)
         self.ui_use_deepseek_api.setVisible(False)
+        self.ui_use_openrouter_api.setVisible(False)
         self.ui_agy_mode.setVisible(False)
 
         self.provider_button_group = QButtonGroup(self)
@@ -1551,6 +1880,7 @@ class SettingsPanelWidget(QWidget):
         self.provider_button_group.addButton(self.ui_use_claude_api)
         self.provider_button_group.addButton(self.ui_use_chatgpt_api)
         self.provider_button_group.addButton(self.ui_use_deepseek_api)
+        self.provider_button_group.addButton(self.ui_use_openrouter_api)
         self.provider_button_group.addButton(self.ui_agy_mode)
 
         self.ui_use_gemini_api.toggled.connect(
@@ -1561,12 +1891,54 @@ class SettingsPanelWidget(QWidget):
             lambda checked: self._on_provider_radio_toggled("chatgpt", checked))
         self.ui_use_deepseek_api.toggled.connect(
             lambda checked: self._on_provider_radio_toggled("deepseek", checked))
+        self.ui_use_openrouter_api.toggled.connect(
+            lambda checked: self._on_provider_radio_toggled("openrouter", checked))
         self.ui_agy_mode.toggled.connect(
             lambda checked: self._on_provider_radio_toggled("antigravity", checked))
 
         self.provider_cards = {}
 
-        # 1. Gemini
+        # 1. OpenRouter
+        card_openrouter = ProviderAccordionCard("openrouter", "OpenRouter API Setup", self)
+        guide_openrouter = QLabel(
+            "1. Go to <a href='https://openrouter.ai/keys'>OpenRouter API Keys</a>.<br>"
+            "2. Sign in and create a new API key.<br>"
+            "3. Paste your key below to access 450+ AI models (Xiaomi MiMo, OpenAI GPT-6, Claude, DeepSeek, Gemini, Meta Llama, and more) with a single key.<br><br>"
+            "<i>Note: OpenRouter normalizes reasoning and tool execution across providers. Speech is generated using the engine "
+            "selected in Agent Voice.</i>"
+        )
+        guide_openrouter.setTextFormat(Qt.RichText)
+        guide_openrouter.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_openrouter.setOpenExternalLinks(True)
+        guide_openrouter.setWordWrap(True)
+        guide_openrouter.setStyleSheet("background-color: transparent;")
+        card_openrouter.body_layout.addWidget(guide_openrouter)
+
+        card_openrouter.body_layout.addWidget(QLabel("OpenRouter API Key:"))
+        self.ui_openrouter_api_key = QLineEdit()
+        self.ui_openrouter_api_key.setEchoMode(QLineEdit.Password)
+        self.ui_openrouter_api_key.textChanged.connect(self._sync_openrouter_key_to_media)
+        card_openrouter.body_layout.addWidget(self.ui_openrouter_api_key)
+
+        self._setup_provider_model_controls("openrouter", card_openrouter.body_layout)
+
+        fetch_layout = QHBoxLayout()
+        self.ui_openrouter_fetch_btn = QPushButton("🔄 Fetch Available Models from OpenRouter")
+        self.ui_openrouter_fetch_status = QLabel("")
+        self.ui_openrouter_fetch_status.setStyleSheet("color: #888888; font-size: 11px;")
+        self.ui_openrouter_fetch_btn.clicked.connect(self._fetch_openrouter_models)
+        fetch_layout.addWidget(self.ui_openrouter_fetch_btn)
+        fetch_layout.addWidget(self.ui_openrouter_fetch_status)
+        fetch_layout.addStretch()
+        card_openrouter.body_layout.addLayout(fetch_layout)
+
+        card_openrouter.clicked.connect(lambda: self._select_provider("openrouter"))
+        self.provider_cards["openrouter"] = card_openrouter
+        main_layout.addWidget(card_openrouter)
+
+        main_layout.addSpacing(6)
+
+        # 2. Gemini
         card_gemini = ProviderAccordionCard("gemini", "Gemini API Setup", self)
         guide_gemini = QLabel(
             "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>"
@@ -1583,6 +1955,8 @@ class SettingsPanelWidget(QWidget):
         card_gemini.body_layout.addWidget(QLabel("Gemini API Key:"))
         self.ui_gemini_api_key = QLineEdit()
         self.ui_gemini_api_key.setEchoMode(QLineEdit.Password)
+        self.ui_gemini_api_key.textChanged.connect(self._sync_gemini_key_to_voice)
+        self.ui_gemini_api_key.textChanged.connect(self._sync_gemini_key_to_media)
         card_gemini.body_layout.addWidget(self.ui_gemini_api_key)
 
         self._setup_provider_model_controls("gemini", card_gemini.body_layout)
@@ -1592,7 +1966,7 @@ class SettingsPanelWidget(QWidget):
 
         main_layout.addSpacing(6)
 
-        # 2. Claude
+        # 3. Claude
         card_claude = ProviderAccordionCard("claude", "Claude API Setup", self)
         guide_claude = QLabel(
             "1. Go to <a href='https://console.anthropic.com/'>Anthropic Console</a>.<br>"
@@ -1620,7 +1994,7 @@ class SettingsPanelWidget(QWidget):
 
         main_layout.addSpacing(6)
 
-        # 3. ChatGPT
+        # 4. ChatGPT
         card_chatgpt = ProviderAccordionCard("chatgpt", "ChatGPT API Setup", self)
         guide_chatgpt = QLabel(
             "1. Go to <a href='https://platform.openai.com/api-keys'>OpenAI Platform</a>.<br>"
@@ -1648,7 +2022,7 @@ class SettingsPanelWidget(QWidget):
 
         main_layout.addSpacing(6)
 
-        # 4. DeepSeek
+        # 5. DeepSeek
         card_deepseek = ProviderAccordionCard("deepseek", "DeepSeek API Setup", self)
         guide_deepseek = QLabel(
             "1. Go to <a href='https://platform.deepseek.com/'>DeepSeek Platform</a>.<br>"
@@ -1680,6 +2054,109 @@ class SettingsPanelWidget(QWidget):
         # Default initial selection
         self.ui_use_gemini_api.setChecked(True)
         self._update_provider_accordion("gemini")
+
+        self.stack.addWidget(panel)
+    build_provider_setup = build_cognitive_provider
+
+    def build_media_provider(self):
+        panel, main_layout, _ = self.create_panel_container("Media Provider")
+
+        guide_top = QLabel(
+            "Configure an image generation provider for your agent. An agent can have zero or one "
+            "image generation provider active at a time.<br><br>"
+            "<b>Tip:</b> Click on a provider card to select and expand it. Click the header of the "
+            "selected provider to collapse the card and effectively select no image provider."
+        )
+        guide_top.setTextFormat(Qt.RichText)
+        guide_top.setWordWrap(True)
+        guide_top.setStyleSheet("color: #CCCCCC; font-size: 13px; line-height: 1.4; margin-bottom: 10px; background-color: transparent;")
+        main_layout.addWidget(guide_top)
+
+        self.media_cards = {}
+
+        # 1. OpenRouter Media Setup
+        card_openrouter = MediaAccordionCard("openrouter", "OpenRouter Media Setup", self)
+        guide_openrouter = QLabel(
+            "1. Go to <a href='https://openrouter.ai/keys'>OpenRouter API Keys</a>.<br>"
+            "2. Sign in and create a new API key.<br>"
+            "3. Paste your key below to generate images using OpenRouter's image generation models (Seedream, FLUX, Stable Diffusion, Imagen, and more).<br><br>"
+            "<i>Note: If you have already set up an OpenRouter API key in Cognitive Provider, it is automatically filled below.</i>"
+        )
+        guide_openrouter.setTextFormat(Qt.RichText)
+        guide_openrouter.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_openrouter.setOpenExternalLinks(True)
+        guide_openrouter.setWordWrap(True)
+        guide_openrouter.setStyleSheet("background-color: transparent;")
+        card_openrouter.body_layout.addWidget(guide_openrouter)
+
+        card_openrouter.body_layout.addWidget(QLabel("OpenRouter API Key:"))
+        self.ui_media_openrouter_api_key = QLineEdit()
+        self.ui_media_openrouter_api_key.setEchoMode(QLineEdit.Password)
+        card_openrouter.body_layout.addWidget(self.ui_media_openrouter_api_key)
+
+        # OpenRouter Image Model controls
+        self._setup_openrouter_image_model_controls(card_openrouter.body_layout)
+
+        fetch_layout = QHBoxLayout()
+        self.ui_media_openrouter_fetch_btn = QPushButton("🔄 Fetch Available Image Models from OpenRouter")
+        self.ui_media_openrouter_fetch_status = QLabel("")
+        self.ui_media_openrouter_fetch_status.setStyleSheet("color: #888888; font-size: 11px;")
+        self.ui_media_openrouter_fetch_btn.clicked.connect(self._fetch_openrouter_image_models)
+        fetch_layout.addWidget(self.ui_media_openrouter_fetch_btn)
+        fetch_layout.addWidget(self.ui_media_openrouter_fetch_status)
+        fetch_layout.addStretch()
+        card_openrouter.body_layout.addLayout(fetch_layout)
+
+        card_openrouter.clicked.connect(lambda: self._select_media_provider("openrouter"))
+        self.media_cards["openrouter"] = card_openrouter
+        main_layout.addWidget(card_openrouter)
+
+        main_layout.addSpacing(6)
+
+        # 2. Gemini Media Setup
+        card_gemini = MediaAccordionCard("gemini", "Gemini Media Setup", self)
+        guide_gemini = QLabel(
+            "1. Go to <a href='https://aistudio.google.com/'>AI Studio</a>.<br>"
+            "2. Sign in with your Google Account.<br>"
+            "3. Click 'Get API key' and create a new key.<br><br>"
+            "<i>Note: If you have already set up a Gemini API key in Cognitive Provider, it is automatically filled below.</i>"
+        )
+        guide_gemini.setTextFormat(Qt.RichText)
+        guide_gemini.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        guide_gemini.setOpenExternalLinks(True)
+        guide_gemini.setWordWrap(True)
+        guide_gemini.setStyleSheet("background-color: transparent;")
+        card_gemini.body_layout.addWidget(guide_gemini)
+
+        card_gemini.body_layout.addWidget(QLabel("Gemini API Key:"))
+        self.ui_media_gemini_api_key = QLineEdit()
+        self.ui_media_gemini_api_key.setEchoMode(QLineEdit.Password)
+        card_gemini.body_layout.addWidget(self.ui_media_gemini_api_key)
+
+        card_gemini.body_layout.addSpacing(6)
+        card_gemini.body_layout.addWidget(QLabel("Image Generation Model:"))
+        self.ui_media_gemini_model = QComboBox()
+        self.configure_combobox(self.ui_media_gemini_model)
+        gemini_image_models = ["gemini-3.1-flash-image", "gemini-3-pro-image", "Custom..."]
+        self.ui_media_gemini_model.addItems(gemini_image_models)
+        card_gemini.body_layout.addWidget(self.ui_media_gemini_model)
+
+        self.ui_media_gemini_custom_model = QLineEdit()
+        self.ui_media_gemini_custom_model.setPlaceholderText("Enter custom model identifier (e.g. gemini-3.1-flash-image)...")
+        self.ui_media_gemini_custom_model.setVisible(False)
+        self.ui_media_gemini_model.currentTextChanged.connect(
+            lambda text: self.ui_media_gemini_custom_model.setVisible(text == "Custom..."))
+        card_gemini.body_layout.addWidget(self.ui_media_gemini_custom_model)
+
+        card_gemini.clicked.connect(lambda: self._select_media_provider("gemini"))
+        self.media_cards["gemini"] = card_gemini
+        main_layout.addWidget(card_gemini)
+
+        main_layout.addStretch()
+
+        # Initial state: no provider selected (both collapsed)
+        self.selected_media_provider = ""
+        self._update_media_accordion("")
 
         self.stack.addWidget(panel)
 
@@ -1904,6 +2381,24 @@ class SettingsPanelWidget(QWidget):
         adv_user_row.addWidget(self.ui_email_username)
         adv_layout.addLayout(adv_user_row)
 
+        # Local Archive Checkbox
+        self.ui_email_archive_local = QCheckBox("Save retrieved emails to local archive (enables fast offline search and storage)")
+        self.ui_email_archive_local.setChecked(True)
+        self.ui_email_archive_local.setStyleSheet("color: #DDD; font-size: 12px; margin-top: 4px;")
+        adv_layout.addWidget(self.ui_email_archive_local)
+
+        # Delete from Server Checkbox
+        self.ui_email_delete_from_server = QCheckBox("Delete retrieved emails from server (recommended for standard IMAP to prevent mailbox quota exhaustion)")
+        init_is_cloud = self.ui_email_provider.currentText() in ["Gmail / Google Workspace", "Outlook / Microsoft 365"]
+        self.ui_email_delete_from_server.setChecked(not init_is_cloud)
+        self.ui_email_delete_from_server.setStyleSheet("color: #DDD; font-size: 12px; margin-top: 2px;")
+        adv_layout.addWidget(self.ui_email_delete_from_server)
+
+        self.ui_email_archive_tip = self.create_tip(
+            "For standard IMAP webmail servers, deleting retrieved emails keeps the server mailbox empty so quota limits are never reached. Google and large cloud providers can keep a copy on their servers."
+        )
+        adv_layout.addWidget(self.ui_email_archive_tip)
+
         self.ui_email_adv_container.setVisible(False)
         layout_email.addWidget(self.ui_email_adv_container)
 
@@ -2063,21 +2558,21 @@ class SettingsPanelWidget(QWidget):
         layout1.addWidget(self.create_tip(
             "This increases token use and can potentially cause context bloat."))
 
-        layout1.addWidget(QLabel("Cognative Budget:"))
-        self.ui_agency_limit_val = QLabel("1000")
+        layout1.addWidget(QLabel("Fatigue Limit (Token Usage Limit):"))
+        self.ui_agency_limit_val = QLabel("400,000 tokens")
         layout1.addWidget(self.ui_agency_limit_val)
         self.ui_agency_limit = QSlider(Qt.Horizontal)
         self.ui_agency_limit.setFocusPolicy(Qt.StrongFocus)
         self.ui_agency_limit.wheelEvent = lambda event: event.ignore()
-        self.ui_agency_limit.setRange(0, 100000)
-        self.ui_agency_limit.setSingleStep(1000)
-        self.ui_agency_limit.setPageStep(1000)
-        self.ui_agency_limit.setValue(1000)
+        self.ui_agency_limit.setRange(50000, 2000000)
+        self.ui_agency_limit.setSingleStep(25000)
+        self.ui_agency_limit.setPageStep(25000)
+        self.ui_agency_limit.setValue(400000)
         self.ui_agency_limit.valueChanged.connect(
-            lambda v: self.ui_agency_limit_val.setText(str(v - (v % 1000))))
+            lambda v: self.ui_agency_limit_val.setText(f"{v - (v % 25000):,} tokens"))
         layout1.addWidget(self.ui_agency_limit)
         layout1.addWidget(self.create_tip(
-            "This affects how long the agent can run autonomously before being forcefully stopped"))
+            "Sets the maximum token consumption before the agent becomes fully fatigued and must execute an autonomous sleep cycle to consolidate memories and reset context. Default: 400,000 tokens.<br><i>Tip: Most modern models support 500k to 1M+ tokens, but some models or providers have smaller context windows. Ensure your limit leaves enough room in your model's context window for a sleep cycle to run without interruption.</i>"))
 
         main_layout.addWidget(card1)
 
@@ -2306,6 +2801,10 @@ class SettingsPanelWidget(QWidget):
         tip_text = preset.get("tip", "Configure standard IMAP and SMTP server settings below.")
         self.ui_email_auth_tip.setText(f"<i>Tip: {tip_text}</i>")
 
+        if hasattr(self, 'ui_email_delete_from_server'):
+            is_cloud = preset_name in ["Gmail / Google Workspace", "Outlook / Microsoft 365"]
+            self.ui_email_delete_from_server.setChecked(not is_cloud)
+
         self._update_advanced_summary()
 
     def _on_email_address_changed(self):
@@ -2475,9 +2974,9 @@ class SettingsPanelWidget(QWidget):
             btn.setVisible(not enabled)
         if enabled:
             for i, btn in enumerate(self.save_buttons):
-                if i < 5:
+                if i < 6:
                     btn.setText("Next")
-                elif i == 5:
+                elif i == 6:
                     btn.setText("Finish")
                 else:
                     btn.setText("Save")
@@ -2491,7 +2990,7 @@ class SettingsPanelWidget(QWidget):
     def _update_wizard_nav_buttons(self):
         for i, btn in enumerate(self.back_buttons):
             if self.wizard_mode and self.current_section_index == i:
-                btn.setVisible(1 <= i <= 5)
+                btn.setVisible(1 <= i <= 6)
             else:
                 btn.setVisible(False)
 
@@ -2503,10 +3002,49 @@ class SettingsPanelWidget(QWidget):
         if 0 <= index < self.stack.count():
             self.current_section_index = index
             self.stack.setCurrentIndex(index)
+            # Copy Gemini key to Agent Voice (index 4) if empty
+            if index == 4:
+                if hasattr(self, 'ui_gemini_tts_api_key') and not self.ui_gemini_tts_api_key.text().strip():
+                    g_key = ""
+                    if hasattr(self, 'ui_gemini_api_key'):
+                        g_key = self.ui_gemini_api_key.text().strip()
+                    if not g_key and hasattr(self, 'settings') and self.settings:
+                        g_key = self.settings.get_env("GEMINI_API_KEY", "")
+                    if g_key:
+                        self.ui_gemini_tts_api_key.setText(g_key)
+                        self._last_synced_gemini_voice_key = g_key
+            # Auto-fill media provider keys from Cognitive Provider / Agent Voice / settings if empty when entering Media Provider (index 5)
+            elif index == 5:
+                if hasattr(self, 'ui_media_gemini_api_key') and not self.ui_media_gemini_api_key.text().strip():
+                    g_key = ""
+                    if hasattr(self, 'ui_gemini_api_key'):
+                        g_key = self.ui_gemini_api_key.text().strip()
+                    if not g_key and hasattr(self, 'ui_gemini_tts_api_key'):
+                        g_key = self.ui_gemini_tts_api_key.text().strip()
+                    if not g_key and hasattr(self, 'settings') and self.settings:
+                        g_key = self.settings.get_env("GEMINI_API_KEY", "") or self.settings.get_env("GEMINI_TTS_API_KEY", "")
+                    if g_key:
+                        self.ui_media_gemini_api_key.setText(g_key)
+                        self._last_synced_gemini_key = g_key
+                if hasattr(self, 'ui_media_openrouter_api_key') and not self.ui_media_openrouter_api_key.text().strip():
+                    o_key = ""
+                    if hasattr(self, 'ui_openrouter_api_key'):
+                        o_key = self.ui_openrouter_api_key.text().strip()
+                    if not o_key and hasattr(self, 'settings') and self.settings:
+                        o_key = self.settings.get_env("OPENROUTER_API_KEY", "")
+                    if o_key:
+                        self.ui_media_openrouter_api_key.setText(o_key)
+                        self._last_synced_openrouter_key = o_key
             if self.wizard_mode:
                 self._update_wizard_nav_buttons()
 
     def request_close(self):
+        if hasattr(self, '_sample_player') and self._sample_player:
+            try:
+                self._sample_player.stop()
+            except Exception:
+                pass
+        self._cleanup_temp_samples()
         if not self.wizard_mode:
             self.save_settings()
             self.close_requested.emit()
@@ -2517,6 +3055,7 @@ class SettingsPanelWidget(QWidget):
             "claude": getattr(self, "ui_use_claude_api", None),
             "chatgpt": getattr(self, "ui_use_chatgpt_api", None),
             "deepseek": getattr(self, "ui_use_deepseek_api", None),
+            "openrouter": getattr(self, "ui_use_openrouter_api", None),
             "antigravity": getattr(self, "ui_agy_mode", None),
         }
         return radio_map.get(provider_id)
@@ -2536,6 +3075,777 @@ class SettingsPanelWidget(QWidget):
             return
         for pid, card in self.provider_cards.items():
             card.set_expanded(pid == selected_provider_id)
+
+    def _sync_gemini_key_to_voice(self, text: str):
+        if not hasattr(self, 'ui_gemini_tts_api_key'):
+            return
+        old_val = getattr(self, '_last_synced_gemini_voice_key', '')
+        current_voice = self.ui_gemini_tts_api_key.text()
+        if not current_voice or current_voice == old_val:
+            self.ui_gemini_tts_api_key.setText(text)
+            self._last_synced_gemini_voice_key = text
+
+    def _sync_gemini_key_to_media(self, text: str):
+        if not hasattr(self, 'ui_media_gemini_api_key'):
+            return
+        old_val = getattr(self, '_last_synced_gemini_key', '')
+        current_media = self.ui_media_gemini_api_key.text()
+        if not current_media or current_media == old_val:
+            self.ui_media_gemini_api_key.setText(text)
+            self._last_synced_gemini_key = text
+
+    def _sync_openrouter_key_to_media(self, text: str):
+        if not hasattr(self, 'ui_media_openrouter_api_key'):
+            return
+        old_val = getattr(self, '_last_synced_openrouter_key', '')
+        current_media = self.ui_media_openrouter_api_key.text()
+        if not current_media or current_media == old_val:
+            self.ui_media_openrouter_api_key.setText(text)
+            self._last_synced_openrouter_key = text
+
+    def _select_media_provider(self, provider_id: str = None):
+        if provider_id == self.selected_media_provider:
+            # User clicked the header of the selected provider to collapse it and select no provider
+            self.selected_media_provider = ""
+        else:
+            self.selected_media_provider = provider_id or ""
+        self._update_media_accordion(self.selected_media_provider)
+
+    def _update_media_accordion(self, selected_provider_id: str):
+        if not hasattr(self, "media_cards"):
+            return
+        for pid, card in self.media_cards.items():
+            card.set_expanded(pid == selected_provider_id)
+
+
+    @staticmethod
+    def _load_cached_openrouter_models() -> list:
+        try:
+            from config import paths
+        except ImportError:
+            import paths
+        cache_file = paths.get_openrouter_models_cache_file()
+        default_file = paths.get_default_openrouter_models_file()
+
+        for target in (cache_file, default_file):
+            if target and os.path.exists(target):
+                try:
+                    with open(target, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    models = data.get("models", []) if isinstance(data, dict) else data
+                    if isinstance(models, list) and models:
+                        if target == default_file and cache_file and not os.path.exists(cache_file):
+                            SettingsPanelWidget._save_cached_openrouter_models(models)
+                        return models
+                except Exception as e:
+                    logging.getLogger("gui.SettingsPanel").warning(
+                        f"Error loading OpenRouter models from {target}: {e}")
+
+        # Fallback to hardcoded list
+        cfg = PROVIDER_MODELS.get("openrouter", {})
+        return list(cfg.get("models", []))
+
+    @staticmethod
+    def _save_cached_openrouter_models(models: list) -> bool:
+        if not models or not isinstance(models, list):
+            return False
+        try:
+            from config import paths
+        except ImportError:
+            import paths
+        try:
+            from core.file_utils import atomic_json_write
+        except ImportError:
+            from file_utils import atomic_json_write
+
+        saved = False
+
+        # 1. Save to writable user cache directory
+        try:
+            cache_file = paths.get_openrouter_models_cache_file()
+            atomic_json_write(cache_file, models, indent=2)
+            saved = True
+            logging.getLogger("gui.SettingsPanel").info(
+                f"Successfully cached {len(models)} OpenRouter models to {cache_file}")
+        except Exception as e:
+            logging.getLogger("gui.SettingsPanel").warning(
+                f"Failed to save OpenRouter models to user cache: {e}")
+
+        # 2. Overwrite the shipped default list if writable
+        try:
+            default_file = paths.get_default_openrouter_models_file()
+            if default_file:
+                atomic_json_write(default_file, models, indent=2)
+                saved = True
+                logging.getLogger("gui.SettingsPanel").info(
+                    f"Successfully overwrote shipped OpenRouter models in {default_file}")
+        except Exception as e:
+            # Expected on read-only environments (e.g., Flatpak /app)
+            logging.getLogger("gui.SettingsPanel").debug(
+                f"Could not overwrite default OpenRouter models file: {e}")
+
+        return saved
+
+    def _fetch_openrouter_models(self):
+        if not hasattr(self, 'ui_openrouter_fetch_btn'):
+            return
+        self.ui_openrouter_fetch_btn.setEnabled(False)
+        self.ui_openrouter_fetch_btn.setText("⏳ Fetching models...")
+        if hasattr(self, 'ui_openrouter_fetch_status'):
+            self.ui_openrouter_fetch_status.setText("")
+
+        api_key = self.ui_openrouter_api_key.text().strip() if hasattr(self, 'ui_openrouter_api_key') else ""
+        from core.openrouter_worker import OpenRouterWorker
+
+        def worker():
+            try:
+                models = OpenRouterWorker.fetch_available_models(api_key=api_key or None)
+                self.openrouter_models_fetched.emit(models, None)
+            except Exception as e:
+                logging.getLogger("gui.SettingsPanel").warning(f"Failed to fetch OpenRouter models: {e}")
+                self.openrouter_models_fetched.emit([], str(e))
+
+        t = threading.Thread(target=worker, daemon=True)
+        self._fetch_models_thread = t
+        t.start()
+        return t
+
+    def _on_openrouter_models_fetched(self, models: list, error: str = None):
+        if hasattr(self, 'ui_openrouter_fetch_btn'):
+            self.ui_openrouter_fetch_btn.setEnabled(True)
+            self.ui_openrouter_fetch_btn.setText("🔄 Fetch Available Models from OpenRouter")
+
+        if error:
+            if hasattr(self, 'ui_openrouter_fetch_status'):
+                self.ui_openrouter_fetch_status.setText(f"❌ Error: {error}")
+            return
+
+        if not models:
+            if hasattr(self, 'ui_openrouter_fetch_status'):
+                self.ui_openrouter_fetch_status.setText("No models found.")
+            return
+
+        # Permanently cache the fetched models, overwriting the provided list
+        self._save_cached_openrouter_models(models)
+
+        cur_p_model = self._get_openrouter_current_value("model")
+        cur_l_model = self._get_openrouter_current_value("light_model")
+
+        self._openrouter_models_list = list(models)
+        self._openrouter_light_models_list = list(models)
+
+        self._refresh_openrouter_provider_dropdowns()
+
+        if cur_p_model:
+            self._select_openrouter_model_by_slug("model", cur_p_model)
+        if cur_l_model:
+            self._select_openrouter_model_by_slug("light_model", cur_l_model)
+
+        providers_count = max(0, len(self._get_openrouter_providers(models)) - 1)
+        if hasattr(self, 'ui_openrouter_fetch_status'):
+            self.ui_openrouter_fetch_status.setText(f"✓ Fetched {len(models)} models across {providers_count} providers.")
+
+    def _parse_openrouter_model_slug(self, slug: str) -> tuple:
+        if not slug or slug == "Custom...":
+            return ("", slug or "")
+        if "/" in slug:
+            parts = slug.split("/", 1)
+            return (parts[0], parts[1])
+        from core.openrouter_worker import OpenRouterWorker
+        norm = OpenRouterWorker._normalize_model_name(slug)
+        if "/" in norm:
+            parts = norm.split("/", 1)
+            return (parts[0], slug)
+        return ("other", slug)
+
+    def _get_openrouter_providers(self, model_list: list) -> list:
+        providers = set()
+        for item in model_list:
+            if not item or item == "Custom...":
+                continue
+            prov, _ = self._parse_openrouter_model_slug(item)
+            if prov:
+                providers.add(prov)
+        sorted_provs = sorted(list(providers), key=lambda s: s.lower())
+        return ["(All Providers)"] + sorted_provs
+
+    def _refresh_openrouter_provider_dropdowns(self):
+        # Refresh primary providers
+        p_provs = self._get_openrouter_providers(getattr(self, "_openrouter_models_list", []))
+        p_combo = getattr(self, "ui_openrouter_provider", None)
+        if p_combo:
+            cur = p_combo.currentText()
+            p_combo.blockSignals(True)
+            p_combo.clear()
+            p_combo.addItems(p_provs)
+            idx = p_combo.findText(cur)
+            if idx >= 0:
+                p_combo.setCurrentIndex(idx)
+            elif "xiaomi" in p_provs:
+                p_combo.setCurrentIndex(p_combo.findText("xiaomi"))
+            elif len(p_provs) > 1:
+                p_combo.setCurrentIndex(1)
+            p_combo.blockSignals(False)
+            self.configure_combobox(p_combo)
+            self._populate_openrouter_models_for_provider("model", p_combo.currentText())
+
+        # Refresh light providers
+        l_provs = self._get_openrouter_providers(getattr(self, "_openrouter_light_models_list", []))
+        l_combo = getattr(self, "ui_openrouter_light_provider", None)
+        if l_combo:
+            cur_l = l_combo.currentText()
+            l_combo.blockSignals(True)
+            l_combo.clear()
+            l_combo.addItems(l_provs)
+            idx_l = l_combo.findText(cur_l)
+            if idx_l >= 0:
+                l_combo.setCurrentIndex(idx_l)
+            elif "openai" in l_provs:
+                l_combo.setCurrentIndex(l_combo.findText("openai"))
+            elif len(l_provs) > 1:
+                l_combo.setCurrentIndex(1)
+            l_combo.blockSignals(False)
+            self.configure_combobox(l_combo)
+            self._populate_openrouter_models_for_provider("light_model", l_combo.currentText())
+
+    def _populate_openrouter_models_for_provider(self, role: str, selected_provider: str):
+        combo_model = getattr(self, f"ui_openrouter_{role}", None)
+        custom_model = getattr(self, f"ui_openrouter_custom_{role}", None)
+        if not combo_model:
+            return
+
+        current_sel_text = combo_model.currentText()
+        current_sel_data = combo_model.currentData()
+        current_slug = current_sel_data or current_sel_text
+
+        raw_list = getattr(self, f"_openrouter_{role}s_list", [])
+
+        from core.openrouter_worker import OpenRouterWorker
+
+        filtered_models = []  # list of (display_text, full_slug)
+        seen_texts = set()
+        for item in raw_list:
+            if not item or item == "Custom...":
+                continue
+            prov, m_name = self._parse_openrouter_model_slug(item)
+            full_slug = item if "/" in item else OpenRouterWorker._normalize_model_name(item)
+
+            if selected_provider == "(All Providers)":
+                d_text = item
+            elif prov == selected_provider:
+                d_text = m_name
+            else:
+                continue
+
+            if d_text not in seen_texts:
+                seen_texts.add(d_text)
+                filtered_models.append((d_text, full_slug))
+
+        combo_model.blockSignals(True)
+        combo_model.clear()
+
+        # Add models with (display_text, userData=full_slug)
+        for d_text, slug in filtered_models:
+            combo_model.addItem(d_text, slug)
+
+        # Add Custom...
+        combo_model.addItem("Custom...", "Custom...")
+
+        # Restore selection
+        target_idx = -1
+        if current_slug and current_slug != "Custom...":
+            for i in range(combo_model.count()):
+                if combo_model.itemData(i) == current_slug or combo_model.itemText(i) in (current_sel_text, current_slug):
+                    target_idx = i
+                    break
+
+        if target_idx >= 0:
+            combo_model.setCurrentIndex(target_idx)
+        else:
+            if combo_model.count() > 1:
+                combo_model.setCurrentIndex(0)
+            else:
+                c_idx = combo_model.findText("Custom...")
+                if c_idx >= 0:
+                    combo_model.setCurrentIndex(c_idx)
+
+        combo_model.blockSignals(False)
+        self.configure_combobox(combo_model)
+
+        if custom_model:
+            custom_model.setVisible(combo_model.currentText() == "Custom...")
+
+    def _select_openrouter_model_by_slug(self, role: str, slug: str):
+        combo_prov = getattr(self, "ui_openrouter_provider" if role == "model" else "ui_openrouter_light_provider", None)
+        combo_model = getattr(self, f"ui_openrouter_{role}", None)
+        custom_model = getattr(self, f"ui_openrouter_custom_{role}", None)
+        if not combo_prov or not combo_model:
+            return
+
+        prov, m_name = self._parse_openrouter_model_slug(slug)
+        from core.openrouter_worker import OpenRouterWorker
+        full_slug = slug if "/" in slug else OpenRouterWorker._normalize_model_name(slug)
+
+        prov_idx = combo_prov.findText(prov)
+        if prov_idx >= 0:
+            combo_prov.setCurrentIndex(prov_idx)
+            m_idx = -1
+            for i in range(combo_model.count()):
+                if combo_model.itemData(i) == full_slug or combo_model.itemText(i) in (m_name, slug):
+                    m_idx = i
+                    break
+            if m_idx >= 0:
+                combo_model.setCurrentIndex(m_idx)
+                if custom_model:
+                    custom_model.setText("")
+                    custom_model.setVisible(False)
+            else:
+                c_idx = combo_model.findText("Custom...")
+                if c_idx >= 0:
+                    combo_model.setCurrentIndex(c_idx)
+                if custom_model:
+                    custom_model.setText(slug)
+                    custom_model.setVisible(True)
+        else:
+            all_idx = combo_prov.findText("(All Providers)")
+            if all_idx >= 0:
+                combo_prov.setCurrentIndex(all_idx)
+                m_idx = -1
+                for i in range(combo_model.count()):
+                    if combo_model.itemData(i) == full_slug or combo_model.itemText(i) in (m_name, slug):
+                        m_idx = i
+                        break
+                if m_idx >= 0:
+                    combo_model.setCurrentIndex(m_idx)
+                    if custom_model:
+                        custom_model.setText("")
+                        custom_model.setVisible(False)
+                    return
+            c_idx = combo_model.findText("Custom...")
+            if c_idx >= 0:
+                combo_model.setCurrentIndex(c_idx)
+            if custom_model:
+                custom_model.setText(slug)
+                custom_model.setVisible(True)
+
+    def _get_openrouter_current_value(self, role: str) -> str:
+        combo_model = getattr(self, f"ui_openrouter_{role}", None)
+        custom_model = getattr(self, f"ui_openrouter_custom_{role}", None)
+        combo_prov = getattr(self, "ui_openrouter_provider" if role == "model" else "ui_openrouter_light_provider", None)
+        if not combo_model:
+            return ""
+        if combo_model.currentText() == "Custom...":
+            return custom_model.text().strip() if custom_model else ""
+        data = combo_model.currentData()
+        if data and data != "Custom...":
+            return data
+        text = combo_model.currentText().strip()
+        prov = combo_prov.currentText().strip() if combo_prov else ""
+        if prov and prov != "(All Providers)" and "/" not in text:
+            return f"{prov}/{text}"
+        return text
+
+    def _setup_openrouter_model_controls(self, layout):
+        cfg = PROVIDER_MODELS["openrouter"]
+
+        if not getattr(self, "_openrouter_models_list", None):
+            self._openrouter_models_list = self._load_cached_openrouter_models()
+        if not getattr(self, "_openrouter_light_models_list", None):
+            self._openrouter_light_models_list = list(self._openrouter_models_list)
+
+        # 1. Primary AI Model (Provider + Model)
+        layout.addSpacing(6)
+        row_model = QHBoxLayout()
+        row_model.setSpacing(10)
+
+        col_prov = QVBoxLayout()
+        col_prov.addWidget(QLabel("Provider:"))
+        combo_provider = QComboBox()
+        self.configure_combobox(combo_provider)
+        col_prov.addWidget(combo_provider)
+        row_model.addLayout(col_prov, 1)
+
+        col_model = QVBoxLayout()
+        col_model.addWidget(QLabel("Model:"))
+        combo_model = QComboBox()
+        self.configure_combobox(combo_model)
+        col_model.addWidget(combo_model)
+        row_model.addLayout(col_model, 2)
+
+        layout.addLayout(row_model)
+
+        custom_model = QLineEdit()
+        custom_model.setPlaceholderText("Enter custom model identifier (e.g. xiaomi/mimo-v2.6-pro)...")
+        custom_model.setVisible(False)
+        combo_model.currentTextChanged.connect(
+            lambda text, cm=custom_model: cm.setVisible(text == "Custom..."))
+        layout.addWidget(custom_model)
+
+        # 2. Thinking Level
+        layout.addSpacing(4)
+        layout.addWidget(QLabel("Thinking Level:"))
+        combo_thinking = QComboBox()
+        combo_thinking.addItems(THINKING_LEVELS)
+        combo_thinking.setCurrentText("low")
+        self.configure_combobox(combo_thinking)
+        layout.addWidget(combo_thinking)
+        tip_thinking = self.create_tip(
+            "Low thinking tends to perform better and agents are able to contemplate within the Open Amity framework anyway which has the benefit of audit trails.")
+        layout.addWidget(tip_thinking)
+
+        # 3. Light Model (Provider + Model)
+        layout.addSpacing(4)
+        row_light = QHBoxLayout()
+        row_light.setSpacing(10)
+
+        col_l_prov = QVBoxLayout()
+        col_l_prov.addWidget(QLabel("Light Model Provider:"))
+        combo_light_provider = QComboBox()
+        self.configure_combobox(combo_light_provider)
+        col_l_prov.addWidget(combo_light_provider)
+        row_light.addLayout(col_l_prov, 1)
+
+        col_l_model = QVBoxLayout()
+        col_l_model.addWidget(QLabel("Light Model:"))
+        combo_light = QComboBox()
+        self.configure_combobox(combo_light)
+        col_l_model.addWidget(combo_light)
+        row_light.addLayout(col_l_model, 2)
+
+        layout.addLayout(row_light)
+
+        custom_light = QLineEdit()
+        custom_light.setPlaceholderText("Enter custom light model identifier (e.g. openai/gpt-6-luna)...")
+        custom_light.setVisible(False)
+        combo_light.currentTextChanged.connect(
+            lambda text, cl=custom_light: cl.setVisible(text == "Custom..."))
+        layout.addWidget(custom_light)
+
+        tip_light = self.create_tip(
+            "The light model is used for low token mode, background subagents, rapid utility tasks (such as query reformulation), and acts as an automatic fallback if the primary model encounters rate limits or errors.")
+        layout.addWidget(tip_light)
+
+        setattr(self, "ui_openrouter_provider", combo_provider)
+        setattr(self, "ui_openrouter_model", combo_model)
+        setattr(self, "ui_openrouter_custom_model", custom_model)
+        setattr(self, "ui_openrouter_thinking_level", combo_thinking)
+        setattr(self, "ui_openrouter_thinking_tip", tip_thinking)
+        setattr(self, "ui_openrouter_light_provider", combo_light_provider)
+        setattr(self, "ui_openrouter_light_model", combo_light)
+        setattr(self, "ui_openrouter_custom_light_model", custom_light)
+        setattr(self, "ui_openrouter_light_model_tip", tip_light)
+
+        combo_provider.currentTextChanged.connect(
+            lambda prov: self._populate_openrouter_models_for_provider("model", prov))
+        combo_light_provider.currentTextChanged.connect(
+            lambda prov: self._populate_openrouter_models_for_provider("light_model", prov))
+
+        self._refresh_openrouter_provider_dropdowns()
+
+    def _load_openrouter_model_controls(self):
+        cfg = PROVIDER_MODELS["openrouter"]
+        combo_thinking = getattr(self, "ui_openrouter_thinking_level", None)
+
+        model_val = self.settings.get("core.openrouter.model", "")
+        if not model_val:
+            model_val = cfg["default_model"]
+        self._select_openrouter_model_by_slug("model", model_val)
+
+        thinking_val = str(self.settings.get("core.openrouter.thinking-level", "low")).lower()
+        if combo_thinking:
+            t_idx = combo_thinking.findText(thinking_val)
+            if t_idx >= 0:
+                combo_thinking.setCurrentIndex(t_idx)
+            else:
+                combo_thinking.setCurrentText("low")
+
+        light_val = self.settings.get("core.openrouter.light-model", "")
+        if not light_val:
+            light_val = cfg["default_light_model"]
+        self._select_openrouter_model_by_slug("light_model", light_val)
+
+    def _save_openrouter_model_controls(self):
+        cfg = PROVIDER_MODELS["openrouter"]
+        combo_thinking = getattr(self, "ui_openrouter_thinking_level", None)
+
+        primary_model = self._get_openrouter_current_value("model") or cfg["default_model"]
+        thinking = (combo_thinking.currentText().strip().lower() if combo_thinking else "low") or "low"
+        light_model = self._get_openrouter_current_value("light_model") or cfg["default_light_model"]
+
+        self.settings.set("core.openrouter.model", primary_model)
+        self.settings.set("core.openrouter.thinking-level", thinking)
+        self.settings.set("core.openrouter.light-model", light_model)
+
+    @staticmethod
+    def _load_cached_openrouter_image_models() -> list:
+        try:
+            from config import paths
+        except ImportError:
+            import paths
+        cache_file = paths.get_openrouter_image_models_cache_file()
+        default_file = paths.get_default_openrouter_image_models_file()
+
+        for target in (cache_file, default_file):
+            if target and os.path.exists(target):
+                try:
+                    with open(target, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    models = data.get("models", []) if isinstance(data, dict) else data
+                    if isinstance(models, list) and models:
+                        if target == default_file and cache_file and not os.path.exists(cache_file):
+                            SettingsPanelWidget._save_cached_openrouter_image_models(models)
+                        return models
+                except Exception as e:
+                    logging.getLogger("gui.SettingsPanel").warning(
+                        f"Error loading OpenRouter image models from {target}: {e}")
+
+        # Fallback to default list with real OpenRouter image generation models
+        return [
+            "black-forest-labs/flux-3-image",
+            "black-forest-labs/flux.2-flex",
+            "black-forest-labs/flux.2-pro",
+            "bytedance-seed/seedream-4.5",
+            "bytedance-seed/seedream-5-0-flash",
+            "google/gemini-3.1-flash-image",
+            "google/gemini-3-pro-image",
+            "openai/gpt-5-image",
+            "openai/gpt-image-2.5-sunburst",
+            "qwen/qwen-image-3",
+            "recraft/recraft-v4.1",
+            "recraft/recraft-v3"
+        ]
+
+    @staticmethod
+    def _save_cached_openrouter_image_models(models: list) -> bool:
+        if not models or not isinstance(models, list):
+            return False
+        try:
+            from config import paths
+        except ImportError:
+            import paths
+        try:
+            from core.file_utils import atomic_json_write
+        except ImportError:
+            from file_utils import atomic_json_write
+
+        saved = False
+        try:
+            cache_file = paths.get_openrouter_image_models_cache_file()
+            atomic_json_write(cache_file, models, indent=2)
+            saved = True
+            logging.getLogger("gui.SettingsPanel").info(
+                f"Successfully cached {len(models)} OpenRouter image models to {cache_file}")
+        except Exception as e:
+            logging.getLogger("gui.SettingsPanel").warning(
+                f"Failed to save OpenRouter image models to user cache: {e}")
+
+        try:
+            default_file = paths.get_default_openrouter_image_models_file()
+            if default_file:
+                atomic_json_write(default_file, models, indent=2)
+                saved = True
+                logging.getLogger("gui.SettingsPanel").info(
+                    f"Successfully overwrote shipped OpenRouter image models in {default_file}")
+        except Exception as e:
+            logging.getLogger("gui.SettingsPanel").debug(
+                f"Could not overwrite default OpenRouter image models file: {e}")
+
+        return saved
+
+    def _fetch_openrouter_image_models(self):
+        if not hasattr(self, 'ui_media_openrouter_fetch_btn'):
+            return
+        self.ui_media_openrouter_fetch_btn.setEnabled(False)
+        self.ui_media_openrouter_fetch_btn.setText("⏳ Fetching models...")
+        if hasattr(self, 'ui_media_openrouter_fetch_status'):
+            self.ui_media_openrouter_fetch_status.setText("")
+
+        api_key = self.ui_media_openrouter_api_key.text().strip() if hasattr(self, 'ui_media_openrouter_api_key') else ""
+        if not api_key and hasattr(self, 'ui_openrouter_api_key'):
+            api_key = self.ui_openrouter_api_key.text().strip()
+        from core.openrouter_worker import OpenRouterWorker
+
+        def worker():
+            try:
+                models = OpenRouterWorker.fetch_available_image_models(api_key=api_key or None)
+                self.openrouter_image_models_fetched.emit(models, None)
+            except Exception as e:
+                logging.getLogger("gui.SettingsPanel").warning(f"Failed to fetch OpenRouter image models: {e}")
+                self.openrouter_image_models_fetched.emit([], str(e))
+
+        t = threading.Thread(target=worker, daemon=True)
+        self._fetch_image_models_thread = t
+        t.start()
+        return t
+
+    def _on_openrouter_image_models_fetched(self, models: list, error: str = None):
+        if hasattr(self, 'ui_media_openrouter_fetch_btn'):
+            self.ui_media_openrouter_fetch_btn.setEnabled(True)
+            self.ui_media_openrouter_fetch_btn.setText("🔄 Fetch Available Image Models from OpenRouter")
+
+        if error:
+            if hasattr(self, 'ui_media_openrouter_fetch_status'):
+                self.ui_media_openrouter_fetch_status.setText(f"❌ Error: {error}")
+            return
+
+        if not models:
+            if hasattr(self, 'ui_media_openrouter_fetch_status'):
+                self.ui_media_openrouter_fetch_status.setText("No image models found.")
+            return
+
+        self._save_cached_openrouter_image_models(models)
+
+        cur_model = self._get_openrouter_image_current_value()
+        self._openrouter_image_models_list = list(models)
+        self._refresh_openrouter_image_provider_dropdowns()
+
+        if cur_model:
+            self._select_openrouter_image_model_by_slug(cur_model)
+
+        providers_count = max(0, len(self._get_openrouter_image_providers(models)) - 1)
+        if hasattr(self, 'ui_media_openrouter_fetch_status'):
+            self.ui_media_openrouter_fetch_status.setText(f"✓ Fetched {len(models)} image models across {providers_count} providers.")
+
+    def _setup_openrouter_image_model_controls(self, layout):
+        if not getattr(self, "_openrouter_image_models_list", None):
+            self._openrouter_image_models_list = self._load_cached_openrouter_image_models()
+
+        layout.addSpacing(6)
+        row_model = QHBoxLayout()
+        row_model.setSpacing(10)
+
+        col_prov = QVBoxLayout()
+        col_prov.addWidget(QLabel("Provider:"))
+        self.ui_media_openrouter_provider = QComboBox()
+        self.configure_combobox(self.ui_media_openrouter_provider)
+        col_prov.addWidget(self.ui_media_openrouter_provider)
+        row_model.addLayout(col_prov, 1)
+
+        col_model = QVBoxLayout()
+        col_model.addWidget(QLabel("Image Model:"))
+        self.ui_media_openrouter_model = QComboBox()
+        self.configure_combobox(self.ui_media_openrouter_model)
+        col_model.addWidget(self.ui_media_openrouter_model)
+        row_model.addLayout(col_model, 2)
+
+        layout.addLayout(row_model)
+
+        self.ui_media_openrouter_custom_model = QLineEdit()
+        self.ui_media_openrouter_custom_model.setPlaceholderText(
+            "Enter custom model identifier (e.g. bytedance-seed/seedream-4.5)...")
+        self.ui_media_openrouter_custom_model.setVisible(False)
+        self.ui_media_openrouter_model.currentTextChanged.connect(
+            lambda text: self.ui_media_openrouter_custom_model.setVisible(text == "Custom..."))
+        layout.addWidget(self.ui_media_openrouter_custom_model)
+
+        self._refresh_openrouter_image_provider_dropdowns()
+        self.ui_media_openrouter_provider.currentTextChanged.connect(
+            self._on_openrouter_image_provider_changed)
+
+    def _refresh_openrouter_image_provider_dropdowns(self):
+        if not hasattr(self, 'ui_media_openrouter_provider') or not hasattr(self, 'ui_media_openrouter_model'):
+            return
+        cur_prov = self.ui_media_openrouter_provider.currentText()
+        cur_slug = self._get_openrouter_image_current_value()
+
+        provs = self._get_openrouter_image_providers(self._openrouter_image_models_list)
+        self.ui_media_openrouter_provider.blockSignals(True)
+        self.ui_media_openrouter_provider.clear()
+        self.ui_media_openrouter_provider.addItems(provs)
+
+        p_idx = self.ui_media_openrouter_provider.findText(cur_prov)
+        if p_idx >= 0:
+            self.ui_media_openrouter_provider.setCurrentIndex(p_idx)
+        else:
+            self.ui_media_openrouter_provider.setCurrentIndex(0)
+        self.ui_media_openrouter_provider.blockSignals(False)
+
+        self._populate_openrouter_image_models_for_provider(self.ui_media_openrouter_provider.currentText())
+        if cur_slug:
+            self._select_openrouter_image_model_by_slug(cur_slug)
+
+    def _on_openrouter_image_provider_changed(self, provider: str):
+        if not hasattr(self, 'ui_media_openrouter_model'):
+            return
+        self._populate_openrouter_image_models_for_provider(provider)
+
+    def _populate_openrouter_image_models_for_provider(self, provider: str):
+        if not hasattr(self, 'ui_media_openrouter_model'):
+            return
+        self.ui_media_openrouter_model.blockSignals(True)
+        self.ui_media_openrouter_model.clear()
+
+        models_list = self._openrouter_image_models_list or []
+        for slug in models_list:
+            if not slug or slug == "Custom...":
+                continue
+            prov, short = self._parse_openrouter_model_slug(slug)
+            if provider == "(All Providers)" or prov.lower() == provider.lower():
+                display = short if provider != "(All Providers)" else slug
+                self.ui_media_openrouter_model.addItem(display, userData=slug)
+
+        self.ui_media_openrouter_model.addItem("Custom...", userData="Custom...")
+        self.ui_media_openrouter_model.blockSignals(False)
+        self.ui_media_openrouter_custom_model.setVisible(
+            self.ui_media_openrouter_model.currentText() == "Custom...")
+
+    def _get_openrouter_image_current_value(self) -> str:
+        if not hasattr(self, 'ui_media_openrouter_model'):
+            return ""
+        if self.ui_media_openrouter_model.currentText() == "Custom...":
+            return self.ui_media_openrouter_custom_model.text().strip()
+        data = self.ui_media_openrouter_model.currentData()
+        return str(data) if data else self.ui_media_openrouter_model.currentText()
+
+    def _select_openrouter_image_model_by_slug(self, slug: str):
+        if not slug or not hasattr(self, 'ui_media_openrouter_model'):
+            return
+        prov, short = self._parse_openrouter_model_slug(slug)
+
+        found = False
+        for i in range(self.ui_media_openrouter_model.count()):
+            if self.ui_media_openrouter_model.itemData(i) == slug:
+                self.ui_media_openrouter_model.setCurrentIndex(i)
+                found = True
+                break
+
+        if not found:
+            p_idx = self.ui_media_openrouter_provider.findText(prov)
+            if p_idx >= 0:
+                self.ui_media_openrouter_provider.setCurrentIndex(p_idx)
+                for i in range(self.ui_media_openrouter_model.count()):
+                    if self.ui_media_openrouter_model.itemData(i) == slug:
+                        self.ui_media_openrouter_model.setCurrentIndex(i)
+                        found = True
+                        break
+
+        if not found:
+            all_idx = self.ui_media_openrouter_provider.findText("(All Providers)")
+            if all_idx >= 0:
+                self.ui_media_openrouter_provider.setCurrentIndex(all_idx)
+                for i in range(self.ui_media_openrouter_model.count()):
+                    if self.ui_media_openrouter_model.itemData(i) == slug:
+                        self.ui_media_openrouter_model.setCurrentIndex(i)
+                        found = True
+                        break
+
+        if not found:
+            c_idx = self.ui_media_openrouter_model.findText("Custom...")
+            if c_idx >= 0:
+                self.ui_media_openrouter_model.setCurrentIndex(c_idx)
+            self.ui_media_openrouter_custom_model.setText(slug)
+            self.ui_media_openrouter_custom_model.setVisible(True)
+
+    def _get_openrouter_image_providers(self, model_list: list) -> list:
+        providers = set()
+        for item in (model_list or []):
+            if not item or item == "Custom...":
+                continue
+            prov, _ = self._parse_openrouter_model_slug(item)
+            if prov:
+                providers.add(prov)
+        sorted_provs = sorted(list(providers), key=lambda s: s.lower())
+        return ["(All Providers)"] + sorted_provs
 
     def _get_voice_radio(self, voice_provider_id: str):
         radio_map = {
@@ -2568,11 +3878,16 @@ class SettingsPanelWidget(QWidget):
                 card.set_expanded(card.checkbox.isChecked())
 
     def _setup_provider_model_controls(self, provider_id, layout):
+        if provider_id == "openrouter":
+            self._setup_openrouter_model_controls(layout)
+            return
+
         cfg = PROVIDER_MODELS[provider_id]
 
         layout.addSpacing(6)
         layout.addWidget(QLabel("AI Model:"))
         combo_model = QComboBox()
+        self.configure_combobox(combo_model)
         combo_model.addItems(cfg["models"])
         custom_model = QLineEdit()
         custom_model.setPlaceholderText("Enter custom model identifier...")
@@ -2585,6 +3900,7 @@ class SettingsPanelWidget(QWidget):
         layout.addSpacing(4)
         layout.addWidget(QLabel("Thinking Level:"))
         combo_thinking = QComboBox()
+        self.configure_combobox(combo_thinking)
         combo_thinking.addItems(THINKING_LEVELS)
         combo_thinking.setCurrentText("low")
         layout.addWidget(combo_thinking)
@@ -2594,6 +3910,7 @@ class SettingsPanelWidget(QWidget):
 
         layout.addWidget(QLabel("Light Model:"))
         combo_light = QComboBox()
+        self.configure_combobox(combo_light)
         combo_light.addItems(cfg["light_models"])
         custom_light = QLineEdit()
         custom_light.setPlaceholderText("Enter custom light model identifier...")
@@ -2615,6 +3932,10 @@ class SettingsPanelWidget(QWidget):
         setattr(self, f"ui_{provider_id}_light_model_tip", tip_light)
 
     def _load_provider_model_controls(self, provider_id):
+        if provider_id == "openrouter":
+            self._load_openrouter_model_controls()
+            return
+
         cfg = PROVIDER_MODELS.get(provider_id)
         if not cfg:
             return
@@ -2689,6 +4010,10 @@ class SettingsPanelWidget(QWidget):
                     custom_light.setVisible(True)
 
     def _save_provider_model_controls(self, provider_id):
+        if provider_id == "openrouter":
+            self._save_openrouter_model_controls()
+            return
+
         cfg = PROVIDER_MODELS.get(provider_id)
         if not cfg:
             return
@@ -2889,6 +4214,49 @@ class SettingsPanelWidget(QWidget):
                 allow_override = self.settings.get("core.tts.gemini.allow-agent-override", True)
                 self.ui_tts_allow_agent_override.setChecked(allow_override)
 
+            if hasattr(self, 'ui_tts_base_voice'):
+                voice_mode = self.settings.get("core.tts.gemini.voice-selection-mode", "auto")
+                custom_voice_id = self.settings.get("core.tts.gemini.custom-voice-id", "")
+                model_name = self.settings.get("core.tts.gemini.model-name", "Sulafat")
+
+                if hasattr(self, 'ui_tts_custom_voice_id'):
+                    self.ui_tts_custom_voice_id.setText(custom_voice_id)
+
+                target_idx = -1
+                if voice_mode == "custom_voice_id":
+                    for i in range(self.ui_tts_base_voice.count()):
+                        if self.ui_tts_base_voice.itemData(i) == "custom_voice_id":
+                            target_idx = i
+                            break
+                    if hasattr(self, 'ui_tts_custom_voice_id'):
+                        self.ui_tts_custom_voice_id.setVisible(True)
+                elif voice_mode == "prebuilt" or (voice_mode not in ("auto", "custom_voice_id") and model_name):
+                    for i in range(self.ui_tts_base_voice.count()):
+                        if str(self.ui_tts_base_voice.itemData(i)).lower() == str(model_name).lower():
+                            target_idx = i
+                            break
+                    if target_idx >= 0:
+                        if hasattr(self, 'ui_tts_custom_voice_id'):
+                            self.ui_tts_custom_voice_id.setVisible(False)
+                    else:
+                        for i in range(self.ui_tts_base_voice.count()):
+                            if self.ui_tts_base_voice.itemData(i) == "custom_voice_id":
+                                target_idx = i
+                                break
+                        if hasattr(self, 'ui_tts_custom_voice_id'):
+                            self.ui_tts_custom_voice_id.setText(model_name)
+                            self.ui_tts_custom_voice_id.setVisible(True)
+                else:
+                    for i in range(self.ui_tts_base_voice.count()):
+                        if self.ui_tts_base_voice.itemData(i) == "auto":
+                            target_idx = i
+                            break
+                    if hasattr(self, 'ui_tts_custom_voice_id'):
+                        self.ui_tts_custom_voice_id.setVisible(False)
+
+                if target_idx >= 0:
+                    self.ui_tts_base_voice.setCurrentIndex(target_idx)
+
             self.ui_voice_prompt.setPlainText(self.settings.get(
                 "core.tts.gemini.prompt.profile", "A serene, youthful South African female voice. Her tone is calm, clear, and deeply intelligent."))
             self.ui_voice.setText(self.settings.get(
@@ -2915,6 +4283,7 @@ class SettingsPanelWidget(QWidget):
             if not gemini_tts_key:
                 gemini_tts_key = self.settings.get_env("GEMINI_API_KEY", "")
             self.ui_gemini_tts_api_key.setText(gemini_tts_key)
+            self._last_synced_gemini_voice_key = self.settings.get_env("GEMINI_API_KEY", "")
 
             agy_mode = self.settings.get("core.antigravity.agy-mode", False)
             provider = self.settings.get("core.api-provider", "gemini")
@@ -2930,6 +4299,9 @@ class SettingsPanelWidget(QWidget):
             elif provider == "deepseek":
                 self.ui_use_deepseek_api.setChecked(True)
                 sel_p = "deepseek"
+            elif provider == "openrouter":
+                self.ui_use_openrouter_api.setChecked(True)
+                sel_p = "openrouter"
             else:
                 self.ui_use_gemini_api.setChecked(True)
                 sel_p = "gemini"
@@ -2948,8 +4320,53 @@ class SettingsPanelWidget(QWidget):
             deepseek_key = self.settings.get_env("DEEPSEEK_API_KEY", "")
             self.ui_deepseek_api_key.setText(deepseek_key)
 
-            for p in ["gemini", "claude", "chatgpt", "deepseek"]:
+            openrouter_key = self.settings.get_env("OPENROUTER_API_KEY", "")
+            if hasattr(self, 'ui_openrouter_api_key'):
+                self.ui_openrouter_api_key.setText(openrouter_key)
+
+            for p in ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]:
                 self._load_provider_model_controls(p)
+
+            # Media Provider settings
+            media_provider = self.settings.get("core.media.image-provider", "")
+            self.selected_media_provider = media_provider
+            self._update_media_accordion(media_provider)
+
+            gemini_media_key = self.settings.get_env("GEMINI_IMAGE_API_KEY", "")
+            if not gemini_media_key:
+                gemini_media_key = self.settings.get_env("GEMINI_API_KEY", "")
+            if not gemini_media_key:
+                gemini_media_key = self.settings.get_env("GEMINI_TTS_API_KEY", "")
+            if hasattr(self, 'ui_media_gemini_api_key'):
+                self.ui_media_gemini_api_key.setText(gemini_media_key)
+                self._last_synced_gemini_key = self.settings.get_env("GEMINI_API_KEY", "") or self.settings.get_env("GEMINI_TTS_API_KEY", "")
+
+            openrouter_media_key = self.settings.get_env("OPENROUTER_IMAGE_API_KEY", "")
+            if not openrouter_media_key:
+                openrouter_media_key = self.settings.get_env("OPENROUTER_API_KEY", "")
+            if hasattr(self, 'ui_media_openrouter_api_key'):
+                self.ui_media_openrouter_api_key.setText(openrouter_media_key)
+                self._last_synced_openrouter_key = self.settings.get_env("OPENROUTER_API_KEY", "")
+
+            if hasattr(self, 'ui_media_gemini_model'):
+                g_model = self.settings.get("core.media.gemini.model", "gemini-3.1-flash-image")
+                idx = self.ui_media_gemini_model.findText(g_model)
+                if idx >= 0:
+                    self.ui_media_gemini_model.setCurrentIndex(idx)
+                    if hasattr(self, 'ui_media_gemini_custom_model'):
+                        self.ui_media_gemini_custom_model.setVisible(False)
+                else:
+                    c_idx = self.ui_media_gemini_model.findText("Custom...")
+                    if c_idx >= 0:
+                        self.ui_media_gemini_model.setCurrentIndex(c_idx)
+                    if hasattr(self, 'ui_media_gemini_custom_model'):
+                        self.ui_media_gemini_custom_model.setText(g_model)
+                        self.ui_media_gemini_custom_model.setVisible(True)
+
+            if hasattr(self, 'ui_media_openrouter_model'):
+                o_model = self.settings.get("core.media.openrouter.model", "bytedance-seed/seedream-4.5")
+                self._select_openrouter_image_model_by_slug(o_model)
+
 
             self.ui_mastodon_url.setText(self.settings.get_env(
                 "MASTODON_API_BASE_URL", "https://mastodon.social"))
@@ -3000,11 +4417,24 @@ class SettingsPanelWidget(QWidget):
 
                 self.ui_email_display_name.setText(self.settings.get_env("EMAIL_DISPLAY_NAME", ""))
                 self.ui_email_username.setText(self.settings.get_env("EMAIL_USERNAME", ""))
+                if hasattr(self, 'ui_email_archive_local'):
+                    env_val = self.settings.get_env("EMAIL_ARCHIVE_LOCAL", "true").lower()
+                    self.ui_email_archive_local.setChecked(env_val in ("true", "1", "yes", "on"))
+                if hasattr(self, 'ui_email_delete_from_server'):
+                    env_del = self.settings.get_env("EMAIL_DELETE_FROM_SERVER", "")
+                    if env_del != "":
+                        self.ui_email_delete_from_server.setChecked(env_del.lower() in ("true", "1", "yes", "on"))
+                    else:
+                        is_cloud = preset in ["Gmail / Google Workspace", "Outlook / Microsoft 365"]
+                        self.ui_email_delete_from_server.setChecked(not is_cloud)
                 self._update_advanced_summary()
 
-            limit = self.settings.get("core.somatic.cognitive-budget", 10000)
+            limit = self.settings.get("core.somatic.token-usage-limit")
+            if limit is None:
+                limit = self.settings.get("core.somatic.session-token-cap", self.settings.get("core.somatic.cognitive-budget", 400000))
+            limit = int(limit)
             self.ui_agency_limit.setValue(limit)
-            self.ui_agency_limit_val.setText(str(limit))
+            self.ui_agency_limit_val.setText(f"{limit:,} tokens")
 
             whitelist = self.settings.get("core.auto-pulse.whitelist", [])
             self.ui_whatsapp_whitelist.clear()
@@ -3089,11 +4519,32 @@ class SettingsPanelWidget(QWidget):
 
                 self.settings.set("core.tts.gemini.allow-agent-override", self.ui_tts_allow_agent_override.isChecked())
 
-                # Resolve base voice model automatically
-                from core.audio_output import resolve_base_voice
+                from core.audio_output import resolve_base_voice, normalize_gemini_voice_models
                 auto_voice = resolve_base_voice(gender_val, age_val, effective_style)
-                self.settings.set("core.tts.gemini.model-name", auto_voice)
-                self.ui_voice.setText(auto_voice)
+
+                if hasattr(self, 'ui_tts_base_voice'):
+                    choice = self.ui_tts_base_voice.currentData()
+                    if choice == "custom_voice_id":
+                        self.settings.set("core.tts.gemini.voice-selection-mode", "custom_voice_id")
+                        c_id = self.ui_tts_custom_voice_id.text().strip() if hasattr(self, 'ui_tts_custom_voice_id') else ""
+                        self.settings.set("core.tts.gemini.custom-voice-id", c_id)
+                        final_voice = c_id if c_id else auto_voice
+                        self.settings.set("core.tts.gemini.model-name", final_voice)
+                        self.ui_voice.setText(final_voice)
+                    elif choice == "auto":
+                        self.settings.set("core.tts.gemini.voice-selection-mode", "auto")
+                        self.settings.set("core.tts.gemini.model-name", auto_voice)
+                        self.ui_voice.setText(auto_voice)
+                    else:
+                        self.settings.set("core.tts.gemini.voice-selection-mode", "prebuilt")
+                        self.settings.set("core.tts.gemini.model-name", choice)
+                        self.ui_voice.setText(choice)
+                else:
+                    self.settings.set("core.tts.gemini.model-name", auto_voice)
+                    self.ui_voice.setText(auto_voice)
+
+                models = self.settings.get("core.gemini.voice-models")
+                self.settings.set("core.gemini.voice-models", normalize_gemini_voice_models(models))
 
                 # Reset override-prompt when user saves from GUI so user choices take effect
                 self.settings.set("core.tts.gemini.override-prompt", False)
@@ -3117,6 +4568,7 @@ class SettingsPanelWidget(QWidget):
             use_claude = self.ui_use_claude_api.isChecked()
             use_chatgpt = self.ui_use_chatgpt_api.isChecked()
             use_deepseek = self.ui_use_deepseek_api.isChecked()
+            use_openrouter = getattr(self, 'ui_use_openrouter_api', None) and self.ui_use_openrouter_api.isChecked()
             agy_mode = self.ui_agy_mode.isChecked()
 
             self.settings.set("core.antigravity.agy-mode", agy_mode)
@@ -3126,6 +4578,8 @@ class SettingsPanelWidget(QWidget):
                 self.settings.set("core.api-provider", "chatgpt")
             elif use_deepseek:
                 self.settings.set("core.api-provider", "deepseek")
+            elif use_openrouter:
+                self.settings.set("core.api-provider", "openrouter")
             else:
                 self.settings.set("core.api-provider", "gemini")
 
@@ -3145,8 +4599,31 @@ class SettingsPanelWidget(QWidget):
                 self.settings.set_env(
                     "DEEPSEEK_API_KEY", self.ui_deepseek_api_key.text().strip())
 
-            for p in ["gemini", "claude", "chatgpt", "deepseek"]:
+            if hasattr(self, 'ui_openrouter_api_key'):
+                self.settings.set_env(
+                    "OPENROUTER_API_KEY", self.ui_openrouter_api_key.text().strip())
+
+            for p in ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]:
                 self._save_provider_model_controls(p)
+
+            # Save Media Provider settings
+            if hasattr(self, 'selected_media_provider'):
+                self.settings.set("core.media.image-provider", self.selected_media_provider)
+
+            if hasattr(self, 'ui_media_gemini_model'):
+                g_model = self.ui_media_gemini_custom_model.text().strip() if self.ui_media_gemini_model.currentText() == "Custom..." else self.ui_media_gemini_model.currentText()
+                self.settings.set("core.media.gemini.model", g_model)
+
+            if hasattr(self, 'ui_media_openrouter_model'):
+                o_model = self._get_openrouter_image_current_value()
+                self.settings.set("core.media.openrouter.model", o_model)
+
+            if hasattr(self, 'ui_media_gemini_api_key'):
+                self.settings.set_env("GEMINI_IMAGE_API_KEY", self.ui_media_gemini_api_key.text().strip())
+
+            if hasattr(self, 'ui_media_openrouter_api_key'):
+                self.settings.set_env("OPENROUTER_IMAGE_API_KEY", self.ui_media_openrouter_api_key.text().strip())
+
 
             if hasattr(self, 'ui_mastodon_url'):
                 self.settings.set_env("MASTODON_API_BASE_URL",
@@ -3180,9 +4657,19 @@ class SettingsPanelWidget(QWidget):
 
                 self.settings.set_env("EMAIL_DISPLAY_NAME", self.ui_email_display_name.text())
                 self.settings.set_env("EMAIL_USERNAME", self.ui_email_username.text())
+                if hasattr(self, 'ui_email_archive_local'):
+                    is_arch = self.ui_email_archive_local.isChecked()
+                    self.settings.set_env("EMAIL_ARCHIVE_LOCAL", "true" if is_arch else "false")
+                    self.settings.set("core.tools.email_archive_local", is_arch)
+                if hasattr(self, 'ui_email_delete_from_server'):
+                    is_del = self.ui_email_delete_from_server.isChecked()
+                    self.settings.set_env("EMAIL_DELETE_FROM_SERVER", "true" if is_del else "false")
+                    self.settings.set("core.tools.email_delete_from_server", is_del)
 
-            self.settings.set("core.somatic.cognitive-budget",
-                              self.ui_agency_limit.value())
+            limit_val = self.ui_agency_limit.value()
+            self.settings.set("core.somatic.token-usage-limit", limit_val)
+            self.settings.set("core.somatic.session-token-cap", limit_val)
+            self.settings.set("core.somatic.cognitive-budget", limit_val)
             whitelist = [self.ui_whatsapp_whitelist.item(
                 i).text() for i in range(self.ui_whatsapp_whitelist.count())]
             self.settings.set("core.auto-pulse.whitelist", whitelist)
@@ -3210,7 +4697,7 @@ class SettingsPanelWidget(QWidget):
 
     def on_save_clicked(self):
         if self.wizard_mode:
-            if self.current_section_index < 5:
+            if self.current_section_index < 6:
                 self.set_section(self.current_section_index + 1)
             else:
                 if self.settings:
@@ -3221,3 +4708,13 @@ class SettingsPanelWidget(QWidget):
         else:
             self.save_settings()
             self.close_requested.emit()
+
+    def closeEvent(self, event):
+        if hasattr(self, 'whatsapp_timer') and self.whatsapp_timer is not None:
+            self.whatsapp_timer.stop()
+        super().closeEvent(event)
+
+    def deleteLater(self):
+        if hasattr(self, 'whatsapp_timer') and self.whatsapp_timer is not None:
+            self.whatsapp_timer.stop()
+        super().deleteLater()

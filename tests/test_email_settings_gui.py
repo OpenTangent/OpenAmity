@@ -74,6 +74,10 @@ def test_settings_panel_email_widget_initialization(qapp):
     assert hasattr(panel, "ui_email_adv_container")
     assert hasattr(panel, "ui_email_test_btn")
     assert hasattr(panel, "ui_email_test_status")
+    assert hasattr(panel, "ui_email_archive_local")
+    assert hasattr(panel, "ui_email_delete_from_server")
+    assert panel.ui_email_archive_local.isChecked() is True
+    assert panel.ui_email_delete_from_server.isChecked() is False
 
     # Wording check
     assert panel.ui_email_auth_password_radio.text() == "Password"
@@ -124,6 +128,7 @@ def test_settings_panel_preset_selection(qapp):
     assert panel.ui_email_imap_host.text() == "outlook.office365.com"
     assert panel.ui_email_smtp_port.text() == "587"
     assert panel.ui_email_smtp_security.currentText() == "STARTTLS"
+    assert panel.ui_email_delete_from_server.isChecked() is False
 
     # Switch to Gmail
     idx = panel.ui_email_provider.findText("Gmail / Google Workspace")
@@ -135,6 +140,13 @@ def test_settings_panel_preset_selection(qapp):
     assert panel.ui_email_smtp_host.text() == "smtp.gmail.com"
     assert panel.ui_email_smtp_port.text() == "465"
     assert panel.ui_email_smtp_security.currentText() == "SSL/TLS"
+    assert panel.ui_email_delete_from_server.isChecked() is False
+
+    # Switch to Custom (IMAP / SMTP)
+    idx_custom = panel.ui_email_provider.findText("Custom (IMAP / SMTP)")
+    assert idx_custom >= 0
+    panel.ui_email_provider.setCurrentIndex(idx_custom)
+    assert panel.ui_email_delete_from_server.isChecked() is True
 
 
 def test_settings_panel_email_address_auto_detect(qapp):
@@ -201,7 +213,9 @@ def test_settings_load_and_save_email_roundtrip(qapp):
         "EMAIL_SMTP_PORT": "465",
         "EMAIL_SMTP_SECURITY": "SSL/TLS",
         "EMAIL_DISPLAY_NAME": "Amy Fastmail",
-        "EMAIL_USERNAME": "amy@fastmail.com"
+        "EMAIL_USERNAME": "amy@fastmail.com",
+        "EMAIL_ARCHIVE_LOCAL": "true",
+        "EMAIL_DELETE_FROM_SERVER": "false"
     }
 
     def fake_get_env(key, default=""):
@@ -221,11 +235,66 @@ def test_settings_load_and_save_email_roundtrip(qapp):
     assert panel.ui_email_provider.currentText() == "Fastmail"
     assert panel.ui_email_password.text() == "fastmail-app-pass"
     assert panel.ui_email_display_name.text() == "Amy Fastmail"
+    assert panel.ui_email_archive_local.isChecked() is True
+    assert panel.ui_email_delete_from_server.isChecked() is False
 
     # Modify and save
     panel.ui_email_display_name.setText("Amy Modified")
+    panel.ui_email_archive_local.setChecked(False)
+    panel.ui_email_delete_from_server.setChecked(True)
     panel.save_settings()
     assert stored_env["EMAIL_DISPLAY_NAME"] == "Amy Modified"
+    assert stored_env["EMAIL_ARCHIVE_LOCAL"] == "false"
+    assert stored_env["EMAIL_DELETE_FROM_SERVER"] == "true"
+    mock_settings.set.assert_any_call("core.tools.email_archive_local", False)
+    mock_settings.set.assert_any_call("core.tools.email_delete_from_server", True)
+
+
+def test_settings_panel_archive_and_purge_toggle(qapp):
+    panel = SettingsPanelWidget()
+    panel._is_loading = False
+
+    # Default state (initial preset is Gmail)
+    assert panel.ui_email_archive_local.isChecked() is True
+    assert panel.ui_email_delete_from_server.isChecked() is False
+
+    # Switching to Custom IMAP defaults purge to True
+    idx_custom = panel.ui_email_provider.findText("Custom (IMAP / SMTP)")
+    panel.ui_email_provider.setCurrentIndex(idx_custom)
+    assert panel.ui_email_delete_from_server.isChecked() is True
+
+    # Switching to Gmail defaults purge to False
+    idx_gmail = panel.ui_email_provider.findText("Gmail / Google Workspace")
+    panel.ui_email_provider.setCurrentIndex(idx_gmail)
+    assert panel.ui_email_delete_from_server.isChecked() is False
+
+    # User explicitly enables purge for Gmail
+    panel.ui_email_delete_from_server.setChecked(True)
+    assert panel.ui_email_delete_from_server.isChecked() is True
+
+    # Switching back to Custom IMAP defaults purge to True
+    panel.ui_email_provider.setCurrentIndex(idx_custom)
+    assert panel.ui_email_delete_from_server.isChecked() is True
+
+    # User explicitly disables archive
+    panel.ui_email_archive_local.setChecked(False)
+    assert panel.ui_email_archive_local.isChecked() is False
+
+    # Test loading where EMAIL_DELETE_FROM_SERVER is not explicitly in env
+    mock_settings = MagicMock()
+    env = {
+        "EMAIL_PROVIDER_PRESET": "Gmail / Google Workspace",
+    }
+    mock_settings.get_env.side_effect = lambda k, d="": env.get(k, d)
+    mock_settings.get.side_effect = lambda k, d=None: d
+    panel.load_settings(mock_settings)
+    # When unset in env, Gmail should infer delete_from_server = False
+    assert panel.ui_email_delete_from_server.isChecked() is False
+
+    # Custom IMAP without env set should infer delete_from_server = True
+    env["EMAIL_PROVIDER_PRESET"] = "Custom (IMAP / SMTP)"
+    panel.load_settings(mock_settings)
+    assert panel.ui_email_delete_from_server.isChecked() is True
 
 
 def test_settings_manager_per_agent_env_isolation():

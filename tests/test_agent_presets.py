@@ -68,7 +68,7 @@ def test_all_eight_presets_exist_and_valid():
         assert isinstance(voice["gemini_model_name"], str) and len(voice["gemini_model_name"]) > 0
         assert isinstance(voice["gemini_prompt_profile"], str) and len(voice["gemini_prompt_profile"]) > 0
 
-        assert isinstance(preset["cognitive_budget"], int) and preset["cognitive_budget"] >= 10000
+        assert isinstance(preset.get("token_usage_limit", preset.get("cognitive_budget")), int) and preset.get("token_usage_limit", preset.get("cognitive_budget")) >= 50000
         assert isinstance(preset["max_memories"], int) and preset["max_memories"] >= 24
 
         # Verify no second-person pronouns are used (Soul Jar / Identity must be pure self-notes)
@@ -113,7 +113,7 @@ def test_preset_selection_prepopulates_ui(qapp):
     assert panel.ui_tts_accent.currentText() == "British (RP / Standard)"
     assert panel.ui_tts_style.currentText() == "Calm & Analytical"
     assert panel.ui_voice.text() == "Aoede"
-    assert panel.ui_agency_limit.value() == 15000
+    assert panel.ui_agency_limit.value() == 400000
     assert panel.ui_max_memories.value() == 48
 
     # 2. Select Alex (Executive Chief of Staff)
@@ -223,21 +223,26 @@ def test_wizard_navigation_and_back_buttons(qapp):
     assert panel.current_section_index == 0
     assert not panel.back_buttons[0].isVisible()
 
-    # Forward to step 5 (Social Accounts)
-    panel.on_save_clicked()  # to 1
-    panel.on_save_clicked()  # to 2
-    panel.on_save_clicked()  # to 3 (Voice)
+    # Forward to step 6 (Social Accounts)
+    panel.on_save_clicked()  # to 1 (Cognitive Provider)
+    panel.on_save_clicked()  # to 2 (Basic Agent Settings)
+    panel.on_save_clicked()  # to 3 (Values & Goals)
     assert panel.current_section_index == 3
     assert panel.back_buttons[3].isVisible()
 
-    panel.on_save_clicked()  # to 4 (Provider Setup)
+    panel.on_save_clicked()  # to 4 (Agent Voice)
     assert panel.current_section_index == 4
     assert panel.back_buttons[4].isVisible()
 
-    panel.on_save_clicked()  # to 5 (Social Accounts)
+    panel.on_save_clicked()  # to 5 (Media Provider)
     assert panel.current_section_index == 5
-    assert panel.save_buttons[5].text() == "Finish"
+    assert panel.save_buttons[5].text() == "Next"
     assert panel.back_buttons[5].isVisible()
+
+    panel.on_save_clicked()  # to 6 (Social Accounts)
+    assert panel.current_section_index == 6
+    assert panel.save_buttons[6].text() == "Finish"
+    assert panel.back_buttons[6].isVisible()
 
     # Verify Finish emits wizard_finished
     wizard_finished_emitted = []

@@ -63,8 +63,11 @@ class QtLoggingHandler(logging.Handler):
 
         html_out = html_out.replace('\n', '<br>')
 
-        from core.logger_config import agent_id_var
-        agent_id = agent_id_var.get() or "global"
+        from core.logger_config import agent_id_var, get_active_websearch_agent_id
+        agent_id = agent_id_var.get()
+        if not agent_id and record.name in ("primp", "tool.WebSearch"):
+            agent_id = get_active_websearch_agent_id()
+        agent_id = agent_id or "global"
 
         self.signals.new_message.emit(agent_id, html_out)
 

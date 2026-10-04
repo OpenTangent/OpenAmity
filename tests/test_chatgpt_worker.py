@@ -339,4 +339,92 @@ def test_chatgpt_worker_light_model_fallback(monkeypatch, tmp_path):
         assert "ChatGPT fallback succeeded" in emitted_thoughts[0]
 
 
+def test_chatgpt_send_function_responses_with_media_attachment(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    img_file = tmp_path / "test_image.jpg"
+    img_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test chatgpt media response")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Generating image...",
+            "tool_calls": [{
+                "id": "call_img_123",
+                "type": "function",
+                "function": {
+                    "name": "Media_generate",
+                    "arguments": '{"prompt": "A mountain lake"}'
+                }
+            }]
+        })
+
+        with patch("threading.Thread") as mock_thread:
+            worker.send_function_responses([
+                ("Media_generate", {
+                    "result": f"Successfully generated and saved image to {str(img_file)}",
+                    "media": [str(img_file)]
+                })
+            ])
+
+        # Verify tool response added and media stripped
+        tool_msg = worker.history[1]
+        assert tool_msg["role"] == "tool"
+        assert tool_msg["tool_call_id"] == "call_img_123"
+        parsed = json.loads(tool_msg["content"])
+        assert "media" not in parsed
+
+        # Verify image attachment added as follow-up user message
+        assert len(worker.history) == 3
+        media_user_msg = worker.history[2]
+        assert media_user_msg["role"] == "user"
+        content_blocks = media_user_msg["content"]
+        assert len(content_blocks) == 2
+        assert content_blocks[0]["type"] == "text"
+        assert content_blocks[1]["type"] == "image_url"
+        assert content_blocks[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_chatgpt_send_function_responses_low_token_skips_media(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    img_file = tmp_path / "test_image.jpg"
+    img_file.write_bytes(b"dummy")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.settings.set("core.low-token-mode", True)
+        worker.start_session(system_instruction="Test low token mode")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Generating...",
+            "tool_calls": [{
+                "id": "call_img_low",
+                "type": "function",
+                "function": {
+                    "name": "Media_generate",
+                    "arguments": '{"prompt": "A lake"}'
+                }
+            }]
+        })
+
+        with patch("threading.Thread") as mock_thread:
+            worker.send_function_responses([
+                ("Media_generate", {
+                    "result": "Saved image",
+                    "media": [str(img_file)]
+                })
+            ])
+
+        assert len(worker.history) == 3
+        media_user_msg = worker.history[2]
+        assert media_user_msg["role"] == "user"
+        assert "[Tool media attachments skipped: Low Token Mode is active]" in media_user_msg["content"]
+
+
+
 

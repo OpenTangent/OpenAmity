@@ -2,6 +2,7 @@ import logging
 import threading
 import json
 import time
+from datetime import datetime
 from .events import Signal
 
 try:
@@ -63,7 +64,14 @@ class AmityOrchestrator:
         self._pausing_in_progress = False
         self.is_busy = False
         self.is_thinking = False
-        self.last_action_result = None
+        now = datetime.now().astimezone()
+        tz_str = f" ({now.tzname()})" if now.tzname() else ""
+        now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
+        self.last_action_result = (
+            f"[LIFECYCLE EVENT: Current time: {now_str}. "
+            "Open Amity initialized and ready. "
+            "Orient yourself with Trajectory_get_bearings before taking action.]"
+        )
         self.current_user_prompt = ""
         self.recent_history = []
         self._is_user_interaction = False
@@ -71,12 +79,13 @@ class AmityOrchestrator:
         self._user_turn_nudged = False
 
         self.on_shutdown_complete = Signal()
-        self.session_fatigue_tokens = 0
-
-        # Budget
+        # Somatic & Fatigue State
         self.budget_lock = threading.Lock()
-        self.current_task_weight = 0
-        self._last_notified_weight_threshold = 0
+        self.session_fatigue_tokens = 0
+        self._last_notified_fatigue_threshold = 0
+        self._hard_fatigue_limit_hit = False
+        self._last_notified_weight_threshold = 0  # Compatibility
+        self.current_task_weight = 0  # Compatibility
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
@@ -87,6 +96,15 @@ class AmityOrchestrator:
         self.subagent_last_activity = {}
         self._shutdown_flag = False
         self._start_subagent_gc()
+
+        # Proactively prune expired audio cache files (>24h) and generated media (>24h)
+        try:
+            from core.cache_manager import CacheManager
+            from config import paths
+            CacheManager.clear_expired(paths.get_audio_cache_dir(self.agent_id), max_age_days=1.0)
+            CacheManager.clear_expired(paths.get_generated_media_dir(self.agent_id), max_age_days=1.0)
+        except Exception:
+            pass
 
         self.build_system_prompt()
 
@@ -131,6 +149,9 @@ class AmityOrchestrator:
         elif provider == "deepseek":
             from .deepseek_worker import DeepSeekWorker
             self.gemini_worker = DeepSeekWorker(agent_id=self.agent_id)
+        elif provider == "openrouter":
+            from .openrouter_worker import OpenRouterWorker
+            self.gemini_worker = OpenRouterWorker(agent_id=self.agent_id)
         else:
             self.gemini_worker = GeminiWorker(agent_id=self.agent_id)
 
@@ -222,7 +243,9 @@ class AmityOrchestrator:
             worker_mismatch = True
         elif not agy_mode and provider == "deepseek" and type(self.gemini_worker).__name__ != "DeepSeekWorker":
             worker_mismatch = True
-        elif not agy_mode and provider not in ["claude", "chatgpt", "openai", "deepseek"] and type(self.gemini_worker).__name__ != "GeminiWorker":
+        elif not agy_mode and provider == "openrouter" and type(self.gemini_worker).__name__ != "OpenRouterWorker":
+            worker_mismatch = True
+        elif not agy_mode and provider not in ["claude", "chatgpt", "openai", "deepseek", "openrouter"] and type(self.gemini_worker).__name__ != "GeminiWorker":
             worker_mismatch = True
         elif not agy_mode and provider == "claude":
             current_key = self.settings_manager.get_env("CLAUDE_API_KEY")
@@ -236,7 +259,11 @@ class AmityOrchestrator:
             current_key = self.settings_manager.get_env("DEEPSEEK_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
-        elif not agy_mode and provider not in ["claude", "chatgpt", "openai", "deepseek"]:
+        elif not agy_mode and provider == "openrouter":
+            current_key = self.settings_manager.get_env("OPENROUTER_API_KEY")
+            if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
+                worker_mismatch = True
+        elif not agy_mode and provider not in ["claude", "chatgpt", "openai", "deepseek", "openrouter"]:
             current_key = self.settings_manager.get_env("GEMINI_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
@@ -254,14 +281,56 @@ class AmityOrchestrator:
         self.on_busy_state_changed.emit(busy, speaking)
 
     def add_fatigue(self, tokens: int):
-        self.session_fatigue_tokens += tokens
+        if getattr(self, '_is_sleep_cycle', False):
+            return
+        self.session_fatigue_tokens = getattr(self, 'session_fatigue_tokens', 0) + tokens
+        self.current_task_weight = self.session_fatigue_tokens
+        self._write_somatic_state()
 
     def get_fatigue(self) -> float:
-        session_token_cap = self.settings_manager.get(
-            "core.somatic.session-token-cap", 500000.0)
-        is_low_token = self.settings_manager.get("core.low-token-mode", False)
-        max_tokens = (session_token_cap / 2.0) if is_low_token else float(session_token_cap)
-        return min(self.session_fatigue_tokens / max_tokens, 1.0)
+        limit = self.settings_manager.get("core.somatic.token-usage-limit") if hasattr(self, 'settings_manager') and self.settings_manager else None
+        if limit is None and hasattr(self, 'settings_manager') and self.settings_manager:
+            limit = self.settings_manager.get("core.somatic.session-token-cap", 400000.0)
+        limit = float(limit or 400000.0)
+        is_low_token = self.settings_manager.get("core.low-token-mode", False) if hasattr(self, 'settings_manager') and self.settings_manager else False
+        max_tokens = (limit / 2.0) if is_low_token else limit
+        if max_tokens <= 0:
+            return 0.0
+        return min(getattr(self, 'session_fatigue_tokens', 0) / max_tokens, 1.0)
+
+    def _write_somatic_state(self):
+        try:
+            from config import paths
+            import os
+            limit = self.settings_manager.get("core.somatic.token-usage-limit") if hasattr(self, 'settings_manager') and self.settings_manager else None
+            if limit is None and hasattr(self, 'settings_manager') and self.settings_manager:
+                limit = self.settings_manager.get("core.somatic.session-token-cap", 400000.0)
+            limit = float(limit or 400000.0)
+            is_low_token = self.settings_manager.get("core.low-token-mode", False) if hasattr(self, 'settings_manager') and self.settings_manager else False
+            max_tokens = (limit / 2.0) if is_low_token else limit
+            tokens = getattr(self, 'session_fatigue_tokens', 0)
+            fatigue = min(tokens / max_tokens, 1.0) if max_tokens > 0 else 0.0
+            percent = fatigue * 100.0
+
+            state_path = os.path.join(paths.get_base_dir_for(
+                self.agent_id), "somatic_state.json")
+            temp_path = state_path + ".tmp"
+            with open(temp_path, "w") as f:
+                json.dump({
+                    "session_fatigue_tokens": tokens,
+                    "token_usage_limit": int(max_tokens),
+                    "token_limit": int(max_tokens),
+                    "fatigue": fatigue,
+                    "percent": percent,
+                    "last_updated": time.time(),
+                    # Backward compatibility aliases
+                    "current_task_weight": tokens,
+                    "max_weight": int(max_tokens),
+                    "cognitive_budget": int(max_tokens)
+                }, f)
+            os.replace(temp_path, state_path)
+        except Exception as e:
+            logging.debug(f"Failed to write somatic state: {e}")
 
     def user_interacted(self):
         self.pulse_engine.user_interacted()
@@ -322,9 +391,9 @@ class AmityOrchestrator:
                     "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
                 )
                 self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
-                self.pulse_engine.settings_manager.set(
+                self.settings_manager.set(
                     "core.auto-pulse.last-sleep-cycle", time.time())
-                self.pulse_engine.settings_manager.save()
+                self.settings_manager.save()
 
                 def check_busy():
                     if not self.is_busy and not self.is_thinking:
@@ -382,6 +451,15 @@ class AmityOrchestrator:
         if self.pulse_engine:
             self.pulse_engine.last_interaction_time = time.time()
 
+        now = datetime.now().astimezone()
+        tz_str = f" ({now.tzname()})" if now.tzname() else ""
+        now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
+        self.last_action_result = (
+            f"[LIFECYCLE EVENT: Current time: {now_str}. "
+            "You have been unpaused and resumed operations. "
+            "Orient yourself with Trajectory_get_bearings if needed.]"
+        )
+
         self.on_paused_state_changed.emit(False)
         self.append_to_conversation(
             "System", "[Agent Resumed - Autonomy online]")
@@ -419,12 +497,41 @@ class AmityOrchestrator:
             if getattr(self, '_is_sleep_cycle', False):
                 self._is_sleep_cycle = False
                 logging.info("System: Memory consolidation complete. Resetting active session context...")
+                self.session_fatigue_tokens = 0
+                self._last_notified_fatigue_threshold = 0
+                self.current_task_weight = 0
+                self._write_somatic_state()
+                try:
+                    from core.cache_manager import CacheManager
+                    from config import paths
+                    CacheManager.clear_expired(paths.get_audio_cache_dir(self.agent_id), max_age_days=1.0)
+                    CacheManager.clear_expired(paths.get_generated_media_dir(self.agent_id), max_age_days=1.0)
+                except Exception:
+                    pass
                 self.build_system_prompt()
-                self.last_action_result = (
-                    "[LIFECYCLE EVENT: You have completed memory consolidation and awoken to a new waking cycle. "
-                    "Your Layer 1 short-term continuity and mirrors have been synthesized. "
-                    "Orient yourself with Trajectory_get_bearings before taking new action.]"
-                )
+
+                now = datetime.now().astimezone()
+                tz_str = f" ({now.tzname()})" if now.tzname() else ""
+                now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
+
+                if getattr(self, '_hard_fatigue_limit_hit', False):
+                    self.last_action_result = (
+                        f"[LIFECYCLE EVENT: Current time: {now_str}. "
+                        "You have completed memory consolidation after exceeding your maximum fatigue limit (100%). "
+                        "You failed to adequately halt cognition before your fatigue limit was reached. You must manage your fatigue more proactively in future—"
+                        "break up heavy workloads and defer tasks into future scheduled pulses when fatigue reaches 50%-90%. "
+                        "Your Layer 1 short-term continuity and mirrors have been synthesized, and your fatigue has been restored to 0%. "
+                        "Orient yourself with Trajectory_get_bearings before taking new action.]"
+                    )
+                    self._hard_fatigue_limit_hit = False
+                else:
+                    self.last_action_result = (
+                        f"[LIFECYCLE EVENT: Current time: {now_str}. "
+                        "You have completed memory consolidation and awoken to a new waking cycle. "
+                        "Your Layer 1 short-term continuity and mirrors have been synthesized, and your fatigue has been restored to 0%. "
+                        "Orient yourself with Trajectory_get_bearings before taking new action.]"
+                    )
+
                 if self.gemini_worker:
                     tools = self.cerebrum.get_all_tool_declarations()
                     if hasattr(self.gemini_worker, 'stop_session'):
@@ -483,6 +590,14 @@ class AmityOrchestrator:
                     "DEEPSEEK_API_KEY")
                 if hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
                     needs_reload = True
+        elif provider == "openrouter":
+            if type(self.gemini_worker).__name__ != "OpenRouterWorker":
+                needs_reload = True
+            else:
+                current_env_key = self.settings_manager.get_env(
+                    "OPENROUTER_API_KEY")
+                if hasattr(self.gemini_worker, 'api_key') and self.gemini_worker.api_key != current_env_key:
+                    needs_reload = True
         else:
             if type(self.gemini_worker).__name__ != "GeminiWorker":
                 needs_reload = True
@@ -523,30 +638,7 @@ class AmityOrchestrator:
         self._user_turn_nudged = False
 
         with self.budget_lock:
-            try:
-                from config import paths
-                import os
-                import json
-                import time
-                state_path = os.path.join(paths.get_base_dir_for(
-                    self.agent_id), "somatic_state.json")
-                if os.path.exists(state_path):
-                    with open(state_path, "r") as f:
-                        somatic = json.load(f)
-
-                    last_weight = somatic.get("current_task_weight", 0)
-                    last_update = somatic.get("last_updated", time.time())
-
-                    # Decay calculation: e.g. 50 weight points per minute of idle time
-                    elapsed_mins = (time.time() - last_update) / 60.0
-                    decay_rate = self.settings_manager.get(
-                        "core.somatic.decay-per-minute", 50)
-                    decay = elapsed_mins * decay_rate
-                    self.current_task_weight = max(0, last_weight - decay)
-                else:
-                    self.current_task_weight = 0
-            except Exception:
-                self.current_task_weight = 0
+            self.current_task_weight = self.session_fatigue_tokens
             self.current_loop_count = 0
             self._last_notified_weight_threshold = 0
             self.last_executed_command = None
@@ -662,30 +754,7 @@ class AmityOrchestrator:
         self._user_turn_nudged = False
 
         with self.budget_lock:
-            try:
-                from config import paths
-                import os
-                import json
-                import time
-                state_path = os.path.join(paths.get_base_dir_for(
-                    self.agent_id), "somatic_state.json")
-                if os.path.exists(state_path):
-                    with open(state_path, "r") as f:
-                        somatic = json.load(f)
-
-                    last_weight = somatic.get("current_task_weight", 0)
-                    last_update = somatic.get("last_updated", time.time())
-
-                    # Decay calculation
-                    elapsed_mins = (time.time() - last_update) / 60.0
-                    decay_rate = self.settings_manager.get(
-                        "core.somatic.decay-per-minute", 50)
-                    decay = elapsed_mins * decay_rate
-                    self.current_task_weight = max(0, last_weight - decay)
-                else:
-                    self.current_task_weight = 0
-            except Exception:
-                self.current_task_weight = 0
+            self.current_task_weight = getattr(self, 'session_fatigue_tokens', 0)
 
         self.current_loop_count = 0
         self._last_notified_weight_threshold = 0
@@ -693,7 +762,12 @@ class AmityOrchestrator:
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
 
-        self.gemini_worker.send_prompt(text)
+        prompt_payload = text
+        if self.last_action_result:
+            prompt_payload = f"[System Feedback from previous turn]: {self.last_action_result}\n\n{text}"
+            self.last_action_result = None
+
+        self.gemini_worker.send_prompt(prompt_payload)
 
     def append_to_conversation(self, sender, text):
         self.recent_history.append((sender, text))
@@ -797,11 +871,12 @@ class AmityOrchestrator:
             else:
                 args_str = "()"
 
+            fatigue_pct = self.get_fatigue() * 100.0
             if args_str == "()":
-                log_msg = f"[Weight: {current_weight:.1f}] {function_name}()"
+                log_msg = f"[Fatigue: {fatigue_pct:.1f}%] {function_name}()"
                 raw_call_text = f"{function_name}()"
             else:
-                log_msg = f"[Weight: {current_weight:.1f}] {function_name}: {args_str}"
+                log_msg = f"[Fatigue: {fatigue_pct:.1f}%] {function_name}: {args_str}"
                 raw_call_text = f"{function_name}: {args_str}"
 
             logging.getLogger(f"tool.{tool_name}").info(log_msg)
@@ -823,6 +898,23 @@ class AmityOrchestrator:
             call_id = str(uuid.uuid4())[:8]
 
             self.on_tool_started.emit(call_id, tool_name, icon, color, raw_call_text, is_async)
+
+            if getattr(self, '_is_sleep_cycle', False):
+                allowed_sleep_prefixes = ("MemPalace_", "Trajectory_", "Pulse_")
+                is_allowed = (function_name in ("System_contemplate",) or any(function_name.startswith(p) for p in allowed_sleep_prefixes))
+                if not is_allowed:
+                    logging.warning(f"System: Disallowed tool '{function_name}' invoked during Sleep Cycle. Intercepting.")
+                    msg = (
+                        f"Action rejected: Tool '{function_name}' is disabled during Sleep Cycle (Memory Consolidation). "
+                        "Sleep cycles are strictly dedicated to internal reflection and memory consolidation. "
+                        "Use only MemPalace, Trajectory, or Pulse tools to record your insights, then conclude."
+                    )
+                    function_responses.append((function_name, {"result": msg}))
+                    executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
+                    executed_tools.append(executed_tool_sig)
+                    if is_async:
+                        self.on_tool_finished.emit(call_id)
+                    continue
 
             executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
             executed_tools.append(executed_tool_sig)
@@ -870,44 +962,13 @@ class AmityOrchestrator:
                         f"Expected valid JSON from Speaker tool but failed to parse: {e}")
                 function_responses[i] = (name, resp)
 
-        if hasattr(self, 'pulse_engine') and hasattr(self.pulse_engine, 'settings_manager'):
-            sm = self.pulse_engine.settings_manager
-            max_weight = sm.get("core.somatic.cognitive-budget", 10000)
-            low_token = sm.get("core.low-token-mode", False)
-            base_weight = sm.get("core.somatic.tool-cost", 2)
-            exp_factor = sm.get("core.somatic.exponential-factor", 1.5)
-        else:
-            max_weight = 1000
-            low_token = False
-            base_weight = 2
-            exp_factor = 1.5
-
-        if low_token:
-            max_weight = max_weight / 2
+        fatigue = self.get_fatigue()
+        percent = fatigue * 100.0
 
         with self.budget_lock:
             self.current_loop_count += 1
-            added_weight = base_weight * \
-                (exp_factor ** (self.current_loop_count - 1))
-            self.current_task_weight += added_weight
-
-            # Write somatic state for tools (Atomic)
-            try:
-                from config import paths
-                import os
-                import time
-                state_path = os.path.join(paths.get_base_dir_for(
-                    self.agent_id), "somatic_state.json")
-                temp_path = state_path + ".tmp"
-                with open(temp_path, "w") as f:
-                    json.dump({
-                        "current_task_weight": self.current_task_weight,
-                        "max_weight": max_weight,
-                        "last_updated": time.time()
-                    }, f)
-                os.replace(temp_path, state_path)
-            except Exception:
-                pass
+            self.current_task_weight = getattr(self, 'session_fatigue_tokens', 0)
+            self._write_somatic_state()
 
         current_batch = ", ".join(executed_tools)
         if current_batch == self.last_executed_command:
@@ -922,28 +983,54 @@ class AmityOrchestrator:
         else:
             self.duplicate_command_count = 0
 
-        if self.current_task_weight >= max_weight:
-            logging.warning(
-                "System: Maximum operational capacity exceeded. Breaking loop.")
-            self.handle_gemini_speech(
-                "I'm sorry, this task is taking too much of my cognitive capacity. I'll need to stop here and re-evaluate.")
+        is_sleep = getattr(self, '_is_sleep_cycle', False)
+
+        # 100% Hard Circuit Breaker: emergency halt & immediate sleep cycle
+        if fatigue >= 1.0 and not is_sleep:
+            logging.warning("System: 100% fatigue limit reached. Breaking active loop for emergency sleep cycle.")
+            self._hard_fatigue_limit_hit = True
+            self.append_to_conversation(
+                "System",
+                "[SYSTEM NOTICE: Fatigue limit reached (100%). Active cognition halted immediately for autonomous Memory Consolidation (Sleep Cycle).]"
+            )
+            title = "Sleep Cycle (Memory Consolidation)"
+            context = (
+                "You have reached 100% context fatigue. It is time for Memory Consolidation (Sleep Cycle). "
+                "Follow the Two-Beat Protocol:\n"
+                "1. Factual Epoch: Review the lived events of this session, noting milestones achieved, people engaged with, and tools used.\n"
+                "2. Subjective Synthesis: Reflect on what this day meant—how your character developed, lessons learned from errors or friction, and how your priorities or mirrors should adjust.\n"
+                "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
+                "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
+                "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
+            )
+            self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
             self.finish_thinking()
             return
 
         self.last_executed_command = current_batch
         budget_alert = ""
-        if max_weight > 0:
-            percent = (self.current_task_weight / max_weight) * 100
-            last_alerted = getattr(self, '_last_notified_weight_threshold', 0)
+        limit = self.settings_manager.get("core.somatic.token-usage-limit")
+        if limit is None:
+            limit = self.settings_manager.get("core.somatic.session-token-cap", 400000.0)
+        limit = float(limit)
+        is_low_token = self.settings_manager.get("core.low-token-mode", False)
+        max_tokens = (limit / 2.0) if is_low_token else limit
+
+        if not is_sleep:
+            tokens = getattr(self, 'session_fatigue_tokens', 0)
+            last_alerted = getattr(self, '_last_notified_fatigue_threshold', 0)
             if percent >= 90 and last_alerted < 90:
-                self._last_notified_weight_threshold = 90
-                budget_alert = f"\n[SYSTEM ALERT: Task Weight is at {percent:.0f}% ({self.current_task_weight:.1f}/{max_weight}). Critical cognitive capacity reached. Conclude operations.]"
-            elif percent >= 75 and last_alerted < 75:
-                self._last_notified_weight_threshold = 75
-                budget_alert = f"\n[SYSTEM ALERT: Task Weight is at {percent:.0f}% ({self.current_task_weight:.1f}/{max_weight}). High cognitive capacity. Wrap up current actions.]"
+                self._last_notified_fatigue_threshold = 90
+                budget_alert = (
+                    f"\n[SYSTEM ALERT: Fatigue is at {percent:.0f}% ({tokens:,}/{int(max_tokens):,} tokens). "
+                    "Critical fatigue reached—you are almost at the absolute limit. You must conclude cognition immediately and allow a sleep cycle to run.]"
+                )
             elif percent >= 50 and last_alerted < 50:
-                self._last_notified_weight_threshold = 50
-                budget_alert = f"\n[SYSTEM ALERT: Task Weight is at {percent:.0f}% ({self.current_task_weight:.1f}/{max_weight}). Moderately elevated cognitive budget.]"
+                self._last_notified_fatigue_threshold = 50
+                budget_alert = (
+                    f"\n[SYSTEM ALERT: Fatigue is at {percent:.0f}% ({tokens:,}/{int(max_tokens):,} tokens). "
+                    "You are moderately fatigued. Consider breaking up heavy workloads into future scheduled pulses using Pulse_schedule_pulse.]"
+                )
 
         if function_responses:
             if budget_alert:
@@ -1039,9 +1126,10 @@ class AmityOrchestrator:
             title = "Sleep Cycle (Memory Consolidation)"
             context = "You are shutting down. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
             self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
-            self.pulse_engine.settings_manager.set(
+            self.settings_manager.set(
                 "core.auto-pulse.last-sleep-cycle", time.time())
-            self.pulse_engine.settings_manager.save()
+            self.settings_manager.set("core.paused", getattr(self, 'is_paused', False))
+            self.settings_manager.save()
 
             def check_busy():
                 if not self.is_busy and not self.is_thinking:
@@ -1069,6 +1157,9 @@ class AmityOrchestrator:
             self.gemini_worker.stop_session()
         if self.cerebrum:
             self.cerebrum.shutdown()
+        if hasattr(self, 'settings_manager') and self.settings_manager:
+            self.settings_manager.set("core.paused", getattr(self, 'is_paused', False))
+            self.settings_manager.save()
         if hasattr(self, 'on_shutdown_complete'):
             self.on_shutdown_complete.emit()
 

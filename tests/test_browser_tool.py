@@ -10,6 +10,8 @@ from core.browser_manager import BrowserManager
 from tools.browser_tool import BrowserSkill
 from core.subagent_worker import SubagentWorker
 
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
+
 
 class DummyOrchestrator:
     def __init__(self, agent_id="test_browser_agent", agent_name="Nova"):

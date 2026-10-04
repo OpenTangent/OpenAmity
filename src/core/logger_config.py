@@ -1,12 +1,53 @@
+import concurrent.futures
 import contextvars
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
 import sys
 
+# Guarantee contextvars (such as agent_id_var) propagate into ThreadPoolExecutor worker threads
+if not getattr(concurrent.futures.ThreadPoolExecutor.submit, "_is_context_preserving", False):
+    _orig_tpe_submit = concurrent.futures.ThreadPoolExecutor.submit
+
+    def _context_preserving_tpe_submit(self, fn, *args, **kwargs):
+        ctx = contextvars.copy_context()
+        return _orig_tpe_submit(self, ctx.run, fn, *args, **kwargs)
+
+    _context_preserving_tpe_submit._is_context_preserving = True
+    concurrent.futures.ThreadPoolExecutor.submit = _context_preserving_tpe_submit
+
+_active_websearch_agent_id = None
+
+
+def set_active_websearch_agent_id(agent_id: str | None):
+    global _active_websearch_agent_id
+    _active_websearch_agent_id = agent_id
+
+
+def get_active_websearch_agent_id() -> str | None:
+    return _active_websearch_agent_id
+
+
+class PrimpLogFilter(logging.Filter):
+    def filter(self, record):
+        if record.name == "primp":
+            record.name = "tool.WebSearch"
+            if not agent_id_var.get():
+                active_id = get_active_websearch_agent_id()
+                if active_id:
+                    agent_id_var.set(active_id)
+        return True
+
 
 class VerbosityFilter(logging.Filter):
     def filter(self, record):
+        if record.name == "primp":
+            record.name = "tool.WebSearch"
+            if not agent_id_var.get():
+                active_id = get_active_websearch_agent_id()
+                if active_id:
+                    agent_id_var.set(active_id)
+
         if "AFC will be disabled" in str(record.msg):
             record.levelno = logging.DEBUG
             record.levelname = "DEBUG"
@@ -23,6 +64,9 @@ class VerbosityFilter(logging.Filter):
 
 class BaseFormatter(logging.Formatter):
     def get_source(self, record):
+        if record.name in ("primp", "tool.WebSearch"):
+            return "tool.WebSearch"
+
         if record.name not in ("root", "core"):
             return record.name
 
@@ -62,6 +106,8 @@ class FileFormatter(BaseFormatter):
     def format(self, record):
         source = self.get_source(record)
         agent_id = agent_id_var.get()
+        if not agent_id and record.name in ("primp", "tool.WebSearch"):
+            agent_id = get_active_websearch_agent_id()
         agent_str = f"[{get_agent_name(agent_id)}] " if agent_id else ""
         if record.levelno == logging.INFO:
             format_str = f"%(asctime)s - {agent_str}[{source}] - %(message)s"
@@ -153,6 +199,8 @@ class ColorFormatter(BaseFormatter):
         section_color = self.get_section_color(source)
 
         agent_id = agent_id_var.get()
+        if not agent_id and record.name in ("primp", "tool.WebSearch"):
+            agent_id = get_active_websearch_agent_id()
         if agent_id:
             agent_name = get_agent_name(agent_id)
             colored_source = f"[{agent_name}] {section_color}[{source}]{level_color}"
@@ -217,6 +265,8 @@ class AgentDispatchingHandler(logging.Handler):
 
     def emit(self, record):
         agent_id = agent_id_var.get()
+        if not agent_id and record.name in ("primp", "tool.WebSearch"):
+            agent_id = get_active_websearch_agent_id()
         if agent_id:
             if agent_id not in self.handlers:
                 from config import paths
@@ -263,6 +313,22 @@ def setup_logging(retention_days=7, debug_logging=False):
 
     early_buffer_handler.setLevel(logging.DEBUG)
     root_logger.addHandler(early_buffer_handler)
+
+    # Attach PrimpLogFilter directly to primp logger so its logs are rewritten early
+    logging.getLogger("primp").addFilter(PrimpLogFilter())
+
+    # Suppress verbose low-level debug framing from Rust networking libraries
+    noisy_loggers = (
+        "hickory_net",
+        "hickory_resolver",
+        "rustls",
+        "h2",
+        "hyper_util",
+        "reqwest",
+        "cookie_store",
+    )
+    for noisy in noisy_loggers:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):

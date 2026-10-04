@@ -186,7 +186,7 @@ class Cerebrum:
             tool = self.tools.get(skill_name)
             if not tool:
                 for k, v in self.tools.items():
-                    if k.lower() == skill_name.lower():
+                    if k.lower() == skill_name.lower() or (skill_name.lower().endswith("tool") and k.lower() == skill_name.lower()[:-4]):
                         tool = v
                         break
         if tool:
@@ -203,7 +203,7 @@ class Cerebrum:
                     tool = self.tools.get(skill_name)
                     if not tool:
                         for k, v in self.tools.items():
-                            if k.lower() == skill_name.lower():
+                            if k.lower() == skill_name.lower() or (skill_name.lower().endswith("tool") and k.lower() == skill_name.lower()[:-4]):
                                 tool = v
                                 break
                     if tool and call_id and tool.is_command_async(command, args):

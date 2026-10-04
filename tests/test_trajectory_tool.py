@@ -97,3 +97,18 @@ def test_operational_hints_priority_in_bearings(temp_environment):
 
     assert len(hint_lines) >= 1
     assert hint_lines[0].startswith("- Operational Protocols:")
+
+
+def test_trajectory_get_bearings_includes_datetime(temp_environment):
+    """Verify that get_bearings includes current date and time prominently."""
+    mock_orch = MagicMock()
+    mock_orch.agent_id = "test-agent-dt"
+
+    tool = TrajectoryTool(orchestrator=mock_orch)
+    output = tool.execute("get_bearings")
+
+    assert "=== THE AGENT'S CURRENT BEARING ===" in output
+    assert "Current Date & Time:" in output
+    now = datetime.now()
+    assert str(now.year) in output
+

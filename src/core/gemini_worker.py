@@ -344,7 +344,13 @@ class GeminiWorker:
 
     def _process_thought(self, prompt, image_path, yolo, audio_path=None):
         with self._process_lock:
-            self._process_thought_locked(prompt, image_path, yolo, audio_path)
+            try:
+                self._process_thought_locked(prompt, image_path, yolo, audio_path)
+            except Exception as e:
+                logging.error(
+                    f"Uncaught exception in _process_thought: {e}", exc_info=True)
+                self.is_processing = False
+                self.error_occurred.emit(f"Gemini Worker Error: {e}")
 
     def _process_thought_locked(self, prompt, image_path, yolo, audio_path=None):
         from core.logger_config import agent_id_var
@@ -424,10 +430,7 @@ class GeminiWorker:
         # Automatically reconcile unfulfilled function calls before sending to API
         content = self._reconcile_tool_calls(content)
 
-        start_idx = self.thinking_models.index(
-            self.current_thinker_model) if self.current_thinker_model in self.thinking_models else 0
-
-        for idx in range(start_idx, len(self.thinking_models)):
+        for idx in range(len(self.thinking_models)):
             model_name = self.thinking_models[idx]
             logging.debug(
                 f"_process_thought attempting to use model: {model_name}")
@@ -498,6 +501,7 @@ class GeminiWorker:
                 return
 
             except Exception as e:
+                is_last_model = (idx == len(self.thinking_models) - 1)
                 err_str = str(e)
 
                 # Non-recoverable errors
@@ -507,15 +511,6 @@ class GeminiWorker:
                     self.error_occurred.emit("API key is invalid (401/403).")
                     self.is_processing = False
                     return
-                elif "500" in err_str or "503" in err_str:
-                    logging.warning(
-                        f"Servers at Peak Capacity (500/503) with {model_name}: {err_str}")
-                    if is_last_model:
-                        self.error_occurred.emit(
-                            "Gemini servers are currently at peak capacity (500/503).")
-                        self.is_processing = False
-                        return
-                    continue
                 elif "400" in err_str and "INVALID_ARGUMENT" in err_str:
                     logging.error(
                         f"Thinker API Error (400 INVALID_ARGUMENT) with {model_name}: {err_str}", exc_info=True)
@@ -530,9 +525,16 @@ class GeminiWorker:
                     return
 
                 # Recoverable errors (attempt fallback models)
-                is_last_model = (idx == len(self.thinking_models) - 1)
-
-                if "429" in err_str or "quota" in err_str.lower() or ("400" in err_str and "FAILED_PRECONDITION" in err_str):
+                if "500" in err_str or "503" in err_str:
+                    logging.warning(
+                        f"Servers at Peak Capacity (500/503) with {model_name}: {err_str}")
+                    if is_last_model:
+                        self.error_occurred.emit(
+                            "Gemini servers are currently at peak capacity (500/503).")
+                        self.is_processing = False
+                        return
+                    continue
+                elif "429" in err_str or "quota" in err_str.lower() or ("400" in err_str and "FAILED_PRECONDITION" in err_str):
                     logging.warning(
                         f"API Rate Limit/Precondition (429/400) with {model_name}: {err_str}")
                     if is_last_model:

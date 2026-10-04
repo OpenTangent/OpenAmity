@@ -20,6 +20,10 @@ def qt_message_handler(mode, context, message):
         logging.debug(f"Qt Wayland: {message}")
         return
 
+    if "qt.multimedia" in message or "FFmpeg" in message or "ffmpeg" in message:
+        logging.debug(f"Qt: {message}")
+        return
+
     if mode == QtMsgType.QtDebugMsg:
         logging.debug(f"Qt: {message}")
     elif mode == QtMsgType.QtInfoMsg:
@@ -41,6 +45,13 @@ def main():
     # Setup logging early to capture all logs
     setup_logging(retention_days=retention_days, debug_logging=debug_logging)
     logger.info(f"Starting Open Amity Version: {amity_version}")
+
+    # Silence noisy multimedia and C-level FFmpeg decode logs
+    try:
+        from core.audio_output import silence_ffmpeg_logs
+        silence_ffmpeg_logs()
+    except Exception:
+        pass
 
     # Handle Ctrl+C (SIGINT) gracefully
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -80,6 +91,13 @@ def main():
         finished = Signal(object)
 
         def run(self):
+            # Ensure out-of-the-box OpenRouter model and image model caches exist in app data dir
+            try:
+                paths.ensure_openrouter_models_cache()
+                paths.ensure_openrouter_image_models_cache()
+            except Exception as e:
+                logging.getLogger("main").warning(f"Could not seed OpenRouter caches: {e}")
+
             from core.agent_manager import AgentManager
             agent_manager = AgentManager()
 

@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 import re
+import os
 import requests
 from pathlib import Path
 from .events import Signal
@@ -111,6 +112,54 @@ def resolve_base_voice(gender: str = "Female", age: str = "Young Adult", style: 
         return "Iapetus"
 
 
+def voice_to_character_profile(voice_name: str) -> dict:
+    """Derives intuitive Gender, Age, and Style character traits from a prebuilt Gemini voice name."""
+    info = GEMINI_VOICES.get(voice_name, {})
+    if not info:
+        return {}
+    gender_raw = info.get("gender", "Female")
+    if gender_raw == "Female":
+        gender = "Female"
+    elif gender_raw == "Male":
+        gender = "Male"
+    else:
+        gender = "Non-binary / Neutral"
+
+    tags = [t.lower() for t in info.get("tags", [])]
+    desc = info.get("description", "").lower()
+    all_text = " ".join(tags + [desc])
+
+    # Age mapping
+    if any(k in all_text for k in ["youthful"]):
+        age = "Youthful (18 - 25)"
+    elif any(k in all_text for k in ["mature", "senior", "gravelly", "gritty"]):
+        age = "Mature / Senior (50+)"
+    elif any(k in all_text for k in ["firm", "commanding", "authoritative", "informative", "serious"]):
+        age = "Adult (30s - 50s)"
+    else:
+        age = "Young Adult (20s - 30s)"
+
+    # Style mapping
+    if any(k in all_text for k in ["vibrant", "dynamic", "sassy", "forward", "confident"]):
+        style = "Vibrant & Sassy"
+    elif any(k in all_text for k in ["warm", "empathetic", "caring", "friendly"]):
+        style = "Warm & Empathetic"
+    elif any(k in all_text for k in ["gentle", "serene", "soft", "reassuring", "breathy"]):
+        style = "Gentle & Serene"
+    elif any(k in all_text for k in ["calm", "smooth", "intellectual", "knowledgeable", "husky"]):
+        style = "Calm & Analytical"
+    elif any(k in all_text for k in ["informative", "professional", "serious", "clear", "articulate", "precise", "firm", "strong", "commanding", "authoritative", "direct", "grounded"]):
+        style = "Professional & Informative"
+    elif any(k in all_text for k in ["cheerful", "upbeat", "lively", "energetic", "excitable", "bright"]):
+        style = "Cheerful & Energetic"
+    elif any(k in all_text for k in ["casual", "playful", "breezy", "relaxed", "easy-going", "conversational", "laid-back"]):
+        style = "Casual & Playful"
+    else:
+        style = "Warm & Empathetic"
+
+    return {"gender": gender, "age": age, "style": style}
+
+
 def build_gemini_tts_prompt(settings, agent_id: str, text: str, somatic_text: str = "") -> str:
     """Formats the TTS prompt cleanly using natural positive direction without markdown scaffolding."""
     override_prompt = settings.get("core.tts.gemini.override-prompt", False)
@@ -144,29 +193,274 @@ def build_gemini_tts_prompt(settings, agent_id: str, text: str, somatic_text: st
     )
 
 
+
+def build_gemini_tts_style(settings, agent_id: str = None, somatic_text: str = "") -> str:
+    """Builds the directorial delivery style instruction for Gemini 3.8 speech_metadata."""
+    override_prompt = settings.get("core.tts.gemini.override-prompt", False)
+    custom_prompt = settings.get("core.tts.gemini.custom-prompt", "").strip()
+
+    if override_prompt and custom_prompt:
+        clean_prompt = custom_prompt
+        for placeholder in ["{transcript}", "{text}"]:
+            clean_prompt = clean_prompt.replace(placeholder, "")
+        clean_prompt = clean_prompt.strip()
+        if clean_prompt.lower().startswith("read the following transcript aloud as"):
+            colon_idx = clean_prompt.rfind(":")
+            if colon_idx != -1:
+                clean_prompt = clean_prompt[:colon_idx].strip()
+        elif clean_prompt.endswith(":"):
+            clean_prompt = clean_prompt[:-1].strip()
+        if clean_prompt:
+            return clean_prompt
+
+    agent_name = settings.get("core.agent.name", "Assistant")
+    gender = settings.get("core.tts.gemini.gender", "Female")
+    age = settings.get("core.tts.gemini.age", "Young Adult")
+    custom_accent = settings.get("core.tts.gemini.custom-accent", "").strip()
+    accent = custom_accent if custom_accent else settings.get("core.tts.gemini.accent", "South African")
+
+    custom_style = settings.get("core.tts.gemini.custom-style", "").strip()
+    style = custom_style if custom_style else settings.get("core.tts.gemini.style", "Warm & Empathetic")
+    clean_style = style.replace("&", "and").strip()
+
+    demeanor_part = f", with a {somatic_text.lower()} demeanor" if somatic_text else ""
+    return (
+        f"natural {accent} accent, {clean_style.lower()} tone{demeanor_part} with clear articulation and natural conversational pacing"
+    )
+
+
+def build_gemini_tts_payload(model: str, settings, agent_id: str, text: str, somatic_text: str = ""):
+    """Builds model-specific request payload.
+    Gemini 3.8 uses a verbatim transcript with speech_metadata delivery direction.
+    Legacy preview models use an integrated directive prompt preamble."""
+    alias_map = {
+        "gemini-3.1-flash-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-3-flash-tts-preview": "gemini-3.1-flash-tts-preview",
+        "gemini-3-flash-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-preview-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-lite-preview-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-lite-tts": "gemini-3.1-flash-tts-preview",
+    }
+    model = alias_map.get(model, model)
+    if model and ("3.8" in model or model.startswith("gemini-3.8")):
+        style = build_gemini_tts_style(settings, agent_id, somatic_text=somatic_text)
+        if hasattr(types, "SpeechMetadata"):
+            speech_metadata = types.SpeechMetadata(style=style)
+            part = types.Part(text=text, speech_metadata=speech_metadata)
+            return [types.Content(role="user", parts=[part])]
+        else:
+            return f"Read the following transcript aloud in style: {style}\n\n{text}"
+    return build_gemini_tts_prompt(settings, agent_id, text, somatic_text=somatic_text)
+
+
+def silence_ffmpeg_logs():
+    """Silences Qt Multimedia and FFmpeg logging clutter on stderr."""
+    import os
+    os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
+
+    try:
+        from PySide6.QtCore import QLoggingCategory
+        QLoggingCategory.setFilterRules("qt.multimedia*=false\nqt.multimedia.ffmpeg*=false")
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        import ctypes.util
+
+        crypto_name = ctypes.util.find_library("crypto") or "libcrypto.so.3"
+        try:
+            ctypes.CDLL(crypto_name, ctypes.RTLD_GLOBAL)
+        except Exception:
+            pass
+
+        # Try PySide6 bundled libavutil
+        try:
+            import PySide6
+            pyside_dir = os.path.dirname(PySide6.__file__)
+            bundled_libavutil = os.path.join(pyside_dir, "Qt", "lib", "libavutil.so")
+            if os.path.exists(bundled_libavutil):
+                lib = ctypes.CDLL(bundled_libavutil, ctypes.RTLD_GLOBAL)
+                if hasattr(lib, "av_log_set_level"):
+                    lib.av_log_set_level(-8)
+        except Exception:
+            pass
+
+        # Try system libavutil
+        try:
+            sys_avutil = ctypes.util.find_library("avutil")
+            if sys_avutil:
+                lib = ctypes.CDLL(sys_avutil, ctypes.RTLD_GLOBAL)
+                if hasattr(lib, "av_log_set_level"):
+                    lib.av_log_set_level(-8)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def synthesize_voice_sample(api_key: str, voice_name: str, style: str = "", text: str = "") -> bytes:
+    """Synthesizes a short audition audio sample using gemini-3.8-flash-tts."""
+    if not text:
+        text = f"Hello, I am {voice_name}, one of the Gemini voices."
+    client = genai.Client(api_key=api_key)
+    if hasattr(types, "SpeechMetadata") and style:
+        part = types.Part(text=text, speech_metadata=types.SpeechMetadata(style=style))
+        contents = [types.Content(role="user", parts=[part])]
+    elif style:
+        contents = f"Read the following transcript aloud in style: {style}\n\n{text}"
+    else:
+        contents = text
+
+    response = client.models.generate_content(
+        model="gemini-3.8-flash-tts",
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=(
+                    types.VoiceConfig(voice=voice_name)
+                    if voice_name and voice_name.startswith("voice_")
+                    else types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
+                    )
+                )
+            ),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+        )
+    )
+    if response.candidates:
+        for cand in response.candidates:
+            if cand.content and cand.content.parts:
+                for p in cand.content.parts:
+                    if hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
+                        raw_data = p.inline_data.data
+                        if raw_data.startswith(b"RIFF"):
+                            return raw_data
+                        import io, wave
+                        buf = io.BytesIO()
+                        with wave.open(buf, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(24000)
+                            wf.writeframes(raw_data)
+                        return buf.getvalue()
+    return b""
+
+
+def load_piper_voice(settings=None):
+    """Loads and returns the configured PiperVoice instance, downloading files if necessary."""
+    try:
+        piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
+        piper_dir.mkdir(parents=True, exist_ok=True)
+
+        voice_name = "en_GB-cori-high"
+        if settings:
+            voice_name = settings.get("core.tts.piper.model-name-piper", "en_GB-cori-high")
+        if not voice_name or "-" not in voice_name:
+            if voice_name == "cori":
+                voice_name = "en_GB-cori-high"
+            else:
+                logging.getLogger("core.TTS.Piper").warning(
+                    f"Invalid Piper voice name '{voice_name}'. Using fallback.")
+                voice_name = "en_GB-cori-high"
+
+        parts = voice_name.split("-")
+        if len(parts) < 3:
+            logging.getLogger("core.TTS.Piper").warning(
+                f"Invalid Piper voice name format '{voice_name}'. Format should be locale-voice-quality. Using fallback.")
+            voice_name = "en_GB-cori-high"
+            parts = voice_name.split("-")
+
+        locale = parts[0]
+        language = locale.split("_")[0]
+        voice = parts[1]
+        quality = parts[2]
+
+        model_path = piper_dir / f"{voice_name}.onnx"
+        config_path = piper_dir / f"{voice_name}.onnx.json"
+
+        if not model_path.exists() or not config_path.exists():
+            logging.getLogger("core.TTS.Piper").info(
+                f"Downloading Piper TTS model '{voice_name}'...")
+            model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx"
+            config_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx.json"
+            try:
+                with requests.get(model_url, stream=True, timeout=10) as r_model:
+                    r_model.raise_for_status()
+                    with open(model_path, 'wb') as f:
+                        for chunk in r_model.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                with requests.get(config_url, stream=True, timeout=10) as r_config:
+                    r_config.raise_for_status()
+                    with open(config_path, 'wb') as f:
+                        for chunk in r_config.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                logging.getLogger("core.TTS.Piper").info(
+                    "Piper TTS model downloaded successfully.")
+            except requests.RequestException as e:
+                logging.getLogger("core.TTS.Piper").warning(
+                    f"Offline or failed to download Piper model: {e}")
+                if model_path.exists():
+                    model_path.unlink()
+                if config_path.exists():
+                    config_path.unlink()
+                return None
+
+        from piper.voice import PiperVoice
+        return PiperVoice.load(str(model_path))
+    except Exception as e:
+        logging.getLogger("core.TTS.Piper").error(f"Error loading Piper voice: {e}")
+        return None
+
+
 def normalize_gemini_voice_models(voice_models) -> list:
     """Sanitizes voice model list: maps legacy/invalid model identifiers to valid ones,
-    deduplicates, and ensures fallback model 'gemini-2.5-flash-preview-tts' is always present."""
+    deduplicates, strips any gemini-2.5 models, ensures 'gemini-3.8-flash-tts' is primary,
+    and ensures fallback model 'gemini-3.1-flash-tts-preview' is present."""
     alias_map = {
-        "gemini-2.5-flash-lite-preview-tts": "gemini-2.5-flash-preview-tts",
-        "gemini-2.5-flash-lite-tts": "gemini-2.5-flash-preview-tts",
+        "gemini-3.1-flash-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-3-flash-tts-preview": "gemini-3.1-flash-tts-preview",
+        "gemini-3-flash-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-preview-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-lite-preview-tts": "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-lite-tts": "gemini-3.1-flash-tts-preview",
     }
     normalized = []
     if isinstance(voice_models, list):
         for m in voice_models:
             if isinstance(m, str) and m.strip():
                 target = alias_map.get(m.strip(), m.strip())
-                if target not in normalized:
+                if target not in normalized and "2.5" not in target:
                     normalized.append(target)
     elif isinstance(voice_models, str) and voice_models.strip():
         target = alias_map.get(voice_models.strip(), voice_models.strip())
-        normalized.append(target)
+        if "2.5" not in target:
+            normalized.append(target)
+
+    # Strip any 2.5 models completely
+    normalized = [m for m in normalized if "2.5" not in m]
 
     if not normalized:
-        return ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+        return [
+            "gemini-3.8-flash-tts",
+            "gemini-3.8-flash-lite-tts",
+            "gemini-3.1-flash-tts-preview"
+        ]
 
-    if "gemini-2.5-flash-preview-tts" not in normalized:
-        normalized.append("gemini-2.5-flash-preview-tts")
+    if "gemini-3.8-flash-tts" not in normalized:
+        normalized.insert(0, "gemini-3.8-flash-tts")
+    elif normalized[0] != "gemini-3.8-flash-tts":
+        normalized.remove("gemini-3.8-flash-tts")
+        normalized.insert(0, "gemini-3.8-flash-tts")
+
+    if "gemini-3.1-flash-tts-preview" not in normalized:
+        normalized.append("gemini-3.1-flash-tts-preview")
     return normalized
 
 
@@ -183,10 +477,16 @@ class TTSWorker(threading.Thread):
 
         override_prompt = self.settings.get("core.tts.gemini.override-prompt", False)
         saved_voice = self.settings.get("core.tts.gemini.model-name")
+        voice_selection_mode = self.settings.get("core.tts.gemini.voice-selection-mode", "auto")
+        custom_voice_id = self.settings.get("core.tts.gemini.custom-voice-id", "").strip()
 
         if voice:
             self.voice = voice
-        elif saved_voice and (override_prompt or saved_voice in GEMINI_VOICES):
+        elif voice_selection_mode == "custom_voice_id" and custom_voice_id:
+            self.voice = custom_voice_id
+        elif voice_selection_mode == "prebuilt" and saved_voice:
+            self.voice = saved_voice
+        elif saved_voice and (override_prompt or saved_voice in GEMINI_VOICES or saved_voice.startswith("voice_")):
             self.voice = saved_voice
         else:
             gender = self.settings.get("core.tts.gemini.gender", "Female")
@@ -198,7 +498,12 @@ class TTSWorker(threading.Thread):
         self.voice_prompt = self.settings.get("core.tts.gemini.prompt", {})
 
         raw_voice_models = self.settings.get(
-            "core.gemini.voice-models", ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"])
+            "core.gemini.voice-models", [
+                "gemini-3.8-flash-tts",
+                "gemini-3.8-flash-lite-tts",
+                "gemini-3.1-flash-tts-preview"
+            ]
+        )
         self.voice_models = normalize_gemini_voice_models(raw_voice_models)
         self.model = self.voice_models[0]
 
@@ -267,10 +572,11 @@ class TTSWorker(threading.Thread):
             if os.path.exists(state_path):
                 with open(state_path, "r") as f:
                     somatic = json.load(f)
-                    current_weight = somatic.get("current_task_weight", 0)
-                    max_weight = somatic.get("max_weight", 1000)
-                    percent = (current_weight / max_weight) * \
-                        100 if max_weight else 0
+                    percent = somatic.get("percent")
+                    if percent is None:
+                        current_weight = somatic.get("session_fatigue_tokens", somatic.get("current_task_weight", 0))
+                        max_weight = somatic.get("token_limit", somatic.get("max_weight", 1000))
+                        percent = (current_weight / max_weight) * 100 if max_weight else 0
 
                     if percent >= 50:
                         somatic_state_text = "Slightly tired, weary, and subdued due to cognitive fatigue."
@@ -289,12 +595,14 @@ class TTSWorker(threading.Thread):
             return
 
         client = genai.Client(api_key=api_key)
-        full_text = build_gemini_tts_prompt(
-            self.settings, self.agent_id, self.text, somatic_text=somatic_state_text
-        )
 
         raw_voice_models = self.settings.get(
-            "core.gemini.voice-models", ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"])
+            "core.gemini.voice-models", [
+                "gemini-3.8-flash-tts",
+                "gemini-3.8-flash-lite-tts",
+                "gemini-3.1-flash-tts-preview"
+            ]
+        )
         voice_models = normalize_gemini_voice_models(raw_voice_models)
         self.voice_models = voice_models
 
@@ -305,8 +613,11 @@ class TTSWorker(threading.Thread):
 
             current_model = voice_models[min(attempt - 1, len(voice_models) - 1)]
             self.model = current_model
+            payload = build_gemini_tts_payload(
+                current_model, self.settings, self.agent_id, self.text, somatic_text=somatic_state_text
+            )
             try:
-                self._stream_gemini_attempt(client, full_text)
+                self._stream_gemini_attempt(client, payload)
                 return
             except Exception as e:
                 if self._is_stopped:
@@ -323,17 +634,30 @@ class TTSWorker(threading.Thread):
                     self.error_occurred.emit(
                         "[System: Gemini voice synthesis connection interrupted. Full text output is available above.]")
 
-    def _stream_gemini_attempt(self, client, full_text, model=None):
-        target_model = model or self.model
+    def _stream_gemini_attempt(self, client, contents_payload, **kwargs):
+        target_model = kwargs.get("model") or getattr(self, "model", "gemini-3.8-flash-tts")
+        alias_map = {
+            "gemini-3.1-flash-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-3-flash-tts-preview": "gemini-3.1-flash-tts-preview",
+            "gemini-3-flash-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-preview-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-lite-preview-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-lite-tts": "gemini-3.1-flash-tts-preview",
+        }
+        target_model = alias_map.get(target_model, target_model)
         response_stream = client.models.generate_content_stream(
             model=target_model,
-            contents=full_text,
+            contents=contents_payload,
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
                 speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=self.voice
+                    voice_config=(
+                        types.VoiceConfig(voice=self.voice)
+                        if self.voice and self.voice.startswith("voice_")
+                        else types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=self.voice
+                            )
                         )
                     )
                 ),
@@ -488,65 +812,13 @@ class TTSWorker(threading.Thread):
 
     def _stream_and_play_piper(self):
         try:
-            piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
-            piper_dir.mkdir(parents=True, exist_ok=True)
+            voice = load_piper_voice(self.settings)
+            if not voice:
+                return
 
-            voice_name = self.settings.get("core.tts.piper.model-name-piper", "en_GB-cori-high")
-            if not voice_name or "-" not in voice_name:
-                if voice_name == "cori":
-                    voice_name = "en_GB-cori-high"
-                else:
-                    logging.getLogger("core.TTS.Piper").warning(
-                        f"Invalid Piper voice name '{voice_name}'. Using fallback.")
-                    voice_name = "en_GB-cori-high"
-
-            parts = voice_name.split("-")
-            if len(parts) < 3:
-                logging.getLogger("core.TTS.Piper").warning(
-                    f"Invalid Piper voice name format '{voice_name}'. Format should be locale-voice-quality. Using fallback.")
-                voice_name = "en_GB-cori-high"
-                parts = voice_name.split("-")
-
-            locale = parts[0]
-            language = locale.split("_")[0]
-            voice = parts[1]
-            quality = parts[2]
-
-            model_path = piper_dir / f"{voice_name}.onnx"
-            config_path = piper_dir / f"{voice_name}.onnx.json"
-
-            if not model_path.exists() or not config_path.exists():
-                logging.getLogger("core.TTS.Piper").info(
-                    f"Downloading Piper TTS model '{voice_name}'...")
-                model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx"
-                config_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx.json"
-                try:
-                    with requests.get(model_url, stream=True, timeout=10) as r_model:
-                        r_model.raise_for_status()
-                        with open(model_path, 'wb') as f:
-                            for chunk in r_model.iter_content(chunk_size=8192):
-                                f.write(chunk)
-
-                    with requests.get(config_url, stream=True, timeout=10) as r_config:
-                        r_config.raise_for_status()
-                        with open(config_path, 'wb') as f:
-                            for chunk in r_config.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                    logging.getLogger("core.TTS.Piper").info(
-                        "Piper TTS model downloaded successfully.")
-                except requests.RequestException as e:
-                    logging.getLogger("core.TTS.Piper").warning(
-                        f"Offline or failed to download Piper model: {e}")
-                    if model_path.exists():
-                        model_path.unlink()
-                    if config_path.exists():
-                        config_path.unlink()
-                    return
-
-            from piper.voice import PiperVoice
-            voice = PiperVoice.load(str(model_path))
-
-            clean_text = re.sub(r'\[.*?\]', '', self.text).strip()
+            clean_text = re.sub(r'\[.*?\]', '', self.text)
+            clean_text = re.sub(r'<.*?>', '', clean_text)
+            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
 
             if not clean_text:
                 return
@@ -646,3 +918,273 @@ class TTSWorker(threading.Thread):
                     except Exception:
                         pass
                 self.process = None
+
+
+def synthesize_speech_to_file(text: str, output_path: str, agent_id: str = None, voice: str = None, settings=None) -> str:
+    """
+    Synthesizes text into an Opus audio file (.opus) at output_path.
+    Uses Gemini TTS if configured and reachable (with fallback cascade),
+    otherwise gracefully falls back to local Piper TTS.
+    Returns the absolute path to the generated .opus file.
+    """
+    if not text or not text.strip():
+        raise ValueError("Transcript text is required for speech synthesis.")
+
+    if settings is None:
+        try:
+            settings = SettingsManager(agent_id=agent_id)
+        except Exception:
+            settings = None
+
+    abs_output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
+
+    # Check low token mode
+    is_low_token = settings.get("core.low-token-mode", False) if settings else False
+
+    provider = None
+    if settings:
+        provider = settings.get("core.tts.provider")
+        if provider is None:
+            if not settings.get("core.tts.piper.prefer-piper", True):
+                provider = "gemini"
+            else:
+                provider = "piper"
+
+    if is_low_token:
+        provider = "piper"
+
+    # Attempt Gemini TTS if selected
+    if provider == "gemini" and settings:
+        api_key = settings.get_env("GEMINI_TTS_API_KEY") or settings.get_env("GEMINI_API_KEY")
+        if api_key:
+            try:
+                return _synthesize_gemini_to_opus(text, abs_output_path, settings, agent_id=agent_id, voice=voice, api_key=api_key)
+            except Exception as e:
+                logging.getLogger("core.TTS.Gemini").warning(
+                    f"Gemini TTS synthesis to file failed: {e}. Falling back to local Piper TTS.")
+        else:
+            logging.getLogger("core.TTS").warning(
+                "Gemini TTS selected but no Gemini API key configured. Falling back to local Piper TTS.")
+
+    # Fallback / Default: Piper TTS
+    return _synthesize_piper_to_opus(text, abs_output_path, settings=settings)
+
+
+def _synthesize_gemini_to_opus(text: str, output_path: str, settings, agent_id: str = None, voice: str = None, api_key: str = None) -> str:
+    somatic_state_text = ""
+    try:
+        from config import paths
+        import json
+        if agent_id:
+            state_path = os.path.join(paths.get_base_dir_for(agent_id), "somatic_state.json")
+            if os.path.exists(state_path):
+                with open(state_path, "r") as f:
+                    somatic = json.load(f)
+                    percent = somatic.get("percent")
+                    if percent is None:
+                        current_weight = somatic.get("session_fatigue_tokens", somatic.get("current_task_weight", 0))
+                        max_weight = somatic.get("token_limit", somatic.get("max_weight", 1000))
+                        percent = (current_weight / max_weight) * 100 if max_weight else 0
+                    if percent >= 50:
+                        somatic_state_text = "Slightly tired, weary, and subdued due to cognitive fatigue."
+                    elif percent >= 25:
+                        somatic_state_text = "Slightly subdued and contemplative due to moderate fatigue."
+    except Exception:
+        pass
+
+    override_prompt = settings.get("core.tts.gemini.override-prompt", False) if settings else False
+    saved_voice = settings.get("core.tts.gemini.model-name") if settings else None
+    voice_selection_mode = settings.get("core.tts.gemini.voice-selection-mode", "auto") if settings else "auto"
+    custom_voice_id = settings.get("core.tts.gemini.custom-voice-id", "").strip() if settings else ""
+
+    if voice:
+        resolved_voice = voice
+    elif voice_selection_mode == "custom_voice_id" and custom_voice_id:
+        resolved_voice = custom_voice_id
+    elif voice_selection_mode == "prebuilt" and saved_voice:
+        resolved_voice = saved_voice
+    elif saved_voice and (override_prompt or saved_voice in GEMINI_VOICES or saved_voice.startswith("voice_")):
+        resolved_voice = saved_voice
+    else:
+        gender = settings.get("core.tts.gemini.gender", "Female") if settings else "Female"
+        age = settings.get("core.tts.gemini.age", "Young Adult") if settings else "Young Adult"
+        custom_style = settings.get("core.tts.gemini.custom-style", "").strip() if settings else ""
+        style = custom_style if custom_style else (settings.get("core.tts.gemini.style", "Warm & Empathetic") if settings else "Warm & Empathetic")
+        resolved_voice = resolve_base_voice(gender, age, style)
+
+    raw_voice_models = settings.get(
+        "core.gemini.voice-models", [
+            "gemini-3.8-flash-tts",
+            "gemini-3.8-flash-lite-tts",
+            "gemini-3.1-flash-tts-preview"
+        ]
+    ) if settings else []
+    voice_models = normalize_gemini_voice_models(raw_voice_models)
+
+    client = genai.Client(api_key=api_key)
+    max_attempts = max(2, len(voice_models))
+    last_err = None
+
+    for attempt in range(1, max_attempts + 1):
+        current_model = voice_models[min(attempt - 1, len(voice_models) - 1)]
+        alias_map = {
+            "gemini-3.1-flash-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-3-flash-tts-preview": "gemini-3.1-flash-tts-preview",
+            "gemini-3-flash-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-preview-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-lite-preview-tts": "gemini-3.1-flash-tts-preview",
+            "gemini-2.5-flash-lite-tts": "gemini-3.1-flash-tts-preview",
+        }
+        current_model = alias_map.get(current_model, current_model)
+        payload = build_gemini_tts_payload(
+            current_model, settings, agent_id, text, somatic_text=somatic_state_text
+        )
+        try:
+            response_stream = client.models.generate_content_stream(
+                model=current_model,
+                contents=payload,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=(
+                            types.VoiceConfig(voice=resolved_voice)
+                            if resolved_voice and resolved_voice.startswith("voice_")
+                            else types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=resolved_voice
+                                )
+                            )
+                        )
+                    ),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
+                )
+            )
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "s16le",
+                "-ar", "24000",
+                "-ac", "1",
+                "-i", "-",
+                "-c:a", "libopus",
+                output_path
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+
+            try:
+                leftover_pcm = b""
+                for chunk in response_stream:
+                    if not chunk.candidates:
+                        continue
+                    candidate = chunk.candidates[0]
+                    finish_reason = getattr(candidate, "finish_reason", None)
+                    reason_name = None
+                    if finish_reason is not None:
+                        if hasattr(finish_reason, "name") and isinstance(finish_reason.name, str):
+                            reason_name = finish_reason.name
+                        elif isinstance(finish_reason, str):
+                            reason_name = finish_reason
+                    if reason_name and reason_name not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+                        raise RuntimeError(f"Gemini TTS stream aborted early with finish_reason: {reason_name}")
+
+                    if not candidate.content or not candidate.content.parts:
+                        continue
+
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                            data = leftover_pcm + part.inline_data.data
+                            if len(data) % 2 != 0:
+                                leftover_pcm = data[-1:]
+                                data = data[:-1]
+                            else:
+                                leftover_pcm = b""
+                            if data:
+                                proc.stdin.write(data)
+
+                if leftover_pcm:
+                    proc.stdin.write(leftover_pcm + b"\x00")
+                proc.stdin.close()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=15)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"FFmpeg encoding error (code {proc.returncode}): {stderr.decode(errors='replace')}")
+
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    return os.path.abspath(output_path)
+                else:
+                    raise RuntimeError("Output file was not generated or is empty.")
+            except Exception:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts:
+                next_model = voice_models[min(attempt, len(voice_models) - 1)]
+                logging.getLogger("core.TTS.Gemini").warning(
+                    f"Gemini TTS attempt {attempt} failed ({current_model}): {e}. Retrying with {next_model}...")
+                time.sleep(0.5)
+            else:
+                raise last_err
+
+
+def _synthesize_piper_to_opus(text: str, output_path: str, settings=None) -> str:
+    voice = load_piper_voice(settings=settings)
+    if not voice:
+        raise RuntimeError("Could not load local Piper voice model.")
+
+    clean_text = re.sub(r'\[.*?\]', '', text)
+    clean_text = re.sub(r'<.*?>', '', clean_text)
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    if not clean_text:
+        raise ValueError("Text contains no speakable characters after tag removal.")
+
+    sample_rate = voice.config.sample_rate
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "s16le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-i", "-",
+        "-c:a", "libopus",
+        output_path
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE
+    )
+    try:
+        for chunk in voice.synthesize(clean_text):
+            if chunk and chunk.audio_int16_bytes:
+                proc.stdin.write(chunk.audio_int16_bytes)
+        proc.stdin.close()
+        stderr = proc.stderr.read()
+        proc.wait(timeout=15)
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg encoding error (code {proc.returncode}): {stderr.decode(errors='replace')}")
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return os.path.abspath(output_path)
+        else:
+            raise RuntimeError("Piper output file was not generated or is empty.")
+    except Exception:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        raise
+

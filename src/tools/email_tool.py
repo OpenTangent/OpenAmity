@@ -2,6 +2,7 @@ import os
 import re
 import ssl
 import time
+import json
 import email
 import base64
 import smtplib
@@ -15,44 +16,12 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from core.cerebrum import Tool
 from core.email_auth import OAuth2TokenManager, build_xoauth2_string
+from core.email_archive import EmailArchive, decode_mime_header, html_to_plain_text
 
 logger = logging.getLogger("tool.Email")
 
-
-def _decode_mime_header(header_value: Optional[str]) -> str:
-    """Decodes MIME encoded header strings to standard Python unicode string."""
-    if not header_value:
-        return ""
-    decoded_fragments = []
-    for fragment, encoding in decode_header(header_value):
-        if isinstance(fragment, bytes):
-            try:
-                decoded_fragments.append(fragment.decode(encoding or "utf-8", errors="replace"))
-            except Exception:
-                decoded_fragments.append(fragment.decode("utf-8", errors="replace"))
-        else:
-            decoded_fragments.append(str(fragment))
-    return "".join(decoded_fragments)
-
-
-def _html_to_plain_text(html_content: str) -> str:
-    """Converts HTML email body into clean, readable plain text."""
-    if not html_content:
-        return ""
-    text = re.sub(r'<head.*?>.*?</head>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style.*?>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<script.*?>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<(?:br|p|div|tr|h[1-6])[\s/>]', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<li[\s>]', '\n* ', text, flags=re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'&nbsp;', ' ', text)
-    text = re.sub(r'&amp;', '&', text)
-    text = re.sub(r'&lt;', '<', text)
-    text = re.sub(r'&gt;', '>', text)
-    text = re.sub(r'&quot;', '"', text)
-    text = re.sub(r'&#39;', "'", text)
-    lines = [line.strip() for line in text.splitlines()]
-    return "\n".join(chunk for chunk in lines if chunk)
+_decode_mime_header = decode_mime_header
+_html_to_plain_text = html_to_plain_text
 
 
 MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB max total attachment size (Gmail standard)
@@ -94,7 +63,12 @@ class EmailTool(Tool):
     icon = "✉️"
     color = "#4169E1"
     async_commands = []
-    description = "Manage the agent's dedicated email account: send emails, fetch recent messages, read full emails, search mailboxes, download attachments, and organize folders."
+    description = (
+        "Manage the agent's dedicated email account: send emails, fetch recent messages, "
+        "read full emails, search mailboxes, download attachments, and organize folders. "
+        "Retrieved emails are moved to a local archive and cleared from the IMAP server to "
+        "prevent server mailbox quota exhaustion."
+    )
     commands = [
         "send_email",
         "fetch_emails",
@@ -103,12 +77,23 @@ class EmailTool(Tool):
         "download_attachment",
         "mark_as_read",
         "delete_email",
-        "list_folders"
+        "list_folders",
+        "sync_emails"
     ]
 
     def __init__(self, orchestrator=None):
         super().__init__(orchestrator)
         self._token_manager = OAuth2TokenManager()
+        self._archive = None
+
+    @property
+    def archive(self) -> EmailArchive:
+        agent_id = getattr(self.orchestrator, "agent_id", None) if self.orchestrator else None
+        if self._archive is None:
+            self._archive = EmailArchive(agent_id=agent_id)
+        elif not getattr(self._archive, "_custom_db", False) and getattr(self._archive, "agent_id", None) != agent_id:
+            self._archive = EmailArchive(agent_id=agent_id)
+        return self._archive
 
     def _get_settings(self) -> Dict[str, Any]:
         """Loads live email configuration from SettingsManager and environment."""
@@ -134,6 +119,28 @@ class EmailTool(Tool):
         smtp_port = int(get_val("EMAIL_SMTP_PORT", "465") or 465)
         smtp_security = get_val("EMAIL_SMTP_SECURITY", "SSL/TLS").upper()
 
+        archive_local = True
+        if sm and hasattr(sm, 'get'):
+            archive_local = sm.get("core.tools.email_archive_local", True)
+        env_archive = get_val("EMAIL_ARCHIVE_LOCAL", "")
+        if env_archive != "":
+            archive_local = env_archive.lower() in ("true", "1", "yes", "on")
+
+        # Determine if remote server should be purged after archiving:
+        # Standard IMAP servers default to True (delete/purge from server so quota does not fill up).
+        # Google and similar large cloud services can keep a copy on their servers (default False).
+        is_cloud = self._is_large_cloud_provider(imap_host, email_address)
+        default_delete = not is_cloud
+
+        delete_from_server = default_delete
+        if sm and hasattr(sm, 'get'):
+            val = sm.get("core.tools.email_delete_from_server", None)
+            if val is not None:
+                delete_from_server = bool(val)
+        env_delete = get_val("EMAIL_DELETE_FROM_SERVER", "")
+        if env_delete != "":
+            delete_from_server = env_delete.lower() in ("true", "1", "yes", "on")
+
         agent_name = "Agent"
         if sm and hasattr(sm, 'get'):
             agent_name = sm.get("core.agent.name", "Agent")
@@ -156,8 +163,26 @@ class EmailTool(Tool):
             "smtp_security": smtp_security,
             "display_name": display_name,
             "username": username,
-            "agent_name": agent_name
+            "agent_name": agent_name,
+            "archive_local": archive_local,
+            "delete_from_server": delete_from_server
         }
+
+    @staticmethod
+    def _is_large_cloud_provider(imap_host: str = "", email_address: str = "") -> bool:
+        """
+        Detects if the account is Google / Gmail or similar large cloud provider
+        capable of keeping a persistent server copy without standard IMAP mailbox quota exhaustion.
+        """
+        host = str(imap_host).strip().lower()
+        email_str = str(email_address).strip().lower()
+        if any(h in host for h in ["gmail.com", "googlemail.com", "google.com"]):
+            return True
+        if any(h in host for h in ["outlook.office365.com", "office365.com", "outlook.com"]):
+            return True
+        if any(d in email_str for d in ["@gmail.com", "@googlemail.com", "@outlook.", "@hotmail.", "@live.", "@msn."]):
+            return True
+        return False
 
     def _get_imap_connection(self) -> Tuple[bool, Any]:
         """Establishes an authenticated IMAP client session."""
@@ -306,6 +331,85 @@ class EmailTool(Tool):
         os.makedirs(download_dir, exist_ok=True)
         return download_dir
 
+    def _sync_imap_to_archive(self, folder: str = "INBOX") -> Tuple[bool, int, str]:
+        """
+        Connects to the IMAP server, downloads emails in the specified folder,
+        persists them to the local archive database, and (if delete_from_server is enabled)
+        deletes/expunges them from the server so that the server mailbox never exceeds quota.
+        Google and similar large cloud providers keep copies on their servers.
+        """
+        cfg = self._get_settings()
+        delete_from_server = cfg.get("delete_from_server", True)
+
+        success, imap_or_err = self._get_imap_connection()
+        if not success:
+            logger.debug(f"IMAP sync skipped: connection not established ({imap_or_err})")
+            return False, 0, str(imap_or_err)
+
+        imap = imap_or_err
+        try:
+            status, _ = imap.select(f'"{folder}"', readonly=not delete_from_server)
+            if status != "OK":
+                imap.logout()
+                return False, 0, f"Error: Mailbox folder '{folder}' could not be selected."
+
+            status, data = imap.uid("search", None, "ALL")
+            if status != "OK" or not data or not data[0]:
+                imap.logout()
+                return True, 0, f"No emails on server in folder '{folder}'."
+
+            uids = data[0].split()
+            moved_count = 0
+            for uid_bytes in uids:
+                uid_str = uid_bytes.decode("ascii", errors="replace")
+                res, msg_data = imap.uid("fetch", uid_bytes, "(RFC822 FLAGS)")
+                if res != "OK" or not msg_data:
+                    continue
+
+                raw_bytes = None
+                is_read = False
+                for part in msg_data:
+                    if isinstance(part, tuple):
+                        raw_bytes = part[1]
+                        flags_str = part[0].decode("ascii", errors="ignore") if isinstance(part[0], bytes) else str(part[0])
+                        if "\\Seen" in flags_str:
+                            is_read = True
+
+                if raw_bytes:
+                    try:
+                        self.archive.save_email(
+                            folder=folder,
+                            raw_bytes=raw_bytes,
+                            server_uid=uid_str,
+                            is_read=is_read
+                        )
+                        if delete_from_server:
+                            del_res, _ = imap.uid("store", uid_bytes, "+FLAGS", "\\Deleted")
+                            if del_res == "OK":
+                                moved_count += 1
+                        else:
+                            moved_count += 1
+                    except Exception as e:
+                        logger.error(f"Error archiving email UID {uid_str}: {e}", exc_info=True)
+
+            if delete_from_server and moved_count > 0:
+                imap.expunge()
+                logger.info(f"Moved {moved_count} email(s) from IMAP folder '{folder}' to local archive and expunged from server.")
+            elif moved_count > 0:
+                logger.info(f"Archived {moved_count} email(s) from IMAP folder '{folder}' to local archive (copy kept on server).")
+
+            imap.logout()
+            action_desc = "moved" if delete_from_server else "archived"
+            return True, moved_count, f"Successfully {action_desc} {moved_count} email(s) to local archive."
+
+        except Exception as e:
+            logger.error(f"Error during IMAP sync to local archive: {type(e).__name__}: {str(e)}", exc_info=True)
+            try:
+                imap.logout()
+            except Exception:
+                pass
+            return False, 0, f"Error syncing IMAP to local archive: {type(e).__name__}: {str(e)}"
+
     def execute(self, command: str, *args, **kwargs) -> str:
         logger.debug(f"Executing EmailTool command '{command}' with args: {kwargs}")
         if command == "send_email":
@@ -324,10 +428,22 @@ class EmailTool(Tool):
             return self._execute_delete_email(kwargs)
         elif command == "list_folders":
             return self._execute_list_folders(kwargs)
+        elif command == "sync_emails":
+            return self._execute_sync_emails(kwargs)
         else:
             err = f"Error: Unknown command '{command}' for EmailTool."
             logger.error(err)
             return err
+
+    def _execute_sync_emails(self, params: dict) -> str:
+        folder = params.get("folder", "INBOX")
+        cfg = self._get_settings()
+        if not cfg.get("archive_local", True):
+            return "Local archive is currently disabled in settings."
+        ok, count, msg = self._sync_imap_to_archive(folder=folder)
+        if not ok:
+            return f"Error syncing emails from IMAP: {msg}"
+        return f"IMAP sync complete: {msg}"
 
     def _execute_send_email(self, params: dict) -> str:
         to_addr = params.get("to")
@@ -349,6 +465,12 @@ class EmailTool(Tool):
 
         msg = EmailMessage()
         msg["From"] = from_header
+        import email.utils
+        if "Date" not in msg:
+            msg["Date"] = email.utils.formatdate(localtime=True)
+        if "Message-ID" not in msg:
+            domain = cfg['email_address'].split('@')[-1]
+            msg["Message-ID"] = email.utils.make_msgid(domain=domain)
         
         # Handle multiple recipients
         if isinstance(to_addr, list):
@@ -445,6 +567,13 @@ class EmailTool(Tool):
             att_info = f" with {len(attachments)} attachment(s)" if attachments else ""
             success_msg = f"Email successfully sent to '{msg['To']}' with subject '{subject}'{att_info}."
             logger.info(success_msg)
+
+            if cfg.get("archive_local", True):
+                try:
+                    self.archive.save_email(folder="Sent", raw_bytes=msg.as_bytes(), is_read=True)
+                except Exception as ex:
+                    logger.warning(f"Could not archive sent email locally: {ex}")
+
             return success_msg
         except Exception as e:
             logger.error(f"Error sending email via SMTP: {type(e).__name__}: {str(e)}", exc_info=True)
@@ -458,8 +587,42 @@ class EmailTool(Tool):
         folder = params.get("folder", "INBOX")
         limit = min(int(params.get("limit", 10)), 50)
         unread_only = bool(params.get("unread_only", False))
+        cfg = self._get_settings()
 
-        logger.debug(f"Fetching emails from folder '{folder}' (limit={limit}, unread_only={unread_only})")
+        logger.debug(f"Fetching emails from folder '{folder}' (limit={limit}, unread_only={unread_only}, archive_local={cfg.get('archive_local', True)})")
+
+        if cfg.get("archive_local", True):
+            # Sync newly arrived emails from IMAP to local archive and purge from server
+            sync_ok, count, sync_msg = self._sync_imap_to_archive(folder=folder)
+            archived = self.archive.get_emails(folder=folder, limit=limit, unread_only=unread_only)
+
+            if archived:
+                results = []
+                for em in archived:
+                    eid = em["id"]
+                    is_read = bool(em.get("is_read"))
+                    sndr = em.get("from_sender") or "Unknown Sender"
+                    subj = em.get("subject") or "(No Subject)"
+                    dt = em.get("date_str") or "Unknown Date"
+                    results.append(
+                        f"- [ID: {eid}] {'[READ]' if is_read else '[UNREAD]'} "
+                        f"From: {sndr} | Subject: '{subj}' | Date: {dt}"
+                    )
+                logger.info(f"Fetched {len(results)} email(s) from '{folder}' (local archive)")
+                header_text = f"Found {len(results)} {'unread ' if unread_only else ''}email(s) in '{folder}':"
+                return header_text + "\n" + "\n".join(results)
+
+            # No emails in local archive for criteria
+            if not sync_ok and count == 0:
+                all_archived = self.archive.get_emails(folder=folder, limit=1, unread_only=False)
+                if not all_archived:
+                    logger.error(f"fetch_emails failed: {sync_msg}")
+                    return f"Failed to connect to IMAP server: {sync_msg}"
+
+            logger.info(f"No {'unread ' if unread_only else ''}emails found in '{folder}'.")
+            return f"No {'unread ' if unread_only else ''}emails found in '{folder}'."
+
+        # Fallback to direct IMAP if archive_local is disabled
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"fetch_emails IMAP connection failed: {imap_or_err}")
@@ -526,12 +689,55 @@ class EmailTool(Tool):
         email_id = str(params.get("email_id", "")).strip()
         folder = params.get("folder", "INBOX")
         mark_as_read = bool(params.get("mark_as_read", True))
+        cfg = self._get_settings()
 
         if not email_id:
             logger.error("read_email failed: 'email_id' is missing.")
             return "Error: 'email_id' is required to read an email."
 
-        logger.debug(f"Reading email UID '{email_id}' from folder '{folder}' (mark_as_read={mark_as_read})")
+        logger.debug(f"Reading email UID '{email_id}' from folder '{folder}' (mark_as_read={mark_as_read}, archive_local={cfg.get('archive_local', True)})")
+
+        if cfg.get("archive_local", True):
+            em = self.archive.get_email(email_id, folder=folder)
+            if not em:
+                # Sync in case it's on server but not yet retrieved
+                self._sync_imap_to_archive(folder=folder)
+                em = self.archive.get_email(email_id, folder=folder)
+
+            if em:
+                if mark_as_read:
+                    self.archive.mark_as_read(email_id, is_read=True, folder=folder)
+
+                subject = em.get("subject") or "(No Subject)"
+                from_sender = em.get("from_sender") or "Unknown"
+                to_recipient = em.get("to_recipient") or "Unknown"
+                date_str = em.get("date_str") or "Unknown"
+                message_id = em.get("message_id") or ""
+                body_text = em.get("body_plain") or "(Email body is empty or in unsupported format)"
+
+                try:
+                    att_names = json.loads(em.get("attachment_names") or "[]")
+                except Exception:
+                    att_names = []
+                att_section = "\nAttachments:\n" + "\n".join(f"- {a}" for a in att_names) if att_names else "\nAttachments: None"
+
+                logger.info(f"Successfully read email ID '{email_id}': '{subject}' from '{from_sender}' (local archive)")
+                return (
+                    f"=== Email Details (ID: {email_id}) ===\n"
+                    f"Subject: {subject}\n"
+                    f"From: {from_sender}\n"
+                    f"To: {to_recipient}\n"
+                    f"Date: {date_str}\n"
+                    f"Message-ID: {message_id}\n"
+                    f"{att_section}\n\n"
+                    f"--- Body ---\n"
+                    f"{body_text}"
+                )
+
+            logger.error(f"read_email failed: ID '{email_id}' not found in local archive or on server in folder '{folder}'.")
+            return f"Error: Email with UID '{email_id}' not found in folder '{folder}'."
+
+        # Fallback to direct IMAP
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"read_email IMAP connection failed: {imap_or_err}")
@@ -631,6 +837,7 @@ class EmailTool(Tool):
         subject = params.get("subject")
         since_date = params.get("since_date")
         limit = min(int(params.get("limit", 10)), 50)
+        cfg = self._get_settings()
 
         criteria_parts = []
         if query:
@@ -645,8 +852,38 @@ class EmailTool(Tool):
             criteria_parts.append(f'SINCE "{since_date}"')
 
         search_criteria = " ".join(criteria_parts) if criteria_parts else "ALL"
-        logger.debug(f"Searching emails in '{folder}' with criteria: {search_criteria}")
+        logger.debug(f"Searching emails in '{folder}' with criteria: {search_criteria} (archive_local={cfg.get('archive_local', True)})")
 
+        if cfg.get("archive_local", True):
+            # Sync any new incoming emails first
+            self._sync_imap_to_archive(folder=folder)
+
+            matches = self.archive.search_emails(
+                folder=folder,
+                query=query,
+                sender=sender,
+                recipient=recipient,
+                subject=subject,
+                since_date=since_date,
+                limit=limit
+            )
+
+            if not matches:
+                logger.info(f"No emails matched criteria '{search_criteria}' in '{folder}' (local archive).")
+                return f"No emails matched criteria '{search_criteria}' in '{folder}'."
+
+            results = []
+            for em in matches:
+                eid = em["id"]
+                sndr = em.get("from_sender") or "Unknown"
+                subj = em.get("subject") or "(No Subject)"
+                dt = em.get("date_str") or "Unknown"
+                results.append(f"- [ID: {eid}] From: {sndr} | Subject: '{subj}' | Date: {dt}")
+
+            logger.info(f"Search matched {len(results)} email(s) in '{folder}' (local archive)")
+            return f"Found {len(results)} match(es) for criteria '{search_criteria}':\n" + "\n".join(results)
+
+        # Fallback to direct IMAP search
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"search_emails IMAP connection failed: {imap_or_err}")
@@ -706,6 +943,7 @@ class EmailTool(Tool):
         attachment_filename = str(params.get("attachment_filename", "")).strip()
         save_directory = params.get("save_directory")
         folder = params.get("folder", "INBOX")
+        cfg = self._get_settings()
 
         if not email_id:
             logger.error("download_attachment failed: 'email_id' is missing.")
@@ -713,8 +951,79 @@ class EmailTool(Tool):
 
         target_dir = os.path.expanduser(save_directory) if save_directory else self._get_agent_download_dir()
         os.makedirs(target_dir, exist_ok=True)
-        logger.debug(f"Downloading attachment(s) '{attachment_filename or 'ALL'}' from email UID '{email_id}' in '{folder}' to '{target_dir}'")
+        logger.debug(f"Downloading attachment(s) '{attachment_filename or 'ALL'}' from email UID '{email_id}' in '{folder}' to '{target_dir}' (archive_local={cfg.get('archive_local', True)})")
 
+        if cfg.get("archive_local", True):
+            em = self.archive.get_email(email_id, folder=folder)
+            if not em:
+                self._sync_imap_to_archive(folder=folder)
+                em = self.archive.get_email(email_id, folder=folder)
+
+            if not em:
+                logger.error(f"download_attachment failed: Email ID '{email_id}' not found.")
+                return f"Error: Email with UID '{email_id}' not found."
+
+            raw_bytes = em.get("raw_msg")
+            if not raw_bytes:
+                return f"Error: Email with ID '{email_id}' does not have raw content stored."
+
+            msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+            found_attachments = []
+            part_idx = 1
+            for part in msg.walk():
+                if part.get_content_maintype() == 'multipart':
+                    continue
+
+                fn = part.get_filename()
+                content_disposition = str(part.get("Content-Disposition", ""))
+                content_type = part.get_content_type()
+
+                if fn or "attachment" in content_disposition or (content_disposition and content_type != "text/plain" and content_type != "text/html"):
+                    payload = part.get_payload(decode=True)
+                    if payload is not None:
+                        if fn:
+                            decoded_fn = _decode_mime_header(fn)
+                        else:
+                            ext = mimetypes.guess_extension(content_type) or ".bin"
+                            decoded_fn = f"attachment_{part_idx}{ext}"
+                        found_attachments.append((decoded_fn, payload, content_type))
+                        part_idx += 1
+
+            if not found_attachments:
+                logger.info(f"No attachments found in email '{email_id}'.")
+                return f"No attachments found in email '{email_id}'."
+
+            save_all = not attachment_filename or attachment_filename.lower() in ["all", "*"]
+            to_save = []
+
+            if save_all:
+                to_save = found_attachments
+            else:
+                for fn, payload, ctype in found_attachments:
+                    if fn.lower() == attachment_filename.lower() or attachment_filename.lower() in fn.lower():
+                        to_save.append((fn, payload, ctype))
+
+            if not to_save:
+                avail = ", ".join(f"'{a[0]}'" for a in found_attachments)
+                logger.error(f"download_attachment failed: Attachment '{attachment_filename}' not found in email '{email_id}'. Available: {avail}")
+                return f"Error: Attachment '{attachment_filename}' not found in email '{email_id}'. Available attachments: {avail}"
+
+            saved_results = []
+            for fn, payload, ctype in to_save:
+                clean_filename = re.sub(r'[/\\?%*:|"<>]', '_', fn)
+                save_path = os.path.join(target_dir, clean_filename)
+                with open(save_path, "wb") as f:
+                    f.write(payload)
+                size_kb = len(payload) / 1024
+                logger.info(f"Saved attachment '{fn}' ({len(payload)} bytes) to '{save_path}'")
+                saved_results.append(f"- {fn} ({size_kb:.1f} KB, {ctype}) -> {save_path}")
+
+            if len(saved_results) == 1:
+                return f"Attachment successfully downloaded and saved:\n{saved_results[0]}"
+            else:
+                return f"Successfully downloaded {len(saved_results)} attachment(s) to '{target_dir}':\n" + "\n".join(saved_results)
+
+        # Fallback to direct IMAP download
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"download_attachment IMAP connection failed: {imap_or_err}")
@@ -806,11 +1115,19 @@ class EmailTool(Tool):
         email_id = str(params.get("email_id", "")).strip()
         read = bool(params.get("read", True))
         folder = params.get("folder", "INBOX")
+        cfg = self._get_settings()
 
         if not email_id:
             return "Error: 'email_id' is required."
 
-        logger.debug(f"Marking email UID '{email_id}' as {'read' if read else 'unread'} in '{folder}'")
+        logger.debug(f"Marking email UID '{email_id}' as {'read' if read else 'unread'} in '{folder}' (archive_local={cfg.get('archive_local', True)})")
+
+        if cfg.get("archive_local", True):
+            self.archive.mark_as_read(email_id, is_read=read, folder=folder)
+            logger.info(f"Updated read flag for email '{email_id}' to {read} in local archive")
+            return f"Email '{email_id}' marked as {'read' if read else 'unread'}."
+
+        # Fallback to direct IMAP
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"mark_as_read IMAP connection failed: {imap_or_err}")
@@ -839,11 +1156,31 @@ class EmailTool(Tool):
         email_id = str(params.get("email_id", "")).strip()
         folder = params.get("folder", "INBOX")
         expunge = bool(params.get("expunge", True))
+        cfg = self._get_settings()
 
         if not email_id:
             return "Error: 'email_id' is required."
 
-        logger.debug(f"Deleting email UID '{email_id}' in '{folder}' (expunge={expunge})")
+        logger.debug(f"Deleting email UID '{email_id}' in '{folder}' (expunge={expunge}, archive_local={cfg.get('archive_local', True)})")
+
+        if cfg.get("archive_local", True):
+            self.archive.delete_email(email_id, folder=folder)
+            # Also attempt deleting from server if still on server
+            try:
+                success, imap_or_err = self._get_imap_connection()
+                if success:
+                    imap = imap_or_err
+                    imap.select(f'"{folder}"', readonly=False)
+                    imap.uid("store", email_id.encode("ascii"), "+FLAGS", "\\Deleted")
+                    if expunge:
+                        imap.expunge()
+                    imap.logout()
+            except Exception:
+                pass
+            logger.info(f"Deleted email UID '{email_id}' from '{folder}'")
+            return f"Email '{email_id}' deleted successfully from folder '{folder}'."
+
+        # Fallback to direct IMAP
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"delete_email IMAP connection failed: {imap_or_err}")
@@ -868,33 +1205,43 @@ class EmailTool(Tool):
 
     def _execute_list_folders(self, params: dict) -> str:
         logger.debug("Listing mailbox folders...")
+        cfg = self._get_settings()
+        local_folders = set(self.archive.list_folders()) if cfg.get("archive_local", True) else set()
+
+        server_folders = []
         success, imap_or_err = self._get_imap_connection()
-        if not success:
+        if success:
+            imap = imap_or_err
+            try:
+                status, folders = imap.list()
+                imap.logout()
+                if status == "OK" and folders:
+                    for f in folders:
+                        if isinstance(f, bytes):
+                            server_folders.append(f.decode("utf-8", errors="replace"))
+            except Exception as e:
+                logger.warning(f"Error querying IMAP folders: {e}")
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+        elif not cfg.get("archive_local", True):
             logger.error(f"list_folders IMAP connection failed: {imap_or_err}")
             return f"Failed to connect to IMAP server: {imap_or_err}"
 
-        imap = imap_or_err
-        try:
-            status, folders = imap.list()
-            imap.logout()
-            if status != "OK" or not folders:
-                logger.info("No mailbox folders found.")
-                return "No mailbox folders found."
+        folder_lines = []
+        if server_folders:
+            for f_str in server_folders:
+                folder_lines.append(f"- {f_str}")
+        else:
+            for lf in sorted(local_folders):
+                folder_lines.append(f"- {lf}")
 
-            folder_names = []
-            for f in folders:
-                if isinstance(f, bytes):
-                    f_str = f.decode("utf-8", errors="replace")
-                    folder_names.append(f"- {f_str}")
-            logger.info(f"Discovered {len(folder_names)} mailbox folder(s)")
-            return "Mailbox Folders:\n" + "\n".join(folder_names)
-        except Exception as e:
-            logger.error(f"Error listing folders: {type(e).__name__}: {str(e)}", exc_info=True)
-            try:
-                imap.logout()
-            except Exception:
-                pass
-            return f"Error listing folders: {type(e).__name__}: {str(e)}"
+        if not folder_lines:
+            folder_lines = ["- INBOX"]
+
+        logger.info(f"Discovered {len(folder_lines)} mailbox folder(s)")
+        return "Mailbox Folders:\n" + "\n".join(folder_lines)
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -1097,10 +1444,23 @@ class EmailTool(Tool):
             },
             {
                 "name": "Email_list_folders",
-                "description": "List all available mailbox folders on the IMAP server.",
+                "description": "List all available mailbox folders on the IMAP server and local archive.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
+                }
+            },
+            {
+                "name": "Email_sync_emails",
+                "description": "Synchronize incoming emails from the IMAP server into the local archive and purge them from the server to free mailbox quota.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "folder": {
+                            "type": "STRING",
+                            "description": "Mailbox folder to sync (default 'INBOX')."
+                        }
+                    }
                 }
             }
         ]

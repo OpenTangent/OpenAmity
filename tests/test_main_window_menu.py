@@ -52,14 +52,15 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
     actions = window.hamburger_menu.actions()
 
     # Verify action sequence
-    # Total items: 6 agent sections + 1 Delete Agent + 1 Separator + 1 System Settings + 1 Exit = 10 items
-    assert len(actions) == 10
+    # Total items: 7 agent sections + 1 Delete Agent + 1 Separator + 1 System Settings + 1 Exit = 11 items
+    assert len(actions) == 11
 
     expected_agent_titles = [
+        "Cognitive Provider",
         "Basic Agent Settings",
         "Agent Values and Goals",
         "Agent Voice",
-        "Provider Setup",
+        "Media Provider",
         "Social Accounts",
         "Other Agent Settings",
         "Delete Agent"
@@ -69,14 +70,14 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
         assert actions[idx].text() == title
         assert not actions[idx].isSeparator()
 
-    # Verify partition separator is at index 7
-    assert actions[7].isSeparator()
+    # Verify partition separator is at index 8
+    assert actions[8].isSeparator()
 
     # Verify system sections below the partition line
-    assert actions[8].text() == "System Settings"
-    assert not actions[8].isSeparator()
-    assert actions[9].text() == "Exit"
+    assert actions[9].text() == "System Settings"
     assert not actions[9].isSeparator()
+    assert actions[10].text() == "Exit"
+    assert not actions[10].isSeparator()
 
     # Test Agent View State
     window.switch_to_agent(aid1)
@@ -84,15 +85,16 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
     for action in window.agent_menu_actions:
         assert action.isVisible()
     assert window.menu_separator.isVisible()
-    assert actions[8].isVisible()  # System Settings
-    assert actions[9].isVisible()  # Exit
+    assert actions[9].isVisible()  # System Settings
+    assert actions[10].isVisible()  # Exit
 
     visible_in_agent_view = [a.text() for a in actions if not a.isSeparator() and a.isVisible()]
     assert visible_in_agent_view == [
+        "Cognitive Provider",
         "Basic Agent Settings",
         "Agent Values and Goals",
         "Agent Voice",
-        "Provider Setup",
+        "Media Provider",
         "Social Accounts",
         "Other Agent Settings",
         "Delete Agent",
@@ -106,8 +108,8 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
     for action in window.agent_menu_actions:
         assert not action.isVisible()
     assert not window.menu_separator.isVisible()
-    assert actions[8].isVisible()  # System Settings
-    assert actions[9].isVisible()  # Exit
+    assert actions[9].isVisible()  # System Settings
+    assert actions[10].isVisible()  # Exit
 
     visible_in_chatroom = [a.text() for a in actions if not a.isSeparator() and a.isVisible()]
     assert visible_in_chatroom == ["System Settings", "Exit"]
@@ -118,8 +120,8 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
     for action in window.agent_menu_actions:
         assert action.isVisible()
     assert window.menu_separator.isVisible()
-    assert actions[8].isVisible()
     assert actions[9].isVisible()
+    assert actions[10].isVisible()
 
     window.close()
 

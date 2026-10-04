@@ -36,6 +36,16 @@ DISALLOWED_SENSITIVE_HOME_ENTRIES = (
     ".var",
 )
 
+EXCLUDED_DIR_NAMES = {"node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__", "browser_data", "audio_cache", "generated_media"}
+EXCLUDED_FILE_NAMES = {
+    "SingletonLock", "SingletonCookie", "SingletonSocket",
+    "daemon.pid", "daemon.port", ".last_engine_update"
+}
+EXCLUDED_EXTERNAL_DIR_NAMES = {
+    "node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__",
+    ".git", ".venv", "venv", ".cache", "audio_cache", "generated_media"
+}
+
 
 def is_safe_external_backup_path(path: str) -> bool:
     """
@@ -392,14 +402,14 @@ def create_agent_backup(
 
     # Discover candidate files first for accurate progress reporting
     # Directories and files to exclude from backups (transient caches, lock files, bulky node_modules and browser binaries)
-    EXCLUDED_DIR_NAMES = {"node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__", "browser_data"}
+    EXCLUDED_DIR_NAMES = {"node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__", "browser_data", "audio_cache", "generated_media"}
     EXCLUDED_FILE_NAMES = {
         "SingletonLock", "SingletonCookie", "SingletonSocket",
         "daemon.pid", "daemon.port", ".last_engine_update"
     }
     EXCLUDED_EXTERNAL_DIR_NAMES = {
         "node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__",
-        ".git", ".venv", "venv", ".cache"
+        ".git", ".venv", "venv", ".cache", "audio_cache", "generated_media"
     }
 
     # Synchronize and clean backup targets before archiving
@@ -692,6 +702,9 @@ def restore_agent_backup(
             if os.path.exists(target_dir):
                 logging.info(f"BackupManager: Fully deleting existing agent state at {target_dir} before restore...")
                 shutil.rmtree(target_dir, ignore_errors=True)
+
+        from core.settings_manager import SettingsManager
+        SettingsManager.remove_instance(target_agent_id)
 
         os.makedirs(target_dir, exist_ok=True)
 

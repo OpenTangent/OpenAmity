@@ -594,3 +594,87 @@ def test_claude_worker_light_model_fallback(monkeypatch, tmp_path):
         assert "Fallback succeeded" in emitted_thoughts[0]
 
 
+def test_claude_send_function_responses_with_media_attachment(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    img_file = tmp_path / "test_image.jpg"
+    img_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-ant-test-key-12345"):
+        worker = ClaudeWorker(agent_id="test_claude_agent")
+        worker.start_session(system_instruction="Test media tool response")
+
+        tc = MagicMock()
+        tc.type = "tool_use"
+        tc.id = "toolu_media_123"
+        tc.name = "Media_generate"
+        tc.input = {"prompt": "A sunset"}
+        worker.history.append({"role": "assistant", "content": [tc]})
+
+        captured_parts = []
+        def synchronous_thread(target, args=(), kwargs=None, daemon=None):
+            m = MagicMock()
+            m.start = lambda: captured_parts.extend(args[0] if args else [])
+            return m
+
+        with patch("threading.Thread", side_effect=synchronous_thread):
+            worker.send_function_responses([
+                ("Media_generate", {
+                    "result": f"Successfully generated and saved image to {str(img_file)}",
+                    "media": [str(img_file)]
+                })
+            ])
+
+        assert len(captured_parts) == 2
+        # First part is tool_result
+        assert captured_parts[0]["type"] == "tool_result"
+        parsed = json.loads(captured_parts[0]["content"])
+        assert "media" not in parsed
+        assert "Successfully generated and saved image" in parsed["result"]
+
+        # Second part is base64 image
+        assert captured_parts[1]["type"] == "image"
+        assert captured_parts[1]["source"]["type"] == "base64"
+        assert captured_parts[1]["source"]["media_type"] == "image/jpeg"
+        assert len(captured_parts[1]["source"]["data"]) > 0
+
+
+def test_claude_send_function_responses_low_token_skips_media(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    img_file = tmp_path / "test_image.jpg"
+    img_file.write_bytes(b"dummy")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-ant-test-key-12345"):
+        worker = ClaudeWorker(agent_id="test_claude_agent")
+        worker.settings.set("core.low-token-mode", True)
+        worker.start_session(system_instruction="Test low token mode")
+
+        tc = MagicMock()
+        tc.type = "tool_use"
+        tc.id = "toolu_media_low"
+        tc.name = "Media_generate"
+        tc.input = {"prompt": "A sunset"}
+        worker.history.append({"role": "assistant", "content": [tc]})
+
+        captured_parts = []
+        def synchronous_thread(target, args=(), kwargs=None, daemon=None):
+            m = MagicMock()
+            m.start = lambda: captured_parts.extend(args[0] if args else [])
+            return m
+
+        with patch("threading.Thread", side_effect=synchronous_thread):
+            worker.send_function_responses([
+                ("Media_generate", {
+                    "result": "Saved image",
+                    "media": [str(img_file)]
+                })
+            ])
+
+        assert len(captured_parts) == 2
+        assert captured_parts[0]["type"] == "tool_result"
+        assert captured_parts[1]["type"] == "text"
+        assert "skipped: Low Token Mode is active" in captured_parts[1]["text"]
+
+
+

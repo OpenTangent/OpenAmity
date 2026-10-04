@@ -129,10 +129,11 @@ class SubagentWorker:
 
         self._abort_flag = False
         self.is_processing = True
-        parts = [
-            types.Part.from_function_response(name=name, response=response)
-            for name, response in responses
-        ]
+        parts = []
+        for name, response in responses:
+            clean_resp = dict(response) if isinstance(response, dict) else {"result": str(response)}
+            clean_resp.pop('media', None)
+            parts.append(types.Part.from_function_response(name=name, response=clean_resp))
         threading.Thread(target=self._process_thought,
                          args=(parts,), daemon=True).start()
 

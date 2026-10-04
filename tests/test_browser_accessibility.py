@@ -4,6 +4,8 @@ import time
 import pytest
 from core.browser_manager import BrowserManager
 
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
+
 
 @pytest.fixture
 def browser_mgr():

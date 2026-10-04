@@ -117,7 +117,7 @@ class SystemTool(Tool):
         "settings (Inspects current agent configuration and voice settings.)",
         "get_external_ip (Queries current public IP address.)",
         "create_backup [target] [backup_location] (Creates .oaa snapshot for 'self' or 'all' agents.)",
-        "set_custom_voice <custom_prompt> [voice_model] (Sets custom directorial voice prompt following acoustic stability guidelines.)",
+        "set_custom_voice <custom_prompt> [voice_model] (Sets custom directorial voice delivery style and optional base voice or custom Voice ID.)",
         "reset_voice (Restores voice settings to baseline user configuration.)",
         "generate_api_key <name> [scopes] [expires_in_days] (Generates an isolated API key for third-party pulse injection.)",
         "list_api_keys (Lists existing API keys with metadata, scopes, and expiration.)",
@@ -130,7 +130,7 @@ class SystemTool(Tool):
         return [
             {
                 "name": "System_platform_info",
-                "description": "Returns useful system information like the Open Amity version number, OS, hardware info (RAM, CPU, storage, temps), log locations, network info, Python version, and uptime.",
+                "description": "Returns useful system information like the Open Amity version number, current system date and time, OS, hardware info (RAM, CPU, storage, temps), log locations, network info, Python version, and uptime.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
@@ -172,15 +172,13 @@ class SystemTool(Tool):
             {
                 "name": "System_set_custom_voice",
                 "description": (
-                    "Sets a custom directorial voice prompt and optional base voice model for this agent's Gemini TTS speech synthesis. "
+                    "Sets a custom directorial voice delivery style and optional base voice model (or custom Voice ID) for this agent's Gemini TTS speech synthesis. "
                     "Enables 'override-prompt' mode in the agent's settings.\n"
-                    "CRITICAL PROMPT STABILITY GUIDELINES (to prevent FinishReason.SAFETY aborts on gemini-3.1-flash-tts-preview):\n"
-                    "1. Positive Imperative Phrasing: State clearly how to speak using direct positive direction (e.g., 'Read the following transcript aloud as [Name] in a [accent] accent with a [tone] demeanor').\n"
-                    "2. Grounding Anchors: Always include acoustic grounding directives like 'with clear articulation and natural conversational pacing:'.\n"
-                    "3. NO Markdown Scaffolding: DO NOT use markdown headings or structural sections (e.g., '# AUDIO PROFILE', '## Scene Setting', 'Director's Notes'). These confuse the audio decoder, causing instruction vocalization or safety watchdog kills.\n"
-                    "4. NO Negative Constraints: DO NOT use negative suppression rules (e.g., 'Do NOT speak fast', 'Never whisper', 'Do NOT sound robotic'). Autoregressive decoders destabilize when processing negative constraints; state positive target characteristics instead.\n"
-                    "5. Delimiter / Injection: End the prompt with a colon (':') or include '{transcript}' where the text should be inserted. The system automatically appends the spoken text if a colon is used.\n"
-                    "Note: If gemini-3.1-flash-tts-preview encounters an unhandled safety abort, the pipeline automatically retries and falls back to gemini-2.5-flash-preview-tts."
+                    "Gemini 3.8 Flash TTS Guidelines:\n"
+                    "1. Directorial Delivery Style: State clearly how to speak using direct positive direction (e.g., 'warm, calm demeanor with natural conversational pacing and a Scottish accent'). This is passed directly into the speech metadata style parameter.\n"
+                    "2. Native Expressive Cues: To express momentary conversational cues during speech (laughs, sighs, whispers, pauses), use angle-bracket tags directly in your spoken text via Speaker_speak_aloud (e.g. <laugh>, <sigh>, <whisper>, <throat-clearing>, <short pause>). Do NOT use square-bracket tags.\n"
+                    "3. Base Voice / Voice ID: You can specify any of Gemini's 30 prebuilt voices (e.g., 'Sulafat', 'Puck', 'Aoede', 'Fenrir') or a custom Voice ID from Google AI Studio (e.g., 'voice_...'). If omitted, preserves the existing voice.\n"
+                    "4. NO Markdown Headers or Negative Constraints: Do not use markdown headers or negative suppression rules ('Never whisper', 'Do not...'). State positive target characteristics."
                 ),
                 "parameters": {
                     "type": "OBJECT",
@@ -188,15 +186,12 @@ class SystemTool(Tool):
                         "custom_prompt": {
                             "type": "STRING",
                             "description": (
-                                "The complete custom directorial prompt. Must follow stability guidelines: positive imperative direction, "
-                                "include 'with clear articulation and natural conversational pacing:', NO markdown headers (# AUDIO PROFILE), "
-                                "NO negative constraints ('Do NOT...'), ending with a colon or containing {transcript}. "
-                                "Example: 'Read the following transcript aloud as Dex in a warm, low-register, sardonic Scottish accent with clear articulation and natural conversational pacing:'"
+                                "The custom directorial voice delivery style directive (e.g., 'warm, calm Scottish accent with clear articulation and natural conversational pacing')."
                             )
                         },
                         "voice_model": {
                             "type": "STRING",
-                            "description": "Optional Gemini prebuilt voice name (e.g., 'Sulafat', 'Achernar', 'Kore', 'Puck', 'Charon', 'Fenrir', 'Aoede'). If omitted, preserves the existing voice."
+                            "description": "Optional Gemini prebuilt voice name (e.g., 'Sulafat', 'Achernar', 'Kore', 'Puck', 'Charon', 'Fenrir', 'Aoede') or custom Voice ID (e.g. 'voice_...'). If omitted, preserves the existing voice."
                         }
                     },
                     "required": ["custom_prompt"]
@@ -311,6 +306,9 @@ class SystemTool(Tool):
         info = []
         info.append("=== Open Amity ===")
         info.append(f"Version: {__version__}")
+        now = datetime.now().astimezone()
+        tz_str = f" ({now.tzname()})" if now.tzname() else ""
+        info.append(f"Current Date & Time: {now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}")
 
         try:
             amity_uptime = time.time() - psutil.Process(os.getpid()).create_time()
@@ -490,13 +488,23 @@ class SystemTool(Tool):
             voice_model = args[1]
         voice_model = str(voice_model).strip() if voice_model else ""
 
+        # Sanitize prompt (remove legacy syntax like {transcript} or trailing colons)
+        clean_prompt = custom_prompt.replace("{transcript}", "").strip().rstrip(":").strip()
+
         sm.set("core.tts.gemini.override-prompt", True)
-        sm.set("core.tts.gemini.custom-prompt", custom_prompt)
+        sm.set("core.tts.gemini.custom-prompt", clean_prompt)
+
         if voice_model:
             sm.set("core.tts.gemini.model-name", voice_model)
+            if voice_model.startswith("voice_"):
+                sm.set("core.tts.gemini.voice-selection-mode", "custom_voice_id")
+                sm.set("core.tts.gemini.custom-voice-id", voice_model)
+            else:
+                sm.set("core.tts.gemini.voice-selection-mode", "prebuilt")
+
         sm.save()
 
-        msg = "Custom voice prompt successfully activated. Gemini TTS will now synthesize speech using your custom directorial prompt."
+        msg = f"Custom voice delivery style successfully activated: '{clean_prompt}'."
         if voice_model:
             msg += f" Base voice model set to '{voice_model}'."
         return msg

@@ -36,7 +36,7 @@ class ToolPip(QWidget):
         self.setAttribute(Qt.WA_Hover, True)
 
         self.created_at = time.monotonic()
-        self.duration = 4.0 if not is_async else None
+        self.duration = 8.0 if not is_async else None
         self.fade_duration = 0.35  # seconds
         self.state = "visible"  # "visible", "fading", "dead"
         self.fade_start_time: Optional[float] = None
@@ -285,7 +285,7 @@ class ToolPipManager(QObject):
         origin_x, origin_y, _ = self._get_container_bounds()
         pip_y = origin_y + 2
 
-        # 1. Check synchronous pips for 4.0s expiration
+        # 1. Check synchronous pips for 8.0s expiration
         expired_sync = []
         for pip in self.sync_pips:
             if pip.duration:
