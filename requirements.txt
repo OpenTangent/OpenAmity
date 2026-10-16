@@ -5,7 +5,7 @@ numpy
 python-dotenv
 Pillow
 markdown
-mempalace
+mempalace==3.10.0
 pyspellchecker
 Mastodon.py
 piper-tts
@@ -18,3 +18,5 @@ ddgs
 anthropic
 openai
 camoufox[geoip]>=0.5.6
+
+cryptography>=44.0

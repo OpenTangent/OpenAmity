@@ -22,8 +22,8 @@ class MediaSkill(Tool):
     icon = "🖼️"
     color = "#FF69B4"
     async_commands = []
-    description = "Allows the agent to explicitly read and append media files from the local file system, and generate images using a model."
-    commands = ["read", "generate"]
+    description = "Allows the agent to explicitly read and append media files from the local file system, generate images using a model, and transcribe audio files using speech-to-text."
+    commands = ["read", "generate", "transcribe_audio"]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -53,6 +53,20 @@ class MediaSkill(Tool):
                         }
                     },
                     "required": ["prompt"]
+                }
+            },
+            {
+                "name": "Media_transcribe_audio",
+                "description": "Transcribes an audio file into text using speech-to-text. Use this to extract messages or text from voice notes and audio recordings if multimodal audio input fails or is unavailable.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "file_path": {
+                            "type": "STRING",
+                            "description": "The absolute path to the audio file to transcribe."
+                        }
+                    },
+                    "required": ["file_path"]
                 }
             }
         ]
@@ -215,6 +229,38 @@ class MediaSkill(Tool):
 
             else:
                 return {"result": f"Error: An image generation provider has not been set up (unsupported provider: {image_provider})."}
+
+        if command == "transcribe_audio":
+            file_path = kwargs.get("file_path") or (args[0] if args else None)
+            if not file_path:
+                return {"result": "Error: Missing file_path parameter."}
+
+            exp_path = os.path.expanduser(file_path)
+
+            if not os.path.exists(exp_path):
+                return {"result": f"Error: File not found at {exp_path}"}
+
+            if not os.path.isfile(exp_path):
+                return {"result": f"Error: {exp_path} is not a file."}
+
+            file_size = os.path.getsize(exp_path)
+            if file_size == 0:
+                return {"result": f"Error: Audio file at {exp_path} is empty (0 bytes)."}
+
+            mime_type, _ = mimetypes.guess_type(exp_path)
+            ext = os.path.splitext(exp_path)[1].lower()
+            valid_audio_exts = {".wav", ".mp3", ".ogg", ".opus", ".m4a", ".flac", ".aac", ".wma"}
+            if not ((mime_type and mime_type.startswith("audio/")) or ext in valid_audio_exts):
+                return {"result": f"Error: {exp_path} does not appear to be an audio file (mime: {mime_type}, ext: {ext})."}
+
+            try:
+                from core.local_stt import LocalSTT
+                stt = LocalSTT()
+                transcription = stt.transcribe(exp_path)
+                return {"result": f"Audio Transcription ({os.path.basename(exp_path)}):\n{transcription}"}
+            except Exception as e:
+                logging.error(f"Media_transcribe_audio error: {e}", exc_info=True)
+                return {"result": f"Error transcribing audio: {e}"}
 
         if command != "read":
             return {"result": f"Unknown command: {command}"}

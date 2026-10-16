@@ -303,13 +303,37 @@ async function ensureListenersAttached() {
                             }
                         }
 
-                        // Final fallback for senderName
-                        if (!senderName || senderName === 'Unknown') {
-                            senderName = msg.notifyName || (resolvedSenderId.includes('@c.us') ? resolvedSenderId.split('@')[0] : (resolvedSenderId || 'Unknown'));
+                        // Group name (groups only)
+                        let groupName = '';
+                        if (isGroup) {
+                            try {
+                                const chat = await window.WPP.chat.get(rawChatId);
+                                groupName = (chat && (chat.name || chat.formattedTitle)) || '';
+                            } catch (e) {}
                         }
 
+                        // Mention / reply-to-me detection
+                        let mentioned = false;
+                        try {
+                            const ser = (w) => (w && (w._serialized || w)) || '';
+                            const myIds = new Set();
+                            try { myIds.add(ser(window.WPP.conn.getMyUserId())); } catch (e) {}
+                            try { if (window.WPP.conn.getMyUserLid) myIds.add(ser(window.WPP.conn.getMyUserLid())); } catch (e) {}
+                            myIds.delete('');
+                            const mentions = (msg.mentionedJidList || []).map(ser);
+                            const quoted = ser(msg.quotedParticipant);
+                            mentioned = mentions.some(j => myIds.has(j)) || (quoted !== '' && myIds.has(quoted));
+                        } catch (e) {}
+
                         const finalChatId = isGroup ? rawChatId : resolvedSenderId;
-                        window.nodeOnMsgReceived(finalChatId, senderName);
+                        const payload = JSON.stringify({
+                            chatId: finalChatId,
+                            senderName: senderName || '',
+                            isGroup: Boolean(isGroup),
+                            groupName: groupName || '',
+                            mentioned: Boolean(mentioned)
+                        });
+                        window.nodeOnMsgReceived(payload);
                     } catch (e) {
                         console.error('Error handling incoming message event:', e);
                     }
@@ -408,8 +432,8 @@ async function startClient() {
             isReady = true;
         });
 
-        await page.exposeFunction('nodeOnMsgReceived', (chatId, senderName) => {
-            console.log(`[MSG_RECEIVED] ${chatId} ${senderName}`);
+        await page.exposeFunction('nodeOnMsgReceived', (payload) => {
+            console.log(`[MSG_RECEIVED_JSON] ${payload}`);
         });
 
         // Pre-evaluate WA-JS on every page reload
@@ -629,9 +653,182 @@ async function serializeMsgInBrowser(msg, chat) {
 
     const msgIdStr = (msg.id && (msg.id._serialized || msg.id)) || '';
     let msgType = msg.type || 'chat';
-    if (msg.isMedia) {
-        if (!msgType || msgType === 'chat') msgType = 'document';
+    const isLocation = msgType === 'location' || msgType === 'live_location' || (typeof msg.lat === 'number' && typeof msg.lng === 'number');
+    const isContact = msgType === 'vcard' || msgType === 'multi_vcard' || msgType === 'contact';
+
+    let locationData = null;
+    let contactData = null;
+    let content = '';
+
+    if (isLocation) {
+        msgType = msg.isLive ? 'live_location' : 'location';
+        locationData = {
+            lat: typeof msg.lat === 'number' ? msg.lat : (msg.lat ? parseFloat(msg.lat) : null),
+            lng: typeof msg.lng === 'number' ? msg.lng : (msg.lng ? parseFloat(msg.lng) : null),
+            name: msg.loc || '',
+            address: msg.address || '',
+            comment: msg.comment || msg.caption || '',
+            url: msg.clientUrl || msg.url || '',
+            isLive: Boolean(msg.isLive),
+            accuracy: msg.accuracy,
+            speed: msg.speed,
+            degrees: msg.degrees,
+            shareDuration: msg.shareDuration
+        };
+
+        const details = [];
+        if (locationData.lat !== null && locationData.lng !== null) {
+            details.push('Latitude: ' + locationData.lat, 'Longitude: ' + locationData.lng);
+        }
+        if (locationData.name) {
+            details.push('Place: ' + locationData.name);
+        }
+        if (locationData.address) {
+            details.push('Address: ' + locationData.address);
+        }
+        if (locationData.lat !== null && locationData.lng !== null) {
+            details.push('Maps: https://maps.google.com/?q=' + locationData.lat + ',' + locationData.lng);
+        }
+        if (locationData.url) {
+            details.push('URL: ' + locationData.url);
+        }
+
+        const tag = locationData.isLive ? 'Live Location' : 'Location Pin';
+        const locHeader = details.length > 0 ? '[' + tag + ': ' + details.join(' | ') + ']' : '[' + tag + ']';
+        const userText = locationData.comment;
+        content = userText ? (locHeader + ' ' + userText) : locHeader;
+    } else if (isContact) {
+        function parseVCardString(vcardStr, fallbackName) {
+            if (!vcardStr || typeof vcardStr !== 'string') {
+                return fallbackName ? { name: fallbackName, phone: null, phones: [], whatsappId: null, org: null, title: null, email: null, url: null, vcard: null } : null;
+            }
+            const lines = vcardStr.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n').replace(/\\n[ \\t]/g, '').split('\\n');
+            let name = fallbackName || '';
+            let phones = [];
+            let whatsappId = null;
+            let org = '';
+            let title = '';
+            let email = '';
+            let url = '';
+
+            for (const rawLine of lines) {
+                const line = rawLine.trim();
+                if (!line) continue;
+                const colonIdx = line.indexOf(':');
+                if (colonIdx === -1) continue;
+                const keyPart = line.slice(0, colonIdx);
+                const valPart = line.slice(colonIdx + 1).trim();
+                const keyUpper = keyPart.toUpperCase();
+
+                if (keyUpper === 'FN' || keyUpper.startsWith('FN;') || keyUpper.startsWith('FN:')) {
+                    if (valPart) name = valPart;
+                } else if ((keyUpper === 'N' || keyUpper.startsWith('N;')) && !name) {
+                    const parts = valPart.split(';').filter(Boolean);
+                    if (parts.length >= 2) name = parts[1] + ' ' + parts[0];
+                    else if (parts.length === 1) name = parts[0];
+                } else if (keyUpper === 'TEL' || keyUpper.startsWith('TEL;') || keyUpper.startsWith('TEL:')) {
+                    if (valPart) phones.push(valPart);
+                    const waidMatch = keyPart.match(/waid=(\\d+)/i);
+                    if (waidMatch && !whatsappId) {
+                        whatsappId = waidMatch[1] + '@c.us';
+                    }
+                } else if (keyUpper === 'ORG' || keyUpper.startsWith('ORG;')) {
+                    org = valPart.replace(/;/g, ' ').trim();
+                } else if (keyUpper === 'TITLE' || keyUpper.startsWith('TITLE;')) {
+                    title = valPart;
+                } else if (keyUpper === 'EMAIL' || keyUpper.startsWith('EMAIL;')) {
+                    email = valPart;
+                } else if (keyUpper === 'URL' || keyUpper.startsWith('URL;')) {
+                    url = valPart;
+                }
+            }
+
+            const primaryPhone = phones[0] || null;
+            if (!whatsappId && primaryPhone) {
+                const cleanDigits = primaryPhone.replace(/[^\\d]/g, '');
+                if (cleanDigits.length >= 7) {
+                    whatsappId = cleanDigits + '@c.us';
+                }
+            }
+
+            return {
+                name: name || 'Unknown Contact',
+                phone: primaryPhone,
+                phones: phones,
+                whatsappId: whatsappId,
+                org: org || null,
+                title: title || null,
+                email: email || null,
+                url: url || null,
+                vcard: vcardStr
+            };
+        }
+
+        let parsedContacts = [];
+        if (msg.vcardList && Array.isArray(msg.vcardList) && msg.vcardList.length > 0) {
+            for (const item of msg.vcardList) {
+                const vcardStr = (item && typeof item === 'object') ? (item.vcard || '') : (typeof item === 'string' ? item : '');
+                const fallbackName = (item && typeof item === 'object') ? (item.displayName || item.name || '') : '';
+                const parsed = parseVCardString(vcardStr, fallbackName);
+                if (parsed) parsedContacts.push(parsed);
+            }
+        } else if (msg.body && typeof msg.body === 'string' && msg.body.includes('BEGIN:VCARD')) {
+            const chunks = msg.body.split(/(?=BEGIN:VCARD)/i).filter(c => c.trim().length > 0);
+            for (const chunk of chunks) {
+                const parsed = parseVCardString(chunk, msg.vcardFormattedName);
+                if (parsed) parsedContacts.push(parsed);
+            }
+        } else if (msg.vcardFormattedName) {
+            parsedContacts.push({
+                name: msg.vcardFormattedName,
+                phone: null,
+                phones: [],
+                whatsappId: null,
+                org: null,
+                title: null,
+                email: null,
+                url: null,
+                vcard: null
+            });
+        }
+
+        contactData = parsedContacts;
+        if (contactData.length === 1) {
+            const c = contactData[0];
+            const details = [];
+            if (c.name) details.push('Name: ' + c.name);
+            if (c.phone) details.push('Phone: ' + c.phone);
+            if (c.whatsappId) details.push('WhatsApp ID: ' + c.whatsappId);
+            if (c.org) details.push('Org: ' + c.org);
+            if (c.title) details.push('Title: ' + c.title);
+            if (c.email) details.push('Email: ' + c.email);
+            if (c.url) details.push('URL: ' + c.url);
+            const cardHeader = details.length > 0 ? '[Contact Card: ' + details.join(' | ') + ']' : '[Contact Card]';
+            const userText = msg.comment || msg.caption || '';
+            content = userText ? (cardHeader + ' ' + userText) : cardHeader;
+        } else if (contactData.length > 1) {
+            const summaries = contactData.map((c, i) => {
+                const parts = [];
+                if (c.name) parts.push('Name: ' + c.name);
+                if (c.phone) parts.push('Phone: ' + c.phone);
+                if (c.whatsappId) parts.push('WhatsApp ID: ' + c.whatsappId);
+                if (c.org) parts.push('Org: ' + c.org);
+                return (i + 1) + '. ' + parts.join(' | ');
+            });
+            const cardHeader = '[Contact Cards (' + contactData.length + '): ' + summaries.join(' ; ') + ']';
+            const userText = msg.comment || msg.caption || '';
+            content = userText ? (cardHeader + ' ' + userText) : cardHeader;
+        } else {
+            content = '[Contact Card]';
+        }
+    } else {
+        if (msg.isMedia) {
+            if (!msgType || msgType === 'chat') msgType = 'document';
+        }
+        content = msg.body || msg.caption || '';
     }
+
+    const hasMedia = !isLocation && !isContact && Boolean(msg.hasMedia || msg.isMedia || msgType === 'ptt' || msgType === 'audio' || msgType === 'image' || msgType === 'video' || msgType === 'document');
 
     return {
         id: msgIdStr,
@@ -642,11 +839,13 @@ async function serializeMsgInBrowser(msg, chat) {
         author: authorStr,
         senderName: senderName,
         senderNumber: senderNumber,
-        content: msg.body || msg.caption || '',
+        content: content,
         fromMe: Boolean(msg.fromMe || msg.id && msg.id.fromMe),
         isGroup: isGroup,
-        hasMedia: Boolean(msg.hasMedia || msg.isMedia || msgType === 'ptt' || msgType === 'audio' || msgType === 'image' || msgType === 'video' || msgType === 'document'),
-        type: msgType
+        hasMedia: hasMedia,
+        type: msgType,
+        location: locationData,
+        contacts: contactData
     };
 }
 `;
@@ -662,13 +861,30 @@ async function downloadAndSaveMedia(msgId, msgType) {
 
         if (!base64Data) return null;
 
-        const matches = base64Data.match(/^data:([^;]+);base64,(.+)$/);
-        const mimeType = matches ? matches[1] : 'application/octet-stream';
-        const rawBase64 = matches ? matches[2] : base64Data;
+        let mimeType = 'application/octet-stream';
+        let rawBase64 = base64Data;
+
+        const commaIdx = base64Data.indexOf(',');
+        if (base64Data.startsWith('data:') && commaIdx !== -1) {
+            const meta = base64Data.slice(5, commaIdx);
+            mimeType = meta.split(';')[0].trim() || 'application/octet-stream';
+            rawBase64 = base64Data.slice(commaIdx + 1).trim();
+        } else {
+            const matches = base64Data.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.+)$/s);
+            if (matches) {
+                mimeType = matches[1].trim();
+                rawBase64 = matches[2].trim();
+            }
+        }
 
         let extension = 'bin';
         if (mimeType.includes('/')) {
-            extension = mimeType.split('/')[1].split(';')[0];
+            extension = mimeType.split('/')[1].split(';')[0].trim();
+        }
+        if (msgType === 'ptt' || msgType === 'audio' || mimeType.startsWith('audio/')) {
+            if (extension === 'bin' || extension === 'octet-stream') {
+                extension = 'ogg';
+            }
         }
         if (msgType === 'ptt') extension = 'ogg';
 
@@ -948,6 +1164,217 @@ app.post('/send', upload.single('media'), async (req, res) => {
     }
 });
 
+app.post('/send_location', async (req, res) => {
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const { target, lat, lng, name, address, url, reply_to } = req.body;
+
+    if (!target) {
+        return res.status(400).json({ error: 'Missing required field: target' });
+    }
+    const parsedLat = typeof lat === 'string' ? parseFloat(lat) : Number(lat);
+    const parsedLng = typeof lng === 'string' ? parseFloat(lng) : Number(lng);
+    if (isNaN(parsedLat) || isNaN(parsedLng)) {
+        return res.status(400).json({ error: 'Invalid or missing coordinates (lat, lng)' });
+    }
+
+    try {
+        const resolvedChatId = await page.evaluate(async (t, resolveHelper) => {
+            eval(resolveHelper);
+            return await resolveTargetInBrowser(t);
+        }, target, browserResolveTarget);
+
+        if (!resolvedChatId) {
+            return res.status(404).json({ error: `Could not resolve target: ${target}` });
+        }
+
+        let sendOptions = {};
+        if (reply_to) {
+            sendOptions.quotedMsg = reply_to;
+        }
+
+        const locationOptions = {
+            lat: parsedLat,
+            lng: parsedLng,
+            name: name || undefined,
+            address: address || undefined,
+            url: url || undefined,
+            ...sendOptions
+        };
+
+        await page.evaluate(async (cid, opts) => {
+            await window.WPP.chat.sendLocationMessage(cid, opts);
+        }, resolvedChatId, locationOptions);
+
+        res.json({ success: true, target: resolvedChatId });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/send_contact', async (req, res) => {
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const { target, name, phone, organization, email, vcard, contacts, reply_to } = req.body;
+
+    if (!target) {
+        return res.status(400).json({ error: 'Missing required field: target' });
+    }
+
+    if (!name && !phone && !vcard && (!contacts || (Array.isArray(contacts) && contacts.length === 0))) {
+        return res.status(400).json({ error: 'Missing contact information (name, phone, vcard, or contacts)' });
+    }
+
+    try {
+        const resolvedChatId = await page.evaluate(async (t, resolveHelper) => {
+            eval(resolveHelper);
+            return await resolveTargetInBrowser(t);
+        }, target, browserResolveTarget);
+
+        if (!resolvedChatId) {
+            return res.status(404).json({ error: `Could not resolve target: ${target}` });
+        }
+
+        let sendOptions = {};
+        if (reply_to) {
+            sendOptions.quotedMsg = reply_to;
+        }
+
+        const contactPayload = {
+            name: name || undefined,
+            phone: phone || undefined,
+            organization: organization || undefined,
+            email: email || undefined,
+            vcard: vcard || undefined,
+            contacts: contacts || undefined
+        };
+
+        await page.evaluate(async (cid, data, opts) => {
+            function buildVCard(cName, cPhone, cOrg, cEmail) {
+                let cleanPhone = (cPhone || '').replace(/[^\d]/g, '');
+                let lines = [
+                    'BEGIN:VCARD',
+                    'VERSION:3.0',
+                    'FN:' + (cName || cleanPhone || 'Contact'),
+                    'N:' + (cName || cleanPhone || 'Contact') + ';;;;'
+                ];
+                if (cleanPhone) {
+                    lines.push('TEL;type=CELL;type=VOICE;waid=' + cleanPhone + ':+' + cleanPhone);
+                }
+                if (cOrg) {
+                    lines.push('ORG:' + cOrg);
+                }
+                if (cEmail) {
+                    lines.push('EMAIL;type=INTERNET:' + cEmail);
+                }
+                lines.push('END:VCARD');
+                return lines.join('\n');
+            }
+
+            // Case 1: Multi-contact array
+            if (data.contacts && Array.isArray(data.contacts) && data.contacts.length > 0) {
+                const list = [];
+                for (const item of data.contacts) {
+                    if (item.vcard) {
+                        list.push({
+                            vcard: item.vcard,
+                            displayName: item.name || item.displayName || 'Contact'
+                        });
+                    } else {
+                        const iName = item.name || item.displayName || 'Contact';
+                        const iPhone = item.phone || item.id || '';
+                        const vcardText = buildVCard(iName, iPhone, item.organization || item.org, item.email);
+                        list.push({
+                            vcard: vcardText,
+                            displayName: iName
+                        });
+                    }
+                }
+                if (list.length === 1) {
+                    return await window.WPP.chat.sendRawMessage(cid, {
+                        type: 'vcard',
+                        body: list[0].vcard,
+                        vcardFormattedName: list[0].displayName
+                    }, opts);
+                } else {
+                    return await window.WPP.chat.sendRawMessage(cid, {
+                        type: 'multi_vcard',
+                        vcardList: list
+                    }, opts);
+                }
+            }
+
+            // Case 2: Raw vCard string provided
+            if (data.vcard && typeof data.vcard === 'string') {
+                let vcardName = data.name;
+                if (!vcardName) {
+                    const fnMatch = data.vcard.match(/FN(?:;[^:]*)?:([^\r\n]+)/i);
+                    vcardName = fnMatch ? fnMatch[1].trim() : 'Contact';
+                }
+                return await window.WPP.chat.sendRawMessage(cid, {
+                    type: 'vcard',
+                    body: data.vcard,
+                    vcardFormattedName: vcardName
+                }, opts);
+            }
+
+            // Case 3: Single contact (with name, phone, optional org/email)
+            let resolvedPhone = data.phone;
+            let resolvedName = data.name;
+
+            // If phone is missing, try looking up contact by name
+            if (!resolvedPhone && resolvedName) {
+                try {
+                    const contactsList = await window.WPP.contact.list();
+                    const lower = resolvedName.toLowerCase();
+                    const matched = contactsList.find(c => (c.name && c.name.toLowerCase() === lower) || (c.pushname && c.pushname.toLowerCase() === lower));
+                    if (matched) {
+                        resolvedPhone = (matched.id && (matched.id._serialized || matched.id)) || '';
+                        resolvedName = resolvedName || matched.name || matched.pushname;
+                    }
+                } catch (e) {}
+            }
+
+            if (!resolvedPhone && !resolvedName) {
+                throw new Error('Could not resolve contact details to send');
+            }
+
+            // If organization or email is present, send rich custom vCard
+            if (data.organization || data.email) {
+                const vcardText = buildVCard(resolvedName, resolvedPhone, data.organization, data.email);
+                return await window.WPP.chat.sendRawMessage(cid, {
+                    type: 'vcard',
+                    body: vcardText,
+                    vcardFormattedName: resolvedName || 'Contact'
+                }, opts);
+            }
+
+            // Standard contact card via WPP.chat.sendVCardContactMessage
+            let wid = resolvedPhone;
+            if (wid && !wid.includes('@')) {
+                const cleanDigits = wid.replace(/[^\d]/g, '');
+                wid = cleanDigits + '@c.us';
+            }
+            if (!wid) {
+                const vcardText = buildVCard(resolvedName, '', '', '');
+                return await window.WPP.chat.sendRawMessage(cid, {
+                    type: 'vcard',
+                    body: vcardText,
+                    vcardFormattedName: resolvedName || 'Contact'
+                }, opts);
+            }
+
+            return await window.WPP.chat.sendVCardContactMessage(cid, {
+                id: wid,
+                name: resolvedName || wid.split('@')[0]
+            }, opts);
+        }, resolvedChatId, contactPayload, sendOptions);
+
+        res.json({ success: true, target: resolvedChatId });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
 app.get('/media/:msgId', async (req, res) => {
     if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     try {
@@ -961,9 +1388,21 @@ app.get('/media/:msgId', async (req, res) => {
             return res.status(404).json({ error: 'No media found or download failed' });
         }
 
-        const matches = base64Data.match(/^data:([^;]+);base64,(.+)$/);
-        const mimeType = matches ? matches[1] : 'application/octet-stream';
-        const rawBase64 = matches ? matches[2] : base64Data;
+        let mimeType = 'application/octet-stream';
+        let rawBase64 = base64Data;
+
+        const commaIdx = base64Data.indexOf(',');
+        if (base64Data.startsWith('data:') && commaIdx !== -1) {
+            const meta = base64Data.slice(5, commaIdx);
+            mimeType = meta.split(';')[0].trim() || 'application/octet-stream';
+            rawBase64 = base64Data.slice(commaIdx + 1).trim();
+        } else {
+            const matches = base64Data.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.+)$/s);
+            if (matches) {
+                mimeType = matches[1].trim();
+                rawBase64 = matches[2].trim();
+            }
+        }
         const buffer = Buffer.from(rawBase64, 'base64');
 
         res.set('Content-Type', mimeType);

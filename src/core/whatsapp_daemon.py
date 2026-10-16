@@ -4,6 +4,7 @@ import time
 import requests
 import logging
 import threading
+import json
 import shutil
 import stat
 import psutil
@@ -266,13 +267,7 @@ class WhatsAppDaemon:
                 if line:
                     line_str = line.strip()
                     logging.debug(f"[{label}] {line_str}")
-                    if line_str.startswith("[MSG_RECEIVED]"):
-                        parts = line_str.split(" ", 2)
-                        if len(parts) >= 2:
-                            sender_id = parts[1]
-                            sender_name = parts[2] if len(parts) >= 3 else ""
-                            if self.message_callback:
-                                self.message_callback(sender_id, sender_name)
+                    self._parse_message_line(line_str)
             pipe.close()
 
         threading.Thread(target=read_output, args=(
@@ -304,6 +299,43 @@ class WhatsAppDaemon:
                 pass
             time.sleep(1)
 
+
+    def _parse_message_line(self, line_str: str):
+        """Parses [MSG_RECEIVED_JSON] or legacy [MSG_RECEIVED] output and invokes callback."""
+        if not self.message_callback:
+            return
+
+        if line_str.startswith("[MSG_RECEIVED_JSON]"):
+            json_part = line_str[len("[MSG_RECEIVED_JSON]"):].strip()
+            try:
+                data = json.loads(json_part)
+                sender_id = data.get("chatId", "")
+                sender_name = data.get("senderName", "")
+                is_group = bool(data.get("isGroup", False))
+                group_name = data.get("groupName", "")
+                mentioned = bool(data.get("mentioned", False))
+                self.message_callback(
+                    sender_id,
+                    sender_name,
+                    is_group=is_group,
+                    group_name=group_name,
+                    mentioned=mentioned,
+                )
+            except Exception as e:
+                logging.debug(f"WhatsAppDaemon: Error parsing JSON message event: {e}")
+        elif line_str.startswith("[MSG_RECEIVED]"):
+            parts = line_str.split(" ", 2)
+            if len(parts) >= 2:
+                sender_id = parts[1]
+                sender_name = parts[2] if len(parts) >= 3 else ""
+                is_group = sender_id.endswith("@g.us")
+                self.message_callback(
+                    sender_id,
+                    sender_name,
+                    is_group=is_group,
+                    group_name="",
+                    mentioned=False,
+                )
 
     def _kill_orphaned_daemon(self):
         # Attempt to kill old daemon by PID

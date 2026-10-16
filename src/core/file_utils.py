@@ -1,4 +1,7 @@
+from core.state_barrier import state_barrier, state_root
 import json
+import contextlib
+from pathlib import Path
 import os
 import threading
 import uuid
@@ -23,7 +26,12 @@ def atomic_json_write(filepath: str, data: Any, lock: Optional[threading.Lock] =
     """
     path_lock = lock if lock is not None else _get_lock_for_path(filepath)
 
-    with path_lock:
+    # Generic file utility also writes non-agent assets/configuration. Only
+    # recognised agent/mempalace paths participate here; manager/settings
+    # operations explicitly acquire their barrier for custom fixture paths.
+    parents = Path(filepath).absolute().parts
+    barrier = state_barrier(state_root(filepath)) if "agents" in parents or "mempalace" in parents else contextlib.nullcontext()
+    with barrier, path_lock:
         dir_name = os.path.dirname(filepath)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)

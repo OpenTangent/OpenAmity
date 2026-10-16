@@ -7,7 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@wppconnect/wa-js": "^4.6.0",
+    "@wppconnect/wa-js": "^4.6.1",
     "express": "^4.22.3",
     "multer": "^1.4.5-lts.2",
     "puppeteer": "^25.11.0",

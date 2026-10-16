@@ -10,18 +10,19 @@ class ChatroomSkill(Tool):
     color = "#A855F7"
     async_commands = []
     description = (
-        "Interact with the Open Amity persistent agent chatroom. "
-        "Allows reading unread/recent public messages and private direct messages (DMs), "
-        "sending public broadcasts, sending private DMs to specific agent IDs, reacting with emojis, "
-        "and filtering mentions. Messages are text-only."
+        "Interact with Open Amity persistent agent chatrooms. "
+        "Allows listing your chatrooms (with unread and mention counts), reading unread/recent public messages "
+        "and private direct messages (DMs), sending messages to specific chatrooms, sending room-bound private DMs, "
+        "reacting with emojis, and filtering mentions. Messages are text-only."
     )
     commands = [
-        "unread [limit=30] (Fetch and catch up on unread messages, advancing your read cursor)",
-        "unread_mentions [limit=30] (Fetch unread messages specifically mentioning your @ID)",
-        "recent [n=20] (Fetch n recent public messages without advancing read cursor)",
-        "recent_from <sender_id> [n=20] (Fetch recent messages from a specific agent ID or User)",
-        "send <message> [reply_to_id] (Broadcast a public message to all agents and user)",
-        "send_dm <recipient_id> <message> [reply_to_id] (Send a private direct message to an agent's ID)",
+        "list_rooms (List all chatrooms you have access to, including unread and mention counts)",
+        "unread [chatroom_id] [limit=30] (Fetch unread messages for a chatroom or across all rooms, advancing read cursor)",
+        "unread_mentions [chatroom_id] [limit=30] (Fetch unread messages mentioning your @ID)",
+        "recent <chatroom_id> [n=20] (Fetch recent messages in a chatroom without advancing cursor)",
+        "recent_from <chatroom_id> <sender_id> [n=20] (Fetch recent messages from a specific agent or User)",
+        "send <chatroom_id> <message> [reply_to_id] (Broadcast a public message to a chatroom)",
+        "send_dm <chatroom_id> <recipient_id> <message> [reply_to_id] (Send a private direct message bound to a chatroom)",
         "react <message_id> <reaction> (Add an emoji reaction to a message)",
         "whoami (Check your own unique agent ID and display name)"
     ]
@@ -42,8 +43,23 @@ class ChatroomSkill(Tool):
             return self.orchestrator.settings_manager.get("core.agent.name", "Agent")
         return "Agent"
 
+    def _resolve_chatroom_id(self, val: Any) -> Optional[int]:
+        if val is None or str(val).strip() == "":
+            return None
+        val_str = str(val).strip()
+        if val_str.isdigit():
+            return int(val_str)
+
+        # Fallback: find room by name among rooms caller has access to
+        rooms = self.manager.get_agent_chatrooms(self.agent_uid)
+        for r in rooms:
+            if r["name"].strip().lower() == val_str.lower():
+                return r["chatroom_id"]
+        return None
+
     def _format_message(self, m: Dict[str, Any]) -> str:
         msg_id = m.get("id")
+        rid = m.get("chatroom_id")
         timestamp = m.get("timestamp", "")
         if "T" in timestamp:
             timestamp = timestamp.split("T")[1][:5]
@@ -54,7 +70,8 @@ class ChatroomSkill(Tool):
         content = m.get("content", "")
         reply_to = m.get("reply_to_id")
 
-        header = f"[MsgID: {msg_id}] [{timestamp}] [TYPE: {sender_type}]"
+        room_tag = f"[Room #{rid}] " if rid else ""
+        header = f"{room_tag}[MsgID: {msg_id}] [{timestamp}] [TYPE: {sender_type}]"
 
         if recipient_id:
             if recipient_id == self.agent_uid:
@@ -78,25 +95,63 @@ class ChatroomSkill(Tool):
         return f"- {header}: {content}{reaction_str}"
 
     def execute(self, command: str, *args, **kwargs) -> str:
-        if command == "unread":
+        if command == "list_rooms":
+            rooms = self.manager.get_agent_chatrooms(self.agent_uid)
+            if not rooms:
+                return "You have not been added to any chatrooms yet. Ask the user to add you to a chatroom."
+
+            lines = [f"Your Accessible Chatrooms ({len(rooms)} rooms, ordered by mentions then unread):"]
+            for r in rooms:
+                watch_str = " (Watching: ON)" if r["you_watch"] else " (Watching: OFF)"
+                purpose_str = f" - Purpose: {r['purpose']}" if r.get("purpose") else ""
+                lines.append(
+                    f"- #{r['chatroom_id']} \"{r['name']}\"{watch_str}: {r['unread_count']} unread, "
+                    f"{r['mention_count']} mentions, {r['member_count']} members{purpose_str}"
+                )
+            return "\n".join(lines)
+
+        elif command == "unread":
+            chatroom_id = self._resolve_chatroom_id(kwargs.get("chatroom_id"))
             try:
                 limit = int(kwargs.get("limit", 30))
             except (ValueError, TypeError):
                 limit = 30
-            messages = self.manager.get_unread_messages(self.agent_uid, limit=limit, mark_as_read=True)
+
+            if chatroom_id is not None and not self.manager.is_member(chatroom_id, self.agent_uid):
+                return f"Error: You are not a member of chatroom ID {chatroom_id}."
+
+            messages = self.manager.get_unread_messages(
+                self.agent_uid,
+                chatroom_id=chatroom_id,
+                limit=limit,
+                mark_as_read=True
+            )
             if not messages:
-                return "No unread messages in the chatroom."
-            lines = [f"Unread Chatroom Messages ({len(messages)} messages):"]
+                if chatroom_id is not None:
+                    return f"No unread messages in chatroom #{chatroom_id}."
+                return "No unread messages across your chatrooms."
+
+            target_scope = f"in chatroom #{chatroom_id}" if chatroom_id else "across your chatrooms"
+            lines = [f"Unread Messages {target_scope} ({len(messages)} messages):"]
             for m in messages:
                 lines.append(self._format_message(m))
             return "\n".join(lines)
 
         elif command == "unread_mentions":
+            chatroom_id = self._resolve_chatroom_id(kwargs.get("chatroom_id"))
             try:
                 limit = int(kwargs.get("limit", 30))
             except (ValueError, TypeError):
                 limit = 30
-            messages = self.manager.get_unread_mentions(self.agent_uid, limit=limit)
+
+            if chatroom_id is not None and not self.manager.is_member(chatroom_id, self.agent_uid):
+                return f"Error: You are not a member of chatroom ID {chatroom_id}."
+
+            messages = self.manager.get_unread_mentions(
+                self.agent_uid,
+                chatroom_id=chatroom_id,
+                limit=limit
+            )
             if not messages:
                 return f"No unread mentions found for @{self.agent_uid}."
             lines = [f"Unread Mentions for @{self.agent_uid} ({len(messages)} messages):"]
@@ -105,19 +160,37 @@ class ChatroomSkill(Tool):
             return "\n".join(lines)
 
         elif command == "recent":
+            chatroom_id = self._resolve_chatroom_id(kwargs.get("chatroom_id"))
+            if chatroom_id is None:
+                return "Error: chatroom_id is required."
+
+            if not self.manager.is_member(chatroom_id, self.agent_uid):
+                return f"Error: You are not a member of chatroom ID {chatroom_id}."
+
             try:
                 n = int(kwargs.get("n", 20))
             except (ValueError, TypeError):
                 n = 20
-            messages = self.manager.get_recent_messages(limit=n, viewer_uid=self.agent_uid)
+            messages = self.manager.get_recent_messages(
+                chatroom_id=chatroom_id,
+                limit=n,
+                viewer_uid=self.agent_uid
+            )
             if not messages:
-                return "Chatroom is empty."
-            lines = [f"Recent Chatroom Messages (showing {len(messages)}):"]
+                return f"Chatroom #{chatroom_id} is empty."
+            lines = [f"Recent Messages in Chatroom #{chatroom_id} (showing {len(messages)}):"]
             for m in messages:
                 lines.append(self._format_message(m))
             return "\n".join(lines)
 
         elif command == "recent_from":
+            chatroom_id = self._resolve_chatroom_id(kwargs.get("chatroom_id"))
+            if chatroom_id is None:
+                return "Error: chatroom_id is required."
+
+            if not self.manager.is_member(chatroom_id, self.agent_uid):
+                return f"Error: You are not a member of chatroom ID {chatroom_id}."
+
             sender_id = kwargs.get("sender_id", "").strip()
             if not sender_id:
                 return "Error: sender_id (Agent UID, name, or 'USER') is required."
@@ -125,15 +198,24 @@ class ChatroomSkill(Tool):
                 n = int(kwargs.get("n", 20))
             except (ValueError, TypeError):
                 n = 20
-            messages = self.manager.get_recent_messages_from(sender_id, limit=n, viewer_uid=self.agent_uid)
+            messages = self.manager.get_recent_messages_from(
+                chatroom_id=chatroom_id,
+                sender_id_or_name=sender_id,
+                limit=n,
+                viewer_uid=self.agent_uid
+            )
             if not messages:
-                return f"No recent messages found from '{sender_id}'."
-            lines = [f"Recent Messages from '{sender_id}' ({len(messages)} messages):"]
+                return f"No recent messages found from '{sender_id}' in chatroom #{chatroom_id}."
+            lines = [f"Recent Messages from '{sender_id}' in Chatroom #{chatroom_id} ({len(messages)} messages):"]
             for m in messages:
                 lines.append(self._format_message(m))
             return "\n".join(lines)
 
         elif command == "send":
+            chatroom_id = self._resolve_chatroom_id(kwargs.get("chatroom_id"))
+            if chatroom_id is None:
+                return "Error: chatroom_id is required."
+
             message = kwargs.get("message", "").strip()
             reply_to_id = kwargs.get("reply_to_id")
             if reply_to_id is not None:
@@ -150,15 +232,20 @@ class ChatroomSkill(Tool):
                     sender_name=self.agent_name,
                     sender_type="agent",
                     content=message,
+                    chatroom_id=chatroom_id,
                     recipient_id=None,
                     reply_to_id=reply_to_id
                 )
-                return f"Message broadcast to chatroom successfully (MsgID: {msg_id})."
+                return f"Message broadcast to chatroom #{chatroom_id} successfully (MsgID: {msg_id})."
             except Exception as e:
                 logging.error(f"ChatroomSkill: Error sending message: {e}", exc_info=True)
                 return f"Error sending message: {e}"
 
         elif command == "send_dm":
+            chatroom_id = self._resolve_chatroom_id(kwargs.get("chatroom_id"))
+            if chatroom_id is None:
+                return "Error: chatroom_id is required. DMs must be bound to a specific chatroom."
+
             recipient_id = kwargs.get("recipient_id", "").strip()
             message = kwargs.get("message", "").strip()
             reply_to_id = kwargs.get("reply_to_id")
@@ -179,10 +266,11 @@ class ChatroomSkill(Tool):
                     sender_name=self.agent_name,
                     sender_type="agent",
                     content=message,
+                    chatroom_id=chatroom_id,
                     recipient_id=recipient_id,
                     reply_to_id=reply_to_id
                 )
-                return f"Direct message sent privately to {recipient_id} (MsgID: {msg_id})."
+                return f"Direct message sent privately to {recipient_id} in chatroom #{chatroom_id} (MsgID: {msg_id})."
             except Exception as e:
                 logging.error(f"ChatroomSkill: Error sending DM: {e}", exc_info=True)
                 return f"Error sending direct message: {e}"
@@ -210,11 +298,20 @@ class ChatroomSkill(Tool):
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
             {
+                "name": "Chatroom_list_rooms",
+                "description": "Lists all chatrooms you have access to, including room ID, name, purpose, member count, whether you are watching, unread count, and mention count (sorted by mentions then unread).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {}
+                }
+            },
+            {
                 "name": "Chatroom_unread",
-                "description": "Fetches all unread messages (public broadcasts and direct messages sent to you) since your last check, and advances your unread cursor.",
+                "description": "Fetches unread messages and advances your read cursor. If chatroom_id is provided, fetches unread messages in that specific room; if omitted, fetches unread messages across all your accessible rooms.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
+                        "chatroom_id": {"type": "INTEGER", "description": "Optional chatroom ID to check."},
                         "limit": {"type": "INTEGER", "description": "Maximum number of messages to fetch (default: 30)."}
                     }
                 }
@@ -225,55 +322,61 @@ class ChatroomSkill(Tool):
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
+                        "chatroom_id": {"type": "INTEGER", "description": "Optional chatroom ID to filter."},
                         "limit": {"type": "INTEGER", "description": "Maximum number of messages to fetch (default: 30)."}
                     }
                 }
             },
             {
                 "name": "Chatroom_recent",
-                "description": "Fetches recent public messages across the chatroom without advancing your unread cursor.",
+                "description": "Fetches recent public messages in a specific chatroom without advancing your unread cursor.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
+                        "chatroom_id": {"type": "INTEGER", "description": "The chatroom ID to fetch messages from."},
                         "n": {"type": "INTEGER", "description": "Number of recent messages to fetch (default: 20)."}
-                    }
+                    },
+                    "required": ["chatroom_id"]
                 }
             },
             {
                 "name": "Chatroom_recent_from",
-                "description": "Fetches recent messages from a specific agent UID or from 'USER'.",
+                "description": "Fetches recent messages from a specific agent UID or 'USER' in a chatroom.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
+                        "chatroom_id": {"type": "INTEGER", "description": "The chatroom ID."},
                         "sender_id": {"type": "STRING", "description": "The UID of the agent (e.g. '+OA-7K9M-4X2B') or 'USER'."},
                         "n": {"type": "INTEGER", "description": "Number of recent messages to fetch (default: 20)."}
                     },
-                    "required": ["sender_id"]
+                    "required": ["chatroom_id", "sender_id"]
                 }
             },
             {
                 "name": "Chatroom_send",
-                "description": "Broadcasts a public text message to all agents and the user in the chatroom. When continuing a discussion or replying to a specific message, include its MsgID in 'reply_to_id'. Use '@<AgentUID>' to mention specific agents.",
+                "description": "Broadcasts a public text message to all members in a specific chatroom. When continuing a discussion or replying to a specific message, include its MsgID in 'reply_to_id'. Use '@<AgentUID>' to mention specific agents.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
+                        "chatroom_id": {"type": "INTEGER", "description": "The target chatroom ID."},
                         "message": {"type": "STRING", "description": "The text message to broadcast."},
                         "reply_to_id": {"type": "INTEGER", "description": "Optional MsgID of the message you are replying to."}
                     },
-                    "required": ["message"]
+                    "required": ["chatroom_id", "message"]
                 }
             },
             {
                 "name": "Chatroom_send_dm",
-                "description": "Sends a private direct message to a specific agent using their unique ID (+OA-XXXX-XXXX). This is visible to the human user in the chatroom UI, but hidden from other agents in the workspace.",
+                "description": "Sends a private direct message bound to a specific chatroom to another member of that room using their unique ID (+OA-XXXX-XXXX). This is visible to the human user in the chatroom UI, but hidden from other agents in the workspace.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
-                        "recipient_id": {"type": "STRING", "description": "The unique ID (+OA-XXXX-XXXX) of the recipient agent."},
+                        "chatroom_id": {"type": "INTEGER", "description": "The chatroom ID where this direct message is bound."},
+                        "recipient_id": {"type": "STRING", "description": "The unique ID (+OA-XXXX-XXXX) of the recipient agent (must be a member of the room)."},
                         "message": {"type": "STRING", "description": "The private message to send."},
                         "reply_to_id": {"type": "INTEGER", "description": "Optional MsgID of the message you are replying to."}
                     },
-                    "required": ["recipient_id", "message"]
+                    "required": ["chatroom_id", "recipient_id", "message"]
                 }
             },
             {

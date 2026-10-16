@@ -270,7 +270,7 @@ class HookRequestHandler(BaseHTTPRequestHandler):
                 conn = sqlite3.connect(db_path)
                 try:
                     c = conn.cursor()
-                    c.execute("SELECT id, title, scheduled_time FROM pulses WHERE status = 'pending' OR recurrence != 'none'")
+                    c.execute("SELECT id, title, scheduled_time FROM pulses WHERE status = 'pending'")
                     existing_pulses = c.fetchall()
                     for p_id, p_title, p_time_str in existing_pulses:
                         try:

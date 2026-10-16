@@ -79,7 +79,8 @@ class SettingsManager:
             self._initialized = True
 
     def _check_and_refresh(self):
-        with self._lock:
+        from core.state_barrier import state_barrier
+        with state_barrier(self.config_dir), self._lock:
             if os.path.exists(self.settings_file):
                 try:
                     mtime = os.path.getmtime(self.settings_file)
@@ -114,11 +115,13 @@ class SettingsManager:
         return dict1
 
     def refresh(self):
-        with self._lock:
+        from core.state_barrier import state_barrier
+        with state_barrier(self.config_dir), self._lock:
             self.settings = self.load_settings()
 
     def load_settings(self):
-        with self._lock:
+        from core.state_barrier import state_barrier
+        with state_barrier(self.config_dir), self._lock:
             default_settings = {}
             if os.path.exists(self.default_file):
                 try:
@@ -189,7 +192,8 @@ class SettingsManager:
             val[keys[-1]] = value
 
     def save(self):
-        with self._lock:
+        from core.state_barrier import state_barrier
+        with state_barrier(self.config_dir), self._lock:
             try:
                 atomic_json_write(self.settings_file, self.settings, lock=self._lock)
                 if os.path.exists(self.settings_file):
@@ -197,6 +201,7 @@ class SettingsManager:
             except Exception as e:
                 logging.error(
                     f"Error saving settings.json: {e}", exc_info=True)
+                raise RuntimeError(f"Error saving settings.json: {e}") from e
 
     def get_env(self, key, default=""):
         if get_key is None:

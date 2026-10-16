@@ -78,3 +78,40 @@ def test_mempalace_curiosity_pulse_scheduling(temp_agent_environment, caplog):
     assert len(pulses) == 1
     assert pulses[0][0] == "Curiosity: Quantum Entanglement Teleportation"
     assert "Quantum Entanglement Teleportation" in pulses[0][1]
+
+
+def test_mempalace_tool_archived_and_refresh_commands(temp_agent_environment):
+    """Verifies that MemPalaceTool exposes and delegates get_archived_short_term and refresh_prospective_anchors."""
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.agent_id = "test-agent-cmds"
+    tool = MemPalaceTool(orchestrator=mock_orchestrator)
+
+    # Mock manager methods
+    tool.manager.get_archived_short_term_memories = MagicMock(return_value=[{"id": "arch-1", "content": "Archived duty"}])
+    tool.manager.refresh_prospective_anchors = MagicMock(return_value=5)
+
+    # Test get_archived_short_term
+    res_arch = tool.execute("get_archived_short_term", memory_id="arch-1")
+    tool.manager.get_archived_short_term_memories.assert_called_once_with("arch-1")
+    assert "arch-1" in res_arch
+    assert "Archived duty" in res_arch
+
+    # Test refresh_prospective_anchors
+    res_ref = tool.execute("refresh_prospective_anchors")
+    tool.manager.refresh_prospective_anchors.assert_called_once()
+    assert "refreshed" in res_ref
+    assert "revision is now 5" in res_ref
+
+
+def test_mempalace_tool_recall_offset(temp_agent_environment):
+    """Verifies that MemPalaceTool recall forwards offset parameter."""
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.agent_id = "test-agent-recall"
+    tool = MemPalaceTool(orchestrator=mock_orchestrator)
+
+    tool.manager.recall = MagicMock(return_value="Drawer #10: Mocked Memory")
+    res = tool.execute("recall", room="tasks", wing="core", n_results=5, offset=10)
+    tool.manager.recall.assert_called_once_with(wing="core", room="tasks", n_results=5, offset=10)
+    assert "Drawer #10" in res
+
+

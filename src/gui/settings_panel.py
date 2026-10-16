@@ -40,7 +40,7 @@ try:
                            BG_DARK, BG_CARD, BG_CARD_DISABLED, BG_INPUT, BG_INPUT_FOCUS,
                            BG_BUTTON, BG_BUTTON_HOVER, BG_BUTTON_PRESSED,
                            BORDER_COLOR, BORDER_COLOR_DISABLED, BORDER_INPUT, BORDER_BUTTON,
-                           TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, MODERN_SCROLLBAR_STYLE)
+                           TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, TEXT_DISABLED, MODERN_SCROLLBAR_STYLE)
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
@@ -59,6 +59,7 @@ except ImportError:
     TEXT_PRIMARY = "#eeeeee"
     TEXT_SECONDARY = "#cccccc"
     TEXT_MUTED = "#aaaaaa"
+    TEXT_DISABLED = "#777777"
     MODERN_SCROLLBAR_STYLE = ""
 
 
@@ -372,6 +373,10 @@ class BackupWorkerThread(QThread):
         self.agent_ids = agent_ids
         self.dest_dir = dest_dir
         self.agent_manager = agent_manager
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
 
     def run(self):
         from core.backup_manager import create_agent_backup
@@ -380,6 +385,10 @@ class BackupWorkerThread(QThread):
         total = len(self.agent_ids)
 
         for idx, aid in enumerate(self.agent_ids):
+            if self.cancel_event.is_set():
+                failed.append("Backup cancelled by user.")
+                break
+
             agent_name = "Agent"
             if self.agent_manager and hasattr(self.agent_manager, 'get_agent_name'):
                 agent_name = self.agent_manager.get_agent_name(aid)
@@ -394,13 +403,20 @@ class BackupWorkerThread(QThread):
                     aid,
                     destination_dir=self.dest_dir,
                     agent_manager=self.agent_manager,
-                    progress_callback=file_cb
+                    progress_callback=file_cb,
+                    cancel_event=self.cancel_event
                 )
                 created.append(path)
+            except InterruptedError:
+                failed.append(f"{agent_name}: Backup cancelled by user.")
+                break
             except Exception as e:
                 failed.append(f"{agent_name}: {str(e)}")
 
-        self.progress_changed.emit(total, total, "Backup process complete!")
+        if self.cancel_event.is_set():
+            self.progress_changed.emit(total, total, "Backup cancelled.")
+        else:
+            self.progress_changed.emit(total, total, "Backup process complete!")
         self.backup_completed.emit(created, failed)
 
 
@@ -417,11 +433,40 @@ class AgentBackupSelectionDialog(QDialog):
         self.checkboxes = {}
         self.worker_thread = None
 
+        checkmark_path = ""
+        try:
+            from config.paths import get_assets_dir
+            assets_dir = get_assets_dir()
+        except Exception:
+            assets_dir = str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
+        cand_chk = os.path.join(assets_dir, "icons", "checkmark.svg")
+        if not os.path.exists(cand_chk):
+            cand_chk = os.path.join(assets_dir, "checkmark.svg")
+        if os.path.exists(cand_chk):
+            checkmark_path = cand_chk.replace("\\", "/")
+        chk_img_css = f'image: url("{checkmark_path}");' if checkmark_path else ""
+
         self.setStyleSheet(f"""
             QDialog {{ background-color: {BG_CARD}; color: {TEXT_PRIMARY}; }}
             QLabel {{ color: {TEXT_PRIMARY}; font-size: 14px; background-color: transparent; }}
             QCheckBox {{ color: {TEXT_PRIMARY}; font-size: 14px; spacing: 8px; background-color: transparent; }}
             QCheckBox:hover {{ color: #FFF; }}
+            QCheckBox::indicator {{
+                width: 18px;
+                height: 18px;
+                border: 1px solid {BORDER_INPUT};
+                border-radius: 4px;
+                background-color: {BG_INPUT};
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: #888888;
+                background-color: #444444;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {PRIMARY_ACCENT_COLOR};
+                border-color: {PRIMARY_ACCENT_COLOR};
+                {chk_img_css}
+            }}
             QPushButton {{ background-color: {BG_BUTTON}; color: {TEXT_PRIMARY}; border: 1px solid #666; border-radius: 5px; padding: 8px 16px; }}
             QPushButton:hover {{ background-color: #555; }}
             QProgressBar {{
@@ -509,7 +554,13 @@ class AgentBackupSelectionDialog(QDialog):
         for cb in self.checkboxes.values():
             cb.setEnabled(False)
         self.btn_backup.setEnabled(False)
-        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setText("Cancel Backup")
+        self.btn_cancel.setEnabled(True)
+        try:
+            self.btn_cancel.clicked.disconnect()
+        except Exception:
+            pass
+        self.btn_cancel.clicked.connect(self.on_cancel_backup)
 
         total = len(self.selected_agent_ids)
         self.progress_bar.setRange(0, total)
@@ -527,6 +578,12 @@ class AgentBackupSelectionDialog(QDialog):
         self.worker_thread.backup_completed.connect(self._on_backup_completed)
         self.worker_thread.start()
 
+    def on_cancel_backup(self):
+        if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
+            self.lbl_status.setText("Cancelling backup...")
+            self.btn_cancel.setEnabled(False)
+            self.worker_thread.cancel()
+
     def _on_progress_changed(self, current, total, message):
         self.lbl_status.setText(message)
         self.progress_bar.setValue(current)
@@ -538,14 +595,19 @@ class AgentBackupSelectionDialog(QDialog):
         self.progress_bar.setValue(len(self.selected_agent_ids))
         self.lbl_status.setText("Backup process finished.")
 
+        try:
+            self.btn_cancel.clicked.disconnect()
+        except Exception:
+            pass
         self.btn_cancel.setText("Close")
+        self.btn_cancel.clicked.connect(self.accept if created else self.reject)
         self.btn_cancel.setEnabled(True)
 
         if created:
             msg = f"Successfully created {len(created)} backup(s) in:\n{os.path.expanduser(self.dest_dir)}\n\n"
             msg += "\n".join([f"• {os.path.basename(p)}" for p in created])
             if failed:
-                msg += "\n\nErrors:\n" + "\n".join(failed)
+                msg += "\n\nErrors / Warnings:\n" + "\n".join(failed)
             QMessageBox.information(self, "Backups Created", msg)
             self.accept()
         else:
@@ -554,10 +616,27 @@ class AgentBackupSelectionDialog(QDialog):
                 cb.setEnabled(True)
             self.btn_backup.setEnabled(True)
             self.btn_cancel.setText("Cancel")
+            try:
+                self.btn_cancel.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_cancel.clicked.connect(self.reject)
 
     def closeEvent(self, event):
         if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
-            event.ignore()
+            reply = QMessageBox.question(
+                self,
+                "Cancel Backup?",
+                "A backup is currently in progress. Would you like to cancel it and close?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.worker_thread.cancel()
+                self.worker_thread.wait(2000)
+                event.accept()
+            else:
+                event.ignore()
             return
         super().closeEvent(event)
 
@@ -1016,6 +1095,29 @@ class SettingsPanelWidget(QWidget):
     check_whatsapp_status = poll_whatsapp_status
 
     def init_ui(self):
+        checkmark_path = ""
+        radio_dot_path = ""
+        try:
+            from config.paths import get_assets_dir
+            assets_dir = get_assets_dir()
+        except Exception:
+            assets_dir = str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
+
+        cand_chk = os.path.join(assets_dir, "icons", "checkmark.svg")
+        if not os.path.exists(cand_chk):
+            cand_chk = os.path.join(assets_dir, "checkmark.svg")
+        if os.path.exists(cand_chk):
+            checkmark_path = cand_chk.replace("\\", "/")
+
+        cand_radio = os.path.join(assets_dir, "icons", "radio_dot.svg")
+        if not os.path.exists(cand_radio):
+            cand_radio = os.path.join(assets_dir, "radio_dot.svg")
+        if os.path.exists(cand_radio):
+            radio_dot_path = cand_radio.replace("\\", "/")
+
+        chk_img_css = f'image: url("{checkmark_path}");' if checkmark_path else ""
+        radio_img_css = f'image: url("{radio_dot_path}");' if radio_dot_path else ""
+
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {BG_DARK};
@@ -1059,6 +1161,18 @@ class SettingsPanelWidget(QWidget):
             QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus, QListWidget:focus {{
                 border: 1px solid {PRIMARY_ACCENT_COLOR};
                 background-color: {BG_INPUT_FOCUS};
+            }}
+            QListWidget::item {{
+                padding: 5px 8px;
+                border-radius: 3px;
+                color: {TEXT_PRIMARY};
+            }}
+            QListWidget::item:hover {{
+                background-color: rgba(255, 255, 255, 0.08);
+            }}
+            QListWidget::item:selected {{
+                background-color: {PRIMARY_ACCENT_COLOR};
+                color: #FFFFFF;
             }}
             QPushButton {{
                 background-color: {BG_BUTTON};
@@ -1104,6 +1218,33 @@ class SettingsPanelWidget(QWidget):
             QCheckBox:hover {{
                 color: #FFF;
             }}
+            QCheckBox::indicator {{
+                width: 18px;
+                height: 18px;
+                border: 1px solid {BORDER_INPUT};
+                border-radius: 4px;
+                background-color: {BG_INPUT};
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: #888888;
+                background-color: #444444;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {PRIMARY_ACCENT_COLOR};
+                border-color: {PRIMARY_ACCENT_COLOR};
+                {chk_img_css}
+            }}
+            QCheckBox::indicator:checked:hover {{
+                background-color: #b52e28;
+                border-color: #b52e28;
+            }}
+            QCheckBox::indicator:disabled {{
+                border-color: {BORDER_COLOR_DISABLED};
+                background-color: #222222;
+            }}
+            QCheckBox:disabled {{
+                color: {TEXT_DISABLED};
+            }}
             QRadioButton {{
                 color: {TEXT_PRIMARY};
                 spacing: 8px;
@@ -1111,6 +1252,29 @@ class SettingsPanelWidget(QWidget):
             }}
             QRadioButton:hover {{
                 color: #FFF;
+            }}
+            QRadioButton::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 1px solid {BORDER_INPUT};
+                border-radius: 9px;
+                background-color: {BG_INPUT};
+            }}
+            QRadioButton::indicator:hover {{
+                border-color: #888888;
+                background-color: #444444;
+            }}
+            QRadioButton::indicator:checked {{
+                background-color: {PRIMARY_ACCENT_COLOR};
+                border-color: {PRIMARY_ACCENT_COLOR};
+                {radio_img_css}
+            }}
+            QRadioButton::indicator:disabled {{
+                border-color: {BORDER_COLOR_DISABLED};
+                background-color: #222222;
+            }}
+            QRadioButton:disabled {{
+                color: {TEXT_DISABLED};
             }}
             QScrollArea, QScrollArea > QWidget > QWidget {{
                 background-color: transparent;
@@ -2448,6 +2612,116 @@ class SettingsPanelWidget(QWidget):
         self.ui_qr_code.setStyleSheet(
             "background-color: #000; border: 1px solid #555; border-radius: 4px;")
         layout_wa.addWidget(self.ui_qr_code, 0, Qt.AlignCenter)
+
+        layout_wa.addSpacing(10)
+
+        # Advanced Whatsapp Settings Accordion
+        self.ui_whatsapp_adv_toggle_btn = QPushButton("▶ Advanced Whatsapp Settings")
+        self.ui_whatsapp_adv_toggle_btn.setObjectName("waAdvToggleBtn")
+        self.ui_whatsapp_adv_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.ui_whatsapp_adv_toggle_btn.setStyleSheet("""
+            QPushButton#waAdvToggleBtn {
+                background-color: transparent;
+                color: #CCCCCC;
+                text-align: left;
+                padding: 6px 0px;
+                border: none;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton#waAdvToggleBtn:hover {
+                color: #FFFFFF;
+                background-color: transparent;
+            }
+            QPushButton#waAdvToggleBtn:focus {
+                outline: none;
+            }
+        """)
+        self.ui_whatsapp_adv_toggle_btn.clicked.connect(self._toggle_advanced_whatsapp_settings)
+        layout_wa.addWidget(self.ui_whatsapp_adv_toggle_btn)
+
+        self.ui_whatsapp_adv_container = QWidget()
+        self.ui_whatsapp_adv_container.setObjectName("settingsSubContainer")
+        wa_adv_layout = QVBoxLayout(self.ui_whatsapp_adv_container)
+        wa_adv_layout.setContentsMargins(0, 4, 0, 0)
+        wa_adv_layout.setSpacing(8)
+
+        wa_adv_layout.addWidget(QLabel("Whatsapp Auto-response Buffer (seconds):"))
+        self.ui_wa_buffer = QSpinBox()
+        self.ui_wa_buffer.setFocusPolicy(Qt.StrongFocus)
+        self.ui_wa_buffer.wheelEvent = lambda event: event.ignore()
+        self.ui_wa_buffer.setRange(0, 3600)
+        self.ui_wa_buffer.setValue(30)
+        wa_adv_layout.addWidget(self.ui_wa_buffer)
+        wa_adv_layout.addWidget(self.create_tip(
+            "The time to wait after receiving a message before the agent is notified. Each notification adds 10s to the next wait, resetting after 30 minutes of silence."))
+
+        self.ui_wa_pulse_all_dms = QCheckBox("Pulse on all DMs")
+        self.ui_wa_pulse_all_dms.setCursor(Qt.PointingHandCursor)
+        self.ui_wa_pulse_all_dms.setChecked(False)
+        wa_adv_layout.addWidget(self.ui_wa_pulse_all_dms)
+        wa_adv_layout.addWidget(self.create_tip(
+            "When enabled, any one-on-one direct message generates a notification pulse after the buffer timeout."))
+
+        self.ui_wa_number_whitelist_container = QWidget()
+        self.ui_wa_number_whitelist_container.setStyleSheet("background-color: transparent;")
+        phone_wl_layout = QVBoxLayout(self.ui_wa_number_whitelist_container)
+        phone_wl_layout.setContentsMargins(0, 0, 0, 0)
+        phone_wl_layout.setSpacing(6)
+
+        phone_wl_layout.addWidget(QLabel("Phone Number Whitelist:"))
+        self.ui_whatsapp_whitelist = QListWidget()
+        self.ui_whatsapp_whitelist.setFixedHeight(100)
+        phone_wl_layout.addWidget(self.ui_whatsapp_whitelist)
+        phone_wl_layout.addLayout(self.create_list_controls(
+            self.ui_whatsapp_whitelist, "Add Number",
+            dialog_title="Add Phone Number",
+            dialog_prompt="Enter phone number (include international dialling code):"))
+        phone_wl_layout.addWidget(self.create_tip(
+            "This is a list of phone numbers that will trigger an automatic pulse when the agent receives a direct message from them. Must include international dialling code."))
+        wa_adv_layout.addWidget(self.ui_wa_number_whitelist_container)
+
+        self.ui_wa_pulse_all_dms.toggled.connect(
+            lambda checked: self.ui_wa_number_whitelist_container.setHidden(checked))
+
+        self.ui_wa_pulse_all_groups = QCheckBox("Pulse on all group messages")
+        self.ui_wa_pulse_all_groups.setCursor(Qt.PointingHandCursor)
+        self.ui_wa_pulse_all_groups.setChecked(False)
+        wa_adv_layout.addWidget(self.ui_wa_pulse_all_groups)
+        wa_adv_layout.addWidget(self.create_tip(
+            "When enabled, messages received in any group chat generate a notification pulse after the buffer timeout."))
+
+        self.ui_wa_group_whitelist_container = QWidget()
+        self.ui_wa_group_whitelist_container.setStyleSheet("background-color: transparent;")
+        group_wl_layout = QVBoxLayout(self.ui_wa_group_whitelist_container)
+        group_wl_layout.setContentsMargins(0, 0, 0, 0)
+        group_wl_layout.setSpacing(6)
+
+        group_wl_layout.addWidget(QLabel("Group Whitelist:"))
+        self.ui_whatsapp_group_whitelist = QListWidget()
+        self.ui_whatsapp_group_whitelist.setFixedHeight(100)
+        group_wl_layout.addWidget(self.ui_whatsapp_group_whitelist)
+        group_wl_layout.addLayout(self.create_list_controls(
+            self.ui_whatsapp_group_whitelist, "Add Group",
+            dialog_title="Add Group",
+            dialog_prompt="Enter group name (exact):"))
+        group_wl_layout.addWidget(self.create_tip(
+            "This is a list of group names that must be matched verbatim to trigger an automatic pulse when messages are received in that group."))
+        wa_adv_layout.addWidget(self.ui_wa_group_whitelist_container)
+
+        self.ui_wa_pulse_all_groups.toggled.connect(
+            lambda checked: self.ui_wa_group_whitelist_container.setHidden(checked))
+
+        self.ui_wa_pulse_on_mentions = QCheckBox("Pulse on Mentions")
+        self.ui_wa_pulse_on_mentions.setCursor(Qt.PointingHandCursor)
+        self.ui_wa_pulse_on_mentions.setChecked(False)
+        wa_adv_layout.addWidget(self.ui_wa_pulse_on_mentions)
+        wa_adv_layout.addWidget(self.create_tip(
+            "When enabled, generates a notification pulse whenever the agent is mentioned or replied to in any group or DM."))
+
+        self.ui_whatsapp_adv_container.setVisible(False)
+        layout_wa.addWidget(self.ui_whatsapp_adv_container)
+
         main_layout.addWidget(card_wa)
 
         main_layout.addSpacing(6)
@@ -2576,35 +2850,6 @@ class SettingsPanelWidget(QWidget):
 
         main_layout.addWidget(card1)
 
-        main_layout.addSpacing(10)
-
-        # Whatsapp Settings Card
-        card2, layout2 = self.create_card_container()
-        lbl_wa_settings = QLabel("<b>Whatsapp Settings</b>")
-        lbl_wa_settings.setStyleSheet(
-            "background-color: transparent; font-size: 16px;")
-        layout2.addWidget(lbl_wa_settings)
-
-        layout2.addWidget(QLabel("Whatsapp Auto-response Buffer (seconds):"))
-        self.ui_wa_buffer = QSpinBox()
-        self.ui_wa_buffer.setFocusPolicy(Qt.StrongFocus)
-        self.ui_wa_buffer.wheelEvent = lambda event: event.ignore()
-        self.ui_wa_buffer.setRange(0, 3600)
-        self.ui_wa_buffer.setValue(30)
-        layout2.addWidget(self.ui_wa_buffer)
-        layout2.addWidget(self.create_tip(
-            "The time to wait before the agent automatically reads direct messages sent to them from a whitelisted number."))
-
-        layout2.addWidget(QLabel("Whatsapp Whitelist:"))
-        self.ui_whatsapp_whitelist = QListWidget()
-        self.ui_whatsapp_whitelist.setFixedHeight(100)
-        layout2.addWidget(self.ui_whatsapp_whitelist)
-        layout2.addLayout(self.create_list_controls(
-            self.ui_whatsapp_whitelist, "Add Number"))
-        layout2.addWidget(self.create_tip(
-            "This is a list of phone numbers that will trigger an automatic pulse when the agent receives a direct message from them. Must include international dialling code."))
-
-        main_layout.addWidget(card2)
 
         main_layout.addStretch()
 
@@ -2837,6 +3082,12 @@ class SettingsPanelWidget(QWidget):
         self.ui_email_adv_container.setVisible(is_visible)
         self._update_advanced_summary()
 
+    def _toggle_advanced_whatsapp_settings(self):
+        is_visible = self.ui_whatsapp_adv_container.isHidden()
+        self.ui_whatsapp_adv_container.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.ui_whatsapp_adv_toggle_btn.setText(f"{arrow} Advanced Whatsapp Settings")
+
     def _update_advanced_summary(self):
         imap_h = self.ui_email_imap_host.text().strip() or "host"
         imap_p = self.ui_email_imap_port.text().strip() or "993"
@@ -2946,12 +3197,55 @@ class SettingsPanelWidget(QWidget):
         lbl.setWordWrap(True)
         return lbl
 
-    def create_list_controls(self, list_widget, add_text):
+    def create_list_controls(self, list_widget, add_text, dialog_title=None, dialog_prompt=None):
         layout = QHBoxLayout()
-        add_btn = QPushButton(add_text)
+        btn_label = f"+ {add_text}" if not add_text.startswith("+") else add_text
+        add_btn = QPushButton(btn_label)
         rem_btn = QPushButton("Remove Selected")
 
-        add_btn.clicked.connect(lambda: self.add_to_list(list_widget))
+        add_btn.setCursor(Qt.PointingHandCursor)
+        rem_btn.setCursor(Qt.PointingHandCursor)
+
+        add_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_BUTTON};
+                color: #FFFFFF;
+                border: 1px solid {BORDER_BUTTON};
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: {BG_BUTTON_HOVER};
+                border-color: {PRIMARY_ACCENT_COLOR};
+                color: #FFFFFF;
+            }}
+            QPushButton:pressed {{
+                background-color: {BG_BUTTON_PRESSED};
+            }}
+        """)
+
+        rem_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {TEXT_MUTED};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {BG_BUTTON};
+                border-color: {BORDER_BUTTON};
+                color: {TEXT_PRIMARY};
+            }}
+            QPushButton:pressed {{
+                background-color: {BG_BUTTON_PRESSED};
+            }}
+        """)
+
+        add_btn.clicked.connect(lambda: self.add_to_list(list_widget, dialog_title, dialog_prompt))
         rem_btn.clicked.connect(lambda: self.remove_from_list(list_widget))
 
         layout.addWidget(add_btn)
@@ -2959,10 +3253,12 @@ class SettingsPanelWidget(QWidget):
         layout.addStretch()
         return layout
 
-    def add_to_list(self, list_widget):
-        text, ok = QInputDialog.getText(self, "Add Item", "Enter new item:")
-        if ok and text:
-            list_widget.addItem(text)
+    def add_to_list(self, list_widget, dialog_title=None, dialog_prompt=None):
+        title = dialog_title or "Add Item"
+        prompt = dialog_prompt or "Enter new item:"
+        text, ok = QInputDialog.getText(self, title, prompt)
+        if ok and text and text.strip():
+            list_widget.addItem(text.strip())
 
     def remove_from_list(self, list_widget):
         for item in list_widget.selectedItems():
@@ -4440,6 +4736,27 @@ class SettingsPanelWidget(QWidget):
             self.ui_whatsapp_whitelist.clear()
             self.ui_whatsapp_whitelist.addItems(whitelist)
 
+            group_whitelist = self.settings.get("core.auto-pulse.group-whitelist", [])
+            if hasattr(self, 'ui_whatsapp_group_whitelist'):
+                self.ui_whatsapp_group_whitelist.clear()
+                self.ui_whatsapp_group_whitelist.addItems(group_whitelist)
+
+            pulse_all_dms = self.settings.get("core.auto-pulse.pulse-all-dms", False)
+            if hasattr(self, 'ui_wa_pulse_all_dms'):
+                self.ui_wa_pulse_all_dms.setChecked(pulse_all_dms)
+                if hasattr(self, 'ui_wa_number_whitelist_container'):
+                    self.ui_wa_number_whitelist_container.setHidden(pulse_all_dms)
+
+            pulse_all_groups = self.settings.get("core.auto-pulse.pulse-all-groups", False)
+            if hasattr(self, 'ui_wa_pulse_all_groups'):
+                self.ui_wa_pulse_all_groups.setChecked(pulse_all_groups)
+                if hasattr(self, 'ui_wa_group_whitelist_container'):
+                    self.ui_wa_group_whitelist_container.setHidden(pulse_all_groups)
+
+            pulse_on_mentions = self.settings.get("core.auto-pulse.pulse-on-mentions", False)
+            if hasattr(self, 'ui_wa_pulse_on_mentions'):
+                self.ui_wa_pulse_on_mentions.setChecked(pulse_on_mentions)
+
             self.ui_wa_buffer.setValue(self.settings.get(
                 "core.auto-pulse.buffer-seconds", 30))
             self.ui_low_token_mode.setChecked(
@@ -4673,6 +4990,19 @@ class SettingsPanelWidget(QWidget):
             whitelist = [self.ui_whatsapp_whitelist.item(
                 i).text() for i in range(self.ui_whatsapp_whitelist.count())]
             self.settings.set("core.auto-pulse.whitelist", whitelist)
+
+            if hasattr(self, 'ui_whatsapp_group_whitelist'):
+                group_whitelist = [self.ui_whatsapp_group_whitelist.item(
+                    i).text() for i in range(self.ui_whatsapp_group_whitelist.count())]
+                self.settings.set("core.auto-pulse.group-whitelist", group_whitelist)
+
+            if hasattr(self, 'ui_wa_pulse_all_dms'):
+                self.settings.set("core.auto-pulse.pulse-all-dms", self.ui_wa_pulse_all_dms.isChecked())
+            if hasattr(self, 'ui_wa_pulse_all_groups'):
+                self.settings.set("core.auto-pulse.pulse-all-groups", self.ui_wa_pulse_all_groups.isChecked())
+            if hasattr(self, 'ui_wa_pulse_on_mentions'):
+                self.settings.set("core.auto-pulse.pulse-on-mentions", self.ui_wa_pulse_on_mentions.isChecked())
+
             self.settings.set("core.auto-pulse.buffer-seconds",
                               self.ui_wa_buffer.value())
             self.settings.set("core.low-token-mode",

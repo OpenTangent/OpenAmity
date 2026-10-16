@@ -1,3 +1,7 @@
+from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+import os
+import base64
+import mimetypes
 import time
 import threading
 import logging
@@ -45,7 +49,7 @@ class FunctionCallObject:
         self.args = args
 
 
-class ClaudeWorker:
+class ClaudeWorker(MemoryContextWorkerMixin):
     def __init__(self, agent_id=None):
         self.agent_id = agent_id
         logging.debug(f"ClaudeWorker.__init__ called.")
@@ -99,7 +103,7 @@ class ClaudeWorker:
     def is_running(self):
         return self.running
 
-    def start_session(self, system_instruction=None, tools=None):
+    def start_session(self, system_instruction=None, tools=None, clear_history=False):
         logging.debug("start_session called in ClaudeWorker")
         if not getattr(self, 'available', False):
             logging.error(
@@ -112,6 +116,7 @@ class ClaudeWorker:
         self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
         self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
 
+        self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
         self.tools = tools
         self.anthropic_tools = []
         if self.tools:
@@ -119,8 +124,9 @@ class ClaudeWorker:
                 self.anthropic_tools.append(_convert_to_anthropic_tool(t))
 
         with self._history_lock:
-            self.history = []
-            self.consumed_tool_use_ids = set()
+            if clear_history:
+                self.history = []
+                self.consumed_tool_use_ids = set()
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
@@ -141,6 +147,39 @@ class ClaudeWorker:
         self.running = True
         logging.info(
             f"Claude SDK sessions started with model {self.current_model}.")
+
+    def get_session_history(self) -> list:
+        """Exports active chat history into a normalized list of turns."""
+        with self._history_lock:
+            messages = []
+            for m in self.history:
+                role = m.get("role", "user")
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    messages.append({"role": role, "content": c})
+                elif isinstance(c, list):
+                    texts = []
+                    for item in c:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text":
+                                texts.append(item.get("text", ""))
+                            elif item.get("type") == "tool_use":
+                                texts.append(f"[Tool invocation: {item.get('name')}({json.dumps(item.get('input', {}))})]")
+                            elif item.get("type") == "tool_result":
+                                texts.append(f"[Tool Result: {json.dumps(item.get('content', ''))}]")
+                    messages.append({"role": role, "content": "\n".join(texts)})
+            return messages
+
+    def set_session_history(self, messages: list):
+        """Restores chat history from normalized turns."""
+        with self._history_lock:
+            self.history = []
+            self.consumed_tool_use_ids = set()
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if content:
+                    self.history.append({"role": role, "content": content})
 
     def stop_session(self):
         self.running = False
@@ -163,6 +202,95 @@ class ClaudeWorker:
         self.is_processing = True
         threading.Thread(target=self._process_thought, args=(
             prompt, image_path, yolo, audio_path), daemon=True).start()
+
+    def _prepare_media_block(self, media_path: str) -> dict:
+        if not media_path:
+            return None
+
+        exp_path = os.path.expanduser(media_path)
+        if not os.path.exists(exp_path):
+            raise FileNotFoundError(f"Media file not found: {exp_path}")
+
+        file_size = os.path.getsize(exp_path)
+        if file_size > 32 * 1024 * 1024:
+            raise ValueError(f"Media {exp_path} exceeds 32 MiB inline limit.")
+
+        mime_type, _ = mimetypes.guess_type(exp_path)
+        ext = os.path.splitext(exp_path)[1].lower()
+
+        # Handle PDF documents via Claude's native document block
+        if mime_type == "application/pdf" or ext == ".pdf":
+            with open(exp_path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("utf-8")
+            return {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": b64_data
+                }
+            }
+
+        # Claude does not natively support multimodal audio input.
+        if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            return {
+                "type": "text",
+                "text": f"[Audio file attached: {exp_path}. Note: Claude does not support multimodal audio input directly. To extract text or messages from this audio file, use the Media_transcribe_audio tool.]"
+            }
+
+        # Handle Images
+        supported_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if (mime_type and mime_type in supported_mimes) or ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+            if ext in [".jpg", ".jpeg"]:
+                norm_mime = "image/jpeg"
+            elif ext == ".png":
+                norm_mime = "image/png"
+            elif ext == ".gif":
+                norm_mime = "image/gif"
+            elif ext == ".webp":
+                norm_mime = "image/webp"
+            else:
+                norm_mime = mime_type or "image/jpeg"
+
+            with open(exp_path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": norm_mime,
+                    "data": b64_data
+                }
+            }
+
+        raise ValueError(
+            f"Unsupported media format '{mime_type or ext}' for {exp_path}. "
+            "Supported formats: images (JPEG, PNG, GIF, WebP), PDF documents, audio files."
+        )
+
+    def _prepare_image_block(self, image_path: str) -> dict:
+        return self._prepare_media_block(image_path)
+
+    def _cull_media_from_history(self):
+        # Intelligent Media Culling: Strip heavy multimodal attachments from older turns (> 4 turns)
+        if len(self.history) > 4:
+            for i in range(len(self.history) - 4):
+                msg = self.history[i]
+                if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                    new_content = []
+                    modified = False
+                    for part in msg["content"]:
+                        if isinstance(part, dict) and part.get("type") in ("image", "document"):
+                            new_content.append({
+                                "type": "text",
+                                "text": "[Media attachment automatically culled to save tokens/memory]"
+                            })
+                            modified = True
+                        else:
+                            new_content.append(part)
+                    if modified:
+                        msg["content"] = new_content
 
     def send_function_response(self, name: str, response: dict):
         self.send_function_responses([(name, response)])
@@ -229,21 +357,9 @@ class ClaudeWorker:
             else:
                 for m_path in attached_media:
                     try:
-                        import os
-                        import mimetypes
-                        import base64
-                        exp_path = os.path.expanduser(m_path)
-                        mime_type, _ = mimetypes.guess_type(exp_path)
-                        with open(exp_path, "rb") as f:
-                            b64_data = base64.b64encode(f.read()).decode("utf-8")
-                        parts.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type or "image/jpeg",
-                                "data": b64_data
-                            }
-                        })
+                        media_block = self._prepare_media_block(m_path)
+                        if media_block:
+                            parts.append(media_block)
                     except Exception as e:
                         logging.warning(f"Failed to attach tool media for Claude {m_path}: {e}")
 
@@ -352,47 +468,24 @@ class ClaudeWorker:
                     {"type": "text", "text": "[Image attachment skipped: Low Token Mode is active]"})
             else:
                 try:
-                    import mimetypes
-                    import base64
-                    mime_type, _ = mimetypes.guess_type(image_path)
-                    with open(image_path, "rb") as image_file:
-                        image_data = base64.b64encode(
-                            image_file.read()).decode("utf-8")
-                    content_blocks.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": mime_type or 'image/jpeg',
-                            "data": image_data,
-                        }
-                    })
+                    media_block = self._prepare_media_block(image_path)
+                    if media_block:
+                        content_blocks.append(media_block)
                 except Exception as e:
                     self.error_occurred.emit(f"Image load error: {e}")
                     self.is_processing = False
                     return
 
         if audio_path:
-            if is_low_token:
-                content_blocks.append(
-                    {"type": "text", "text": "[Audio attachment skipped: Low Token Mode is active]"})
-            else:
-                try:
-                    # Transcribe using faster-whisper via LocalSTT
-                    logging.info(
-                        f"Transcribing audio for Claude: {audio_path}")
-                    transcription = self.local_stt.transcribe(audio_path)
-                    content_blocks.append(
-                        {"type": "text", "text": f"[Audio Transcribed via Whisper]: {transcription}"})
-                except Exception as e:
-                    self.error_occurred.emit(f"Audio load error: {e}")
-                    self.is_processing = False
-                    return
+            content_blocks.append(
+                {"type": "text", "text": f"[Audio attached: {audio_path}. Claude does not support direct audio input; use Media_transcribe_audio to transcribe if needed.]"})
 
         # Add to history (keep reference for rollback on error)
         user_msg = {"role": "user", "content": content_blocks}
         with self._history_lock:
             self.history.append(user_msg)
             self._reconcile_tool_calls()
+            self._cull_media_from_history()
 
         models_to_attempt = [self.current_model]
         if self.current_model != self.light_model:

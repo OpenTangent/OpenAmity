@@ -73,6 +73,25 @@ def qapp():
     app = QApplication.instance()
     if app is None:
         app = QApplication(["-platform", "offscreen"])
-    setup_app_theme(app)
+        setup_app_theme(app)
+    # Existing QApplication may already own widgets from module fixtures.
+    # Replacing its proxy style here can hang Qt during global repolish.
     return app
 
+
+
+@pytest.fixture(autouse=True, scope="session")
+def initialise_shared_qt_theme():
+    """Establish style before module qapp fixtures can populate the app.
+
+    Replacing a live application's proxy style mid-suite can hang Qt. A single
+    early theme application preserves the style contract without repolish.
+    """
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PySide6.QtWidgets import QApplication
+    from gui.theme import setup_app_theme
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(["-platform", "offscreen"])
+    setup_app_theme(app)
+    yield app

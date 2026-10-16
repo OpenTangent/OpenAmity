@@ -181,14 +181,23 @@
       "dt": 0.1,
       "n_steps": 25
     },
+    "memory_budgets": {
+      "sanctuary_max_chars": 4800,
+      "short_term_max_chars": 2400,
+      "prospective_max_chars": 2400,
+      "short_term_context_max_chars": 3200
+    },
     "somatic": {
       "token-usage-limit": 400000,
       "session-token-cap": 400000
     },
     "auto-pulse": {
       "whitelist": [],
+      "group-whitelist": [],
+      "pulse-all-dms": false,
+      "pulse-all-groups": false,
+      "pulse-on-mentions": false,
       "buffer-seconds": 30,
-      "ratelimit-minutes": 5,
       "idle-timeout-minutes": 1
     },
     "logging": {
@@ -226,6 +235,17 @@
       "websearch": true,
       "media": true,
       "browser": true
+    },
+    "provider_context_limits": {
+      "default": {
+        "context_tokens": 131072,
+        "output_reserve_tokens": 4096,
+        "history_reserve_tokens": 8192,
+        "framing_reserve_tokens": 1024
+      }
+    },
+    "identity_evolution": {
+      "mode": "autonomous"
     }
   }
 }

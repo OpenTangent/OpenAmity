@@ -11,6 +11,9 @@ from gui.spellcheck import SpellCheckHighlighter
 from gui.logger_formatter import QtLoggingHandler, StreamLogger
 from gui.agent_view import AgentView
 from gui.chatroom_view import ChatroomView
+from gui.chatroom_sidebar import ChatroomSidebar
+from gui.chatroom_editor_panel import ChatroomEditorPanel
+from core.chatroom_manager import ChatroomManager
 
 try:
     from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR, MODERN_SCROLLBAR_STYLE
@@ -79,7 +82,7 @@ class AgentTabButton(QPushButton):
         else:
             self.pulse_timer.stop()
             self.pulse_phase = 0.0
-        self.update()
+            self.update()
 
     def set_selected(self, selected: bool):
         if self.is_selected != selected:
@@ -232,9 +235,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Open Amity")
         self.resize(1000, 600)
         self.agent_manager = agent_manager
+        self.chatroom_manager = ChatroomManager()
         self.agent_views = {}  # dict of agent_id -> AgentView
         self.tab_buttons = {}  # dict of agent_id -> AgentTabButton
         self.current_agent_id = None
+        self.current_chatroom_id = None
+        self.last_dm_agent_id = None
+        self.current_context = ("all", None)  # ("all", None) or ("room", chatroom_id)
         self._shutting_down = False
         self.agents_pending_shutdown = 0
 
@@ -268,6 +275,13 @@ class MainWindow(QMainWindow):
         self.main_hlayout.setContentsMargins(0, 0, 0, 0)
         self.main_hlayout.setSpacing(0)
 
+        # Chatroom Tabs Sidebar (runs full height down the left side)
+        self.chatroom_sidebar = ChatroomSidebar(self)
+        self.chatroom_sidebar.all_agents_selected.connect(self._on_sidebar_all_agents_selected)
+        self.chatroom_sidebar.chatroom_selected.connect(self._on_sidebar_chatroom_selected)
+        self.chatroom_sidebar.new_chatroom_requested.connect(self.open_new_chatroom)
+        self.main_hlayout.addWidget(self.chatroom_sidebar)
+
         self.left_container = QWidget()
         self.main_vlayout = QVBoxLayout(self.left_container)
         self.main_vlayout.setContentsMargins(0, 0, 0, 0)
@@ -278,7 +292,7 @@ class MainWindow(QMainWindow):
         self.consoles_stack.hide()
         self.main_hlayout.addWidget(self.consoles_stack, 1)
 
-        # Header Bar
+        # Header Bar (Agent Tabs to the right of the Chatroom Sidebar)
         self.header_widget = QWidget()
         self.header_widget.setStyleSheet("background-color: #1a1a1a;")
         self.header_layout = QHBoxLayout(self.header_widget)
@@ -289,20 +303,13 @@ class MainWindow(QMainWindow):
         self.tabs_layout.setSpacing(2)
         self.header_layout.addLayout(self.tabs_layout)
 
-        # Persistent Chatroom Tab Button (Hidden if <= 1 agent)
-        self.btn_chatroom = QPushButton("🗫 Chatroom")
-        self.btn_chatroom.setToolTip("Chatroom")
-        self.btn_chatroom.setFixedHeight(30)
-        self.btn_chatroom.setStyleSheet(
-            "QPushButton { background-color: #222; color: #AAA; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #333; color: #FFF; }")
-        self.btn_chatroom.clicked.connect(self.switch_to_chatroom)
-        self.tabs_layout.addWidget(self.btn_chatroom)
-
+        # Contextual top [+] button (Add Agent when in All Agents, Edit Chatroom when in Chatroom)
         self.btn_add_agent = QPushButton("+")
         self.btn_add_agent.setFixedSize(30, 30)
+        self.btn_add_agent.setToolTip("Add Agent")
         self.btn_add_agent.setStyleSheet(
             "QPushButton { background-color: #333; color: #FFF; border: none; font-size: 18px; border-radius: 4px; } QPushButton:hover { background-color: #444; }")
-        self.btn_add_agent.clicked.connect(self.add_new_agent)
+        self.btn_add_agent.clicked.connect(self._on_top_plus_clicked)
         self.header_layout.addWidget(self.btn_add_agent)
 
         self.header_layout.addStretch()
@@ -339,6 +346,16 @@ class MainWindow(QMainWindow):
         self.hamburger_menu.addAction(self.action_delete_agent)
         self.agent_menu_actions.append(self.action_delete_agent)
 
+        self.action_edit_chatroom = QAction("Edit Chatroom", self)
+        self.action_edit_chatroom.triggered.connect(self._on_menu_edit_chatroom)
+        self.hamburger_menu.addAction(self.action_edit_chatroom)
+
+        self.action_delete_chatroom = QAction("Delete Chatroom", self)
+        self.action_delete_chatroom.triggered.connect(self.delete_current_chatroom)
+        self.hamburger_menu.addAction(self.action_delete_chatroom)
+
+        self.chatroom_menu_actions = [self.action_edit_chatroom, self.action_delete_chatroom]
+
         self.menu_separator = self.hamburger_menu.addSeparator()
 
         system_settings_action = QAction("System Settings", self)
@@ -355,7 +372,7 @@ class MainWindow(QMainWindow):
 
         self.main_vlayout.addWidget(self.header_widget)
 
-        # Content Area (Stacked: Views vs Settings)
+        # Content Area (Stacked: Views vs Settings vs Chatroom Editor)
         self.content_container = QWidget()
         self.stacked_layout = QStackedLayout(self.content_container)
         self.stacked_layout.setContentsMargins(0, 0, 0, 0)
@@ -380,6 +397,12 @@ class MainWindow(QMainWindow):
         self.settings_panel.agent_restored.connect(self.on_agent_restored)
         self.stacked_layout.addWidget(self.settings_panel)
 
+        self.chatroom_editor_panel = ChatroomEditorPanel(self.agent_manager, self)
+        self.chatroom_editor_panel.close_requested.connect(self.hide_chatroom_editor)
+        self.chatroom_editor_panel.saved.connect(self.on_chatroom_saved)
+        self.chatroom_editor_panel.new_agent_requested.connect(self._on_editor_new_agent_requested)
+        self.stacked_layout.addWidget(self.chatroom_editor_panel)
+
         self.ui_shutdown_complete.connect(self.close)
 
         self.setStyleSheet("""
@@ -395,12 +418,10 @@ class MainWindow(QMainWindow):
         for aid in agent_ids:
             self.add_agent_tab(aid)
 
-        self.update_chatroom_tab_visibility()
-
-        if len(self.agent_views) > 1:
-            self.switch_to_chatroom()
-        elif agent_ids:
-            self.switch_to_agent(agent_ids[0])
+        # Start on "All Agents" showing the oldest agent
+        agents_by_age = self.agent_manager.get_agents_by_age()
+        initial_aid = agents_by_age[0] if agents_by_age else agent_ids[0]
+        self.switch_to_all_agents(target_agent_id=initial_aid)
 
         # Flush early logs
         from core.logger_config import EARLY_LOG_BUFFER, early_buffer_handler
@@ -413,37 +434,151 @@ class MainWindow(QMainWindow):
         # Check first run for current agent
         self.check_first_launch()
 
-    def update_chatroom_tab_visibility(self):
-        """Shows the chatroom tab if there is more than one agent, hides it if there is only one."""
-        if len(self.agent_views) > 1:
-            self.btn_chatroom.show()
-        else:
-            self.btn_chatroom.hide()
-            if self.current_agent_id == "__chatroom__" and self.agent_views:
-                first_aid = list(self.agent_views.keys())[0]
-                self.switch_to_agent(first_aid)
+    @property
+    def btn_chatroom(self):
+        """Backward-compatibility property returning the sidebar All Agents tab button."""
+        return self.chatroom_sidebar.btn_all_agents
 
-    def switch_to_chatroom(self):
+    def update_chatroom_tab_visibility(self):
+        """Refreshes sidebar rooms and agent tab list."""
+        if hasattr(self, 'chatroom_sidebar'):
+            self.chatroom_sidebar.refresh_rooms()
+        self._rebuild_agent_tabs()
+
+    def _rebuild_agent_tabs(self):
+        """Rebuilds the top tab bar ordered by agent age, filtered by current context (All Agents vs Chatroom members)."""
+        agents_by_age = self.agent_manager.get_agents_by_age()
+        curr_type, room_id = self.current_context
+
+        if curr_type == "room" and room_id is not None:
+            members = self.chatroom_manager.get_members(room_id)
+            member_uids = {m["agent_uid"] for m in members}
+            visible_agent_ids = [aid for aid in agents_by_age if self.agent_manager.get_agent_uid(aid) in member_uids]
+        else:
+            visible_agent_ids = agents_by_age
+
+        while self.tabs_layout.count():
+            self.tabs_layout.takeAt(0)
+
+        for aid in agents_by_age:
+            if aid in self.tab_buttons:
+                btn = self.tab_buttons[aid]
+                if aid in visible_agent_ids:
+                    btn.show()
+                    self.tabs_layout.addWidget(btn)
+                    if curr_type == "all":
+                        btn.set_selected(aid == self.current_agent_id)
+                    else:
+                        btn.set_selected(False)
+                else:
+                    btn.hide()
+
+    def _on_sidebar_all_agents_selected(self):
+        self.switch_to_all_agents(target_agent_id=self.last_dm_agent_id)
+
+    def _on_sidebar_chatroom_selected(self, room_id: int):
+        self.switch_to_chatroom(room_id)
+
+    def on_agent_tab_clicked(self, agent_id: str):
+        self.switch_to_all_agents(target_agent_id=agent_id)
+
+    def switch_to_agent(self, agent_id: str):
+        self.switch_to_all_agents(target_agent_id=agent_id)
+
+    def switch_to_all_agents(self, target_agent_id: str = None):
         if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
             self.settings_panel.save_settings()
+        elif self.stacked_layout.currentIndex() == 2:
+            self.hide_chatroom_editor()
 
+        if not target_agent_id:
+            target_agent_id = self.last_dm_agent_id
+        if not target_agent_id or target_agent_id not in self.agent_views:
+            agents_by_age = self.agent_manager.get_agents_by_age()
+            target_agent_id = agents_by_age[0] if agents_by_age else (list(self.agent_views.keys())[0] if self.agent_views else None)
+
+        if not target_agent_id or target_agent_id not in self.agent_views:
+            return
+
+        self.current_context = ("all", None)
+        self.current_chatroom_id = None
+        self.current_agent_id = target_agent_id
+        self.last_dm_agent_id = target_agent_id
+
+        self.agents_stack.setCurrentWidget(self.agent_views[target_agent_id])
+        self.consoles_stack.setCurrentWidget(
+            self.agent_views[target_agent_id].console_log)
+        self.hamburger_btn.show()
+
+        # Configure top [+] button for Add Agent
+        self.btn_add_agent.setText("+")
+        self.btn_add_agent.setToolTip("Add Agent")
+
+        # Configure hamburger menu for agent
+        for action in self.agent_menu_actions:
+            action.setVisible(True)
+        for action in self.chatroom_menu_actions:
+            action.setVisible(False)
+        if hasattr(self, 'menu_separator') and self.menu_separator:
+            self.menu_separator.setVisible(True)
+
+        # Update sidebar selection
+        self.chatroom_sidebar.set_selected_context("all", None)
+
+        # Rebuild agent tabs (shows all agents, selects target_agent_id)
+        self._rebuild_agent_tabs()
+
+        # Update tool pip active states across agent views
+        for aid, v in self.agent_views.items():
+            if hasattr(v, 'set_active_tab'):
+                v.set_active_tab(aid == target_agent_id)
+
+        # Point settings panel to this agent's settings
+        orchestrator = self.agent_views[target_agent_id].orchestrator
+        self.settings_panel.load_settings(orchestrator.settings_manager)
+
+        if not getattr(self.settings_panel, 'wizard_mode', False):
+            self.hide_settings()
+
+    def switch_to_chatroom(self, chatroom_id: int = None):
+        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
+            self.settings_panel.save_settings()
+        elif self.stacked_layout.currentIndex() == 2:
+            self.hide_chatroom_editor()
+
+        if chatroom_id is None:
+            active_rooms = self.chatroom_manager.list_chatrooms(include_deleted=False)
+            if active_rooms:
+                chatroom_id = active_rooms[0]["id"]
+            else:
+                chatroom_id = 1
+
+        self.current_context = ("room", chatroom_id)
+        self.current_chatroom_id = chatroom_id
         self.current_agent_id = "__chatroom__"
+
+        self.chatroom_view.set_chatroom(chatroom_id)
         self.agents_stack.setCurrentWidget(self.chatroom_view)
         self.consoles_stack.setCurrentWidget(self.chatroom_view.console_log)
         self.hamburger_btn.show()
 
+        # Configure top [+] button for Edit Chatroom
+        self.btn_add_agent.setText("+")
+        self.btn_add_agent.setToolTip("Edit Chatroom")
+
+        # Configure hamburger menu for chatroom
         for action in self.agent_menu_actions:
             action.setVisible(False)
+        for action in self.chatroom_menu_actions:
+            action.setVisible(True)
         if hasattr(self, 'menu_separator') and self.menu_separator:
-            self.menu_separator.setVisible(False)
+            self.menu_separator.setVisible(True)
 
-        # Highlight chatroom button
-        self.btn_chatroom.setStyleSheet(
-            "QPushButton { background-color: #444; color: #FFF; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; }")
+        # Update sidebar selection
+        self.chatroom_sidebar.set_selected_context("room", chatroom_id)
 
-        # Unhighlight agent tab buttons
-        for aid, btn in self.tab_buttons.items():
-            btn.set_selected(False)
+        # Rebuild agent tabs for this room
+        self._rebuild_agent_tabs()
 
         # Deactivate tool pips on all agent views while viewing chatroom
         for aid, view in self.agent_views.items():
@@ -452,6 +587,58 @@ class MainWindow(QMainWindow):
 
         if not getattr(self.settings_panel, 'wizard_mode', False):
             self.hide_settings()
+
+    def _on_top_plus_clicked(self):
+        if self.current_context[0] == "room" and self.current_chatroom_id is not None:
+            self.open_edit_chatroom(self.current_chatroom_id)
+        else:
+            self.add_new_agent()
+
+    def _on_menu_edit_chatroom(self):
+        if self.current_context[0] == "room" and self.current_chatroom_id is not None:
+            self.open_edit_chatroom(self.current_chatroom_id)
+
+    def open_new_chatroom(self):
+        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
+            self.settings_panel.save_settings()
+        self.chatroom_editor_panel.load_new_chatroom()
+        self.stacked_layout.setCurrentIndex(2)
+
+    def open_edit_chatroom(self, chatroom_id: int):
+        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
+            self.settings_panel.save_settings()
+        self.chatroom_editor_panel.load_edit_chatroom(chatroom_id)
+        self.stacked_layout.setCurrentIndex(2)
+
+    def hide_chatroom_editor(self):
+        self.stacked_layout.setCurrentIndex(0)
+        self._rebuild_agent_tabs()
+
+    def on_chatroom_saved(self, chatroom_id: int):
+        self.chatroom_sidebar.refresh_rooms()
+        self.switch_to_chatroom(chatroom_id)
+
+    def _on_editor_new_agent_requested(self):
+        self.add_new_agent()
+
+    def delete_current_chatroom(self):
+        if self.current_context[0] != "room" or self.current_chatroom_id is None:
+            return
+        room = self.chatroom_manager.get_chatroom(self.current_chatroom_id)
+        if not room or room.get("deleted_at") is not None:
+            return
+        room_name = room["name"]
+        reply = QMessageBox.question(
+            self,
+            "Confirm Chatroom Deletion",
+            f"Are you sure you want to delete chatroom '{room_name}'?\nThis will hide the room from all agents.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.chatroom_manager.delete_chatroom(self.current_chatroom_id)
+            self.switch_to_all_agents()
+            self.chatroom_sidebar.refresh_rooms()
 
     def _on_agent_busy_state_changed(self, agent_id: str, busy: bool, speaking: bool):
         if agent_id not in self.tab_buttons:
@@ -478,11 +665,11 @@ class MainWindow(QMainWindow):
         if not target:
             return
         if target in self.agent_views:
-            self.switch_to_agent(target)
+            self.switch_to_all_agents(target_agent_id=target)
             return
         aid = self.agent_manager.get_agent_id_by_uid(target)
         if aid and aid in self.agent_views:
-            self.switch_to_agent(aid)
+            self.switch_to_all_agents(target_agent_id=aid)
 
     def add_agent_tab(self, agent_id):
         # Create orchestrator for agent
@@ -500,8 +687,7 @@ class MainWindow(QMainWindow):
         btn = AgentTabButton(agent_id, agent_name, self)
         btn.set_paused(orchestrator.is_paused)
         btn.clicked.connect(lambda checked=False,
-                            a=agent_id: self.switch_to_agent(a))
-        self.tabs_layout.addWidget(btn)
+                            a=agent_id: self.on_agent_tab_clicked(a))
         self.tab_buttons[agent_id] = btn
 
         orchestrator.on_shutdown_complete.connect(self.check_all_shutdown)
@@ -511,50 +697,12 @@ class MainWindow(QMainWindow):
         orchestrator.on_paused_state_changed.connect(
             lambda paused, aid=agent_id: self.ui_agent_paused_state_changed.emit(aid, paused)
         )
-        self.update_chatroom_tab_visibility()
-
-    def switch_to_agent(self, agent_id):
-        if agent_id not in self.agent_views:
-            return
-
-        if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
-            self.settings_panel.save_settings()
-
-        self.current_agent_id = agent_id
-        self.agents_stack.setCurrentWidget(self.agent_views[agent_id])
-        self.consoles_stack.setCurrentWidget(
-            self.agent_views[agent_id].console_log)
-        self.hamburger_btn.show()
-
-        for action in self.agent_menu_actions:
-            action.setVisible(True)
-        if hasattr(self, 'menu_separator') and self.menu_separator:
-            self.menu_separator.setVisible(True)
-
-        # Update tab styles
-        self.btn_chatroom.setStyleSheet(
-            "QPushButton { background-color: #222; color: #AAA; border: none; font-size: 14px; padding: 0 15px; border-radius: 4px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #333; color: #FFF; }")
-
-        for aid, btn in self.tab_buttons.items():
-            btn.set_selected(aid == agent_id)
-
-        # Update tool pip active states across agent views
-        for aid, v in self.agent_views.items():
-            if hasattr(v, 'set_active_tab'):
-                v.set_active_tab(aid == agent_id)
-
-        # Point settings panel to this agent's settings
-        orchestrator = self.agent_views[agent_id].orchestrator
-        self.settings_panel.load_settings(orchestrator.settings_manager)
-
-        if not getattr(self.settings_panel, 'wizard_mode', False):
-            self.hide_settings()
+        self._rebuild_agent_tabs()
 
     def add_new_agent(self):
         new_id = self.agent_manager.create_new_agent()
         self.add_agent_tab(new_id)
-        self.switch_to_agent(new_id)
-        self.update_chatroom_tab_visibility()
+        self.switch_to_all_agents(target_agent_id=new_id)
         # Start wizard
         self.settings_panel.settings.set("core.first-run", True)
         self.settings_panel.settings.save()
@@ -576,7 +724,7 @@ class MainWindow(QMainWindow):
 
             # Switch away first
             other_ids = [k for k in self.agent_views.keys() if k != aid]
-            self.switch_to_agent(other_ids[0])
+            self.switch_to_all_agents(target_agent_id=other_ids[0])
 
             # Disconnect shutdown signal so deleting an individual agent does not trigger app shutdown
             orch = self.agent_manager.get_orchestrator(aid)
@@ -600,7 +748,8 @@ class MainWindow(QMainWindow):
 
             # Delete data
             self.agent_manager.delete_agent(aid)
-            self.update_chatroom_tab_visibility()
+            self._rebuild_agent_tabs()
+            self.chatroom_sidebar.refresh_rooms()
 
     def append_to_agent_console(self, agent_id, text):
         if agent_id == "global":
@@ -697,6 +846,8 @@ class MainWindow(QMainWindow):
 
         if self.stacked_layout.currentIndex() == 1 and not getattr(self.settings_panel, 'wizard_mode', False):
             self.settings_panel.save_settings()
+        elif self.stacked_layout.currentIndex() == 2 and getattr(self.chatroom_editor_panel, 'is_edit_mode', False):
+            self.chatroom_editor_panel._save_changes()
 
         logging.info("System: Shutting down all agents gracefully...")
         self._shutting_down = True

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 # Add src to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from core.agent_manager import AgentManager
 from gui.main_window import MainWindow
 
@@ -51,9 +51,9 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
 
     actions = window.hamburger_menu.actions()
 
-    # Verify action sequence
-    # Total items: 7 agent sections + 1 Delete Agent + 1 Separator + 1 System Settings + 1 Exit = 11 items
-    assert len(actions) == 11
+    # Verify action sequence:
+    # 7 agent sections + 1 Delete Agent + 2 Chatroom sections + 1 Separator + 1 System Settings + 1 Exit = 13 items
+    assert len(actions) == 13
 
     expected_agent_titles = [
         "Cognitive Provider",
@@ -70,23 +70,29 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
         assert actions[idx].text() == title
         assert not actions[idx].isSeparator()
 
-    # Verify partition separator is at index 8
-    assert actions[8].isSeparator()
+    # Verify chatroom actions
+    assert actions[8].text() == "Edit Chatroom"
+    assert actions[9].text() == "Delete Chatroom"
+
+    # Verify partition separator is at index 10
+    assert actions[10].isSeparator()
 
     # Verify system sections below the partition line
-    assert actions[9].text() == "System Settings"
-    assert not actions[9].isSeparator()
-    assert actions[10].text() == "Exit"
-    assert not actions[10].isSeparator()
+    assert actions[11].text() == "System Settings"
+    assert not actions[11].isSeparator()
+    assert actions[12].text() == "Exit"
+    assert not actions[12].isSeparator()
 
     # Test Agent View State
     window.switch_to_agent(aid1)
     assert not window.hamburger_btn.isHidden()
     for action in window.agent_menu_actions:
         assert action.isVisible()
+    for action in window.chatroom_menu_actions:
+        assert not action.isVisible()
     assert window.menu_separator.isVisible()
-    assert actions[9].isVisible()  # System Settings
-    assert actions[10].isVisible()  # Exit
+    assert actions[11].isVisible()  # System Settings
+    assert actions[12].isVisible()  # Exit
 
     visible_in_agent_view = [a.text() for a in actions if not a.isSeparator() and a.isVisible()]
     assert visible_in_agent_view == [
@@ -107,21 +113,71 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
     assert not window.hamburger_btn.isHidden()
     for action in window.agent_menu_actions:
         assert not action.isVisible()
-    assert not window.menu_separator.isVisible()
-    assert actions[9].isVisible()  # System Settings
-    assert actions[10].isVisible()  # Exit
+    for action in window.chatroom_menu_actions:
+        assert action.isVisible()
+    assert window.menu_separator.isVisible()
+    assert actions[11].isVisible()  # System Settings
+    assert actions[12].isVisible()  # Exit
 
     visible_in_chatroom = [a.text() for a in actions if not a.isSeparator() and a.isVisible()]
-    assert visible_in_chatroom == ["System Settings", "Exit"]
+    assert visible_in_chatroom == ["Edit Chatroom", "Delete Chatroom", "System Settings", "Exit"]
 
     # Test switching back to Agent View
     window.switch_to_agent(aid2)
     assert not window.hamburger_btn.isHidden()
     for action in window.agent_menu_actions:
         assert action.isVisible()
+    for action in window.chatroom_menu_actions:
+        assert not action.isVisible()
     assert window.menu_separator.isVisible()
-    assert actions[9].isVisible()
-    assert actions[10].isVisible()
+    assert actions[11].isVisible()
+    assert actions[12].isVisible()
+
+    window.close()
+
+
+def test_dynamic_agent_tabs_and_context_switching(qapp, temp_environment):
+    from core.chatroom_manager import ChatroomManager
+    agent_manager = AgentManager()
+    aid1 = agent_manager.create_new_agent()
+    aid2 = agent_manager.create_new_agent()
+    uid1 = agent_manager.get_agent_uid(aid1)
+    uid2 = agent_manager.get_agent_uid(aid2)
+
+    cm = ChatroomManager()
+    # Create room with only aid1 access
+    room_id = cm.create_chatroom("Alpha Room", members=[{"agent_uid": uid1, "watch": False}])
+
+    with patch("gui.main_window.SpellCheckHighlighter"):
+        window = MainWindow(agent_manager)
+
+    # Initially in "All Agents"
+    assert window.current_context == ("all", None)
+    assert window.btn_add_agent.toolTip() == "Add Agent"
+    # Both tabs visible in age order
+    visible_tab_ids = [window.tabs_layout.itemAt(i).widget().agent_id for i in range(window.tabs_layout.count())]
+    assert aid1 in visible_tab_ids
+    assert aid2 in visible_tab_ids
+
+    # Switch to room
+    window.switch_to_chatroom(room_id)
+    assert window.current_context == ("room", room_id)
+    assert window.btn_add_agent.toolTip() == "Edit Chatroom"
+
+    # Only aid1 is visible in tabs bar
+    visible_tab_ids = [window.tabs_layout.itemAt(i).widget().agent_id for i in range(window.tabs_layout.count())]
+    assert visible_tab_ids == [aid1]
+
+    # Clicking agent tab in chatroom switches to All Agents and opens DM
+    window.on_agent_tab_clicked(aid1)
+    assert window.current_context == ("all", None)
+    assert window.current_agent_id == aid1
+    assert window.btn_add_agent.toolTip() == "Add Agent"
+
+    # Now all tabs visible again
+    visible_tab_ids = [window.tabs_layout.itemAt(i).widget().agent_id for i in range(window.tabs_layout.count())]
+    assert aid1 in visible_tab_ids
+    assert aid2 in visible_tab_ids
 
     window.close()
 
@@ -229,6 +285,41 @@ def test_switching_away_from_open_settings_commits_settings(qapp, temp_environme
     # Panel should be closed and aid1's settings committed
     assert window.stacked_layout.currentIndex() == 0
     assert "Courage" in sm1.get("core.agent.core-values", [])
+
+    window.close()
+
+
+def test_delete_current_chatroom(qapp, temp_environment):
+    from core.chatroom_manager import ChatroomManager
+    agent_manager = AgentManager()
+    aid1 = agent_manager.create_new_agent()
+    uid1 = agent_manager.get_agent_uid(aid1)
+
+    cm = ChatroomManager()
+    rid = cm.create_chatroom("Project Delta", members=[{"agent_uid": uid1, "watch": False}])
+
+    with patch("gui.main_window.SpellCheckHighlighter"):
+        window = MainWindow(agent_manager)
+
+    # Switch to the created room
+    window.switch_to_chatroom(rid)
+    assert window.current_context == ("room", rid)
+    assert window.current_chatroom_id == rid
+
+    # Test cancel deletion (QMessageBox.No)
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.No):
+        window.delete_current_chatroom()
+        # Room should still exist and context unchanged
+        assert cm.get_chatroom(rid)["deleted_at"] is None
+        assert window.current_context == ("room", rid)
+
+    # Test confirm deletion (QMessageBox.Yes)
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        window.delete_current_chatroom()
+        # Room should be deleted and window switched to All Agents
+        assert cm.get_chatroom(rid)["deleted_at"] is not None
+        assert window.current_context == ("all", None)
+        assert rid not in [r["id"] for r in cm.list_chatrooms()]
 
     window.close()
 

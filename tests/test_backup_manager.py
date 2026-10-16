@@ -308,14 +308,19 @@ def test_system_tool_create_backup(temp_backup_env):
     orch = MockOrchestrator(aid)
     tool = SystemTool(orchestrator=orch)
 
-    # Test "self" backup
-    result_self = tool.execute("create_backup", target="self", backup_location=temp_backup_env["backup_dest_dir"])
+    # Test "self" backup with wait=True
+    result_self = tool.execute("create_backup", target="self", backup_location=temp_backup_env["backup_dest_dir"], wait=True)
     assert "Successfully created backup snapshot" in result_self
     assert "ToolAgent-" in result_self
 
-    # Test "all" backup
-    result_all = tool.execute("create_backup", target="all", backup_location=temp_backup_env["backup_dest_dir"])
+    # Test "all" backup with wait=True
+    result_all = tool.execute("create_backup", target="all", backup_location=temp_backup_env["backup_dest_dir"], wait=True)
     assert "Successfully created backup(s) for all agents" in result_all
+
+    # Test default async start returns task ID immediately
+    result_async = tool.execute("create_backup", target="self", backup_location=temp_backup_env["backup_dest_dir"])
+    assert "Backup process started in background with ID:" in result_async
+
 
 
 def test_config_manager_backup_location(temp_backup_env):
@@ -340,6 +345,8 @@ def test_system_tool_declarations():
     declarations = tool.get_tool_declarations()
     names = [d["name"] for d in declarations]
     assert "System_create_backup" in names
+    assert "System_check_backup_status" in names
+    assert "System_kill_backup" in names
 
     backup_decl = next(d for d in declarations if d["name"] == "System_create_backup")
     props = backup_decl["parameters"]["properties"]
@@ -480,11 +487,12 @@ def test_backup_excludes_node_modules_and_caches(temp_backup_env):
     with zipfile.ZipFile(backup_path, "r") as zf:
         namelist = zf.namelist()
 
-        # Check preserved items
-        assert any("whatsapp_data/.wpp_session/session_state.json" in n.replace("\\", "/") for n in namelist)
-        assert any("whatsapp_data/uploads/received_photo.jpg" in n.replace("\\", "/") for n in namelist)
+        # Check preserved state items
+        assert any("settings.json" in n for n in namelist)
 
-        # Check excluded items
+        # Check excluded items (BP1: WhatsApp session data excluded by default)
+        assert not any("whatsapp_data" in n for n in namelist)
+        assert not any("whatsapp_bridge" in n for n in namelist)
         assert not any("node_modules" in n for n in namelist)
         assert not any("puppeteer_cache" in n for n in namelist)
         assert not any(".wwebjs_cache" in n for n in namelist)
@@ -560,15 +568,7 @@ def test_backup_manager_c1_zip_slip_rejection(temp_backup_env):
     # Delete agent to restore as new instance
     am.delete_agent(aid)
 
-    # Restoring should skip the malicious entry without escaping target_dir
+    # Tampered archives fail closed before restore rather than silently skipping.
     success, msg, details = restore_agent_backup(backup_path, agent_manager=am)
-    assert success is True
-    new_aid = details["agent_id"]
-    new_dir = paths.get_agent_data_dir(new_aid)
-
-    # Verify evil.txt was NOT written to parent of new_dir
-    parent_dir = os.path.dirname(new_dir)
-    assert not os.path.exists(os.path.join(parent_dir, "evil.txt"))
-
-
-
+    assert success is False
+    assert not os.path.exists(os.path.join(temp_backup_env["app_data_dir"], "agents", "evil.txt"))

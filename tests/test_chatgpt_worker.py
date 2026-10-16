@@ -426,5 +426,88 @@ def test_chatgpt_send_function_responses_low_token_skips_media(monkeypatch, tmp_
         assert "[Tool media attachments skipped: Low Token Mode is active]" in media_user_msg["content"]
 
 
+def test_chatgpt_worker_pdf_media_attachment(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    pdf_file = tmp_path / "research.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4 test research pdf")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-chatgpt-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test chatgpt pdf response")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Reading document...",
+            "tool_calls": [{
+                "id": "call_pdf_1",
+                "type": "function",
+                "function": {
+                    "name": "Media_read",
+                    "arguments": '{"file_path": "research.pdf"}'
+                }
+            }]
+        })
+
+        with patch("threading.Thread") as mock_thread:
+            worker.send_function_responses([
+                ("Media_read", {
+                    "result": f"Attached {str(pdf_file)}",
+                    "media": [str(pdf_file)]
+                })
+            ])
+
+        assert len(worker.history) == 3
+        media_user_msg = worker.history[2]
+        assert media_user_msg["role"] == "user"
+        content_blocks = media_user_msg["content"]
+        assert len(content_blocks) == 2
+        assert content_blocks[1]["type"] == "file"
+        assert content_blocks[1]["file"]["filename"] == "research.pdf"
+        assert content_blocks[1]["file"]["file_data"].startswith("data:application/pdf;base64,")
+
+
+def test_chatgpt_worker_media_culling(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-chatgpt-test-key-12345"):
+        worker = ChatGptWorker(agent_id="test_chatgpt_agent")
+        worker.start_session(system_instruction="Test culling")
+
+        # Set up 6 turns: turn 0 has heavy image and file
+        worker.history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Turn 0"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,BBB"}}
+                ]
+            },
+            {"role": "assistant", "content": "Response 0"},
+            {"role": "user", "content": "Turn 1"},
+            {"role": "assistant", "content": "Response 1"},
+            {"role": "user", "content": "Turn 2"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Recent turn"},
+                    {"type": "file", "file": {"filename": "recent.pdf", "file_data": "data:application/pdf;base64,CCC"}}
+                ]
+            }
+        ]
+
+        worker._cull_media_from_history()
+
+        culled_blocks = worker.history[0]["content"]
+        assert culled_blocks[0]["text"] == "Turn 0"
+        assert "[Media attachment automatically culled" in culled_blocks[1]["text"]
+        assert "[Media attachment automatically culled" in culled_blocks[2]["text"]
+
+        recent_blocks = worker.history[5]["content"]
+        assert recent_blocks[1]["type"] == "file"
+
+
+
 
 

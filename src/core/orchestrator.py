@@ -64,6 +64,7 @@ class AmityOrchestrator:
         self._pausing_in_progress = False
         self.is_busy = False
         self.is_thinking = False
+        self._pending_settings_reload = False
         now = datetime.now().astimezone()
         tz_str = f" ({now.tzname()})" if now.tzname() else ""
         now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
@@ -183,6 +184,23 @@ class AmityOrchestrator:
         self.system_prompt += "\n" + self.cerebrum.get_agent_manual()
         if self.settings_manager.get("core.low-token-mode", False):
             self.system_prompt += "\n\n[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]"
+        from core.prompt_context import fit_system_prompt
+        self.system_prompt = fit_system_prompt(self.system_prompt, self.settings_manager,
+                                              self.cerebrum.get_all_tool_declarations())
+
+    def deliver_memory_refresh(self, context):
+        """Replace worker system memory before continuing a refresh tool round trip."""
+        from core.prompt_context import replace_memory_context, fit_system_prompt
+        # Rebuild other dynamic sections, then put the freshly delivered block
+        # in the authoritative system position (old history remains historical).
+        self.build_system_prompt()
+        prompt = replace_memory_context(self.system_prompt, context)
+        tools = self.cerebrum.get_all_tool_declarations()
+        prompt = fit_system_prompt(prompt, self.settings_manager, tools)
+        worker = getattr(self, "gemini_worker", None)
+        if worker is not None:
+            worker.update_system_instruction(prompt)
+        self.system_prompt = prompt
 
     def _teardown_worker(self):
         if self.gemini_worker:
@@ -216,10 +234,20 @@ class AmityOrchestrator:
             self.gemini_worker = None
 
     def restart_worker(self):
-        self._teardown_worker()
+        if self.is_thinking or (self.gemini_worker and getattr(self.gemini_worker, 'is_processing', False)):
+            logging.info(
+                f"Agent {self.agent_id} is actively thinking. Deferring worker restart until thought process completes.")
+            self._pending_settings_reload = True
+            return
         self.reload_settings()
 
     def reload_settings(self):
+        if self.is_thinking or (self.gemini_worker and getattr(self.gemini_worker, 'is_processing', False)):
+            logging.info(
+                f"Agent {self.agent_id} is actively thinking. Deferring settings reload until thought process completes.")
+            self._pending_settings_reload = True
+            return
+
         self.settings_manager.settings = self.settings_manager.load_settings()
         self.is_paused = self.settings_manager.get("core.paused", False)
         self.mempalace_manager.reload_settings()
@@ -228,6 +256,8 @@ class AmityOrchestrator:
         wa_skill = self.cerebrum.tools.get("WhatsApp")
         if wa_skill:
             wa_skill.message_received_callback = self.pulse_engine.handle_whatsapp_message
+        if hasattr(self, 'pulse_engine') and self.pulse_engine and hasattr(self.pulse_engine, 'reset_whatsapp_slowdown'):
+            self.pulse_engine.reset_whatsapp_slowdown()
 
         provider = self.settings_manager.get("core.api-provider", "gemini")
         agy_mode = self.settings_manager.get("core.antigravity.agy-mode", False)
@@ -269,12 +299,23 @@ class AmityOrchestrator:
                 worker_mismatch = True
 
         if worker_mismatch:
+            history = None
+            if self.gemini_worker and hasattr(self.gemini_worker, 'get_session_history'):
+                try:
+                    history = self.gemini_worker.get_session_history()
+                except Exception as e:
+                    logging.warning(f"Error exporting session history before worker swap: {e}")
             self._teardown_worker()
             self.init_worker()
+            if history and self.gemini_worker and hasattr(self.gemini_worker, 'set_session_history'):
+                try:
+                    self.gemini_worker.set_session_history(history)
+                except Exception as e:
+                    logging.warning(f"Error restoring session history after worker swap: {e}")
         else:
             if not self.is_paused and self.gemini_worker and getattr(self.gemini_worker, 'available', False):
                 tools = self.cerebrum.get_all_tool_declarations()
-                self.gemini_worker.start_session(self.system_prompt, tools=tools)
+                self.gemini_worker.start_session(self.system_prompt, tools=tools, clear_history=False)
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
         self.is_busy = busy
@@ -538,7 +579,13 @@ class AmityOrchestrator:
                         self.gemini_worker.stop_session()
                     if hasattr(self.gemini_worker, 'start_session'):
                         if not getattr(self, '_pausing_in_progress', False) and not getattr(self, '_shutdown_flag', False):
-                            self.gemini_worker.start_session(self.system_prompt, tools=tools)
+                            self.gemini_worker.start_session(self.system_prompt, tools=tools, clear_history=True)
+
+            if getattr(self, '_pending_settings_reload', False):
+                self._pending_settings_reload = False
+                logging.info(
+                    f"Applying deferred settings reload for Agent {self.agent_id} after thought completion.")
+                self.reload_settings()
 
             self.set_busy_state(False)
             if self.event_queue:
@@ -682,6 +729,13 @@ class AmityOrchestrator:
         self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
         logging.debug("gemini_worker.send_prompt returned.")
 
+    def has_queued_pulse(self, purpose: str) -> bool:
+        """Checks if a pulse with the specified purpose is currently waiting in the event queue."""
+        return any(
+            isinstance(e, dict) and e.get("type") == "pulse" and e.get("purpose") == purpose
+            for e in list(self.event_queue)
+        )
+
     @with_agent_context
     def process_pulse(self, text="Autonomy Pulse", purpose=None):
         if self.is_paused:
@@ -689,6 +743,9 @@ class AmityOrchestrator:
             return
 
         if self.is_busy:
+            if purpose == "WhatsApp message received" and self.has_queued_pulse("WhatsApp message received"):
+                logging.debug("WhatsApp pulse already queued while busy; coalescing.")
+                return
             self.event_queue.append({"type": "pulse", "text": text, "purpose": purpose})
             return
 
@@ -717,14 +774,17 @@ class AmityOrchestrator:
             "Scheduled task",
             "Autonomous routine",
             "External pulse received",
+            "Chatroom message received",
         }
 
         category = purpose
         if category not in PREWRITTEN_PULSE_CATEGORIES:
             cat_lower = str(category).lower() if category else ""
-            if "memory consolidation" in cat_lower or "sleep cycle" in cat_lower or "Sleep Cycle" in text:
+            if "chatroom" in cat_lower or "CHATROOM_WATCH" in text:
+                category = "Chatroom message received"
+            elif "memory consolidation" in cat_lower or "sleep cycle" in cat_lower or "Sleep Cycle" in text:
                 category = "Memory consolidation cycle"
-            elif "whatsapp" in cat_lower or "WhatsApp Message" in text:
+            elif "whatsapp" in cat_lower or "whatsapp" in text.lower():
                 category = "WhatsApp message received"
             elif "external" in cat_lower or "hook" in cat_lower:
                 category = "External pulse received"
@@ -763,7 +823,7 @@ class AmityOrchestrator:
         self.accumulated_thoughts = ""
 
         prompt_payload = text
-        if self.last_action_result:
+        if getattr(self, "last_action_result", None):
             prompt_payload = f"[System Feedback from previous turn]: {self.last_action_result}\n\n{text}"
             self.last_action_result = None
 

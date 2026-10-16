@@ -2,6 +2,7 @@ import os
 import shutil
 import uuid
 import logging
+from datetime import datetime
 from config import paths
 
 
@@ -11,8 +12,43 @@ class AgentManager:
         self.orchestrators = {}
         os.makedirs(self.agents_dir, exist_ok=True)
         self.migrate_legacy_data()
+
+        # Enforce creation-date backfill on existing agents
+        self._backfill_creation_dates()
+
+        # Complete legacy chatroom migration if needed
+        self._complete_legacy_chatroom_migration()
+
+        # Start watch notifier
+        from core.chatroom_notifier import ChatroomWatchNotifier
+        self.chatroom_notifier = ChatroomWatchNotifier(self)
+
         self.hook_server = None
         self.start_hook_server()
+
+    def _backfill_creation_dates(self):
+        """Ensures all existing agents have core.agent.creation-date set, falling back to current date."""
+        from core.settings_manager import SettingsManager
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for aid in self.get_all_agents():
+            try:
+                settings = SettingsManager(agent_id=aid)
+                cdate = settings.get("core.agent.creation-date", "")
+                if not cdate or str(cdate).strip().lower() in ("", "unknown"):
+                    settings.set("core.agent.creation-date", today_str)
+                    settings.save()
+                    logging.info(f"AgentManager: Backfilled creation-date '{today_str}' for agent {aid}")
+            except Exception as e:
+                logging.warning(f"AgentManager: Error checking creation-date for agent {aid}: {e}")
+
+    def _complete_legacy_chatroom_migration(self):
+        try:
+            from core.chatroom_manager import ChatroomManager
+            cm = ChatroomManager()
+            all_uids = [self.get_agent_uid(aid) for aid in self.get_all_agents()]
+            cm.complete_legacy_migration(all_uids)
+        except Exception as e:
+            logging.warning(f"AgentManager: Error completing legacy chatroom migration: {e}")
 
     def migrate_legacy_data(self):
         legacy_files = [
@@ -48,9 +84,6 @@ class AgentManager:
                     break
 
         if needs_migration:
-            import logging
-
-            # Check if we already migrated to 'default' previously
             default_agent_dir = os.path.join(self.agents_dir, "default")
             migrated_agent_id = str(uuid.uuid4())
             migrated_agent_dir = os.path.join(
@@ -75,7 +108,6 @@ class AgentManager:
                         except Exception as e:
                             logging.error(f"Failed to migrate file {f}: {e}")
                     else:
-                        # If destination already exists, just remove the source to prevent repeated migration attempts.
                         os.remove(src)
 
             for d in legacy_dirs:
@@ -99,6 +131,29 @@ class AgentManager:
                     agents.append(entry)
         return agents
 
+    def get_agent_creation_date(self, agent_id: str) -> str:
+        from core.settings_manager import SettingsManager
+        settings = SettingsManager(agent_id=agent_id)
+        cdate = settings.get("core.agent.creation-date", "")
+        if cdate and str(cdate).strip().lower() not in ("", "unknown"):
+            return str(cdate).strip()
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def get_agents_by_age(self):
+        """
+        Returns all agent IDs sorted from oldest to newest based on core.agent.creation-date.
+        Ties are broken by agent directory mtime or ID.
+        """
+        all_agents = self.get_all_agents()
+
+        def _sort_key(aid):
+            cdate = self.get_agent_creation_date(aid)
+            agent_dir = os.path.join(self.agents_dir, aid)
+            mtime = os.path.getmtime(agent_dir) if os.path.exists(agent_dir) else 0.0
+            return (cdate, mtime, aid)
+
+        return sorted(all_agents, key=_sort_key)
+
     def create_agent(self, agent_id: str) -> str:
         agent_dir = os.path.join(self.agents_dir, agent_id)
         os.makedirs(agent_dir, exist_ok=True)
@@ -106,6 +161,14 @@ class AgentManager:
         if not os.path.exists(env_path):
             with open(env_path, "w") as f:
                 f.write("")
+
+        # Enforce creation date
+        from core.settings_manager import SettingsManager
+        settings = SettingsManager(agent_id=agent_id)
+        if not settings.get("core.agent.creation-date"):
+            settings.set("core.agent.creation-date", datetime.now().strftime("%Y-%m-%d"))
+            settings.save()
+
         self.get_agent_uid(agent_id)
         return agent_id
 
@@ -114,6 +177,16 @@ class AgentManager:
         return self.create_agent(agent_id)
 
     def delete_agent(self, agent_id: str):
+        uid = self.get_agent_uid(agent_id)
+        if hasattr(self, 'chatroom_notifier') and self.chatroom_notifier and uid:
+            self.chatroom_notifier.cancel_room_notifications_for_agent(None, uid)
+
+        try:
+            from core.chatroom_manager import ChatroomManager
+            ChatroomManager().remove_agent_everywhere(uid)
+        except Exception as e:
+            logging.warning(f"AgentManager: Error removing agent {uid} from chatrooms: {e}")
+
         if agent_id in self.orchestrators:
             orchestrator = self.orchestrators[agent_id]
             try:
@@ -123,6 +196,7 @@ class AgentManager:
                 logging.error(
                     f"AgentManager: Error during shutdown while deleting agent {agent_id}: {e}", exc_info=True)
             self.orchestrators.pop(agent_id, None)
+
         agent_dir = os.path.join(self.agents_dir, agent_id)
         if os.path.exists(agent_dir):
             try:
@@ -137,6 +211,10 @@ class AgentManager:
         return self.orchestrators.get(agent_id)
 
     def stop_agent(self, agent_id: str):
+        uid = self.get_agent_uid(agent_id)
+        if hasattr(self, 'chatroom_notifier') and self.chatroom_notifier and uid:
+            self.chatroom_notifier.cancel_room_notifications_for_agent(None, uid)
+
         if agent_id in self.orchestrators:
             orchestrator = self.orchestrators.pop(agent_id)
             try:
@@ -207,6 +285,5 @@ class AgentManager:
             except Exception as e:
                 logging.debug(f"AgentManager: Error stopping HookServer: {e}")
             self.hook_server = None
-
-
-
+        if hasattr(self, 'chatroom_notifier') and self.chatroom_notifier:
+            self.chatroom_notifier.stop()

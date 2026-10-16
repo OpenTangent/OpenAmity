@@ -33,11 +33,16 @@ class ChatroomView(QWidget):
     ui_event_received = Signal(dict)
     agent_tab_requested = Signal(str)
 
-    def __init__(self, agent_manager, parent=None):
+    def __init__(self, agent_manager, parent=None, chatroom_id: int = 1):
         super().__init__(parent)
         self.agent_manager = agent_manager
+        self.chatroom_id = chatroom_id
         self.manager = ChatroomManager()
         self._uid_to_name_cache = {}
+        self.BATCH_SIZE = 50
+        self._loaded_messages = []
+        self._has_more_history = True
+        self._is_loading_history = False
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -49,6 +54,7 @@ class ChatroomView(QWidget):
         self.conversation_log.setOpenExternalLinks(False)
         self.conversation_log.setOpenLinks(False)
         self.conversation_log.anchorClicked.connect(self.on_anchor_clicked)
+        self.conversation_log.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self.main_layout.addWidget(self.conversation_log, 1)
 
         # Console Log for Global Stream
@@ -97,85 +103,134 @@ class ChatroomView(QWidget):
         self.bridge_signals.new_event.connect(self.on_chatroom_event)
         self.manager.register_listener(self._on_manager_event)
 
+        self.set_chatroom(self.chatroom_id)
+
+    def set_chatroom(self, chatroom_id: int):
+        self.chatroom_id = chatroom_id
+        room = self.manager.get_chatroom(chatroom_id)
+        room_name = room["name"] if room else f"Room {chatroom_id}"
+        self.text_input.setPlaceholderText(f"Message #{room_name}...")
         self.load_history()
 
     def _on_manager_event(self, event_dict: dict):
-        self.bridge_signals.new_event.emit(event_dict)
+        try:
+            self.bridge_signals.new_event.emit(event_dict)
+        except (RuntimeError, AttributeError):
+            try:
+                self.manager.unregister_listener(self._on_manager_event)
+            except Exception:
+                pass
 
     def on_chatroom_event(self, event_dict: dict):
-        # Reload or re-render to reflect new messages or updated reactions
-        self.load_history()
-
-    def on_anchor_clicked(self, url: QUrl):
-        url_str = url.toString()
-        if url.scheme() == "agent" or url_str.startswith("agent:") or url_str.startswith("agent://"):
-            target = url.path() or url_str.replace("agent://", "").replace("agent:", "")
-            target = urllib.parse.unquote(target).strip()
-            if target:
-                self.agent_tab_requested.emit(target)
+        event_rid = event_dict.get("chatroom_id")
+        if event_rid is not None and event_rid != self.chatroom_id:
             return
 
-        anchor = url.fragment() or url_str.lstrip('#')
-        if anchor:
-            self.conversation_log.scrollToAnchor(anchor)
+        evt = event_dict.get("event")
+        if evt == "new_message":
+            msg = event_dict.get("message") or event_dict
+            if msg and msg.get("chatroom_id") == self.chatroom_id:
+                if any(m.get("id") == msg.get("id") for m in self._loaded_messages):
+                    return
+                sid = msg.get("sender_id", "")
+                sname = msg.get("sender_name", "")
+                if sid and sname and sid.startswith("+OA-"):
+                    self._uid_to_name_cache[sid] = sname
 
-    def send_user_message(self):
-        text = self.text_input.toPlainText().strip()
-        if not text:
-            return
-        self.text_input.clear()
+                self._loaded_messages.append(msg)
+                msg_map = {m["id"]: m for m in self._loaded_messages}
+                scroll_bar = self.conversation_log.verticalScrollBar()
+                was_at_bottom = (scroll_bar.maximum() - scroll_bar.value()) <= 60
+
+                self._render_message(msg, msg_map)
+                if was_at_bottom:
+                    scroll_bar.setValue(scroll_bar.maximum())
+                self.manager.mark_room_read(self.chatroom_id, "USER")
+        elif evt in ("reaction_added", "reaction_removed", "new_reaction"):
+            scroll_bar = self.conversation_log.verticalScrollBar()
+            pos = scroll_bar.value()
+            self._render_all_loaded_messages()
+            scroll_bar.setValue(pos)
+        elif evt == "room_read":
+            pass
+        else:
+            self.load_history()
+
+    def closeEvent(self, event):
         try:
-            config = ConfigManager()
-            user_full_name = config.get("user-full-name", "").strip() or "User"
-            self.manager.post_message(
-                sender_id="USER",
-                sender_name=user_full_name,
-                sender_type="user",
-                content=text,
-                recipient_id=None
-            )
-        except Exception as e:
-            self.append_to_console(f"Error sending message to chatroom: {e}")
+            self.manager.unregister_listener(self._on_manager_event)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
-    def append_to_console(self, text: str):
-        self.console_log.append(text)
-        scroll_bar = self.console_log.verticalScrollBar()
-        scroll_bar.setValue(scroll_bar.maximum())
-
-    def _resolve_mentions(self, text: str) -> str:
-        """Resolves @+OA-XXXX-XXXX agent UIDs into clickable @AgentName badges."""
-        def replace_uid(match):
-            uid = match.group(1).upper()
-            resolved_name = None
-            if self.agent_manager:
-                aid = self.agent_manager.get_agent_id_by_uid(uid)
-                if aid:
-                    resolved_name = self.agent_manager.get_agent_name(aid)
-            if not resolved_name and uid in self._uid_to_name_cache:
-                resolved_name = self._uid_to_name_cache[uid]
-
-            display_tag = f"@{resolved_name}" if resolved_name else f"@{uid}"
-            return (
-                f'<a href="agent:{uid}" style="text-decoration: none;">'
-                f'<span style="color: #f39c12; font-weight: bold; background-color: #2c2214; padding: 1px 5px; border-radius: 3px;" title="{uid}">'
-                f'{display_tag}</span></a>'
-            )
-
-        mention_pattern = re.compile(r"@(\+OA-[0-9A-HJKMNP-Za-z]{4}-[0-9A-HJKMNP-Za-z]{4})")
-        return mention_pattern.sub(replace_uid, text)
+    def _on_scroll_value_changed(self, value: int):
+        if value <= 5 and self._has_more_history and not self._is_loading_history and self._loaded_messages:
+            self.load_older_messages()
 
     def load_history(self):
-        messages = self.manager.get_all_ui_messages(limit=200)
-        # Populate UID to Name cache
-        for m in messages:
-            sid = m.get("sender_id", "")
-            sname = m.get("sender_name", "")
-            if sid and sname and sid.startswith("+OA-"):
-                self._uid_to_name_cache[sid] = sname
+        self._is_loading_history = True
+        try:
+            self._loaded_messages = []
+            self._has_more_history = True
+            messages = self.manager.get_all_ui_messages(chatroom_id=self.chatroom_id, limit=self.BATCH_SIZE)
+            self.manager.mark_room_read(self.chatroom_id, "USER")
 
-        msg_map = {m["id"]: m for m in messages}
+            if len(messages) < self.BATCH_SIZE:
+                self._has_more_history = False
+
+            for m in messages:
+                sid = m.get("sender_id", "")
+                sname = m.get("sender_name", "")
+                if sid and sname and sid.startswith("+OA-"):
+                    self._uid_to_name_cache[sid] = sname
+
+            self._loaded_messages = messages
+            self._render_all_loaded_messages()
+
+            scroll_bar = self.conversation_log.verticalScrollBar()
+            scroll_bar.setValue(scroll_bar.maximum())
+        finally:
+            self._is_loading_history = False
+
+    def load_older_messages(self):
+        if not self._loaded_messages or not self._has_more_history or self._is_loading_history:
+            return
+        self._is_loading_history = True
+        try:
+            oldest_id = self._loaded_messages[0]["id"]
+            older_msgs = self.manager.get_all_ui_messages(
+                chatroom_id=self.chatroom_id,
+                limit=self.BATCH_SIZE,
+                before_id=oldest_id
+            )
+            if not older_msgs:
+                self._has_more_history = False
+                return
+            if len(older_msgs) < self.BATCH_SIZE:
+                self._has_more_history = False
+
+            for m in older_msgs:
+                sid = m.get("sender_id", "")
+                sname = m.get("sender_name", "")
+                if sid and sname and sid.startswith("+OA-"):
+                    self._uid_to_name_cache[sid] = sname
+
+            scroll_bar = self.conversation_log.verticalScrollBar()
+            old_max = scroll_bar.maximum()
+            old_val = scroll_bar.value()
+
+            self._loaded_messages = older_msgs + self._loaded_messages
+            self._render_all_loaded_messages()
+
+            new_max = scroll_bar.maximum()
+            scroll_bar.setValue(old_val + (new_max - old_max))
+        finally:
+            self._is_loading_history = False
+
+    def _render_all_loaded_messages(self):
+        msg_map = {m["id"]: m for m in self._loaded_messages}
         self.conversation_log.clear()
-        for m in messages:
+        for m in self._loaded_messages:
             self._render_message(m, msg_map)
 
     def _render_message(self, m: dict, msg_map: dict = None):
@@ -363,3 +418,63 @@ class ChatroomView(QWidget):
             border_left=border_left,
         )
         insert_message_into_log(self.conversation_log, isolated_html)
+
+    def on_anchor_clicked(self, url: QUrl):
+        url_str = url.toString()
+        if url.scheme() == "agent" or url_str.startswith("agent:") or url_str.startswith("agent://"):
+            target = url.path() or url_str.replace("agent://", "").replace("agent:", "")
+            target = urllib.parse.unquote(target).strip()
+            if target:
+                self.agent_tab_requested.emit(target)
+            return
+
+        anchor = url.fragment() or url_str.lstrip('#')
+        if anchor:
+            self.conversation_log.scrollToAnchor(anchor)
+
+    def send_user_message(self):
+        text = self.text_input.toPlainText().strip()
+        if not text:
+            return
+        self.text_input.clear()
+        try:
+            config = ConfigManager()
+            user_full_name = config.get("user-full-name", "").strip() or "User"
+            self.manager.post_message(
+                sender_id="USER",
+                sender_name=user_full_name,
+                sender_type="user",
+                content=text,
+                recipient_id=None,
+                chatroom_id=self.chatroom_id,
+            )
+        except Exception as e:
+            self.append_to_console(f"Error sending message to chatroom: {e}")
+
+    def append_to_console(self, text: str):
+        self.console_log.append(text)
+        scroll_bar = self.console_log.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def _resolve_mentions(self, text: str) -> str:
+        """Resolves @+OA-XXXX-XXXX agent UIDs into clickable @AgentName badges."""
+        def replace_uid(match):
+            uid = match.group(1).upper()
+            resolved_name = None
+            if self.agent_manager:
+                aid = self.agent_manager.get_agent_id_by_uid(uid)
+                if aid:
+                    resolved_name = self.agent_manager.get_agent_name(aid)
+            if not resolved_name and uid in self._uid_to_name_cache:
+                resolved_name = self._uid_to_name_cache[uid]
+
+            display_tag = f"@{resolved_name}" if resolved_name else f"@{uid}"
+            return (
+                f'<a href="agent:{uid}" style="text-decoration: none;">'
+                f'<span style="color: #f39c12; font-weight: bold; background-color: #2c2214; padding: 1px 5px; border-radius: 3px;" title="{uid}">'
+                f'{display_tag}</span></a>'
+            )
+
+        mention_pattern = re.compile(r"@(\+OA-[0-9A-HJKMNP-Za-z]{4}-[0-9A-HJKMNP-Za-z]{4})")
+        return mention_pattern.sub(replace_uid, text)
+

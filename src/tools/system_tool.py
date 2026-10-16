@@ -6,6 +6,7 @@ import getpass
 import psutil
 import json
 import urllib.request
+import threading
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -105,7 +106,7 @@ class SystemTool(Tool):
     name = "System"
     icon = "⚙️"
     color = "#78909C"
-    async_commands = []
+    async_commands = ["create_backup"]
     description = (
         "Provides internal system information, settings, backup snapshots, and Gemini TTS voice customization.\n"
         "WARNING: System information is highly sensitive and confidential. It must NEVER be shared, leaked, or exposed "
@@ -116,7 +117,9 @@ class SystemTool(Tool):
         "platform_info (Returns host OS, uptime, CPU/RAM usage, and version.)",
         "settings (Inspects current agent configuration and voice settings.)",
         "get_external_ip (Queries current public IP address.)",
-        "create_backup [target] [backup_location] (Creates .oaa snapshot for 'self' or 'all' agents.)",
+        "create_backup [target] [backup_location] (Starts .oaa snapshot for 'self' or 'all' agents in a background thread.)",
+        "check_backup_status [backup_id] (Checks the progress and status of a background backup task.)",
+        "kill_backup [backup_id] (Terminates a running background backup task if it freezes.)",
         "set_custom_voice <custom_prompt> [voice_model] (Sets custom directorial voice delivery style and optional base voice or custom Voice ID.)",
         "reset_voice (Restores voice settings to baseline user configuration.)",
         "generate_api_key <name> [scopes] [expires_in_days] (Generates an isolated API key for third-party pulse injection.)",
@@ -154,7 +157,7 @@ class SystemTool(Tool):
             },
             {
                 "name": "System_create_backup",
-                "description": "Creates a single compressed snapshot (.oaa file) of this agent's stateful data and memories, or of all agents in the Open Amity system. Snapshots include settings, memory palace, sanctuary, trajectories, pulses, and logs.",
+                "description": "Creates a single compressed snapshot (.oaa file) of this agent's stateful data and memories, or of all agents in the Open Amity system asynchronously in a separate background thread. Returns a backup_id immediately. You can check progress with System_check_backup_status or kill/cancel it with System_kill_backup.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -165,6 +168,32 @@ class SystemTool(Tool):
                         "backup_location": {
                             "type": "STRING",
                             "description": "Optional directory path to save the .oaa backup file(s). If omitted, defaults to the configured system backup location."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "System_check_backup_status",
+                "description": "Checks the progress and status of an ongoing or completed background backup process. Returns progress percentage, current file, total files, elapsed time, and output path.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "backup_id": {
+                            "type": "STRING",
+                            "description": "Optional ID of the backup task to check (e.g. 'backup_1'). If omitted, checks the most recent backup task."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "System_kill_backup",
+                "description": "Terminates/cancels a running background backup process if it freezes or takes too long, cleaning up temporary files.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "backup_id": {
+                            "type": "STRING",
+                            "description": "Optional ID of the backup task to terminate. If omitted, terminates the currently running backup task."
                         }
                     }
                 }
@@ -286,6 +315,10 @@ class SystemTool(Tool):
             return self._get_external_ip()
         elif command == "create_backup":
             return self._create_backup(*args, **kwargs)
+        elif command in ["check_backup_status", "backup_status"]:
+            return self._check_backup_status(*args, **kwargs)
+        elif command in ["kill_backup", "cancel_backup"]:
+            return self._kill_backup(*args, **kwargs)
         elif command == "set_custom_voice":
             return self._set_custom_voice(*args, **kwargs)
         elif command == "reset_voice":
@@ -435,32 +468,189 @@ class SystemTool(Tool):
             if not custom_dest:
                 custom_dest = None
 
-        from core.backup_manager import create_agent_backup, create_all_backups, get_default_backup_location
+        from core.backup_manager import (
+            create_agent_backup,
+            create_all_backups,
+            get_default_backup_location,
+            BackupTaskManager
+        )
 
         dest_dir = custom_dest or get_default_backup_location()
+        call_id = kwargs.get("_call_id")
+        wait = kwargs.get("wait", False)
 
-        try:
-            if target == "all":
-                paths_created = create_all_backups(destination_dir=dest_dir)
-                if not paths_created:
-                    return f"No agents found or backups could not be created in {dest_dir}."
-                lines = [f"Successfully created backup(s) for all agents in '{dest_dir}':"]
-                for p in paths_created:
-                    sz = format_bytes(os.path.getsize(p)) if os.path.exists(p) else "0 B"
-                    lines.append(f"- {os.path.basename(p)} ({sz}) -> {p}")
-                return "\n".join(lines)
+        task_mgr = BackupTaskManager.get_instance()
+
+        # Check if an active backup is already running
+        active_task = task_mgr.get_active_task()
+        if active_task:
+            return (
+                f"Error: A backup task ('{active_task.task_id}') is already in progress "
+                f"({active_task.percent:.1f}% complete). Please wait for it to complete or "
+                f"terminate it using System_kill_backup before starting a new backup."
+            )
+
+        agent_id = None
+        if self.orchestrator:
+            agent_id = getattr(self.orchestrator, "agent_id", None)
+        if target != "all" and not agent_id:
+            return "Error: Agent ID is not available from orchestrator to perform self backup."
+
+        task = task_mgr.create_task(
+            target=target,
+            agent_id=agent_id,
+            destination_dir=dest_dir,
+            call_id=call_id
+        )
+
+        def runner():
+            def on_progress(filename: str, cur_idx: int, total_idx: int):
+                task.current_file = filename
+                task.current_file_index = cur_idx
+                task.total_files = total_idx
+                if total_idx > 0:
+                    task.percent = round((cur_idx / total_idx) * 100.0, 1)
+
+            try:
+                task.status = "in_progress"
+                if target == "all":
+                    paths_created = create_all_backups(
+                        destination_dir=dest_dir,
+                        progress_callback=on_progress,
+                        cancel_event=task.cancel_event
+                    )
+                    task.created_paths = paths_created
+                    if task.cancel_event.is_set():
+                        task.status = "cancelled"
+                    elif paths_created:
+                        task.status = "completed"
+                    else:
+                        task.status = "failed"
+                        task.error = "No backups could be created."
+                else:
+                    path_created = create_agent_backup(
+                        agent_id,
+                        destination_dir=dest_dir,
+                        progress_callback=on_progress,
+                        cancel_event=task.cancel_event
+                    )
+                    task.created_paths = [path_created]
+                    task.status = "completed"
+                task.end_time = time.time()
+                if task.total_files > 0:
+                    task.percent = 100.0
+
+            except InterruptedError:
+                task.status = "cancelled"
+                task.end_time = time.time()
+            except Exception as e:
+                task.status = "failed"
+                task.error = f"{type(e).__name__}: {str(e)}"
+                task.end_time = time.time()
+            finally:
+                # Dismiss tool pip if call_id is active
+                if task.call_id and hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'on_tool_finished'):
+                    try:
+                        self.orchestrator.on_tool_finished.emit(task.call_id)
+                    except Exception:
+                        pass
+
+                # Send system notification pulse to agent
+                if hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'pulse_engine') and self.orchestrator.pulse_engine:
+                    try:
+                        if task.status == "completed":
+                            created_str = ", ".join(os.path.basename(p) for p in task.created_paths)
+                            prompt = (
+                                f"[SYSTEM_NOTIFICATION] Background Backup Task '{task.task_id}' completed successfully in {task.get_elapsed_seconds():.1f}s.\n"
+                                f"Created archive(s): {created_str}\n"
+                                f"Destination: {task.destination_dir}"
+                            )
+                            self.orchestrator.pulse_engine.trigger_pulse.emit(prompt, purpose="Backup completed")
+                        elif task.status == "failed":
+                            prompt = (
+                                f"[SYSTEM_NOTIFICATION] Background Backup Task '{task.task_id}' failed after {task.get_elapsed_seconds():.1f}s.\n"
+                                f"Error: {task.error}"
+                            )
+                            self.orchestrator.pulse_engine.trigger_pulse.emit(prompt, purpose="Backup failed")
+                        elif task.status == "cancelled":
+                            prompt = (
+                                f"[SYSTEM_NOTIFICATION] Background Backup Task '{task.task_id}' was cancelled/killed."
+                            )
+                            self.orchestrator.pulse_engine.trigger_pulse.emit(prompt, purpose="Backup cancelled")
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(target=runner, name=f"BackupWorker-{task.task_id}", daemon=True)
+        task.thread = thread
+        thread.start()
+
+        if wait:
+            thread.join()
+            if task.status == "completed":
+                if target == "all":
+                    lines = [f"Successfully created backup(s) for all agents in '{dest_dir}':"]
+                    for p in task.created_paths:
+                        sz = format_bytes(os.path.getsize(p)) if os.path.exists(p) else "0 B"
+                        lines.append(f"- {os.path.basename(p)} ({sz}) -> {p}")
+                    return "\n".join(lines)
+                else:
+                    path_created = task.created_paths[0] if task.created_paths else ""
+                    sz = format_bytes(os.path.getsize(path_created)) if os.path.exists(path_created) else "0 B"
+                    return f"Successfully created backup snapshot:\n- {os.path.basename(path_created)} ({sz})\nPath: {path_created}"
+            elif task.status == "cancelled":
+                return f"Backup task '{task.task_id}' was cancelled."
             else:
-                agent_id = None
-                if self.orchestrator:
-                    agent_id = self.orchestrator.agent_id
-                if not agent_id:
-                    return "Error: Agent ID is not available from orchestrator to perform self backup."
+                return f"Error creating backup: {task.error}"
 
-                path_created = create_agent_backup(agent_id, destination_dir=dest_dir)
-                sz = format_bytes(os.path.getsize(path_created)) if os.path.exists(path_created) else "0 B"
-                return f"Successfully created backup snapshot:\n- {os.path.basename(path_created)} ({sz})\nPath: {path_created}"
-        except Exception as e:
-            return f"Error creating backup: {type(e).__name__}: {str(e)}"
+        return (
+            f"Backup process started in background with ID: '{task.task_id}' "
+            f"(Target: '{target}', Destination: '{dest_dir}'). "
+            f"You can check its progress using System_check_backup_status or kill it using System_kill_backup if it freezes. "
+            f"You will receive a system notification pulse when it finishes."
+        )
+
+    def _check_backup_status(self, *args, **kwargs) -> str:
+        from core.backup_manager import BackupTaskManager
+        task_id = kwargs.get("backup_id") or (args[0] if args else None)
+        task_mgr = BackupTaskManager.get_instance()
+        task = task_mgr.get_task(task_id)
+        if not task:
+            if task_id:
+                return f"Error: No backup task found with ID '{task_id}'."
+            return "No backup tasks have been initiated yet in this session."
+        return task.to_status_summary()
+
+    def _kill_backup(self, *args, **kwargs) -> str:
+        from core.backup_manager import BackupTaskManager
+        task_id = kwargs.get("backup_id") or (args[0] if args else None)
+        task_mgr = BackupTaskManager.get_instance()
+        if task_id:
+            task = task_mgr.get_task(task_id)
+            if not task:
+                return f"Error: No backup task found with ID '{task_id}'."
+        else:
+            task = task_mgr.get_active_task()
+            if not task:
+                task = task_mgr.get_task()
+                if not task:
+                    return "No backup tasks found to kill."
+                if not task.is_active():
+                    return f"Backup task '{task.task_id}' is already {task.status}."
+
+        if not task.is_active():
+            return f"Backup task '{task.task_id}' is not running (status: {task.status})."
+
+        task.cancel()
+        if task.call_id and hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'on_tool_finished'):
+            try:
+                self.orchestrator.on_tool_finished.emit(task.call_id)
+            except Exception:
+                pass
+
+        return (
+            f"Backup task '{task.task_id}' has been signalled to terminate and cancelled. "
+            f"Temporary staging files are being cleaned up."
+        )
 
     def _get_settings_manager(self):
         if self.orchestrator and getattr(self.orchestrator, "settings_manager", None):

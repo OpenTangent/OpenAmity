@@ -677,4 +677,84 @@ def test_claude_send_function_responses_low_token_skips_media(monkeypatch, tmp_p
         assert "skipped: Low Token Mode is active" in captured_parts[1]["text"]
 
 
+def test_claude_send_function_responses_with_pdf_document(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    pdf_file = tmp_path / "paper.pdf"
+    pdf_file.write_bytes(b"%PDF-1.7 Claude PDF test")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-ant-test-key-12345"):
+        worker = ClaudeWorker(agent_id="test_claude_agent")
+        worker.start_session(system_instruction="Test claude pdf response")
+
+        tc = MagicMock()
+        tc.type = "tool_use"
+        tc.id = "toolu_pdf_123"
+        tc.name = "Media_read"
+        tc.input = {"file_path": "paper.pdf"}
+        worker.history.append({"role": "assistant", "content": [tc]})
+
+        captured_parts = []
+        def synchronous_thread(target, args=(), kwargs=None, daemon=None):
+            m = MagicMock()
+            m.start = lambda: captured_parts.extend(args[0] if args else [])
+            return m
+
+        with patch("threading.Thread", side_effect=synchronous_thread):
+            worker.send_function_responses([
+                ("Media_read", {
+                    "result": f"Successfully attached {str(pdf_file)}",
+                    "media": [str(pdf_file)]
+                })
+            ])
+
+        assert len(captured_parts) == 2
+        assert captured_parts[0]["type"] == "tool_result"
+        assert captured_parts[1]["type"] == "document"
+        assert captured_parts[1]["source"]["type"] == "base64"
+        assert captured_parts[1]["source"]["media_type"] == "application/pdf"
+        assert captured_parts[1]["source"]["data"] != ""
+
+
+def test_claude_worker_media_culling(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-ant-test-key-12345"):
+        worker = ClaudeWorker(agent_id="test_claude_agent")
+        worker.start_session(system_instruction="Test culling")
+
+        worker.history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Turn 0"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "BBB"}}
+                ]
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "Resp 0"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Turn 1"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Resp 1"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Turn 2"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Recent"},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "CCC"}}
+                ]
+            }
+        ]
+
+        worker._cull_media_from_history()
+
+        culled_blocks = worker.history[0]["content"]
+        assert culled_blocks[0]["text"] == "Turn 0"
+        assert "[Media attachment automatically culled" in culled_blocks[1]["text"]
+        assert "[Media attachment automatically culled" in culled_blocks[2]["text"]
+
+        recent_blocks = worker.history[5]["content"]
+        assert recent_blocks[1]["type"] == "document"
+
+
+
 

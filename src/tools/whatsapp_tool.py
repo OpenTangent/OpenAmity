@@ -18,6 +18,8 @@ class WhatsAppSkill(Tool):
         "recent_chat <target> [n] (Fetch n recent messages from a specific target/contact/group)",
         "send <target> <message> (Send a text message)",
         "send_voice <target> <message> (Send a text message that gets converted to voice/TTS and sent)",
+        "send_location <target> <latitude> <longitude> [name] [address] [url] (Send a location pin with GPS coordinates)",
+        "send_contact <target> <contact_name> <contact_phone> [organization] [email] (Send a contact card / vCard)",
         "react <msgId> <reaction> (React to a specific message with an emoji)",
         "mark_read <chatId> (Mark a chat as read)",
         "reset_connection (Clears WhatsApp cache, checks for engine updates, and restarts the server if stuck in a QR loop)"
@@ -34,9 +36,9 @@ class WhatsAppSkill(Tool):
         self.transcriber = None
         self.daemon.start()
 
-    def _on_message_received(self, sender_id, sender_name):
+    def _on_message_received(self, sender_id, sender_name, **kwargs):
         if hasattr(self, 'message_received_callback') and self.message_received_callback:
-            self.message_received_callback(sender_id, sender_name)
+            self.message_received_callback(sender_id, sender_name, **kwargs)
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -92,6 +94,41 @@ class WhatsAppSkill(Tool):
                         "reply_to": {"type": "STRING", "description": "Optional MsgID to reply directly to a specific message."}
                     },
                     "required": ["target", "message"]
+                }
+            },
+            {
+                "name": "WhatsApp_send_location",
+                "description": "Sends a location pin with GPS coordinates (latitude and longitude) to the specified target. Optionally includes place name, address, URL, and a reply_to MsgID.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": {"type": "STRING", "description": "Name, phone, or ID of the contact/group."},
+                        "latitude": {"type": "NUMBER", "description": "Latitude coordinate in decimal degrees (e.g., -29.740804)."},
+                        "longitude": {"type": "NUMBER", "description": "Longitude coordinate in decimal degrees (e.g., 30.831676)."},
+                        "name": {"type": "STRING", "description": "Optional name of the venue or place."},
+                        "address": {"type": "STRING", "description": "Optional physical address of the location."},
+                        "url": {"type": "STRING", "description": "Optional URL associated with the location."},
+                        "reply_to": {"type": "STRING", "description": "Optional MsgID to reply directly to a specific message."}
+                    },
+                    "required": ["target", "latitude", "longitude"]
+                }
+            },
+            {
+                "name": "WhatsApp_send_contact",
+                "description": "Sends a contact card (vCard) to the specified target. You can share a single contact (with name, phone number, optional organization and email) or multiple contacts, or pass a raw vCard string. Optionally include reply_to MsgID.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": {"type": "STRING", "description": "Name, phone, or ID of the contact/group."},
+                        "contact_name": {"type": "STRING", "description": "Full name of the contact being shared (e.g., 'Alice Smith')."},
+                        "contact_phone": {"type": "STRING", "description": "Phone number or WhatsApp ID of the contact being shared (e.g., '+1234567890' or '1234567890@c.us')."},
+                        "organization": {"type": "STRING", "description": "Optional organization or company of the contact."},
+                        "email": {"type": "STRING", "description": "Optional email address of the contact."},
+                        "vcard": {"type": "STRING", "description": "Optional raw vCard RFC 2426 formatted string."},
+                        "contacts": {"type": "STRING", "description": "Optional JSON string or array of contacts to share multiple contact cards at once (e.g. `[{\"name\": \"Alice\", \"phone\": \"+1234567890\"}, {\"name\": \"Bob\", \"phone\": \"+0987654321\"}]`)."},
+                        "reply_to": {"type": "STRING", "description": "Optional MsgID to reply directly to a specific message."}
+                    },
+                    "required": ["target"]
                 }
             },
             {
@@ -174,17 +211,26 @@ class WhatsAppSkill(Tool):
                     return "No unread messages."
 
                 output = "Unread Messages:\n"
+                media_files = []
                 for msg in unread:
                     content = msg.get('content', '')
-                    if msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
-                        if msg['type'] in ['ptt', 'audio']:
+                    msg_type = msg.get('type', 'chat')
+                    if msg_type in ['location', 'live_location']:
+                        # Location messages are structured and omit raw map thumbnails
+                        pass
+                    elif msg_type in ['vcard', 'multi_vcard', 'contact']:
+                        # Contact card messages are structured and omit raw vcards/media
+                        pass
+                    elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
+                        if msg_type in ['ptt', 'audio']:
                             content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
-                        elif msg['type'] in ['image', 'document', 'video']:
-                            content = f"[{msg['type'].capitalize()} (Path: {msg['mediaPath']})] {content}"
+                            media_files.append(msg['mediaPath'])
+                        elif msg_type in ['image', 'document', 'video']:
+                            content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
                         else:
-                            content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
+                            content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
                     elif msg.get('hasMedia'):
-                        content = f"[Media: {msg['type']}] {content}"
+                        content = f"[Media: {msg_type}] {content}"
 
                     channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
                         "@g.us") else "WHATSAPP_DM"
@@ -192,8 +238,15 @@ class WhatsAppSkill(Tool):
                         'senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
 
-                output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
-                return output
+                if media_files:
+                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    return {
+                        "result": output,
+                        "media": media_files
+                    }
+                else:
+                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    return output
             except Exception as e:
                 return f"Failed to fetch unread messages: {e}"
 
@@ -218,17 +271,27 @@ class WhatsAppSkill(Tool):
                     return "No recent messages."
 
                 output = f"Recent Messages (Last {len(messages)}):\n"
+                media_files = []
                 for msg in messages:
                     content = msg.get('content', '')
-                    if msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
-                        if msg['type'] in ['ptt', 'audio']:
+                    msg_type = msg.get('type', 'chat')
+                    if msg_type in ['location', 'live_location']:
+                        # Location messages are structured and omit raw map thumbnails
+                        pass
+                    elif msg_type in ['vcard', 'multi_vcard', 'contact']:
+                        # Contact card messages are structured and omit raw vcards/media
+                        pass
+                    elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
+                        if msg_type in ['ptt', 'audio']:
                             content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
-                        elif msg['type'] in ['image', 'document', 'video']:
-                            content = f"[{msg['type'].capitalize()} (Path: {msg['mediaPath']})] {content}"
+                            if len(media_files) < 5:
+                                media_files.append(msg['mediaPath'])
+                        elif msg_type in ['image', 'document', 'video']:
+                            content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
                         else:
-                            content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
+                            content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
                     elif msg.get('hasMedia'):
-                        content = f"[Media: {msg['type']}] {content}"
+                        content = f"[Media: {msg_type}] {content}"
 
                     channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
                         "@g.us") else "WHATSAPP_DM"
@@ -236,8 +299,15 @@ class WhatsAppSkill(Tool):
                         'senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
 
-                output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
-                return output
+                if media_files:
+                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    return {
+                        "result": output,
+                        "media": media_files
+                    }
+                else:
+                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    return output
             except Exception as e:
                 return f"Failed to fetch recent messages: {e}"
 
@@ -280,17 +350,27 @@ class WhatsAppSkill(Tool):
                     return f"No recent messages for {target}."
 
                 output = f"Recent Messages for {target} (Last {len(messages)}):\n"
+                media_files = []
                 for msg in messages:
                     content = msg.get('content', '')
-                    if msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
-                        if msg['type'] in ['ptt', 'audio']:
+                    msg_type = msg.get('type', 'chat')
+                    if msg_type in ['location', 'live_location']:
+                        # Location messages are structured and omit raw map thumbnails
+                        pass
+                    elif msg_type in ['vcard', 'multi_vcard', 'contact']:
+                        # Contact card messages are structured and omit raw vcards/media
+                        pass
+                    elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
+                        if msg_type in ['ptt', 'audio']:
                             content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
-                        elif msg['type'] in ['image', 'document', 'video']:
-                            content = f"[{msg['type'].capitalize()} (Path: {msg['mediaPath']})] {content}"
+                            if len(media_files) < 5:
+                                media_files.append(msg['mediaPath'])
+                        elif msg_type in ['image', 'document', 'video']:
+                            content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
                         else:
-                            content = f"[Media: {msg['type']} (Path: {msg['mediaPath']})] {content}"
+                            content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
                     elif msg.get('hasMedia'):
-                        content = f"[Media: {msg['type']}] {content}"
+                        content = f"[Media: {msg_type}] {content}"
 
                     channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
                         "@g.us") else "WHATSAPP_DM"
@@ -298,8 +378,15 @@ class WhatsAppSkill(Tool):
                         'senderNumber') else msg['senderName']
                     output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
 
-                output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send or WhatsApp_send_voice.]"
-                return output
+                if media_files:
+                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    return {
+                        "result": output,
+                        "media": media_files
+                    }
+                else:
+                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    return output
             except Exception as e:
                 return f"Failed: {e}"
 
@@ -381,9 +468,6 @@ class WhatsAppSkill(Tool):
             if not target or not message:
                 return "Usage: send_voice <target> <message text to speak>"
 
-            if hasattr(self, 'orchestrator') and self.orchestrator and self.orchestrator.settings_manager.get("core.antigravity.agy-mode", False):
-                return "Error: Voice notes are currently unavailable when agy-mode is active. Please use WhatsApp_send instead."
-
             try:
                 try:
                     # 1. Attempt to resolve via internal Rolodex first
@@ -398,92 +482,26 @@ class WhatsAppSkill(Tool):
                     pass
 
                 import tempfile
-                from google import genai
-                from google.genai import types
+                from core.audio_output import synthesize_speech_to_file
 
-                settings = self.orchestrator.settings_manager if hasattr(
+                settings = getattr(self.orchestrator, 'settings_manager', None) if hasattr(
                     self, 'orchestrator') and self.orchestrator else None
-                from core.audio_output import (
-                    normalize_gemini_voice_models,
-                    build_gemini_tts_style,
-                    build_gemini_tts_payload,
-                    resolve_base_voice
-                )
-                if settings:
-                    voice_mode = settings.get("core.tts.gemini.voice-selection-mode", "auto")
-                    if voice_mode == "custom_voice_id":
-                        voice = settings.get("core.tts.gemini.custom-voice-id", "") or settings.get("core.tts.gemini.model-name", "Achernar")
-                    elif voice_mode == "prebuilt":
-                        voice = settings.get("core.tts.gemini.model-name", "Achernar")
-                    else:
-                        gender = settings.get("core.tts.gemini.gender", "Female")
-                        age = settings.get("core.tts.gemini.age", "Young Adult")
-                        style = settings.get("core.tts.gemini.style", "Warm & Empathetic")
-                        voice = resolve_base_voice(gender, age, style)
-                    voice_prompt = settings.get("core.tts.gemini.prompt.profile", "")
-                    api_key = settings.get_env("GEMINI_TTS_API_KEY") or settings.get_env("GEMINI_API_KEY")
-                else:
-                    voice = "Achernar"
-                    voice_prompt = ""
-                    api_key = None
+                agent_id = getattr(self.orchestrator, 'agent_id', None) if hasattr(
+                    self, 'orchestrator') and self.orchestrator else None
 
-                gemini_settings = settings.get(
-                    "core.gemini", {}) if settings else {}
-                voice_models = normalize_gemini_voice_models(gemini_settings.get("voice-models"))
-                model_name = voice_models[0]
-
-                temp_fd, temp_wav = tempfile.mkstemp(suffix=".wav")
+                temp_fd, temp_ogg = tempfile.mkstemp(suffix=".ogg")
                 os.close(temp_fd)
-                temp_ogg = temp_wav.replace(".wav", ".ogg")
 
                 try:
-                    client = genai.Client(api_key=api_key) if api_key else genai.Client()
-                    agent_id = getattr(self.orchestrator, 'agent_id', None) if hasattr(self, 'orchestrator') and self.orchestrator else None
-                    contents_payload = build_gemini_tts_payload(
-                        model=model_name,
-                        settings=settings,
+                    audio_path = synthesize_speech_to_file(
+                        text=message,
+                        output_path=temp_ogg,
                         agent_id=agent_id,
-                        text=message
+                        settings=settings
                     )
 
-                    if voice.startswith("voice_"):
-                        v_cfg = types.VoiceConfig(voice=voice)
-                    else:
-                        v_cfg = types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))
-
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents_payload,
-                        config=types.GenerateContentConfig(
-                            response_modalities=["AUDIO"],
-                            speech_config=types.SpeechConfig(
-                                voice_config=v_cfg
-                            ),
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                                disable=True
-                            ),
-                        )
-                    )
-
-                    audio_data = response.candidates[0].content.parts[0].inline_data.data
-                    with open(temp_wav, "wb") as f:
-                        f.write(audio_data)
-
-                    if audio_data.startswith(b"RIFF"):
-                        # Proper WAV container returned - ffmpeg auto-detects header
-                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", temp_wav, "-c:a", "libopus", temp_ogg]
-                    else:
-                        # Raw PCM stream
-                        ffmpeg_cmd = ["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", temp_wav, "-c:a", "libopus", temp_ogg]
-
-                    subprocess.run(
-                        ffmpeg_cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-
-                    if os.path.exists(temp_ogg):
-                        with open(temp_ogg, 'rb') as f:
+                    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                        with open(audio_path, 'rb') as f:
                             files = {'media': ('voice.ogg', f, 'audio/ogg')}
                             data = {'target': target, 'isVoice': 'true'}
                             if reply_to:
@@ -501,13 +519,157 @@ class WhatsAppSkill(Tool):
                 except Exception as e:
                     return f"Failed to generate TTS audio: {e}"
                 finally:
-                    if os.path.exists(temp_wav):
-                        os.remove(temp_wav)
                     if os.path.exists(temp_ogg):
                         os.remove(temp_ogg)
 
             except Exception as e:
                 return f"Failed to send voice message: {e}"
+
+        elif command == "send_location":
+            target = kwargs.get('target')
+            lat = kwargs.get('latitude') if kwargs.get('latitude') is not None else kwargs.get('lat')
+            lng = kwargs.get('longitude') if kwargs.get('longitude') is not None else kwargs.get('lng')
+            name = kwargs.get('name')
+            address = kwargs.get('address')
+            url = kwargs.get('url')
+            reply_to = kwargs.get('reply_to')
+
+            if not target and len(args) >= 1:
+                target = args[0]
+            if lat is None and len(args) >= 2:
+                lat = args[1]
+            if lng is None and len(args) >= 3:
+                lng = args[2]
+            if not name and len(args) >= 4:
+                name = args[3]
+            if not address and len(args) >= 5:
+                address = args[4]
+            if not url and len(args) >= 6:
+                url = args[5]
+
+            if not target or lat is None or lng is None:
+                return "Usage: send_location <target> <latitude> <longitude> [name] [address] [url]"
+
+            try:
+                lat = float(lat)
+                lng = float(lng)
+            except (ValueError, TypeError):
+                return "Error: Latitude and longitude must be valid numbers."
+
+            try:
+                try:
+                    # Attempt to resolve via internal Rolodex first
+                    from core.rolodex import Rolodex
+                    r = Rolodex()
+                    entity = r._find_entity(target)
+                    if entity and entity.get('whatsapp_id'):
+                        target = entity['whatsapp_id']
+                    elif entity and entity.get('phone'):
+                        target = entity['phone']
+                except Exception:
+                    pass
+
+                payload = {
+                    "target": target,
+                    "lat": lat,
+                    "lng": lng
+                }
+                if name:
+                    payload["name"] = name
+                if address:
+                    payload["address"] = address
+                if url:
+                    payload["url"] = url
+                if reply_to:
+                    payload["reply_to"] = reply_to
+
+                res = requests.post(f"{self.base_url}/send_location", json=payload, timeout=15)
+                data = res.json()
+                if "error" in data:
+                    return f"Error: {data['error']}"
+                return f"Location pin sent to {target} successfully."
+            except Exception as e:
+                return f"Failed to send location pin: {e}"
+
+        elif command == "send_contact":
+            target = kwargs.get('target')
+            contact_name = kwargs.get('contact_name') or kwargs.get('name')
+            contact_phone = kwargs.get('contact_phone') or kwargs.get('phone') or kwargs.get('contact_id')
+            organization = kwargs.get('organization') or kwargs.get('org')
+            email = kwargs.get('email')
+            vcard = kwargs.get('vcard')
+            contacts = kwargs.get('contacts')
+            reply_to = kwargs.get('reply_to')
+
+            if not target and len(args) >= 1:
+                target = args[0]
+            if not contact_name and len(args) >= 2:
+                contact_name = args[1]
+            if not contact_phone and len(args) >= 3:
+                contact_phone = args[2]
+            if not organization and len(args) >= 4:
+                organization = args[3]
+            if not email and len(args) >= 5:
+                email = args[4]
+
+            if not target or (not contact_name and not contact_phone and not vcard and not contacts):
+                return "Usage: send_contact <target> <contact_name> <contact_phone> [organization] [email]"
+
+            try:
+                try:
+                    # Attempt to resolve target via internal Rolodex first
+                    from core.rolodex import Rolodex
+                    r = Rolodex()
+                    entity = r._find_entity(target)
+                    if entity and entity.get('whatsapp_id'):
+                        target = entity['whatsapp_id']
+                    elif entity and entity.get('phone'):
+                        target = entity['phone']
+                except Exception:
+                    pass
+
+                # If contact_name is given without contact_phone or vcard or contacts, try Rolodex
+                if not contact_phone and contact_name and not vcard and not contacts:
+                    try:
+                        from core.rolodex import Rolodex
+                        r = Rolodex()
+                        entity = r._find_entity(contact_name)
+                        if entity:
+                            contact_phone = entity.get('whatsapp_id') or entity.get('phone')
+                    except Exception:
+                        pass
+
+                import json
+                if isinstance(contacts, str):
+                    try:
+                        contacts = json.loads(contacts)
+                    except Exception:
+                        pass
+
+                payload = {"target": target}
+                if contact_name:
+                    payload["name"] = contact_name
+                if contact_phone:
+                    payload["phone"] = contact_phone
+                if organization:
+                    payload["organization"] = organization
+                if email:
+                    payload["email"] = email
+                if vcard:
+                    payload["vcard"] = vcard
+                if contacts:
+                    payload["contacts"] = contacts
+                if reply_to:
+                    payload["reply_to"] = reply_to
+
+                res = requests.post(f"{self.base_url}/send_contact", json=payload, timeout=15)
+                data = res.json()
+                if "error" in data:
+                    return f"Error: {data['error']}"
+                label = contact_name or (f"{len(contacts)} contacts" if isinstance(contacts, list) else "Contact card")
+                return f"Contact card for {label} sent to {target} successfully."
+            except Exception as e:
+                return f"Failed to send contact card: {e}"
 
         elif command == "react":
             msg_id = kwargs.get('msgId')

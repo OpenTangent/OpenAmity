@@ -1,3 +1,4 @@
+from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
 import os
 import json
 import logging
@@ -13,7 +14,7 @@ class DummyCall:
         self.args = args
 
 
-class AgyWorker:
+class AgyWorker(MemoryContextWorkerMixin):
     def __init__(self, agent_id=None):
         self.agent_id = agent_id
         self.thought_received = Signal()  # text, list of function calls
@@ -35,7 +36,7 @@ class AgyWorker:
     def is_running(self):
         return self.running
 
-    def start_session(self, system_instruction=None, tools=None):
+    def start_session(self, system_instruction=None, tools=None, clear_history=False):
         self.tools = tools or []
         base_instruct = system_instruction or ""
 
@@ -71,8 +72,9 @@ Available Tools:
 
         schema_instruct += "\nCRITICAL INSTRUCTION: You are fully autonomous. You must output raw JSON. If you wish to speak, invoke the Speaker tool. If no tools are needed, return an empty array for tool_calls."
 
-        self.sys_instruct = base_instruct + "\n\n" + schema_instruct
-        self.history = []
+        self.sys_instruct = fit_system_prompt(base_instruct + "\n\n" + schema_instruct, self.settings, tools)
+        if clear_history:
+            self.history = []
 
         primary_model = self.settings.get("core.antigravity.model", "")
         if not primary_model:
@@ -90,6 +92,14 @@ Available Tools:
         self.running = True
         logging.info(
             f"AgyWorker session started using model {self.current_model}.")
+
+    def get_session_history(self) -> list:
+        """Exports active chat history into a normalized list of turns."""
+        return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in self.history]
+
+    def set_session_history(self, messages: list):
+        """Restores chat history from normalized turns."""
+        self.history = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages if m.get("content")]
 
     def stop_session(self):
         self.running = False

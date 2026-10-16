@@ -53,17 +53,22 @@ def media_tool_fixture(tmp_path):
 def test_media_skill_metadata_and_declarations():
     tool = MediaSkill()
     assert tool.name == "Media"
-    assert tool.commands == ["read", "generate"]
+    assert tool.commands == ["read", "generate", "transcribe_audio"]
 
     declarations = tool.get_tool_declarations()
     decl_names = [d["name"] for d in declarations]
     assert "Media_read" in decl_names
     assert "Media_generate" in decl_names
+    assert "Media_transcribe_audio" in decl_names
 
     gen_decl = next(d for d in declarations if d["name"] == "Media_generate")
     assert "prompt" in gen_decl["parameters"]["properties"]
     assert gen_decl["parameters"]["required"] == ["prompt"]
     assert "24-hour cache" in gen_decl["description"]
+
+    transcribe_decl = next(d for d in declarations if d["name"] == "Media_transcribe_audio")
+    assert "file_path" in transcribe_decl["parameters"]["properties"]
+    assert transcribe_decl["parameters"]["required"] == ["file_path"]
 
 
 def test_media_generate_missing_prompt(media_tool_fixture):
@@ -569,5 +574,66 @@ def test_media_generate_result_includes_24h_cache_notice(media_tool_fixture):
         assert "24 hours" in res["result"]
         assert "temporary" in res["result"]
         assert "Be sure to use the image" in res["result"]
+
+
+def test_media_transcribe_audio_missing_param(media_tool_fixture):
+    tool, _, _, _ = media_tool_fixture
+    res = tool.execute("transcribe_audio")
+    assert res == {"result": "Error: Missing file_path parameter."}
+
+
+def test_media_transcribe_audio_file_not_found(media_tool_fixture):
+    tool, _, _, _ = media_tool_fixture
+    res = tool.execute("transcribe_audio", file_path="/nonexistent/path/audio.ogg")
+    assert "Error: File not found" in res["result"]
+
+
+def test_media_transcribe_audio_empty_file(media_tool_fixture, tmp_path):
+    tool, _, _, _ = media_tool_fixture
+    empty_file = tmp_path / "empty.ogg"
+    empty_file.write_bytes(b"")
+
+    res = tool.execute("transcribe_audio", file_path=str(empty_file))
+    assert "empty (0 bytes)" in res["result"]
+
+
+def test_media_transcribe_audio_unsupported_format(media_tool_fixture, tmp_path):
+    tool, _, _, _ = media_tool_fixture
+    txt_file = tmp_path / "document.txt"
+    txt_file.write_text("Hello world")
+
+    res = tool.execute("transcribe_audio", file_path=str(txt_file))
+    assert "does not appear to be an audio file" in res["result"]
+
+
+def test_media_transcribe_audio_success(media_tool_fixture, tmp_path):
+    tool, _, _, _ = media_tool_fixture
+    audio_file = tmp_path / "voice_note.ogg"
+    audio_file.write_bytes(b"OggS" + b"\x00" * 60)
+
+    mock_stt = MagicMock()
+    mock_stt.transcribe.return_value = "Meeting scheduled for 3 PM."
+
+    with patch("core.local_stt.LocalSTT", return_value=mock_stt):
+        res = tool.execute("transcribe_audio", file_path=str(audio_file))
+        assert "Audio Transcription (voice_note.ogg):" in res["result"]
+        assert "Meeting scheduled for 3 PM." in res["result"]
+        mock_stt.transcribe.assert_called_once_with(str(audio_file))
+
+
+def test_local_stt_truncated_and_missing_file_safety(tmp_path):
+    from core.local_stt import LocalSTT
+    stt = LocalSTT()
+
+    res_missing = stt.transcribe("/nonexistent/file.wav")
+    assert "Transcription Failed: File not found" in res_missing
+
+    stub_file = tmp_path / "stub.ogg"
+    stub_file.write_bytes(b"\x75\xab\x5a\x6a\xe7\x62\xa3\xfa\x20\x81\xca\x1d\x79\xcb")
+    res_stub = stt.transcribe(str(stub_file))
+    assert "too small or truncated" in res_stub
+    assert "14 bytes" in res_stub
+
+
 
 

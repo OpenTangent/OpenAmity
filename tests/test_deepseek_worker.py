@@ -623,6 +623,81 @@ def test_deepseek_worker_light_model_fallback(monkeypatch, tmp_path):
         assert "DeepSeek fallback succeeded" in emitted_thoughts[0]
 
 
+def test_deepseek_worker_pdf_media_text_extraction(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    pdf_file = tmp_path / "paper.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4 dummy pdf")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-deepseek-test-key-12345"):
+        worker = DeepSeekWorker(agent_id="test_deepseek_agent")
+        worker.start_session(system_instruction="Test deepseek prompt")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Reading paper",
+            "tool_calls": [{
+                "id": "call_media_deepseek",
+                "type": "function",
+                "function": {"name": "Media_read", "arguments": "{}"}
+            }]
+        })
+
+        worker.client.chat.completions.create = MagicMock(return_value=[])
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = "Extracted PDF abstract and conclusions."
+        with patch("subprocess.run", return_value=mock_proc):
+            worker.send_function_response("Media_read", {
+                "result": "Attached paper",
+                "media": [str(pdf_file)]
+            })
+
+        user_media_msg = worker.history[2]
+        assert user_media_msg["role"] == "user"
+        content_blocks = user_media_msg["content"]
+        assert len(content_blocks) == 2
+        assert content_blocks[1]["type"] == "text"
+        assert "Extracted text from PDF paper.pdf" in content_blocks[1]["text"]
+        assert "Extracted PDF abstract and conclusions." in content_blocks[1]["text"]
+
+
+def test_deepseek_worker_unsupported_media_error(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    unknown_file = tmp_path / "data.xyz"
+    unknown_file.write_bytes(b"some binary data")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-deepseek-test-key-12345"):
+        worker = DeepSeekWorker(agent_id="test_deepseek_agent")
+        worker.start_session(system_instruction="Test deepseek prompt")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Reading data",
+            "tool_calls": [{
+                "id": "call_media_unknown",
+                "type": "function",
+                "function": {"name": "Media_read", "arguments": "{}"}
+            }]
+        })
+
+        worker.client.chat.completions.create = MagicMock(return_value=[])
+
+        worker.send_function_response("Media_read", {
+            "result": "Attached unknown",
+            "media": [str(unknown_file)]
+        })
+
+        user_media_msg = worker.history[2]
+        content_blocks = user_media_msg["content"]
+        assert len(content_blocks) == 2
+        assert content_blocks[1]["type"] == "text"
+        assert "[Error attaching media" in content_blocks[1]["text"]
+        assert "Unsupported media format" in content_blocks[1]["text"]
+
+
+
 
 
 

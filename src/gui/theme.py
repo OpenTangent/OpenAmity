@@ -264,12 +264,37 @@ class OpenAmityProxyStyle(QProxyStyle):
 
 def setup_app_theme(app: QApplication):
     """Applies the centralized Fusion style, dark palette, and modern scrollbars to the application."""
+    import os
     fusion_style = QStyleFactory.create("Fusion")
     if fusion_style:
         app.setStyle(OpenAmityProxyStyle(fusion_style))
     else:
         app.setStyle(OpenAmityProxyStyle())
     app.setPalette(get_dark_palette())
+
+    checkmark_path = ""
+    radio_dot_path = ""
+    try:
+        from config.paths import get_assets_dir
+        assets_dir = get_assets_dir()
+    except Exception:
+        assets_dir = str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
+
+    cand_chk = os.path.join(assets_dir, "icons", "checkmark.svg")
+    if not os.path.exists(cand_chk):
+        cand_chk = os.path.join(assets_dir, "checkmark.svg")
+    if os.path.exists(cand_chk):
+        checkmark_path = cand_chk.replace("\\", "/")
+
+    cand_radio = os.path.join(assets_dir, "icons", "radio_dot.svg")
+    if not os.path.exists(cand_radio):
+        cand_radio = os.path.join(assets_dir, "radio_dot.svg")
+    if os.path.exists(cand_radio):
+        radio_dot_path = cand_radio.replace("\\", "/")
+
+    chk_img_css = f'image: url("{checkmark_path}");' if checkmark_path else ""
+    radio_img_css = f'image: url("{radio_dot_path}");' if radio_dot_path else ""
+
     app.setStyleSheet(f"""
         QToolTip {{
             color: #ffffff;
@@ -288,6 +313,70 @@ def setup_app_theme(app: QApplication):
             width: 0px;
             border: none;
             background: transparent;
+        }}
+        QCheckBox {{
+            color: {TEXT_PRIMARY};
+            spacing: 8px;
+        }}
+        QCheckBox:hover {{
+            color: #ffffff;
+        }}
+        QCheckBox::indicator {{
+            width: 18px;
+            height: 18px;
+            border: 1px solid {BORDER_INPUT};
+            border-radius: 4px;
+            background-color: {BG_INPUT};
+        }}
+        QCheckBox::indicator:hover {{
+            border-color: #888888;
+            background-color: #444444;
+        }}
+        QCheckBox::indicator:checked {{
+            background-color: {PRIMARY_ACCENT_COLOR};
+            border-color: {PRIMARY_ACCENT_COLOR};
+            {chk_img_css}
+        }}
+        QCheckBox::indicator:checked:hover {{
+            background-color: #b52e28;
+            border-color: #b52e28;
+        }}
+        QCheckBox::indicator:disabled {{
+            border-color: {BORDER_COLOR_DISABLED};
+            background-color: #222222;
+        }}
+        QCheckBox:disabled {{
+            color: {TEXT_DISABLED};
+        }}
+        QRadioButton {{
+            color: {TEXT_PRIMARY};
+            spacing: 8px;
+        }}
+        QRadioButton:hover {{
+            color: #ffffff;
+        }}
+        QRadioButton::indicator {{
+            width: 16px;
+            height: 16px;
+            border: 1px solid {BORDER_INPUT};
+            border-radius: 9px;
+            background-color: {BG_INPUT};
+        }}
+        QRadioButton::indicator:hover {{
+            border-color: #888888;
+            background-color: #444444;
+        }}
+        QRadioButton::indicator:checked {{
+            background-color: {PRIMARY_ACCENT_COLOR};
+            border-color: {PRIMARY_ACCENT_COLOR};
+            {radio_img_css}
+        }}
+        QRadioButton::indicator:disabled {{
+            border-color: {BORDER_COLOR_DISABLED};
+            background-color: #222222;
+        }}
+        QRadioButton:disabled {{
+            color: {TEXT_DISABLED};
         }}
         {MODERN_SCROLLBAR_STYLE}
     """)

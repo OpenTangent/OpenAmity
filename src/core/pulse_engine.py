@@ -44,7 +44,9 @@ class PulseEngine:
         self.init_db()
 
         # WhatsApp state
-        self.last_pulse_time = 0
+        self._wa_lock = threading.Lock()
+        self._wa_extra_delay = 0.0
+        self._wa_last_pulse_time = 0.0
         self.whatsapp_timer = None
         self.pending_whatsapp_senders = set()
 
@@ -66,6 +68,14 @@ class PulseEngine:
         self._wakeup_event.set()
 
     @property
+    def last_pulse_time(self):
+        return self._wa_last_pulse_time
+
+    @last_pulse_time.setter
+    def last_pulse_time(self, val):
+        self._wa_last_pulse_time = float(val or 0.0)
+
+    @property
     def pending_whatsapp_sender(self):
         if not self.pending_whatsapp_senders:
             return None
@@ -78,11 +88,20 @@ class PulseEngine:
         else:
             self.pending_whatsapp_senders = {val}
 
+    def reset_whatsapp_slowdown(self):
+        """Resets the cumulative WhatsApp buffer delay back to 0.0."""
+        with self._wa_lock:
+            self._wa_extra_delay = 0.0
+            self._wa_last_pulse_time = 0.0
+            logging.debug("PulseEngine: WhatsApp cumulative slow-down reset to 0.")
+
     def stop(self):
         self.is_running = False
         self._wakeup_event.set()
-        if self.whatsapp_timer:
-            self.whatsapp_timer.cancel()
+        with self._wa_lock:
+            if self.whatsapp_timer:
+                self.whatsapp_timer.cancel()
+                self.whatsapp_timer = None
 
     def _schedule_loop(self):
         from core.logger_config import agent_id_var
@@ -132,38 +151,61 @@ class PulseEngine:
         c.execute(
             'CREATE INDEX IF NOT EXISTS idx_status_time ON pulses (status, scheduled_time)')
 
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS pulse_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+
         self._migrate_db(c)
 
-        # Migration: Check if table is empty
+        # Check if initial lifecycle pulses have already been seeded
+        c.execute("SELECT value FROM pulse_meta WHERE key = 'lifecycle_seeded'")
+        meta_row = c.fetchone()
+        already_seeded = (meta_row is not None and meta_row[0] == "1") or self.settings_manager.get("core.auto-pulse.seeded", False)
+
         c.execute('SELECT COUNT(*) FROM pulses')
-        if c.fetchone()[0] == 0:
-            logging.info(
-                "PulseEngine: Empty database detected. Migrating initial lifecycle pulses.")
-            now = datetime.now()
+        pulse_count = c.fetchone()[0]
 
-            pulses_to_seed = [
-                (
-                    "Morning Kickoff",
-                    "Get the ball rolling. Think about what needs to be done today to advance your trajectory. Divide the work into manageable chunks and use the PulseTool to schedule targeted pulses for them. If you lack context on the user's goals, make it your priority to find out.",
-                    now.replace(hour=9, minute=0, second=0, microsecond=0)
-                ),
-                (
-                    "Mid-Day Check-In",
-                    "Review your trajectory data and recent short-term memories. Ensure that your current tasks and aspirations are actively moving you towards your intended targets. Course-correct if you have drifted or gotten distracted.",
-                    now.replace(hour=13, minute=0, second=0, microsecond=0)
-                ),
-                (
-                    "Evening Reflection",
-                    "Reflect on what has been achieved today. Critically evaluate not just what was done, but how you reasoned. Update your Trajectory reflection state and record any meaningful lessons. Crucially, if you received feedback or formed new opinions about yourself or others, use MemPalace_update_mirror to update your Theory of Mind records in your Sanctuary.",
-                    now.replace(hour=17, minute=0, second=0, microsecond=0)
-                )
-            ]
+        is_first_run = self.settings_manager.get("core.first-run", True)
 
-            for title, context, sched in pulses_to_seed:
-                c.execute('''
-                    INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (title, context, sched.isoformat(), "daily", "pending", 0, now.isoformat()))
+        if not already_seeded:
+            if pulse_count == 0 and is_first_run:
+                logging.info(
+                    "PulseEngine: Fresh agent detected. Migrating initial lifecycle pulses.")
+                now = datetime.now()
+
+                pulses_to_seed = [
+                    (
+                        "Morning Kickoff",
+                        "Get the ball rolling. Think about what needs to be done today to advance your trajectory. Divide the work into manageable chunks and use the PulseTool to schedule targeted pulses for them. If you lack context on the user's goals, make it your priority to find out.",
+                        now.replace(hour=9, minute=0, second=0, microsecond=0)
+                    ),
+                    (
+                        "Mid-Day Check-In",
+                        "Review your trajectory data and recent short-term memories. Ensure that your current tasks and aspirations are actively moving you towards your intended targets. Course-correct if you have drifted or gotten distracted.",
+                        now.replace(hour=13, minute=0, second=0, microsecond=0)
+                    ),
+                    (
+                        "Evening Reflection",
+                        "Reflect on what has been achieved today. Critically evaluate not just what was done, but how you reasoned. Update your Trajectory reflection state and record any meaningful lessons. Crucially, if you received feedback or formed new opinions about yourself or others, use MemPalace_update_mirror to update your Theory of Mind records in your Sanctuary.",
+                        now.replace(hour=17, minute=0, second=0, microsecond=0)
+                    )
+                ]
+
+                for title, context, sched in pulses_to_seed:
+                    c.execute('''
+                        INSERT INTO pulses (title, context, scheduled_time, recurrence, status, has_run, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (title, context, sched.isoformat(), "daily", "pending", 0, now.isoformat()))
+            else:
+                logging.info(
+                    f"PulseEngine: Existing agent detected (pulses={pulse_count}, first_run={is_first_run}). Marking lifecycle as seeded without recreating pulses.")
+
+            c.execute("INSERT OR REPLACE INTO pulse_meta (key, value) VALUES ('lifecycle_seeded', '1')")
+            self.settings_manager.set("core.auto-pulse.seeded", True)
+            self.settings_manager.save()
 
         conn.commit()
         conn.close()
@@ -284,30 +326,38 @@ class PulseEngine:
                 if sched.tzinfo is not None:
                     sched = sched.astimezone().replace(tzinfo=None)
 
+                delta = (now - sched).total_seconds()
+
                 if recurrence == 'none':
-                    # Fire once-off pulse. It fires even if it was missed while offline.
-                    active_type = p_type if p_type in ["external_hook", "sleep_cycle", "whatsapp"] else "scheduled_task"
-                    self.fire_pulse(title, context, pulse_type=active_type)
-                    c.execute(
-                        'UPDATE pulses SET has_run=1, status="completed" WHERE id=?', (p_id,))
-                    conn.commit()
-                    break  # Process one pulse at a time to prevent cognitive overload
+                    if delta > 900:  # Older than 15 minutes: completely ignore and mark missed
+                        logging.info(
+                            f"PulseEngine: Skipped missed once-off pulse '{title}' (was scheduled for {sched_str}, delta {delta:.0f}s > 900s)")
+                        c.execute(
+                            'UPDATE pulses SET has_run=1, status="missed" WHERE id=?', (p_id,))
+                        conn.commit()
+                        continue
+                    else:
+                        # Within 15-minute leniency period: fire it
+                        active_type = p_type if p_type in ["external_hook", "sleep_cycle", "whatsapp"] else "scheduled_task"
+                        self.fire_pulse(title, context, pulse_type=active_type)
+                        c.execute(
+                            'UPDATE pulses SET has_run=1, status="completed" WHERE id=?', (p_id,))
+                        conn.commit()
+                        break  # Process one pulse at a time to prevent cognitive overload
                 else:
                     # It's a recurring pulse
                     next_sched = self.calculate_next_recurrence(
                         sched, recurrence, now, target_day=sched.day)
 
-                    # Check if it was missed (offline or busy for more than 15 mins)
-                    delta = (now - sched).total_seconds()
-                    recently_unpaused = (time.time() - self._last_unpause_time) < 900
-                    if delta > 900 and not recently_unpaused:  # 15 minutes grace period
+                    if delta > 900:  # Older than 15 minutes: completely ignore and advance recurrence
                         logging.info(
-                            f"PulseEngine: Skipped missed recurring pulse '{title}' (was scheduled for {sched_str})")
+                            f"PulseEngine: Skipped missed recurring pulse '{title}' (was scheduled for {sched_str}, delta {delta:.0f}s > 900s)")
                         c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
                                   (next_sched.isoformat(), p_id))
                         conn.commit()
+                        continue
                     else:
-                        # Within grace period, fire it
+                        # Within 15-minute leniency period: fire it
                         active_type = p_type if p_type == "external_hook" else "scheduled_routine"
                         self.fire_pulse(title, context, pulse_type=active_type)
                         c.execute('UPDATE pulses SET scheduled_time=? WHERE id=?',
@@ -368,30 +418,8 @@ class PulseEngine:
         )
         self.trigger_pulse.emit(prompt, purpose=purpose)
 
-    # --- WhatsApp Handling Ported from WakeUpService ---
-    def handle_whatsapp_message(self, sender_id, sender_name):
-        if getattr(self.orchestrator, 'is_paused', False):
-            return
-        if not sender_id:
-            return
-        if sender_id.endswith("@g.us") or sender_id.endswith("@broadcast"):
-            return
-
-        sys_settings = self.settings_manager.get("core.auto-pulse", {})
-        whitelist = sys_settings.get("whitelist", [])
-        if not whitelist:
-            return
-
-        clean_sender = sender_id.replace(
-            "@c.us", "").replace("@g.us", "").replace("@lid", "").replace("+", "").strip()
-        contact = self.address_book_manager.lookup_by_number(clean_sender)
-
-        if contact:
-            rel = f" ({contact['relationship']})" if contact.get(
-                "relationship") else ""
-            sender_name = f"{contact['name']}{rel}"
-
-        matched = False
+    # --- WhatsApp Message Handling & Pulse Management ---
+    def _matches_phone_whitelist(self, clean_sender: str, sender_name: str, contact: dict, whitelist: list) -> bool:
         for w_item in whitelist:
             if not w_item:
                 continue
@@ -401,64 +429,129 @@ class PulseEngine:
             w_clean = re.sub(r"[^\d]", "", w_item_str)
             if w_clean and clean_sender.isdigit():
                 if clean_sender == w_clean:
-                    matched = True
-                    break
+                    return True
                 # Suffix matching for international / national number differences
                 if len(w_clean) >= 7 and len(clean_sender) >= 7:
                     if clean_sender.endswith(w_clean) or w_clean.endswith(clean_sender):
-                        matched = True
-                        break
+                        return True
                     # Strip leading zeros for national prefix match (e.g. 083... vs 2783...)
                     w_no_zero = w_clean.lstrip("0")
                     sender_no_zero = clean_sender.lstrip("0")
                     if len(w_no_zero) >= 7 and len(sender_no_zero) >= 7:
                         if sender_no_zero.endswith(w_no_zero) or w_no_zero.endswith(sender_no_zero):
-                            matched = True
-                            break
+                            return True
 
             # 2. Name / String comparison
             w_lower = w_item_str.lower()
             if sender_name and (sender_name.lower() == w_lower or w_lower in sender_name.lower()):
-                matched = True
-                break
+                return True
             if contact:
                 c_name = contact.get("name", "").lower()
                 c_rel = contact.get("relationship", "").lower()
                 if (c_name and (c_name == w_lower or w_lower in c_name)) or (c_rel and (c_rel == w_lower or w_lower in c_rel)):
-                    matched = True
-                    break
+                    return True
+        return False
 
-        if not matched:
+    def _matches_group_whitelist(self, group_name: str, group_whitelist: list) -> bool:
+        if not group_name or not group_whitelist:
+            return False
+        clean_target = group_name.strip().lower()
+        for g_item in group_whitelist:
+            if g_item and str(g_item).strip().lower() == clean_target:
+                return True
+        return False
+
+    def handle_whatsapp_message(self, sender_id, sender_name="", is_group=None, group_name="", mentioned=False, **kwargs):
+        if getattr(self.orchestrator, 'is_paused', False):
+            return
+        if not sender_id:
+            return
+        if sender_id.endswith("@broadcast") or sender_id == "status@broadcast":
+            return
+
+        if is_group is None:
+            is_group = sender_id.endswith("@g.us")
+
+        sys_settings = self.settings_manager.get("core.auto-pulse", {})
+        pulse_on_mentions = sys_settings.get("pulse-on-mentions", False)
+        pulse_all_dms = sys_settings.get("pulse-all-dms", False)
+        pulse_all_groups = sys_settings.get("pulse-all-groups", False)
+
+        qualifies = False
+
+        # 1. Pulse on Mentions check (applies to both DMs and groups)
+        if pulse_on_mentions and mentioned:
+            qualifies = True
+        elif is_group:
+            # 2. Group message check
+            if pulse_all_groups:
+                qualifies = True
+            else:
+                group_whitelist = sys_settings.get("group-whitelist", [])
+                if self._matches_group_whitelist(group_name, group_whitelist):
+                    qualifies = True
+        else:
+            # 3. Direct Message check
+            if pulse_all_dms:
+                qualifies = True
+            else:
+                clean_sender = sender_id.replace(
+                    "@c.us", "").replace("@g.us", "").replace("@lid", "").replace("+", "").strip()
+                contact = self.address_book_manager.lookup_by_number(clean_sender)
+                resolved_name = sender_name
+                if contact:
+                    rel = f" ({contact['relationship']})" if contact.get("relationship") else ""
+                    resolved_name = f"{contact['name']}{rel}"
+                whitelist = sys_settings.get("whitelist", [])
+                if self._matches_phone_whitelist(clean_sender, resolved_name, contact, whitelist):
+                    qualifies = True
+
+        if not qualifies:
             logging.debug(
-                f"PulseEngine: WhatsApp message from sender_id='{sender_id}' (name='{sender_name}') not in whitelist.")
+                f"PulseEngine: WhatsApp message ignored (sender_id='{sender_id}', name='{sender_name}', group='{group_name}', is_group={is_group}, mentioned={mentioned}).")
             return
 
-        cooldown = sys_settings.get("ratelimit-minutes", 5)
-        if (time.time() - self.last_pulse_time) < (cooldown * 60):
-            logging.info(
-                "PulseEngine: WhatsApp pulse suppressed due to rate limiting.")
-            return
+        self._schedule_whatsapp_pulse()
 
-        buffer_seconds = sys_settings.get("buffer-seconds", 30)
-        sender_label = sender_name or f"+{clean_sender}"
-        self.pending_whatsapp_senders.add(sender_label)
+    def _schedule_whatsapp_pulse(self):
+        with self._wa_lock:
+            if self.whatsapp_timer is not None:
+                logging.debug("PulseEngine: WhatsApp pulse timer already running; message joined pending batch.")
+                return
 
-        if self.whatsapp_timer:
-            self.whatsapp_timer.cancel()
+            now = time.time()
+            if self._wa_last_pulse_time > 0 and (now - self._wa_last_pulse_time) >= 1800.0:
+                self._wa_extra_delay = 0.0
+                logging.debug("PulseEngine: WhatsApp buffer extra delay reset to 0 after 30 minutes of silence.")
 
-        self.whatsapp_timer = threading.Timer(
-            buffer_seconds, self.execute_whatsapp_pulse, args=[sys_settings])
-        self.whatsapp_timer.start()
-        logging.debug(
-            f"PulseEngine: WhatsApp message from {sender_label} buffered for {buffer_seconds}s.")
+            sys_settings = self.settings_manager.get("core.auto-pulse", {})
+            buffer_seconds = float(sys_settings.get("buffer-seconds", 30))
+            delay = max(0.0, buffer_seconds + self._wa_extra_delay)
 
-    def execute_whatsapp_pulse(self, sys_settings):
+            self.whatsapp_timer = threading.Timer(delay, self.execute_whatsapp_pulse)
+            self.whatsapp_timer.daemon = True
+            self.whatsapp_timer.start()
+            logging.debug(f"PulseEngine: WhatsApp pulse scheduled in {delay}s (base={buffer_seconds}s, extra={self._wa_extra_delay}s).")
+
+    def execute_whatsapp_pulse(self, *args, **kwargs):
         from core.logger_config import agent_id_var
         agent_id_var.set(self.agent_id)
-        self.last_pulse_time = time.time()
 
-        sender_label = ", ".join(sorted(self.pending_whatsapp_senders)) if self.pending_whatsapp_senders else "Contact"
-        self.pending_whatsapp_senders.clear()
-        title = f"WhatsApp Message from {sender_label}"
-        context = "Check your unread WhatsApp messages now and reply if appropriate."
+        with self._wa_lock:
+            self.whatsapp_timer = None
+
+        if getattr(self.orchestrator, 'is_paused', False):
+            return
+
+        if hasattr(self.orchestrator, "has_queued_pulse") and self.orchestrator.has_queued_pulse("WhatsApp message received") is True:
+            logging.info("PulseEngine: WhatsApp pulse already queued in orchestrator; coalescing.")
+            return
+
+        title = "New WhatsApp messages"
+        context = "You have new unread WhatsApp messages. Check your unread messages (WhatsApp_unread) and reply if appropriate."
         self.fire_pulse(title, context, pulse_type="whatsapp")
+
+        with self._wa_lock:
+            self._wa_extra_delay += 10.0
+            self._wa_last_pulse_time = time.time()
+            logging.debug(f"PulseEngine: WhatsApp pulse generated; cumulative delay increased to +{self._wa_extra_delay}s.")

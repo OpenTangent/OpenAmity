@@ -1,4 +1,6 @@
+from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
 import os
+import subprocess
 import time
 import threading
 import logging
@@ -52,7 +54,7 @@ class FunctionCallObject:
         self.args = args
 
 
-class DeepSeekWorker:
+class DeepSeekWorker(MemoryContextWorkerMixin):
     def __init__(self, agent_id=None):
         super().__init__()
         self.agent_id = agent_id
@@ -110,7 +112,7 @@ class DeepSeekWorker:
     def is_running(self):
         return self.running
 
-    def start_session(self, system_instruction=None, tools=None):
+    def start_session(self, system_instruction=None, tools=None, clear_history=False):
         logging.debug("start_session called in DeepSeekWorker")
         if not getattr(self, 'available', False):
             logging.error(
@@ -123,14 +125,16 @@ class DeepSeekWorker:
         self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
         self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
 
+        self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
         self.tools = tools
         self.openai_tools = []
         if self.tools:
             for t in self.tools:
                 self.openai_tools.append(_convert_to_openai_tool(t))
 
-        self.history = []
-        self.consumed_tool_call_ids = set()
+        if clear_history:
+            self.history = []
+            self.consumed_tool_call_ids = set()
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
@@ -151,6 +155,32 @@ class DeepSeekWorker:
         self.running = True
         logging.info(
             f"DeepSeek session started with model {self.current_model}.")
+
+    def get_session_history(self) -> list:
+        """Exports active chat history into a normalized list of turns."""
+        messages = []
+        for m in self.history:
+            role = m.get("role", "user")
+            content = m.get("content", "") or ""
+            if m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    fn = tc.get("function", {})
+                    content += f"\n[Tool invocation: {fn.get('name')}({fn.get('arguments', '')})]"
+            if role == "tool":
+                messages.append({"role": "user", "content": f"[Tool Result: {content}]"})
+            else:
+                messages.append({"role": role, "content": content})
+        return messages
+
+    def set_session_history(self, messages: list):
+        """Restores chat history from normalized turns."""
+        self.history = []
+        self.consumed_tool_call_ids = set()
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if content:
+                self.history.append({"role": role, "content": content})
 
     def stop_session(self):
         self.running = False
@@ -180,55 +210,94 @@ class DeepSeekWorker:
         threading.Thread(target=self._process_thought, args=(
             prompt, image_path, yolo, audio_path), daemon=True).start()
 
-    def _prepare_image_block(self, image_path: str, detail: str = "auto") -> dict:
-        if not image_path:
+    def _prepare_media_block(self, media_path: str, detail: str = "auto") -> dict:
+        if not media_path:
             return None
 
         # Check if external URL
-        if image_path.startswith("http://") or image_path.startswith("https://"):
+        if media_path.startswith("http://") or media_path.startswith("https://"):
             return {
                 "type": "image_url",
                 "image_url": {
-                    "url": image_path,
+                    "url": media_path,
                     "detail": detail
                 }
             }
 
-        exp_path = os.path.expanduser(image_path)
+        exp_path = os.path.expanduser(media_path)
         if not os.path.exists(exp_path):
-            raise FileNotFoundError(f"Image file not found: {exp_path}")
+            raise FileNotFoundError(f"Media file not found: {exp_path}")
 
         file_size = os.path.getsize(exp_path)
         mime_type, _ = mimetypes.guess_type(exp_path)
-        supported_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-        if not mime_type or mime_type not in supported_mimes:
-            ext = os.path.splitext(exp_path)[1].lower()
-            if ext in [".jpg", ".jpeg"]:
-                mime_type = "image/jpeg"
-            elif ext == ".png":
-                mime_type = "image/png"
-            elif ext == ".gif":
-                mime_type = "image/gif"
-            elif ext == ".webp":
-                mime_type = "image/webp"
-            else:
-                mime_type = "image/jpeg"
+        ext = os.path.splitext(exp_path)[1].lower()
 
-        # If file size is larger than 32 MiB inline limit, DeepSeek Chat Completions API does not support file attachments
-        if file_size > 32 * 1024 * 1024:
-            raise ValueError(
-                f"Image {exp_path} exceeds 32 MiB inline limit. DeepSeek Chat Completions API does not support file attachments.")
+        # Handle PDF documents via text extraction (DeepSeek Chat Completions does not support native PDF input)
+        if mime_type == "application/pdf" or ext == ".pdf":
+            try:
+                proc = subprocess.run(
+                    ["pdftotext", exp_path, "-"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=30
+                )
+                pdf_text = proc.stdout.strip()
+                if pdf_text:
+                    if len(pdf_text) > 50000:
+                        pdf_text = pdf_text[:50000] + "\n... [Text truncated at 50,000 characters]"
+                    return {
+                        "type": "text",
+                        "text": f"[Extracted text from PDF {os.path.basename(exp_path)}]:\n{pdf_text}"
+                    }
+                else:
+                    raise ValueError("PDF contains no extractable text.")
+            except Exception as e:
+                raise ValueError(f"DeepSeek does not natively support PDF attachments, and text extraction failed: {e}")
 
-        with open(exp_path, "rb") as image_file:
-            image_data = base64.b64encode(image_file.read()).decode("utf-8")
-
-        return {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{mime_type};base64,{image_data}",
-                "detail": detail
+        # DeepSeek does not natively support multimodal audio input.
+        if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            return {
+                "type": "text",
+                "text": f"[Audio file attached: {exp_path}. Note: DeepSeek does not support multimodal audio input directly. To extract text or messages from this audio file, use the Media_transcribe_audio tool.]"
             }
-        }
+
+        # Handle Images
+        supported_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if (mime_type and mime_type in supported_mimes) or ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+            if ext in [".jpg", ".jpeg"]:
+                norm_mime = "image/jpeg"
+            elif ext == ".png":
+                norm_mime = "image/png"
+            elif ext == ".gif":
+                norm_mime = "image/gif"
+            elif ext == ".webp":
+                norm_mime = "image/webp"
+            else:
+                norm_mime = mime_type or "image/jpeg"
+
+            if file_size > 32 * 1024 * 1024:
+                raise ValueError(
+                    f"Image {exp_path} exceeds 32 MiB inline limit. DeepSeek Chat Completions API does not support file attachments.")
+
+            with open(exp_path, "rb") as image_file:
+                image_data = base64.b64encode(image_file.read()).decode("utf-8")
+
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{norm_mime};base64,{image_data}",
+                    "detail": detail
+                }
+            }
+
+        raise ValueError(
+            f"Unsupported media format '{mime_type or ext}' for {exp_path}. "
+            "Supported formats: images (JPEG, PNG, GIF, WebP), PDF documents (via text extraction), audio files."
+        )
+
+    def _prepare_image_block(self, image_path: str, detail: str = "auto") -> dict:
+        return self._prepare_media_block(image_path, detail=detail)
 
     def _cull_media_from_history(self):
         # Intelligent Media Culling: Strip heavy multimodal attachments from older turns (> 4 turns)
@@ -319,9 +388,9 @@ class DeepSeekWorker:
                 ]
                 for m_path in attached_media:
                     try:
-                        img_block = self._prepare_image_block(m_path)
-                        if img_block:
-                            user_content_blocks.append(img_block)
+                        media_block = self._prepare_media_block(m_path)
+                        if media_block:
+                            user_content_blocks.append(media_block)
                     except Exception as e:
                         logging.warning(f"Failed to attach tool media {m_path}: {e}")
                         user_content_blocks.append({
@@ -402,7 +471,7 @@ class DeepSeekWorker:
                         {"type": "text", "text": "[Image attachment skipped: Low Token Mode is active]"})
                 else:
                     try:
-                        img_block = self._prepare_image_block(image_path)
+                        img_block = self._prepare_media_block(image_path)
                         if img_block:
                             content_blocks.append(img_block)
                     except Exception as e:
@@ -411,20 +480,10 @@ class DeepSeekWorker:
                         return
 
             if audio_path:
-                if is_low_token:
-                    content_blocks.append(
-                        {"type": "text", "text": "[Audio attachment skipped: Low Token Mode is active]"})
-                else:
-                    try:
-                        logging.info(
-                            f"Transcribing audio for DeepSeek: {audio_path}")
-                        transcription = self.local_stt.transcribe(audio_path)
-                        content_blocks.append(
-                            {"type": "text", "text": f"[Audio Transcribed via Whisper]: {transcription}"})
-                    except Exception as e:
-                        self.error_occurred.emit(f"Audio load error: {e}")
-                        self.is_processing = False
-                        return
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"[Audio attached: {audio_path}. DeepSeek does not support direct audio input; use Media_transcribe_audio to transcribe if needed.]"
+                })
 
             # If only a single text block, pass as plain string for simplicity
             if len(content_blocks) == 1 and content_blocks[0].get("type") == "text":

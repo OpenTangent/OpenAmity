@@ -1,3 +1,4 @@
+import os
 import logging
 from faster_whisper import WhisperModel
 
@@ -27,6 +28,13 @@ class LocalSTT:
     def transcribe(self, audio_path: str) -> str:
         """Transcribes the audio at audio_path using faster-whisper."""
         try:
+            if not audio_path or not os.path.exists(audio_path) or not os.path.isfile(audio_path):
+                return f"[Transcription Failed: File not found or not a valid file: {audio_path}]"
+
+            file_size = os.path.getsize(audio_path)
+            if file_size < 32:
+                return f"[Transcription Failed: Audio file {audio_path} is too small or truncated ({file_size} bytes)]"
+
             model = self._get_model()
             logging.debug(f"Local STT transcribing: {audio_path}")
 

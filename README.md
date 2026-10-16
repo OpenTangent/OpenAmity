@@ -15,28 +15,6 @@
   <a href="src/assets/screenshots/sc-Agent.png">
     <img src="src/assets/screenshots/sc-Agent.png" alt="Open Amity Agent Interface" width="100%" />
   </a>
-
-  <br />
-
-  <table>
-    <tr>
-      <td width="33.3%" align="center">
-        <a href="src/assets/screenshots/sc-Chatroom.png">
-          <img src="src/assets/screenshots/sc-Chatroom.png" alt="Multi-Agent Chatroom" />
-        </a>
-      </td>
-      <td width="33.3%" align="center">
-        <a href="src/assets/screenshots/sc-Values.png">
-          <img src="src/assets/screenshots/sc-Values.png" alt="Agent Values and Goals" />
-        </a>
-      </td>
-      <td width="33.3%" align="center">
-        <a href="src/assets/screenshots/sc-Voice.png">
-          <img src="src/assets/screenshots/sc-Voice.png" alt="Agent Voice" />
-        </a>
-      </td>
-    </tr>
-  </table>
 </div>
 
 ## 👤 Overview

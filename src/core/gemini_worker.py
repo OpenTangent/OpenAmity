@@ -1,3 +1,4 @@
+from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
 import threading
 from google import genai
 from google.genai import types
@@ -10,7 +11,7 @@ from .settings_manager import SettingsManager
 load_dotenv()
 
 
-class GeminiWorker:
+class GeminiWorker(MemoryContextWorkerMixin):
     def __init__(self, agent_id=None):
         super().__init__()
         self.agent_id = agent_id
@@ -158,7 +159,7 @@ class GeminiWorker:
     def is_running(self):
         return self.running
 
-    def start_session(self, system_instruction=None, tools=None):
+    def start_session(self, system_instruction=None, tools=None, clear_history=False):
         logging.debug("start_session called in GeminiWorker")
         if not getattr(self, 'available', False):
             logging.error(
@@ -228,6 +229,7 @@ class GeminiWorker:
                 except Exception:
                     thinking_config = None
 
+            self.sys_instruct = fit_system_prompt(self.sys_instruct or "", self.settings, self.tools)
             self.thinker_config = types.GenerateContentConfig(
                 system_instruction=self.sys_instruct,
                 tools=tool_list if tool_list else None,
@@ -236,11 +238,12 @@ class GeminiWorker:
                     disable=True)
             )
 
-            # Reset to top of list if this is a fresh start
-            if not self.current_thinker_model or self.current_thinker_model not in self.thinking_models:
-                self.current_thinker_model = self.thinking_models[0]
+            # Update thinker model to configured primary model (or light model if low token)
+            target_model = self.thinking_models[0]
+            if self.current_thinker_model != target_model:
+                self.current_thinker_model = target_model
 
-            old_history = self._get_chat_history()
+            old_history = [] if clear_history else self._get_chat_history()
             try:
                 self.thinker_chat = self.client.chats.create(
                     model=self.current_thinker_model, config=self.thinker_config, history=old_history if old_history else None)
@@ -257,6 +260,54 @@ class GeminiWorker:
             logging.error(f"Failed to start session: {e}", exc_info=True)
             self.running = False
             self.error_occurred.emit(f"Session Start Error: {e}")
+
+    def get_session_history(self) -> list:
+        """Exports active chat history into a normalized list of turns."""
+        with self._chat_lock:
+            history = self._get_chat_history()
+            messages = []
+            for content in history:
+                role = "user" if getattr(content, "role", "") == "user" else "assistant"
+                parts_text = []
+                if getattr(content, "parts", None):
+                    for p in content.parts:
+                        if getattr(p, "text", None):
+                            parts_text.append(p.text)
+                        elif getattr(p, "function_call", None):
+                            fc = p.function_call
+                            args = dict(fc.args) if getattr(fc, "args", None) else {}
+                            parts_text.append(f"[Tool invocation: {fc.name}({json.dumps(args)})]")
+                        elif getattr(p, "function_response", None):
+                            fr = p.function_response
+                            resp = dict(fr.response) if getattr(fr, "response", None) else {}
+                            parts_text.append(f"[Tool Result: {fr.name} -> {json.dumps(resp)}]")
+                messages.append({"role": role, "content": "\n".join(parts_text)})
+            return messages
+
+    def set_session_history(self, messages: list):
+        """Restores chat history from normalized turns into Gemini types.Content objects."""
+        if not getattr(self, 'available', False) or not self.client:
+            return
+        from google.genai import types
+        with self._chat_lock:
+            sdk_history = []
+            for msg in messages:
+                role = "user" if msg.get("role") == "user" else "model"
+                content_text = msg.get("content", "")
+                if content_text:
+                    sdk_history.append(types.Content(
+                        role=role,
+                        parts=[types.Part.from_text(text=content_text)]
+                    ))
+            if sdk_history:
+                try:
+                    self.thinker_chat = self.client.chats.create(
+                        model=self.current_thinker_model or getattr(self, 'primary_model', "gemini-3.8-flash"),
+                        config=getattr(self, 'thinker_config', None),
+                        history=sdk_history
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not restore chat history in GeminiWorker: {e}")
 
     def stop_session(self):
         self.running = False
@@ -314,8 +365,15 @@ class GeminiWorker:
         for name, response in responses:
             if isinstance(response, dict):
                 response = response.copy()
-                if 'media' in response and isinstance(response['media'], list):
-                    for file_path in response['media']:
+                media_list = []
+                if 'media' in response:
+                    if isinstance(response['media'], list):
+                        media_list = response['media']
+                    elif isinstance(response['media'], str):
+                        media_list = [response['media']]
+
+                if media_list:
+                    for file_path in media_list:
                         if is_low_token:
                             response['result'] = f"{response.get('result', '')}\n[Multimedia attachment skipped: Low Token Mode is active] (Path: {file_path})"
                         else:

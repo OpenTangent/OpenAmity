@@ -254,35 +254,64 @@ def test_pulse_engine_whatsapp_whitelist_matching(temp_agent_environment):
     # 4. Whitelisted international number should match and schedule pulse
     engine.handle_whatsapp_message("27836527975@c.us", "")
     assert engine.whatsapp_timer is not None
-    assert "Kerry Parker" in engine.pending_whatsapp_sender
 
     # Wait for buffer execution
     import time
     time.sleep(0.1)
     assert len(pulse_fired) == 1
-    assert "Check your unread WhatsApp messages" in pulse_fired[0]
+    assert "Check your unread messages" in pulse_fired[0]
+    # Verify no sender name or number leaked into prompt
+    assert "Kerry Parker" not in pulse_fired[0]
+    assert "27836527975" not in pulse_fired[0]
 
-    # 5. Rate limiting prevents immediate second pulse
-    engine.whatsapp_timer = None
+    # 5. Cumulative buffer escalation: second message schedules with extra 10s delay
     engine.handle_whatsapp_message("27836527975@c.us", "Kerry Parker")
-    assert engine.whatsapp_timer is None  # Suppressed by rate limit
+    assert engine.whatsapp_timer is not None  # Not blocked by old rate limit!
+    assert engine._wa_extra_delay == 10.0
+    if engine.whatsapp_timer:
+        engine.whatsapp_timer.cancel()
 
     # 6. Test matching national number format in whitelist (e.g. 0836527975)
     settings.set("core.auto-pulse.whitelist", ["0836527975"])
     settings.save()
-    engine.last_pulse_time = 0  # reset cooldown
     engine.handle_whatsapp_message("27836527975@c.us", "")
     assert engine.whatsapp_timer is not None
-
-    # 7. Test matching contact name in whitelist
     if engine.whatsapp_timer:
         engine.whatsapp_timer.cancel()
+
+    # 7. Test matching contact name in whitelist
     settings.set("core.auto-pulse.whitelist", ["Alice Smith"])
     settings.save()
-    engine.last_pulse_time = 0
     engine.handle_whatsapp_message("27999999999@c.us", "Alice Smith")
     assert engine.whatsapp_timer is not None
     if engine.whatsapp_timer:
         engine.whatsapp_timer.cancel()
+
+
+def test_whatsapp_daemon_parse_message_line():
+    from core.whatsapp_daemon import WhatsAppDaemon
+    daemon = WhatsAppDaemon(agent_id="test-daemon")
+    events = []
+    daemon.message_callback = lambda s_id, s_name, **kwargs: events.append((s_id, s_name, kwargs))
+
+    # 1. Parse JSON message line with group and mention
+    line_json = '[MSG_RECEIVED_JSON] {"chatId": "12345@g.us", "senderName": "Alice", "isGroup": true, "groupName": "Project Amity", "mentioned": true}'
+    daemon._parse_message_line(line_json)
+    assert len(events) == 1
+    assert events[0][0] == "12345@g.us"
+    assert events[0][1] == "Alice"
+    assert events[0][2]["is_group"] is True
+    assert events[0][2]["group_name"] == "Project Amity"
+    assert events[0][2]["mentioned"] is True
+
+    # 2. Parse legacy line
+    line_legacy = '[MSG_RECEIVED] 27836527975@c.us Bob'
+    daemon._parse_message_line(line_legacy)
+    assert len(events) == 2
+    assert events[1][0] == "27836527975@c.us"
+    assert events[1][1] == "Bob"
+    assert events[1][2]["is_group"] is False
+    assert events[1][2]["group_name"] == ""
+    assert events[1][2]["mentioned"] is False
 
 

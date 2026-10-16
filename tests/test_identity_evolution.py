@@ -24,7 +24,9 @@ def temp_agent_env(monkeypatch, tmp_path):
     return palace_path
 
 
-def test_apply_identity_delta_autonomous_tool(temp_agent_env, tmp_path):
+def test_apply_identity_delta_autonomous_tool(temp_agent_env, tmp_path, monkeypatch):
+    from identity_test_support import signer
+    approve = signer(monkeypatch, tmp_path)
     agent_id = "test-agent-evolution"
     agent_dir = tmp_path / agent_id
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -33,18 +35,54 @@ def test_apply_identity_delta_autonomous_tool(temp_agent_env, tmp_path):
     orch.agent_id = agent_id
     orch.mempalace_manager = MemPalaceManager(agent_id=agent_id, palace_path=temp_agent_env)
 
+    policy = SettingsManager(agent_id=agent_id)
+    policy.set("core.identity_evolution.mode", "signed_approval"); policy.save()
     tool = MemPalaceTool(orchestrator=orch)
 
-    # 1. Apply delta via tool
-    res = tool.execute(
+    # 1. Unapproved mutation without reference must be rejected
+    unapproved_res = tool.execute(
         "apply_identity_delta",
         target_section="core_values",
         delta_type="add",
         content="Intellectual Humility (I readily adapt when presented with sound evidence.)",
         rationale="Conversational alignment with Andrew regarding over-confidence in debugging."
     )
+    assert "Error:" in unapproved_res
+
+    # 2. Register human-controlled approval record (untrusted must fail, trusted succeeds)
+    content = "Intellectual Humility (I readily adapt when presented with sound evidence.)"
+    with pytest.raises(PermissionError):
+        orch.mempalace_manager.register_identity_approval(
+            target_section="core_values",
+            delta_type="add",
+            content=content,
+            user_id="Andrew"
+        )
+
+    approval_ref = approve(orch.mempalace_manager, "core_values", "add", content, user_id="Andrew")
+
+    # 3. Apply delta via tool with valid approval_ref
+    res = tool.execute(
+        "apply_identity_delta",
+        target_section="core_values",
+        delta_type="add",
+        content=content,
+        rationale="Conversational alignment with Andrew regarding over-confidence in debugging.",
+        approval_ref=approval_ref
+    )
 
     assert "Successfully applied identity delta to core_values" in res
+
+    # 4. Anti-replay: reusing the same approval_ref must fail
+    replay_res = tool.execute(
+        "apply_identity_delta",
+        target_section="core_values",
+        delta_type="add",
+        content=content,
+        rationale="Conversational alignment with Andrew regarding over-confidence in debugging.",
+        approval_ref=approval_ref
+    )
+    assert "already been used" in replay_res
 
     # 2. Check settings.json updated
     sm = SettingsManager(agent_id=agent_id)

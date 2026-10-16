@@ -178,8 +178,12 @@ class PulseTool(Tool):
                 c.execute(
                     'UPDATE pulses SET scheduled_time=?, status="pending", has_run=0 WHERE id=?', (new_time, pulse_id))
                 msg = f"Success: Pulse ID {pulse_id} snoozed to {new_time}."
+            elif action in ['cancel', 'cancelled']:
+                c.execute('UPDATE pulses SET status="cancelled" WHERE id=?',
+                          (pulse_id,))
+                msg = f"Success: Pulse ID {pulse_id} marked as cancelled."
             else:
-                # complete or cancel
+                # complete
                 c.execute('UPDATE pulses SET status=? WHERE id=?',
                           (action, pulse_id))
                 msg = f"Success: Pulse ID {pulse_id} marked as {action}."
@@ -221,7 +225,7 @@ class PulseTool(Tool):
             c.execute('''
                 SELECT id, title, scheduled_time, recurrence, status
                 FROM pulses 
-                WHERE status != 'deleted' AND scheduled_time <= ?
+                WHERE status NOT IN ('deleted', 'missed', 'cancel', 'cancelled') AND scheduled_time <= ?
                 ORDER BY scheduled_time ASC
             ''', (end_date.isoformat(),))
             rows = c.fetchall()
@@ -239,9 +243,12 @@ class PulseTool(Tool):
                 continue
 
             if rec == 'none':
-                if (now - timedelta(minutes=15) <= dt <= end_date) or (status == 'pending' and dt <= end_date):
+                if (status == 'pending' and dt <= end_date) or (status in ('completed', 'complete') and now - timedelta(minutes=15) <= dt <= end_date):
                     items.append((dt, p_id, title, status, rec))
             else:
+                if status != 'pending':
+                    continue
+
                 target_day = dt.day
                 curr = dt
 

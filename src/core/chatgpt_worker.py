@@ -1,3 +1,7 @@
+from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+import os
+import base64
+import mimetypes
 import time
 import uuid
 import threading
@@ -49,7 +53,7 @@ class FunctionCallObject:
         self.args = args
 
 
-class ChatGptWorker:
+class ChatGptWorker(MemoryContextWorkerMixin):
     def __init__(self, agent_id=None):
         super().__init__()
         self.agent_id = agent_id
@@ -103,7 +107,7 @@ class ChatGptWorker:
     def is_running(self):
         return self.running
 
-    def start_session(self, system_instruction=None, tools=None):
+    def start_session(self, system_instruction=None, tools=None, clear_history=False):
         logging.debug("start_session called in ChatGptWorker")
         if not getattr(self, 'available', False):
             logging.error(
@@ -116,14 +120,16 @@ class ChatGptWorker:
         self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
         self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
 
+        self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
         self.tools = tools
         self.openai_tools = []
         if self.tools:
             for t in self.tools:
                 self.openai_tools.append(_convert_to_openai_tool(t))
 
-        self.history = []
-        self.consumed_tool_call_ids = set()
+        if clear_history:
+            self.history = []
+            self.consumed_tool_call_ids = set()
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
@@ -145,6 +151,32 @@ class ChatGptWorker:
         logging.info(
             f"ChatGPT SDK session started with model {self.current_model}.")
 
+    def get_session_history(self) -> list:
+        """Exports active chat history into a normalized list of turns."""
+        messages = []
+        for m in self.history:
+            role = m.get("role", "user")
+            content = m.get("content", "") or ""
+            if m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    fn = tc.get("function", {})
+                    content += f"\n[Tool invocation: {fn.get('name')}({fn.get('arguments', '')})]"
+            if role == "tool":
+                messages.append({"role": "user", "content": f"[Tool Result: {content}]"})
+            else:
+                messages.append({"role": role, "content": content})
+        return messages
+
+    def set_session_history(self, messages: list):
+        """Restores chat history from normalized turns."""
+        self.history = []
+        self.consumed_tool_call_ids = set()
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if content:
+                self.history.append({"role": role, "content": content})
+
     def stop_session(self):
         self.running = False
         self.history = []
@@ -165,6 +197,141 @@ class ChatGptWorker:
         self.is_processing = True
         threading.Thread(target=self._process_thought, args=(
             prompt, image_path, yolo, audio_path), daemon=True).start()
+
+    def _prepare_media_block(self, media_path: str, detail: str = "auto") -> dict:
+        if not media_path:
+            return None
+
+        # Check if external URL
+        if media_path.startswith("http://") or media_path.startswith("https://"):
+            ext = os.path.splitext(media_path.split("?")[0])[1].lower()
+            if ext == ".pdf":
+                return {
+                    "type": "file",
+                    "file": {
+                        "filename": os.path.basename(media_path.split("?")[0]) or "document.pdf",
+                        "file_data": media_path
+                    }
+                }
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": media_path,
+                    "detail": detail
+                }
+            }
+
+        exp_path = os.path.expanduser(media_path)
+        if not os.path.exists(exp_path):
+            raise FileNotFoundError(f"Media file not found: {exp_path}")
+
+        file_size = os.path.getsize(exp_path)
+        if file_size > 32 * 1024 * 1024:
+            raise ValueError(
+                f"Media {exp_path} exceeds 32 MiB inline limit.")
+
+        mime_type, _ = mimetypes.guess_type(exp_path)
+        ext = os.path.splitext(exp_path)[1].lower()
+
+        # Handle PDF documents
+        if mime_type == "application/pdf" or ext == ".pdf":
+            with open(exp_path, "rb") as doc_file:
+                b64_data = base64.b64encode(doc_file.read()).decode("utf-8")
+            return {
+                "type": "file",
+                "file": {
+                    "filename": os.path.basename(exp_path),
+                    "file_data": f"data:application/pdf;base64,{b64_data}"
+                }
+            }
+
+        # Handle Audio files via native multimodal audio input
+        if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            fmt = ext.lstrip(".").lower()
+            if fmt in ["wav", "mp3"]:
+                with open(exp_path, "rb") as f:
+                    b64_data = base64.b64encode(f.read()).decode("utf-8")
+                return {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": b64_data,
+                        "format": fmt
+                    }
+                }
+            else:
+                import subprocess, tempfile
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
+                    tmp_wav = tmp_f.name
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", exp_path, "-ar", "16000", "-ac", "1", tmp_wav],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    with open(tmp_wav, "rb") as f:
+                        b64_data = base64.b64encode(f.read()).decode("utf-8")
+                    return {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64_data,
+                            "format": "wav"
+                        }
+                    }
+                finally:
+                    if os.path.exists(tmp_wav):
+                        os.unlink(tmp_wav)
+
+        # Handle Images
+        supported_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if (mime_type and mime_type in supported_mimes) or ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+            if ext in [".jpg", ".jpeg"]:
+                norm_mime = "image/jpeg"
+            elif ext == ".png":
+                norm_mime = "image/png"
+            elif ext == ".gif":
+                norm_mime = "image/gif"
+            elif ext == ".webp":
+                norm_mime = "image/webp"
+            else:
+                norm_mime = mime_type or "image/jpeg"
+
+            with open(exp_path, "rb") as image_file:
+                image_data = base64.b64encode(image_file.read()).decode("utf-8")
+
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{norm_mime};base64,{image_data}",
+                    "detail": detail
+                }
+            }
+
+        raise ValueError(
+            f"Unsupported media format '{mime_type or ext}' for {exp_path}. "
+            "Supported formats: images (JPEG, PNG, GIF, WebP), PDF documents, audio files."
+        )
+
+    def _prepare_image_block(self, image_path: str, detail: str = "auto") -> dict:
+        return self._prepare_media_block(image_path, detail=detail)
+
+    def _cull_media_from_history(self):
+        # Intelligent Media Culling: Strip heavy multimodal attachments from older turns (> 4 turns)
+        if len(self.history) > 4:
+            for i in range(len(self.history) - 4):
+                msg = self.history[i]
+                if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                    new_content = []
+                    modified = False
+                    for part in msg["content"]:
+                        if isinstance(part, dict) and part.get("type") in ("image_url", "file"):
+                            new_content.append({
+                                "type": "text",
+                                "text": "[Media attachment automatically culled to save tokens/memory]"
+                            })
+                            modified = True
+                        else:
+                            new_content.append(part)
+                    if modified:
+                        msg["content"] = new_content
 
     def send_function_response(self, name: str, response: dict):
         self.send_function_responses([(name, response)])
@@ -224,19 +391,9 @@ class ChatGptWorker:
                 ]
                 for m_path in attached_media:
                     try:
-                        import os
-                        import mimetypes
-                        import base64
-                        exp_path = os.path.expanduser(m_path)
-                        mime_type, _ = mimetypes.guess_type(exp_path)
-                        with open(exp_path, "rb") as image_file:
-                            image_data = base64.b64encode(image_file.read()).decode("utf-8")
-                        user_content_blocks.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type or 'image/jpeg'};base64,{image_data}"
-                            }
-                        })
+                        media_block = self._prepare_media_block(m_path)
+                        if media_block:
+                            user_content_blocks.append(media_block)
                     except Exception as e:
                         logging.warning(f"Failed to attach tool media for ChatGPT {m_path}: {e}")
                         user_content_blocks.append({
@@ -317,18 +474,9 @@ class ChatGptWorker:
                         {"type": "text", "text": "[Image attachment skipped: Low Token Mode is active]"})
                 else:
                     try:
-                        import mimetypes
-                        import base64
-                        mime_type, _ = mimetypes.guess_type(image_path)
-                        with open(image_path, "rb") as image_file:
-                            image_data = base64.b64encode(
-                                image_file.read()).decode("utf-8")
-                        content_blocks.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type or 'image/jpeg'};base64,{image_data}"
-                            }
-                        })
+                        media_block = self._prepare_media_block(image_path)
+                        if media_block:
+                            content_blocks.append(media_block)
                     except Exception as e:
                         self.error_occurred.emit(f"Image load error: {e}")
                         self.is_processing = False
@@ -340,11 +488,39 @@ class ChatGptWorker:
                         {"type": "text", "text": "[Audio attachment skipped: Low Token Mode is active]"})
                 else:
                     try:
-                        logging.info(
-                            f"Transcribing audio for ChatGPT: {audio_path}")
-                        transcription = self.local_stt.transcribe(audio_path)
-                        content_blocks.append(
-                            {"type": "text", "text": f"[Audio Transcribed via Whisper]: {transcription}"})
+                        ext = os.path.splitext(audio_path)[1].lower()
+                        fmt = ext.lstrip(".").lower()
+                        if fmt in ["wav", "mp3"]:
+                            with open(audio_path, "rb") as f:
+                                b64_audio = base64.b64encode(f.read()).decode("utf-8")
+                            content_blocks.append({
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": b64_audio,
+                                    "format": fmt
+                                }
+                            })
+                        else:
+                            import subprocess, tempfile
+                            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
+                                tmp_wav = tmp_f.name
+                            try:
+                                subprocess.run(
+                                    ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", tmp_wav],
+                                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                                )
+                                with open(tmp_wav, "rb") as f:
+                                    b64_audio = base64.b64encode(f.read()).decode("utf-8")
+                                content_blocks.append({
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": b64_audio,
+                                        "format": "wav"
+                                    }
+                                })
+                            finally:
+                                if os.path.exists(tmp_wav):
+                                    os.unlink(tmp_wav)
                     except Exception as e:
                         self.error_occurred.emit(f"Audio load error: {e}")
                         self.is_processing = False
@@ -358,6 +534,7 @@ class ChatGptWorker:
             self.history.append(user_msg)
 
         self._reconcile_tool_calls()
+        self._cull_media_from_history()
         models_to_attempt = [self.current_model]
         if self.current_model != self.light_model:
             models_to_attempt.append(self.light_model)

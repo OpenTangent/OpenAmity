@@ -616,3 +616,121 @@ def test_openrouter_dropdown_no_scroller_buttons_and_scrollbar_policy(qapp):
     panel.deleteLater()
 
 
+def test_openrouter_worker_pdf_media_attachment(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    pdf_file = tmp_path / "manuscript.pdf"
+    pdf_file.write_bytes(b"%PDF-1.5 test pdf content")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Reading manuscript",
+            "tool_calls": [{
+                "id": "call_media_read_1",
+                "type": "function",
+                "function": {"name": "Media_read", "arguments": "{}"}
+            }]
+        })
+
+        worker.client.chat.completions.create = MagicMock(return_value=[])
+
+        worker.send_function_response("Media_read", {
+            "result": "Attached media file",
+            "media": [str(pdf_file)]
+        })
+
+        assert len(worker.history) >= 3
+        media_msg = worker.history[2]
+        assert media_msg["role"] == "user"
+        content_blocks = media_msg["content"]
+        assert len(content_blocks) == 2
+        assert content_blocks[0]["type"] == "text"
+        assert "[Attached media from tool execution]:" in content_blocks[0]["text"]
+        assert content_blocks[1]["type"] == "file"
+        assert content_blocks[1]["file"]["filename"] == "manuscript.pdf"
+        assert content_blocks[1]["file"]["file_data"].startswith("data:application/pdf;base64,")
+
+
+def test_openrouter_worker_image_and_audio_media_attachment(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    img_file = tmp_path / "photo.png"
+    img_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
+
+    audio_file = tmp_path / "speech.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 30)
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system")
+        worker.local_stt = MagicMock()
+        worker.local_stt.transcribe.return_value = "Transcribed speech content"
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Reading media",
+            "tool_calls": [{
+                "id": "call_media_read_2",
+                "type": "function",
+                "function": {"name": "Media_read", "arguments": "{}"}
+            }]
+        })
+
+        worker.client.chat.completions.create = MagicMock(return_value=[])
+
+        worker.send_function_response("Media_read", {
+            "result": "Attached media files",
+            "media": [str(img_file), str(audio_file)]
+        })
+
+        assert len(worker.history) >= 3
+        media_msg = worker.history[2]
+        content_blocks = media_msg["content"]
+        assert len(content_blocks) == 3
+        assert content_blocks[1]["type"] == "image_url"
+        assert content_blocks[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert content_blocks[2]["type"] == "input_audio"
+        assert content_blocks[2]["input_audio"]["format"] == "wav"
+        assert len(content_blocks[2]["input_audio"]["data"]) > 0
+
+
+def test_openrouter_worker_unsupported_media_error_handling(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    bin_file = tmp_path / "data.xyz_unknown"
+    bin_file.write_bytes(b"\x00\x01\x02\x03")
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system")
+
+        worker.history.append({
+            "role": "assistant",
+            "content": "Reading data",
+            "tool_calls": [{
+                "id": "call_media_read_3",
+                "type": "function",
+                "function": {"name": "Media_read", "arguments": "{}"}
+            }]
+        })
+
+        worker.client.chat.completions.create = MagicMock(return_value=[])
+
+        worker.send_function_response("Media_read", {
+            "result": "Attached unknown file",
+            "media": [str(bin_file)]
+        })
+
+        media_msg = worker.history[2]
+        content_blocks = media_msg["content"]
+        assert len(content_blocks) == 2
+        assert content_blocks[1]["type"] == "text"
+        assert "[Error attaching media" in content_blocks[1]["text"]
+        assert "Unsupported media format" in content_blocks[1]["text"]
+
+
+
