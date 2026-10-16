@@ -2,10 +2,12 @@
 Version=1.0
 Type=Application
 Name=Open Amity
-Comment=Open Amity AI Companion
+GenericName=AI Companion & Multi-Agent Framework
+Comment=Proactive multi-agent AI desktop companion and team orchestration framework
 Exec=run_OpenAmity.sh
 Icon=com.openamity.OpenAmity
 Terminal=false
-Categories=Utility;
+Categories=Network;Chat;InstantMessaging;
+Keywords=AI;Agent;Companion;Assistant;LLM;Chat;Autonomous;Gemini;Claude;DeepSeek;MemPalace;
 StartupNotify=true
 StartupWMClass=com.openamity.OpenAmity
