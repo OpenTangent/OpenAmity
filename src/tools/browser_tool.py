@@ -476,10 +476,24 @@ class BrowserSkill(Tool):
                 domain = kwargs.get("domain")
                 return self.manager.clear_cache(domain=domain)
 
-            elif command == "close":
-                return self.manager.close()
+            if command == "close":
+                res = self.manager.close()
+            else:
+                res = f"Unknown command: {command}"
 
-            return f"Unknown command: {command}"
+            if getattr(self.manager, "_did_first_time_download", False):
+                self.manager._did_first_time_download = False
+                note = "[System Note: One-time stealth browser engine setup completed successfully; subsequent browser actions will be immediate.]\n"
+                if isinstance(res, dict):
+                    if "tree" in res:
+                        res["tree"] = note + str(res["tree"])
+                    elif "message" in res:
+                        res["message"] = note + str(res["message"])
+                elif isinstance(res, str):
+                    res = note + res
+
+            return res
         except Exception as e:
             logger.error(f"Error executing browser command '{command}': {e}", exc_info=True)
             return {"error": f"Command '{command}' failed: {e}"}
+

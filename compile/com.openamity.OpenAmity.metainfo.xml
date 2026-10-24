@@ -48,39 +48,39 @@
   </branding>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Agent.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Agent.png</image>
       <caption>Main conversational interface with active speech and thought monitoring</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Chatroom.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Chatroom.png</image>
       <caption>Multi-agent collaborative chatroom environment with team message feed</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-NewAgent.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-NewAgent.png</image>
       <caption>Creating a new agent persona with customized archetype and Crockford Base32 ID</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Provider.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Provider.png</image>
       <caption>Configuring cognitive AI providers including Gemini, Claude, ChatGPT, DeepSeek, and OpenRouter</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Settings.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Settings.png</image>
       <caption>Agent settings panel managing fatigue budgets, Low Token Mode, and autonomous behavior</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Snapshots.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Snapshots.png</image>
       <caption>Managing portable Open Amity Agent (.oaa) snapshots for backup, export, and migration</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Social.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Social.png</image>
       <caption>Social communication integrations including WhatsApp, Email, Mastodon, and Moltbook</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Values.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Values.png</image>
       <caption>Autonomous Layer 0 identity evolution showing core values, aspirations, and anti-patterns</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/main/src/assets/screenshots/sc-Voice.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.5/src/assets/screenshots/sc-Voice.png</image>
       <caption>Voice synthesis options between local neural Piper TTS and cloud Gemini TTS</caption>
     </screenshot>
   </screenshots>
@@ -89,7 +89,7 @@
     <category>Utility</category>
     <category>Network</category>
     <category>Chat</category>
-    <category>ArtificialIntelligence</category>
+    <category>InstantMessaging</category>
   </categories>
   <keywords>
     <keyword>ai</keyword>
@@ -111,6 +111,19 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.3.5" date="2026-10-24">
+      <description>
+        <p>Open Amity v0.3.5 introduces substantial Flatpak package size reductions, streamlined STT decoding, and Flathub distribution readiness:</p>
+        <ul>
+          <li>Reduced Flatpak installation and download size by over 75% via on-demand caching of browser engines and memory models</li>
+          <li>Streamlined local speech-to-text audio decoding using system FFmpeg directly into NumPy arrays, eliminating PyAV binary bloat</li>
+          <li>Added non-blocking status notifications across one-time engine and model initialization workflows</li>
+          <li>Optimized Camoufox browser integration and WhatsApp bridge with automatic font and asset pruning</li>
+          <li>Prepared verified Flathub distribution packaging and metadata standards compliance</li>
+        </ul>
+      </description>
+    </release>
+
     <release version="0.3.4" date="2026-10-16">
       <description>
         <p>Open Amity v0.3.4 includes substantial reliability improvements, asynchronous snapshots, chatrooms, and tool upgrades:</p>

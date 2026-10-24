@@ -453,6 +453,16 @@ class DeepSeekWorker(MemoryContextWorkerMixin):
         if hasattr(self, 'agent_id'):
             agent_id_var.set(self.agent_id)
 
+        try:
+            self._process_thought_inner(prompt, image_path, yolo, audio_path)
+        except Exception as e:
+            logging.error(f"DeepSeekWorker unhandled error in _process_thought: {e}", exc_info=True)
+            self.error_occurred.emit(f"DeepSeek API Error: {e}")
+        finally:
+            self.is_processing = False
+
+    def _process_thought_inner(self, prompt=None, image_path=None, yolo=False, audio_path=None):
+
         history_snapshot_len = len(self.history)
         is_low_token = self.settings.get("core.low-token-mode", False)
 
@@ -480,9 +490,17 @@ class DeepSeekWorker(MemoryContextWorkerMixin):
                         return
 
             if audio_path:
+                text_desc = f"[Audio attached: {audio_path}. DeepSeek does not support direct audio input; use Media_transcribe_audio to transcribe if needed.]"
+                try:
+                    from core.local_stt import LocalSTT
+                    stt_text = LocalSTT().transcribe(audio_path)
+                    if stt_text and not stt_text.startswith("Failed"):
+                        text_desc += f"\n[Voice Message Transcription: {stt_text}]"
+                except Exception:
+                    pass
                 content_blocks.append({
                     "type": "text",
-                    "text": f"[Audio attached: {audio_path}. DeepSeek does not support direct audio input; use Media_transcribe_audio to transcribe if needed.]"
+                    "text": text_desc
                 })
 
             # If only a single text block, pass as plain string for simplicity

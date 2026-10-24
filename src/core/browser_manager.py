@@ -328,10 +328,25 @@ class BrowserManager:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
+        self._did_first_time_download = False
+
+    def _is_camoufox_available(self) -> bool:
+        if self._resolve_executable_path():
+            return True
+        try:
+            from camoufox.multiversion import get_active_path
+            active = get_active_path()
+            if active and active.exists():
+                return True
+        except Exception:
+            pass
+        return False
+
     def _run_async(self, coro, timeout: Optional[float] = None) -> Any:
         """Executes a coroutine on the dedicated background event loop and blocks for result."""
         self._ensure_event_loop()
-        effective_timeout = timeout if timeout is not None else (self.page_timeout_seconds + 10)
+        default_timeout = (self.page_timeout_seconds + 300) if not self._is_camoufox_available() else (self.page_timeout_seconds + 10)
+        effective_timeout = timeout if timeout is not None else default_timeout
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
             return future.result(timeout=effective_timeout)
@@ -450,6 +465,48 @@ class BrowserManager:
         os.makedirs(data_dir, exist_ok=True)
 
         exec_path = self._resolve_executable_path()
+        if not exec_path and not self._is_camoufox_available():
+            logger.info("BrowserManager: Camoufox browser engine not installed. Initiating one-time download...")
+            if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                try:
+                    self.orchestrator.on_message_appended.emit(
+                        "System", "[System: Downloading stealth browser engine (one-time setup)...]"
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not emit download notice: {e}")
+
+            try:
+                from camoufox.pkgman import camoufox_path
+                active_dir = camoufox_path(download_if_missing=True)
+                # Prune non-Linux fonts (saving 891 MB in user home)
+                if active_dir and os.path.exists(active_dir):
+                    import shutil
+                    for extra in ["macos", "windows"]:
+                        fpath = os.path.join(active_dir, "fonts", extra)
+                        if os.path.exists(fpath):
+                            try:
+                                shutil.rmtree(fpath, ignore_errors=True)
+                            except Exception:
+                                pass
+                self._did_first_time_download = True
+                if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                    try:
+                        self.orchestrator.on_message_appended.emit(
+                            "System", "[System: Stealth browser engine ready.]"
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"BrowserManager: Failed to download Camoufox: {e}")
+                if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                    try:
+                        self.orchestrator.on_message_appended.emit(
+                            "System", f"[System: Failed to download stealth browser engine: {e}]"
+                        )
+                    except Exception:
+                        pass
+                raise
+
         viewport_w = int(self._get_setting("default-viewport-width", 1280))
         viewport_h = int(self._get_setting("default-viewport-height", 800))
 
@@ -458,6 +515,8 @@ class BrowserManager:
             "persistent_context": True,
             "headless": self.is_headless,
             "humanize": self.is_humanize,
+            "os": "linux",
+            "i_know_what_im_doing": True,
         }
         if exec_path:
             launch_kwargs["executable_path"] = exec_path

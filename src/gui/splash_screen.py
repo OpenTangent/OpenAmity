@@ -80,9 +80,23 @@ class LoadingCard(QWidget):
         # Loading Rotator
         self.rotator = LoadingRotator()
 
+        # Status Label (subtle indicator for one-time initialization tasks)
+        self.status_label = QLabel("")
+        status_font = QFont("Ubuntu")
+        status_font.setPointSize(9)
+        self.status_label.setFont(status_font)
+        self.status_label.setStyleSheet(
+            "color: #888888; background: transparent; border: none;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+
         container_layout.addStretch()
         container_layout.addWidget(self.title_label, 0, Qt.AlignCenter)
         container_layout.addWidget(self.rotator, 0, Qt.AlignCenter)
+        container_layout.addWidget(self.status_label, 0, Qt.AlignCenter)
         container_layout.addStretch()
 
         main_layout.addWidget(self.container)
+
+    def set_status(self, text: str):
+        self.status_label.setText(text)

@@ -1,4 +1,5 @@
 from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+import json
 import threading
 from google import genai
 from google.genai import types
@@ -276,11 +277,11 @@ class GeminiWorker(MemoryContextWorkerMixin):
                         elif getattr(p, "function_call", None):
                             fc = p.function_call
                             args = dict(fc.args) if getattr(fc, "args", None) else {}
-                            parts_text.append(f"[Tool invocation: {fc.name}({json.dumps(args)})]")
+                            parts_text.append(f"[Tool invocation: {fc.name}({json.dumps(args, default=str)})]")
                         elif getattr(p, "function_response", None):
                             fr = p.function_response
                             resp = dict(fr.response) if getattr(fr, "response", None) else {}
-                            parts_text.append(f"[Tool Result: {fr.name} -> {json.dumps(resp)}]")
+                            parts_text.append(f"[Tool Result: {fr.name} -> {json.dumps(resp, default=str)}]")
                 messages.append({"role": role, "content": "\n".join(parts_text)})
             return messages
 
@@ -386,6 +387,14 @@ class GeminiWorker(MemoryContextWorkerMixin):
                             except Exception as e:
                                 logging.error(
                                     f"Failed to attach multimodal file {file_path}: {e}")
+                                if mime_type and mime_type.startswith("audio/"):
+                                    try:
+                                        from core.local_stt import LocalSTT
+                                        stt = LocalSTT().transcribe(file_path)
+                                        if stt and not stt.startswith("Failed"):
+                                            response['result'] = f"{response.get('result', '')}\n[Voice Message Transcription: {stt}]"
+                                    except Exception:
+                                        pass
 
                     # Remove media from response dict so Gemini SDK doesn't complain about unexpected keys
                     del response['media']
@@ -450,9 +459,16 @@ class GeminiWorker(MemoryContextWorkerMixin):
                         file=audio_path, config={'mime_type': mime_type or 'audio/wav'})
                     content.append(uploaded_audio)
                 except Exception as e:
-                    self.error_occurred.emit(f"Audio load error: {e}")
-                    self.is_processing = False
-                    return
+                    logging.warning(f"Direct audio upload failed ({e}), falling back to LocalSTT...")
+                    try:
+                        from core.local_stt import LocalSTT
+                        stt_text = LocalSTT().transcribe(audio_path)
+                        if stt_text and not stt_text.startswith("Failed"):
+                            content.append(f"[Voice Message Transcription: {stt_text}]")
+                        else:
+                            content.append(f"[Audio attachment skipped: {e}]")
+                    except Exception:
+                        content.append(f"[Audio attachment skipped: {e}]")
 
         # Intelligent Media Culling: Strip heavy multimodal tokens from older context (> 4 turns)
         history = self._get_chat_history()

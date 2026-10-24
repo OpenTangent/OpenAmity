@@ -89,6 +89,7 @@ def main():
 
     class InitWorker(QObject):
         finished = Signal(object)
+        status_changed = Signal(str)
 
         def run(self):
             # Ensure out-of-the-box OpenRouter model and image model caches exist in app data dir
@@ -97,6 +98,11 @@ def main():
                 paths.ensure_openrouter_image_models_cache()
             except Exception as e:
                 logging.getLogger("main").warning(f"Could not seed OpenRouter caches: {e}")
+
+            # Check if Chroma ONNX embedding model exists; if not, show one-time setup status
+            chroma_model_path = os.path.expanduser("~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/model.onnx")
+            if not os.path.exists(chroma_model_path):
+                self.status_changed.emit("Setting up local memory (one-time setup)...")
 
             from core.agent_manager import AgentManager
             agent_manager = AgentManager()
@@ -129,6 +135,7 @@ def main():
             thread.wait()
 
     runner = MainThreadRunner()
+    worker.status_changed.connect(splash.set_status)
     worker.finished.connect(runner.finish_init)
     thread.started.connect(worker.run)
 

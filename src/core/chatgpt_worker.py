@@ -456,6 +456,16 @@ class ChatGptWorker(MemoryContextWorkerMixin):
         if hasattr(self, 'agent_id'):
             agent_id_var.set(self.agent_id)
 
+        try:
+            self._process_thought_inner(prompt, image_path, yolo, audio_path)
+        except Exception as e:
+            logging.error(f"ChatGPTWorker unhandled error in _process_thought: {e}", exc_info=True)
+            self.error_occurred.emit(f"ChatGPT API Error: {e}")
+        finally:
+            self.is_processing = False
+
+    def _process_thought_inner(self, prompt=None, image_path=None, yolo=False, audio_path=None):
+
         history_snapshot_len = len(self.history)
         is_low_token = self.settings.get("core.low-token-mode", False)
 
@@ -522,9 +532,25 @@ class ChatGptWorker(MemoryContextWorkerMixin):
                                 if os.path.exists(tmp_wav):
                                     os.unlink(tmp_wav)
                     except Exception as e:
-                        self.error_occurred.emit(f"Audio load error: {e}")
-                        self.is_processing = False
-                        return
+                        logging.warning(f"Audio load error for ChatGPT: {e}, falling back to LocalSTT...")
+                        try:
+                            from core.local_stt import LocalSTT
+                            stt_text = LocalSTT().transcribe(audio_path)
+                            if stt_text and not stt_text.startswith("Failed"):
+                                content_blocks.append({
+                                    "type": "text",
+                                    "text": f"[Voice Message Transcription: {stt_text}]"
+                                })
+                            else:
+                                content_blocks.append({
+                                    "type": "text",
+                                    "text": f"[Audio attachment skipped: {e}]"
+                                })
+                        except Exception:
+                            content_blocks.append({
+                                "type": "text",
+                                "text": f"[Audio attachment skipped: {e}]"
+                            })
 
             # If only a single text block, pass as plain string for simplicity
             if len(content_blocks) == 1 and content_blocks[0].get("type") == "text":

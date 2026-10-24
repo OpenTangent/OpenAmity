@@ -352,7 +352,7 @@ def synthesize_voice_sample(api_key: str, voice_name: str, style: str = "", text
     return b""
 
 
-def load_piper_voice(settings=None):
+def load_piper_voice(settings=None, status_callback=None):
     """Loads and returns the configured PiperVoice instance, downloading files if necessary."""
     try:
         piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
@@ -385,6 +385,11 @@ def load_piper_voice(settings=None):
         config_path = piper_dir / f"{voice_name}.onnx.json"
 
         if not model_path.exists() or not config_path.exists():
+            if status_callback:
+                try:
+                    status_callback("[System: Downloading local voice model (one-time setup)...]")
+                except Exception:
+                    pass
             logging.getLogger("core.TTS.Piper").info(
                 f"Downloading Piper TTS model '{voice_name}'...")
             model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx"
@@ -470,6 +475,7 @@ class TTSWorker(threading.Thread):
         self.started_playback = Signal()
         self.amplitude_emitted = Signal()
         self.error_occurred = Signal()
+        self.status_emitted = Signal()
         self.agent_id = agent_id
 
         self.settings = SettingsManager(agent_id=self.agent_id)
@@ -812,7 +818,7 @@ class TTSWorker(threading.Thread):
 
     def _stream_and_play_piper(self):
         try:
-            voice = load_piper_voice(self.settings)
+            voice = load_piper_voice(self.settings, status_callback=self.status_emitted.emit)
             if not voice:
                 return
 
@@ -920,7 +926,7 @@ class TTSWorker(threading.Thread):
                 self.process = None
 
 
-def synthesize_speech_to_file(text: str, output_path: str, agent_id: str = None, voice: str = None, settings=None) -> str:
+def synthesize_speech_to_file(text: str, output_path: str, agent_id: str = None, voice: str = None, settings=None, status_callback=None) -> str:
     """
     Synthesizes text into an Opus audio file (.opus) at output_path.
     Uses Gemini TTS if configured and reachable (with fallback cascade),
@@ -968,7 +974,7 @@ def synthesize_speech_to_file(text: str, output_path: str, agent_id: str = None,
                 "Gemini TTS selected but no Gemini API key configured. Falling back to local Piper TTS.")
 
     # Fallback / Default: Piper TTS
-    return _synthesize_piper_to_opus(text, abs_output_path, settings=settings)
+    return _synthesize_piper_to_opus(text, abs_output_path, settings=settings, status_callback=status_callback)
 
 
 def _synthesize_gemini_to_opus(text: str, output_path: str, settings, agent_id: str = None, voice: str = None, api_key: str = None) -> str:
@@ -1139,8 +1145,8 @@ def _synthesize_gemini_to_opus(text: str, output_path: str, settings, agent_id: 
                 raise last_err
 
 
-def _synthesize_piper_to_opus(text: str, output_path: str, settings=None) -> str:
-    voice = load_piper_voice(settings=settings)
+def _synthesize_piper_to_opus(text: str, output_path: str, settings=None, status_callback=None) -> str:
+    voice = load_piper_voice(settings=settings, status_callback=status_callback)
     if not voice:
         raise RuntimeError("Could not load local Piper voice model.")
 

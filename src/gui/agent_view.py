@@ -32,6 +32,7 @@ class AgentView(QWidget):
     ui_pause_pending_changed = Signal(bool)
     ui_tool_started = Signal(str, str, str, str, str, bool)
     ui_tool_finished = Signal(str)
+    ui_listening_state_changed = Signal(bool)
 
     def __init__(self, orchestrator: AmityOrchestrator, parent=None):
         super().__init__(parent)
@@ -97,7 +98,7 @@ class AgentView(QWidget):
         self.btn_pause = QPushButton()
         self.btn_pause.setFixedSize(40, 40)
         self.btn_pause.setCursor(Qt.PointingHandCursor)
-        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_pause.clicked.connect(self.on_pause_button_clicked)
         self.footer_layout.addWidget(self.btn_pause)
 
         from gui.main_window import PromptTextEdit
@@ -164,6 +165,10 @@ class AgentView(QWidget):
         self.ui_tool_finished.connect(self.pip_manager.complete_async_pip)
         self.orchestrator.on_tool_finished.connect(self.ui_tool_finished.emit)
 
+        self.ui_listening_state_changed.connect(self.set_listening_state)
+        if hasattr(self.orchestrator, 'on_listening_state_changed'):
+            self.orchestrator.on_listening_state_changed.connect(self.ui_listening_state_changed.emit)
+
         self.set_paused_state(self.orchestrator.is_paused)
 
     def cleanup(self):
@@ -175,6 +180,8 @@ class AgentView(QWidget):
             self.orchestrator.on_pause_pending.disconnect(self.ui_pause_pending_changed.emit)
             self.orchestrator.on_tool_started.disconnect(self.ui_tool_started.emit)
             self.orchestrator.on_tool_finished.disconnect(self.ui_tool_finished.emit)
+            if hasattr(self.orchestrator, 'on_listening_state_changed'):
+                self.orchestrator.on_listening_state_changed.disconnect(self.ui_listening_state_changed.emit)
         except Exception:
             pass
         if hasattr(self, 'pip_manager') and self.pip_manager:
@@ -184,6 +191,14 @@ class AgentView(QWidget):
         """Notifies pip manager of active tab selection state."""
         if hasattr(self, 'pip_manager') and self.pip_manager:
             self.pip_manager.set_active(is_selected)
+
+    def on_pause_button_clicked(self):
+        if getattr(self.orchestrator, 'is_paused', False):
+            self.toggle_pause()
+        elif getattr(self.orchestrator, 'is_busy', False):
+            self.orchestrator.stop_all_processing()
+        else:
+            self.toggle_pause()
 
     def toggle_pause(self):
         was_paused = getattr(self.orchestrator, 'is_paused', False)
@@ -210,41 +225,46 @@ class AgentView(QWidget):
             self.text_input.setEnabled(False)
             self.text_input.setPlaceholderText("Agent is paused...")
             self.btn_send.setEnabled(False)
+            self.btn_send.setToolTip("Send")
             self.btn_mic.setEnabled(False)
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
         else:
-            self.btn_pause.setText("❚❚")
-            self.btn_pause.setToolTip("Pause Agent")
-            self.btn_pause.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 13px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
-            )
-            self.text_input.setPlaceholderText("Type a message...")
+            self.text_input.setEnabled(True)
+            self.btn_send.setEnabled(True)
+            self.btn_mic.setEnabled(True)
             if getattr(self.orchestrator, 'is_busy', False) is True or getattr(self.orchestrator, 'is_thinking', False) is True:
-                self.btn_mic.setEnabled(True)
                 self.set_busy_state(True)
             else:
-                self.text_input.setEnabled(True)
-                self.btn_send.setEnabled(True)
-                self.btn_mic.setEnabled(True)
+                self.set_busy_state(False)
 
     def set_busy_state(self, busy: bool, speaking: bool = False):
         if self.orchestrator.is_paused:
-            self.btn_mic.setText("⏺")
-            self.btn_mic.setToolTip("Mic")
-            self.btn_mic.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
             return
 
         if busy:
-            self.btn_mic.setText("⏹")
-            self.btn_mic.setToolTip("Stop Agent")
-            self.btn_mic.setStyleSheet(
-                "QPushButton { background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #CC0000; }")
+            # When busy, pause button becomes Stop Agent (⏹) in red
+            self.btn_pause.setText("⏹")
+            self.btn_pause.setToolTip("Stop Agent")
+            self.btn_pause.setStyleSheet(
+                "QPushButton { background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #CC0000; }"
+            )
+
+            self.text_input.setEnabled(True)
+            self.text_input.setPlaceholderText("Interject while agent is working...")
+            self.btn_send.setEnabled(True)
+            self.btn_send.setToolTip("Interject")
+
+            if not getattr(self, '_is_listening', False):
+                self.btn_mic.setText("⏺")
+                self.btn_mic.setToolTip("Voice Interject")
+                self.btn_mic.setStyleSheet(
+                    "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+                )
 
             if speaking:
                 self.loading_bar.hide()
@@ -255,13 +275,44 @@ class AgentView(QWidget):
                 self.visualizer.hide()
                 self.loading_bar.show()
         else:
-            self.btn_mic.setText("⏺")
-            self.btn_mic.setToolTip("Mic")
-            self.btn_mic.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
+            # When idle, pause button is Pause Agent (❚❚)
+            self.btn_pause.setText("❚❚")
+            self.btn_pause.setToolTip("Pause Agent")
+            self.btn_pause.setStyleSheet(
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 13px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+            )
+
+            self.text_input.setEnabled(True)
+            self.text_input.setPlaceholderText("Type a message...")
+            self.btn_send.setEnabled(True)
+            self.btn_send.setToolTip("Send")
+
+            if not getattr(self, '_is_listening', False):
+                self.btn_mic.setText("⏺")
+                self.btn_mic.setToolTip("Mic")
+                self.btn_mic.setStyleSheet(
+                    "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+                )
+
             self.loading_bar.hide()
             self.visualizer.set_active(False)
             self.visualizer.hide()
+
+    def set_listening_state(self, is_listening: bool):
+        self._is_listening = is_listening
+        if is_listening:
+            self.btn_mic.setText("⏹")
+            self.btn_mic.setToolTip("Finish Recording")
+            self.btn_mic.setStyleSheet(
+                "QPushButton { background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #CC0000; }"
+            )
+        else:
+            is_busy = getattr(self.orchestrator, 'is_busy', False)
+            self.btn_mic.setText("⏺")
+            self.btn_mic.setToolTip("Voice Interject" if is_busy else "Mic")
+            self.btn_mic.setStyleSheet(
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+            )
 
     def toggle_mic(self):
         if self.orchestrator.is_paused:
@@ -303,7 +354,14 @@ class AgentView(QWidget):
         except Exception:
             pass
 
-        if sender in ["User", user_name]:
+        if sender in ["User (Interjection)", f"{user_name} (Interjection)"] or sender.endswith("(Interjection)"):
+            display_name = f"{user_name} (Interjection)"
+            name_color = PRIMARY_ACCENT_COLOR
+            text_color = "#888888"
+            bg_color = "#1f1818"
+            border_color = "#422424"
+            formatted_text = render_user_message_content(text)
+        elif sender in ["User", user_name]:
             display_name = user_name
             name_color = PRIMARY_ACCENT_COLOR
             text_color = "#888888"

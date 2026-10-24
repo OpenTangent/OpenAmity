@@ -31,6 +31,7 @@ class AudioService:
         self.transcriber = None
         self.recording_thread = None
         self.abort_flag = False
+        self.finish_flag = False
 
     def start_initialization(self):
         threading.Thread(target=self._initialize_thread, daemon=True).start()
@@ -58,9 +59,14 @@ class AudioService:
             return
         self.running = True
         self.abort_flag = False
+        self.finish_flag = False
         self.recording_thread = threading.Thread(
             target=self._record_loop, daemon=True)
         self.recording_thread.start()
+
+    def finish_listening(self):
+        """Finish recording immediately and process the collected audio."""
+        self.finish_flag = True
 
     def stop_listening(self):
         """Cancel/Abort the current recording."""
@@ -104,6 +110,10 @@ class AudioService:
                 self.listening_stopped.emit()
                 return
 
+            if self.finish_flag:
+                logging.info("Recording finished by user.")
+                break
+
             try:
                 data = self.audio_queue.get(timeout=1.0)
                 frames.append(data)
@@ -131,9 +141,10 @@ class AudioService:
 
         if not frames:
             logging.info("No audio recorded.")
+            self.audio_prompt_ready.emit("", None)
             return
 
-        logging.debug("Transcribing (using Gemini API)...")
+        logging.debug("Processing recorded audio...")
         try:
             # Save audio to wav file
             audio_data_int16 = np.concatenate(frames)
@@ -151,62 +162,21 @@ class AudioService:
             if is_low_token or is_agy_mode:
                 from .local_stt import LocalSTT
                 text = LocalSTT().transcribe(temp_wav)
-                if not text or "Failed" in text:
+                if not text or text.startswith("Failed"):
                     raise Exception(f"Local STT error: {text}")
+                text = self._correct_phonetic_errors(text)
+                logging.info(f"Local STT transcription result: '{text}'")
+                if text and not self.abort_flag:
+                    self.transcription_finished.emit(text)
+                    self.audio_prompt_ready.emit(text, temp_wav)
             else:
-                if not self.client:
-                    raise Exception(
-                        "Gemini client not initialized. Check API Key.")
-                model = self.settings.get("core.gemini.model", "")
-                if not model:
-                    legacy = self.settings.get("core.gemini.gemini-models", ["gemini-3.8-flash"])
-                    model = legacy[0] if isinstance(legacy, list) and legacy else "gemini-3.8-flash"
-                light_model = self.settings.get("core.gemini.light-model", "")
-                if not light_model:
-                    legacy_l = self.settings.get("core.gemini.light-models", ["gemini-3.5-flash-lite"])
-                    light_model = legacy_l[0] if isinstance(legacy_l, list) and legacy_l else "gemini-3.5-flash-lite"
-                models = [model]
-                if light_model != model:
-                    models.append(light_model)
-
-                audio_file = self.client.files.upload(file=temp_wav)
-                prompt = "Please transcribe this audio accurately. Output only the exact transcription without any commentary."
-
-                text = ""
-                for model_name in models:
-                    try:
-                        response = self.client.models.generate_content(
-                            model=model_name,
-                            contents=[prompt, audio_file],
-                            config=types.GenerateContentConfig(
-                                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                                    disable=True
-                                )
-                            )
-                        )
-                        if response.text:
-                            text = response.text.strip()
-                            break
-                    except Exception as e:
-                        logging.warning(
-                            f"Transcription failed with {model_name}: {e}")
-                        continue
-
-                if not text:
-                    raise Exception(
-                        "All Gemini models failed to transcribe audio.")
-
-            # Post-processing correction
-            text = self._correct_phonetic_errors(text)
-
-            logging.info(f"Transcription result: '{text}'")
-            if text and not self.abort_flag:
-                self.transcription_finished.emit(text)
-                self.audio_prompt_ready.emit(text, temp_wav)
+                logging.info(f"Direct multimodal audio ready at '{temp_wav}'. Emitting audio prompt.")
+                if not self.abort_flag:
+                    self.audio_prompt_ready.emit("[Voice Message]", temp_wav)
 
         except Exception as e:
-            logging.error(f"Transcription failed: {e}", exc_info=True)
-            self.error_occurred.emit(f"Transcription failed: {e}")
+            logging.error(f"Audio processing failed: {e}", exc_info=True)
+            self.error_occurred.emit(f"Audio processing failed: {e}")
 
     def _correct_phonetic_errors(self, text: str) -> str:
         """Fixes common phonetic misinterpretations by the tiny model."""

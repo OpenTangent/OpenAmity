@@ -8,10 +8,11 @@
     "command": "run_OpenAmity.sh",
     "finish-args": [
         "--share=network",
+        "--share=ipc",
         "--socket=wayland",
         "--socket=fallback-x11",
         "--socket=pulseaudio",
-        "--device=all",
+        "--device=dri",
         "--filesystem=xdg-download",
         "--filesystem=xdg-documents",
         "--filesystem=xdg-pictures",
@@ -50,64 +51,31 @@
             ]
         },
         {
-            "name": "puppeteer-chromium",
-            "buildsystem": "simple",
-            "build-commands": [
-                "mkdir -p /app/share/puppeteer/chrome-linux64",
-                "cp -a * /app/share/puppeteer/chrome-linux64/",
-                "chmod -R 755 /app/share/puppeteer/chrome-linux64"
-            ],
-            "sources": [
-                {
-                    "type": "archive",
-                    "url": "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chrome-linux64.zip",
-                    "sha256": "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8"
-                }
-            ]
-        },
-        {
-            "name": "camoufox",
-            "buildsystem": "simple",
-            "build-commands": [
-                "mkdir -p /app/share/camoufox",
-                "cp -a * /app/share/camoufox/",
-                "chmod -R 755 /app/share/camoufox"
-            ],
-            "sources": [
-                {
-                    "type": "archive",
-                    "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.30/camoufox-152.0.4-beta.30-lin.x86_64.zip",
-                    "sha256": "5720d45b894ce1770543de024c6f10d514b38be560fa2dc3226b3d8586caf672",
-                    "strip-components": 0
-                }
-            ]
-        },
-        {
-            "name": "chroma-onnx-model",
-            "buildsystem": "simple",
-            "build-commands": [
-                "mkdir -p /app/share/chroma_onnx/all-MiniLM-L6-v2",
-                "cp onnx.tar.gz /app/share/chroma_onnx/all-MiniLM-L6-v2/onnx.tar.gz"
-            ],
-            "sources": [
-                {
-                    "type": "file",
-                    "url": "https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz",
-                    "sha256": "913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3"
-                }
-            ]
-        },
-        {
             "name": "open_amity",
             "buildsystem": "simple",
             "build-commands": [
-                "install -D compile/com.openamity.OpenAmity.desktop /app/share/applications/com.openamity.OpenAmity.desktop",
-                "install -D compile/com.openamity.OpenAmity.metainfo.xml /app/share/metainfo/com.openamity.OpenAmity.metainfo.xml",
-                "install -D src/assets/com.openamity.OpenAmity.png /app/share/icons/hicolor/512x512/apps/com.openamity.OpenAmity.png",
+                "install -D -m 644 LICENSE /app/share/licenses/com.openamity.OpenAmity/LICENSE",
+                "install -D -m 644 LICENSE /app/LICENSE",
+                "install -D -m 644 compile/com.openamity.OpenAmity.desktop /app/share/applications/com.openamity.OpenAmity.desktop",
+                "install -D -m 644 compile/com.openamity.OpenAmity.metainfo.xml /app/share/metainfo/com.openamity.OpenAmity.metainfo.xml",
+                "install -D -m 644 src/assets/com.openamity.OpenAmity.png /app/share/icons/hicolor/512x512/apps/com.openamity.OpenAmity.png",
                 "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true PUPPETEER_SKIP_DOWNLOAD=true npm --prefix src/tools/whatsapp_node --cache flatpak-node/npm-cache --prefer-offline --no-audit --no-fund ci",
                 "cp -r src /app/src",
                 "cp run_OpenAmity.sh /app/bin/run_OpenAmity.sh",
                 "chmod +x /app/bin/run_OpenAmity.sh"
+            ],
+            "post-install": [
+                "BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh || true",
+                "rm -rf /app/lib/libLLVM* /app/lib/libclang*",
+                "rm -rf /app/lib/python3.*/site-packages/OpenGL*",
+                "rm -rf /app/lib/python3.*/site-packages/PySide6/QtQuick* /app/lib/python3.*/site-packages/PySide6/QtQml* /app/lib/python3.*/site-packages/PySide6/Qt3D* /app/lib/python3.*/site-packages/PySide6/QtPdf* /app/lib/python3.*/site-packages/PySide6/QtSensors* /app/lib/python3.*/site-packages/PySide6/QtPositioning*",
+                "rm -rf /app/lib/python3.*/site-packages/kubernetes* /app/lib/python3.*/site-packages/google_antigravity*",
+                "rm -rf /app/lib/python3.*/site-packages/av* /app/lib/python3.*/site-packages/av.libs",
+                "rm -rf /app/lib/python3.*/site-packages/piper/train /app/lib/python3.*/site-packages/piper/hebrew* /app/lib/python3.*/site-packages/piper/tashkeel*",
+                "ln -sf /app/bin/node /app/lib/python3.*/site-packages/playwright/driver/node 2>/dev/null || true",
+                "strip /app/bin/node 2>/dev/null || true",
+                "rm -rf /app/src/assets/screenshots /app/src/assets/fonts/Inter-*.ttf",
+                "find /app/src/tools/whatsapp_node/node_modules -type f \\( -name \"*.d.ts\" -o -name \"*.map\" \\) -delete"
             ],
             "sources": [
                 {

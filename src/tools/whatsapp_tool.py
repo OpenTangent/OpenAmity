@@ -31,10 +31,16 @@ class WhatsAppSkill(Tool):
         agent_id = self.orchestrator.agent_id if self.orchestrator else None
         self.daemon = WhatsAppDaemon(agent_id=agent_id)
         self.daemon.message_callback = self._on_message_received
+        self.daemon.status_callback = self._on_status_notice
         self.base_url = self.daemon.base_url
         self.data_dir = self.daemon.data_dir
         self.transcriber = None
         self.daemon.start()
+
+    def _on_status_notice(self, notice: str):
+        if hasattr(self, 'orchestrator') and self.orchestrator:
+            if hasattr(self.orchestrator, 'on_message_appended') and self.orchestrator.on_message_appended:
+                self.orchestrator.on_message_appended.emit("System", notice)
 
     def _on_message_received(self, sender_id, sender_name, **kwargs):
         if hasattr(self, 'message_received_callback') and self.message_received_callback:
@@ -171,6 +177,9 @@ class WhatsAppSkill(Tool):
         return {"ready": False, "qr": None}
 
     def execute(self, command: str, *args, **kwargs) -> Any:
+        if getattr(self.daemon, "is_downloading_chrome", False):
+            return "[System Notice: WhatsApp bridge is currently completing its one-time browser engine download. Please retry in a moment.]"
+
         if command in ["unread", "recent", "recent_chat"]:
             CacheManager.clear_expired(os.path.join(
                 self.data_dir, 'uploads'), max_age_days=1.0)
@@ -187,6 +196,8 @@ class WhatsAppSkill(Tool):
             if not status.get("ready"):
                 return "WhatsApp client is still initializing or not ready. If it is stuck, use WhatsApp_reset_connection to fix it."
         except requests.exceptions.RequestException:
+            if getattr(self.daemon, "is_downloading_chrome", False):
+                return "[System Notice: WhatsApp bridge is currently completing its one-time browser engine download. Please retry in a moment.]"
             return "WhatsApp bridge is not running. If it crashed, use WhatsApp_reset_connection to restart it."
 
         if command == "unread":

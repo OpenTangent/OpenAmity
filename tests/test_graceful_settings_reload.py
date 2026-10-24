@@ -157,6 +157,57 @@ def test_session_history_migrated_on_provider_change(temp_agent_environment):
             orch._shutdown_flag = True
 
 
+def test_worker_swap_from_gemini_to_openrouter_migrates_session_history(temp_agent_environment):
+    """Verifies that changing provider from Gemini to OpenRouter migrates session context including tool turns without error."""
+    agent_id = "test-agent-graceful-gemini-openrouter"
+
+    with patch("core.audio_input.AudioService.start_initialization"), \
+         patch("google.genai.Client"):
+        from google.genai import types
+        orch = AmityOrchestrator(agent_id=agent_id)
+        try:
+            # Start with Gemini
+            orch.settings_manager.set("core.api-provider", "gemini")
+            orch.settings_manager.set_env("GEMINI_API_KEY", "sk-mock-gemini-key")
+            orch.settings_manager.save()
+            orch.reload_settings()
+
+            gemini_worker = orch.gemini_worker
+            assert type(gemini_worker).__name__ == "GeminiWorker"
+
+            user_part = types.Part.from_text(text="Research black holes.")
+            turn1 = types.Content(role="user", parts=[user_part])
+            fc_part = types.Part.from_function_call(name="Terminal_run_command", args={"command": "echo test"})
+            turn2 = types.Content(role="model", parts=[fc_part])
+            fr_part = types.Part.from_function_response(name="Terminal_run_command", response={"output": "test"})
+            turn3 = types.Content(role="user", parts=[fr_part])
+            asst_part = types.Part.from_text(text="Black holes are regions of spacetime where gravity is extremely strong.")
+            turn4 = types.Content(role="model", parts=[asst_part])
+
+            gemini_worker.thinker_chat = MagicMock()
+            gemini_worker.thinker_chat._curated_history = [turn1, turn2, turn3, turn4]
+
+            # Switch provider to OpenRouter
+            orch.settings_manager.set("core.api-provider", "openrouter")
+            orch.settings_manager.set_env("OPENROUTER_API_KEY", "sk-mock-openrouter-key")
+            orch.settings_manager.save()
+
+            orch.reload_settings()
+
+            new_worker = orch.gemini_worker
+            assert type(new_worker).__name__ == "OpenRouterWorker"
+
+            # Check that conversation history was migrated!
+            exported = new_worker.get_session_history()
+            assert len(exported) >= 4
+            assert any("Research black holes." in m["content"] for m in exported)
+            assert any("Terminal_run_command" in m["content"] for m in exported)
+            assert any("Black holes are regions of spacetime" in m["content"] for m in exported)
+        finally:
+            orch.pulse_engine.stop()
+            orch._shutdown_flag = True
+
+
 def test_sleep_cycle_clears_session_history(temp_agent_environment):
     """Verifies that Memory Consolidation (Sleep Cycle) cleans active session history as required by the architecture."""
     agent_id = "test-agent-graceful-004"

@@ -51,6 +51,7 @@ class AmityOrchestrator:
         self.on_pause_pending = Signal()  # is_pending (bool)
         self.on_tool_started = Signal()  # call_id, tool_name, icon, color, call_text, is_async
         self.on_tool_finished = Signal()  # call_id
+        self.on_listening_state_changed = Signal()  # is_listening (bool)
         self.subagent_call_ids = {}
 
         self.settings_manager = SettingsManager(agent_id=self.agent_id)
@@ -93,6 +94,10 @@ class AmityOrchestrator:
         self.accumulated_thoughts = ""
         self.speech_queue = []
         self.event_queue = []
+        self._pending_interjections = []
+        self._interjection_lock = threading.Lock()
+        self._audio_interjection_in_progress = False
+        self._audio_interjection_event = None
         self.active_subagents = {}
         self.subagent_last_activity = {}
         self._shutdown_flag = False
@@ -167,6 +172,26 @@ class AmityOrchestrator:
         if not getattr(self, 'is_paused', False) and getattr(self.gemini_worker, 'available', False):
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
+
+    def _get_interjection_lock(self):
+        if not hasattr(self, '_interjection_lock') or self._interjection_lock is None:
+            self._interjection_lock = threading.Lock()
+        return self._interjection_lock
+
+    def _get_pending_interjections(self):
+        if not hasattr(self, '_pending_interjections') or self._pending_interjections is None:
+            self._pending_interjections = []
+        return self._pending_interjections
+
+    def _format_interjection_payload(self, text: str) -> str:
+        return (
+            f"[USER INTERJECTION]\n"
+            f"{text}\n\n"
+            f"[CRITICAL CONTINUITY DIRECTIVE: This is a user interjection submitted while you were working. "
+            f"Address or incorporate this interjection cleanly. Do NOT let this interjection derail your ongoing thought process, "
+            f"active task, or intended actions unless the user explicitly instructed you to stop, cancel, or change course. "
+            f"If previous tool calls were paused, verify if their parameters need updating; if still appropriate, re-invoke them immediately.]"
+        )
 
     @property
     def agent_uid(self) -> str:
@@ -380,19 +405,38 @@ class AmityOrchestrator:
         if self.is_paused:
             return
         self.user_interacted()
-        if self.is_busy:
-            self.stop_all_processing()
-        else:
+
+        if hasattr(self, 'audio_service') and self.audio_service and getattr(self.audio_service, 'running', False):
+            # User clicked mic while recording -> finish recording immediately
+            self.audio_service.finish_listening()
+            return
+
+        # If TTS is speaking, interrupt immediately
+        if hasattr(self, 'tts_worker') and self.tts_worker:
+            self.tts_worker.stop()
+        if hasattr(self, 'speech_queue') and self.speech_queue is not None:
+            self.speech_queue.clear()
+
+        # If agent is busy thinking or executing tools, mark audio interjection in progress
+        if getattr(self, 'is_busy', False):
+            self._audio_interjection_in_progress = True
+            self._audio_interjection_event = threading.Event()
+
+        if hasattr(self, 'audio_service') and self.audio_service:
             self.audio_service.start_listening()
 
     @with_agent_context
     def stop_all_processing(self):
-        if self.audio_service.running:
+        if hasattr(self, 'audio_service') and self.audio_service and getattr(self.audio_service, 'running', False):
             self.audio_service.stop_listening()
         if self.gemini_worker and hasattr(self.gemini_worker, 'is_processing') and self.gemini_worker.is_processing:
             self.gemini_worker.abort()
         if self.tts_worker:
             self.tts_worker.stop()
+
+        self._audio_interjection_in_progress = False
+        with self._get_interjection_lock():
+            self._get_pending_interjections().clear()
 
         self.speech_queue.clear()
         self.event_queue.clear()
@@ -505,18 +549,70 @@ class AmityOrchestrator:
         self.append_to_conversation(
             "System", "[Agent Resumed - Autonomy online]")
 
-    def process_text_input(self, text):
+    def _is_truly_busy(self) -> bool:
+        worker_busy = bool(self.gemini_worker and getattr(self.gemini_worker, 'is_processing', False))
+        speaking_busy = bool((self.tts_worker and self.tts_worker.is_alive()) or len(self.speech_queue) > 0)
+        tool_busy = getattr(self, '_is_executing_tools', False)
+        audio_busy = bool(hasattr(self, 'audio_service') and self.audio_service and getattr(self.audio_service, 'running', False))
+        return worker_busy or speaking_busy or tool_busy or audio_busy
+
+    def process_text_input(self, text, audio_path=None):
         if not text or self.is_paused:
             return
-        if self.is_busy:
-            self.event_queue.append({"type": "input", "text": text})
+        if self.is_busy and not self._is_truly_busy():
+            logging.warning(
+                f"Agent {self.agent_id} detected in stale busy state during process_text_input. "
+                "Recovering to idle state."
+            )
+            self.is_thinking = False
+            self.set_busy_state(False)
+            self.event_queue.clear()
+
+        # If sleep cycle consolidation is active, queue normally so it runs right after wake
+        if getattr(self, '_is_sleep_cycle', False):
+            self.append_to_conversation("User", text)
+            self.event_queue.append({"type": "input", "text": text, "audio_path": audio_path})
+            return
+
+        worker_busy = bool(self.gemini_worker and getattr(self.gemini_worker, 'is_processing', False))
+        tool_busy = getattr(self, '_is_executing_tools', False)
+
+        if worker_busy or tool_busy:
+            # Immediate TTS Interruption
+            if self.tts_worker:
+                self.tts_worker.stop()
+            self.speech_queue.clear()
+
+            # Immediate UI log display with "User (Interjection)"
+            self.append_to_conversation("User (Interjection)", text)
+
+            # Store in thread-safe pending interjections queue
+            with self._get_interjection_lock():
+                self._get_pending_interjections().append((text, audio_path))
+
+            logging.info(f"Queued User Interjection during active cycle: '{text}' (audio: {bool(audio_path)})")
         else:
-            self.process_input(text)
+            if self.tts_worker:
+                self.tts_worker.stop()
+            self.speech_queue.clear()
+            self.process_input(text, audio_path=audio_path)
 
     @with_agent_context
     def finish_thinking(self):
         logging.debug("finish_thinking called")
         self.is_thinking = False
+
+        # Drain any pending interjections that arrived right as thinking was finishing
+        interjections = []
+        with self._get_interjection_lock():
+            q = self._get_pending_interjections()
+            if q:
+                interjections = list(q)
+                q.clear()
+
+        for t, a in interjections:
+            self.event_queue.append({"type": "input", "text": t, "audio_path": a})
+
         if hasattr(self, 'mempalace_manager') and self.mempalace_manager:
             try:
                 is_sleep = getattr(self, '_is_sleep_cycle', False)
@@ -593,7 +689,7 @@ class AmityOrchestrator:
                     "check_cycle_completion popping next event from queue")
                 next_event = self.event_queue.pop(0)
                 if next_event["type"] == "input":
-                    self.process_input(next_event["text"])
+                    self.process_input(next_event["text"], audio_path=next_event.get("audio_path"))
                 elif next_event["type"] == "pulse":
                     self.process_pulse(next_event["text"], purpose=next_event.get("purpose"))
         else:
@@ -602,7 +698,7 @@ class AmityOrchestrator:
             self.set_busy_state(True, speaking=is_speaking)
 
     @with_agent_context
-    def process_input(self, text, audio_path=None):
+    def process_input(self, text, audio_path=None, sender="User"):
         if self.is_paused:
             logging.debug(f"Input rejected: Agent {self.agent_id} is paused.")
             return
@@ -675,7 +771,8 @@ class AmityOrchestrator:
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
             logging.debug("start_session returned.")
 
-        self.append_to_conversation("User", text)
+        if sender:
+            self.append_to_conversation(sender, text)
         self.is_thinking = True
         self.set_busy_state(True)
         self.current_user_prompt = text
@@ -696,38 +793,44 @@ class AmityOrchestrator:
             text, None, audio_path), daemon=True).start()
 
     def _async_query_prep(self, text, history=None, audio_path=None):
-        from core.logger_config import agent_id_var
-        agent_id_var.set(self.agent_id)
-        logging.debug("_async_query_prep started.")
+        try:
+            from core.logger_config import agent_id_var
+            agent_id_var.set(self.agent_id)
+            logging.debug("_async_query_prep started.")
 
-        user_name = "User"
-        if hasattr(self, 'config_manager') and self.config_manager:
-            configured_name = self.config_manager.get("user-full-name", "").strip()
-            if configured_name:
-                user_name = configured_name
+            user_name = "User"
+            if hasattr(self, 'config_manager') and self.config_manager:
+                configured_name = self.config_manager.get("user-full-name", "").strip()
+                if configured_name:
+                    user_name = configured_name
 
-        prompt = "[CHANNEL: LOCAL_GUI]\n"
-        if self.last_action_result:
-            prompt += f"[System Feedback from previous turn]: {self.last_action_result}\n\n"
-            self.last_action_result = None
+            prompt = "[CHANNEL: LOCAL_GUI]\n"
+            if self.last_action_result:
+                prompt += f"[System Feedback from previous turn]: {self.last_action_result}\n\n"
+                self.last_action_result = None
 
-        if hasattr(self, 'mempalace_manager') and self.mempalace_manager and text:
-            try:
-                mirrors = self.mempalace_manager._load_mirrors()
-                known_entities = [k for k in mirrors.keys() if isinstance(k, str) and k.lower() != "self" and len(k) > 2]
-                matched = [ent for ent in known_entities if ent.lower() in text.lower()]
-                if matched:
-                    ctx = self.mempalace_manager.get_entity_context(matched[:2])
-                    if ctx:
-                        prompt += f"[Proactive Memory Recall for {', '.join(matched[:2])}]:\n{ctx}\n\n"
-            except Exception as e:
-                logging.debug(f"Proactive entity recall check error: {e}")
+            if hasattr(self, 'mempalace_manager') and self.mempalace_manager and text:
+                try:
+                    mirrors = self.mempalace_manager._load_mirrors()
+                    known_entities = [k for k in mirrors.keys() if isinstance(k, str) and k.lower() != "self" and len(k) > 2]
+                    matched = [ent for ent in known_entities if ent.lower() in text.lower()]
+                    if matched:
+                        ctx = self.mempalace_manager.get_entity_context(matched[:2])
+                        if ctx:
+                            prompt += f"[Proactive Memory Recall for {', '.join(matched[:2])}]:\n{ctx}\n\n"
+                except Exception as e:
+                    logging.debug(f"Proactive entity recall check error: {e}")
 
-        prompt += f"[{user_name} (User)]: {self.current_user_prompt}"
-        logging.debug(
-            f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
-        self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
-        logging.debug("gemini_worker.send_prompt returned.")
+            prompt += f"[{user_name} (User)]: {self.current_user_prompt}"
+            logging.debug(
+                f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
+            self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
+            logging.debug("gemini_worker.send_prompt returned.")
+        except Exception as e:
+            logging.error(f"Error in _async_query_prep: {e}", exc_info=True)
+            self.append_to_conversation("System Warning", f"Query preparation failed: {e}")
+            self.finish_thinking()
+            self.set_busy_state(False)
 
     def has_queued_pulse(self, purpose: str) -> bool:
         """Checks if a pulse with the specified purpose is currently waiting in the event queue."""
@@ -741,6 +844,15 @@ class AmityOrchestrator:
         if self.is_paused:
             logging.debug(f"Pulse dropped: Agent {self.agent_id} is paused.")
             return
+
+        if self.is_busy and not self._is_truly_busy():
+            logging.warning(
+                f"Agent {self.agent_id} detected in stale busy state during process_pulse (is_thinking={self.is_thinking}, is_busy={self.is_busy}). "
+                "Worker, speech, and tools are idle. Recovering to idle state."
+            )
+            self.is_thinking = False
+            self.set_busy_state(False)
+            self.event_queue.clear()
 
         if self.is_busy:
             if purpose == "WhatsApp message received" and self.has_queued_pulse("WhatsApp message received"):
@@ -827,7 +939,13 @@ class AmityOrchestrator:
             prompt_payload = f"[System Feedback from previous turn]: {self.last_action_result}\n\n{text}"
             self.last_action_result = None
 
-        self.gemini_worker.send_prompt(prompt_payload)
+        try:
+            self.gemini_worker.send_prompt(prompt_payload)
+        except Exception as e:
+            logging.error(f"Failed to dispatch prompt to worker in process_pulse: {e}", exc_info=True)
+            self.append_to_conversation("System Warning", f"Pulse prompt dispatch failed: {e}")
+            self.finish_thinking()
+            self.set_busy_state(False)
 
     def append_to_conversation(self, sender, text):
         self.recent_history.append((sender, text))
@@ -844,13 +962,25 @@ class AmityOrchestrator:
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
     def on_listening_start(self):
-        self.is_thinking = True
-        self.set_busy_state(True)
+        if hasattr(self, 'on_listening_state_changed'):
+            self.on_listening_state_changed.emit(True)
+        if not getattr(self, 'is_busy', False):
+            self.is_thinking = True
+            self.set_busy_state(True)
 
     def on_listening_stop(self):
-        pass
+        if hasattr(self, 'on_listening_state_changed'):
+            self.on_listening_state_changed.emit(False)
 
     def on_audio_prompt_ready(self, text, audio_path):
+        if getattr(self, '_audio_interjection_in_progress', False):
+            self._audio_interjection_in_progress = False
+            if text:
+                self.process_text_input(text, audio_path=audio_path)
+            else:
+                logging.info("Audio interjection canceled or empty.")
+            return
+
         if text:
             self.process_input(text, audio_path=audio_path)
         else:
@@ -858,7 +988,13 @@ class AmityOrchestrator:
 
     def on_audio_error(self, error):
         logging.error(f"Audio Error: {error}")
-        self.finish_thinking()
+        self.append_to_conversation("System Warning", f"Audio Error: {error}")
+        self._audio_interjection_in_progress = False
+        if hasattr(self, 'on_listening_state_changed'):
+            self.on_listening_state_changed.emit(False)
+        if not getattr(self, 'is_busy', False):
+            self.finish_thinking()
+            self.set_busy_state(False)
 
     @with_agent_context
     def handle_gemini_thought(self, text: str, function_calls: list):
@@ -882,6 +1018,45 @@ class AmityOrchestrator:
                 worker_type = "geminiworker"
             logging.getLogger(f"{worker_type}.Thoughts").info(clean_text)
             self.accumulated_thoughts += clean_text + "\n"
+
+        # Check for pending interjections arrived during thought generation
+        interjections = []
+        with self._get_interjection_lock():
+            q = self._get_pending_interjections()
+            if q:
+                interjections = list(q)
+                q.clear()
+
+        if interjections:
+            combined_interjection = "\n\n".join(self._format_interjection_payload(t) for t, _ in interjections)
+            audio_paths = [a for _, a in interjections if a]
+            first_audio = audio_paths[0] if audio_paths else None
+
+            if not function_calls:
+                logging.info(f"Injecting user interjection at turn boundary: '{combined_interjection[:80]}...'")
+                self.gemini_worker.send_prompt(combined_interjection, audio_path=first_audio)
+                return
+            else:
+                logging.info(f"Holding {len(function_calls)} unexecuted tool calls for user interjection.")
+                paused_responses = []
+                for call in function_calls:
+                    fn_name = call.name
+                    paused_msg = (
+                        f"[Tool execution paused for User Interjection]: Tool '{fn_name}' was not executed yet. "
+                        "A user interjection arrived. Review the user's interjection below before taking any actions. "
+                        "If this tool call remains valid and appropriate, re-invoke it immediately with any updated parameters."
+                    )
+                    paused_responses.append((fn_name, {"result": paused_msg}))
+
+                # Attach interjection text and optional media to last paused response
+                last_name, last_resp = paused_responses[-1]
+                last_resp["result"] = f"{last_resp['result']}\n\n{combined_interjection}"
+                if first_audio:
+                    last_resp["media"] = [first_audio]
+                paused_responses[-1] = (last_name, last_resp)
+
+                self.on_tool_execution_finished(paused_responses, [f"{c.name}()" for c in function_calls])
+                return
 
         if not function_calls:
             if (
@@ -911,92 +1086,133 @@ class AmityOrchestrator:
             function_calls, self.current_task_weight), daemon=True).start()
 
     def _async_tool_execution(self, function_calls, current_weight):
-        from core.logger_config import agent_id_var
-        agent_id_var.set(self.agent_id)
-        function_responses = []
-        executed_tools = []
+        self._is_executing_tools = True
+        try:
+            from core.logger_config import agent_id_var
+            agent_id_var.set(self.agent_id)
+            function_responses = []
+            executed_tools = []
 
-        for call in function_calls:
-            function_name = call.name
-            tool_name = function_name.split(
-                "_")[0] if "_" in function_name else function_name
-            command_name = function_name.split(
-                "_", 1)[1] if "_" in function_name else ""
-            args = call.args or {}
+            for call_idx, call in enumerate(function_calls):
+                # Check for interjection arrived during previous tool execution
+                interjections = []
+                with self._get_interjection_lock():
+                    q = self._get_pending_interjections()
+                    if q:
+                        interjections = list(q)
+                        q.clear()
 
-            if len(args) == 1 and "text" in args:
-                args_str = str(args["text"])
-            elif args:
-                args_str = ", ".join(f"{k}='{v}'" for k, v in args.items())
-            else:
-                args_str = "()"
+                if interjections:
+                    logging.info(f"User interjection arrived during multi-tool execution. Pausing remaining {len(function_calls) - call_idx} tool(s).")
+                    combined_interjection = "\n\n".join(self._format_interjection_payload(t) for t, _ in interjections)
+                    audio_paths = [a for _, a in interjections if a]
+                    first_audio = audio_paths[0] if audio_paths else None
 
-            fatigue_pct = self.get_fatigue() * 100.0
-            if args_str == "()":
-                log_msg = f"[Fatigue: {fatigue_pct:.1f}%] {function_name}()"
-                raw_call_text = f"{function_name}()"
-            else:
-                log_msg = f"[Fatigue: {fatigue_pct:.1f}%] {function_name}: {args_str}"
-                raw_call_text = f"{function_name}: {args_str}"
+                    # Pause remaining unexecuted tools
+                    for remaining_call in function_calls[call_idx:]:
+                        rem_name = remaining_call.name
+                        paused_msg = (
+                            f"[Tool execution paused for User Interjection]: Tool '{rem_name}' was not executed yet. "
+                            "A user interjection arrived. Review the user's interjection below before taking any actions. "
+                            "If this tool call remains valid and appropriate, re-invoke it immediately with any updated parameters."
+                        )
+                        function_responses.append((rem_name, {"result": paused_msg}))
+                        executed_tools.append(f"{rem_name}()")
 
-            logging.getLogger(f"tool.{tool_name}").info(log_msg)
+                    last_name, last_resp = function_responses[-1]
+                    last_resp["result"] = f"{last_resp['result']}\n\n{combined_interjection}"
+                    if first_audio:
+                        last_resp["media"] = [first_audio]
+                    function_responses[-1] = (last_name, last_resp)
+                    break
 
-            # Determine icon, color, and async status from tool object
-            tool_obj = self.cerebrum.tools.get(tool_name)
-            if not tool_obj:
-                from core.cerebrum import Tool
-                tool_cls = Tool.get_tool_class(tool_name)
-                icon = getattr(tool_cls, "icon", "🔧") if tool_cls else "🔧"
-                color = getattr(tool_cls, "color", "#888888") if tool_cls else "#888888"
-                is_async = False
-            else:
-                icon = getattr(tool_obj, "icon", "🔧")
-                color = getattr(tool_obj, "color", "#888888")
-                is_async = tool_obj.is_command_async(command_name, args)
+                function_name = call.name
+                tool_name = function_name.split(
+                    "_")[0] if "_" in function_name else function_name
+                command_name = function_name.split(
+                    "_", 1)[1] if "_" in function_name else ""
+                args = call.args or {}
 
-            import uuid
-            call_id = str(uuid.uuid4())[:8]
+                if len(args) == 1 and "text" in args:
+                    args_str = str(args["text"])
+                elif args:
+                    args_str = ", ".join(f"{k}='{v}'" for k, v in args.items())
+                else:
+                    args_str = "()"
 
-            self.on_tool_started.emit(call_id, tool_name, icon, color, raw_call_text, is_async)
+                fatigue_pct = self.get_fatigue() * 100.0
+                if args_str == "()":
+                    log_msg = f"[Fatigue: {fatigue_pct:.1f}%] {function_name}()"
+                    raw_call_text = f"{function_name}()"
+                else:
+                    log_msg = f"[Fatigue: {fatigue_pct:.1f}%] {function_name}: {args_str}"
+                    raw_call_text = f"{function_name}: {args_str}"
 
-            if getattr(self, '_is_sleep_cycle', False):
-                allowed_sleep_prefixes = ("MemPalace_", "Trajectory_", "Pulse_")
-                is_allowed = (function_name in ("System_contemplate",) or any(function_name.startswith(p) for p in allowed_sleep_prefixes))
-                if not is_allowed:
-                    logging.warning(f"System: Disallowed tool '{function_name}' invoked during Sleep Cycle. Intercepting.")
-                    msg = (
-                        f"Action rejected: Tool '{function_name}' is disabled during Sleep Cycle (Memory Consolidation). "
-                        "Sleep cycles are strictly dedicated to internal reflection and memory consolidation. "
-                        "Use only MemPalace, Trajectory, or Pulse tools to record your insights, then conclude."
-                    )
-                    function_responses.append((function_name, {"result": msg}))
-                    executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
-                    executed_tools.append(executed_tool_sig)
+                logging.getLogger(f"tool.{tool_name}").info(log_msg)
+
+                # Determine icon, color, and async status from tool object
+                tool_obj = self.cerebrum.tools.get(tool_name)
+                if not tool_obj:
+                    from core.cerebrum import Tool
+                    tool_cls = Tool.get_tool_class(tool_name)
+                    icon = getattr(tool_cls, "icon", "🔧") if tool_cls else "🔧"
+                    color = getattr(tool_cls, "color", "#888888") if tool_cls else "#888888"
+                    is_async = False
+                else:
+                    icon = getattr(tool_obj, "icon", "🔧")
+                    color = getattr(tool_obj, "color", "#888888")
+                    is_async = tool_obj.is_command_async(command_name, args)
+
+                import uuid
+                call_id = str(uuid.uuid4())[:8]
+
+                self.on_tool_started.emit(call_id, tool_name, icon, color, raw_call_text, is_async)
+
+                if getattr(self, '_is_sleep_cycle', False):
+                    allowed_sleep_prefixes = ("MemPalace_", "Trajectory_", "Pulse_")
+                    is_allowed = (function_name in ("System_contemplate",) or any(function_name.startswith(p) for p in allowed_sleep_prefixes))
+                    if not is_allowed:
+                        logging.warning(f"System: Disallowed tool '{function_name}' invoked during Sleep Cycle. Intercepting.")
+                        msg = (
+                            f"Action rejected: Tool '{function_name}' is disabled during Sleep Cycle (Memory Consolidation). "
+                            "Sleep cycles are strictly dedicated to internal reflection and memory consolidation. "
+                            "Use only MemPalace, Trajectory, or Pulse tools to record your insights, then conclude."
+                        )
+                        function_responses.append((function_name, {"result": msg}))
+                        executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
+                        executed_tools.append(executed_tool_sig)
+                        if is_async:
+                            self.on_tool_finished.emit(call_id)
+                        continue
+
+                executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
+                executed_tools.append(executed_tool_sig)
+                try:
+                    skill_result = self.cerebrum.execute_tool_call(function_name, args, call_id=call_id)
+                    if isinstance(skill_result, dict):
+                        function_responses.append((function_name, skill_result))
+                    else:
+                        function_responses.append(
+                            (function_name, {"result": str(skill_result)}))
+
+                    # If async tool returned an immediate error, dismiss the pip
+                    if is_async:
+                        result_str = str(skill_result)
+                        if result_str.startswith("Error:"):
+                            self.on_tool_finished.emit(call_id)
+                except Exception as e:
+                    function_responses.append((function_name, {"error": str(e)}))
                     if is_async:
                         self.on_tool_finished.emit(call_id)
-                    continue
 
-            executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
-            executed_tools.append(executed_tool_sig)
-            try:
-                skill_result = self.cerebrum.execute_tool_call(function_name, args, call_id=call_id)
-                if isinstance(skill_result, dict):
-                    function_responses.append((function_name, skill_result))
-                else:
-                    function_responses.append(
-                        (function_name, {"result": str(skill_result)}))
-
-                # If async tool returned an immediate error, dismiss the pip
-                if is_async:
-                    result_str = str(skill_result)
-                    if result_str.startswith("Error:"):
-                        self.on_tool_finished.emit(call_id)
-            except Exception as e:
-                function_responses.append((function_name, {"error": str(e)}))
-                if is_async:
-                    self.on_tool_finished.emit(call_id)
-
-        self.on_tool_execution_finished(function_responses, executed_tools)
+            self.on_tool_execution_finished(function_responses, executed_tools)
+        except Exception as e:
+            logging.error(f"Error in _async_tool_execution: {e}", exc_info=True)
+            self.append_to_conversation("System Warning", f"Tool execution failed: {e}")
+            self.finish_thinking()
+            self.set_busy_state(False)
+        finally:
+            self._is_executing_tools = False
 
     def on_tool_execution_finished(self, function_responses, executed_tools):
         if len(executed_tools) == 0:
@@ -1025,14 +1241,16 @@ class AmityOrchestrator:
         fatigue = self.get_fatigue()
         percent = fatigue * 100.0
 
-        with self.budget_lock:
-            self.current_loop_count += 1
-            self.current_task_weight = getattr(self, 'session_fatigue_tokens', 0)
-            self._write_somatic_state()
+        if hasattr(self, 'budget_lock'):
+            with self.budget_lock:
+                self.current_loop_count = getattr(self, 'current_loop_count', 0) + 1
+                self.current_task_weight = getattr(self, 'session_fatigue_tokens', 0)
+                if hasattr(self, '_write_somatic_state'):
+                    self._write_somatic_state()
 
         current_batch = ", ".join(executed_tools)
-        if current_batch == self.last_executed_command:
-            self.duplicate_command_count += 1
+        if current_batch == getattr(self, 'last_executed_command', None):
+            self.duplicate_command_count = getattr(self, 'duplicate_command_count', 0) + 1
             if self.duplicate_command_count >= 3:
                 logging.warning(
                     "System: Duplicate Action Detected. Breaking loop.")
@@ -1092,6 +1310,29 @@ class AmityOrchestrator:
                     "You are moderately fatigued. Consider breaking up heavy workloads into future scheduled pulses using Pulse_schedule_pulse.]"
                 )
 
+        # Check if user interjections arrived while tools were executing
+        interjections = []
+        with self._get_interjection_lock():
+            q = self._get_pending_interjections()
+            if q:
+                interjections = list(q)
+                q.clear()
+
+        if interjections and function_responses:
+            logging.info(f"Attaching {len(interjections)} pending user interjection(s) to tool responses.")
+            combined_interjection = "\n\n".join(self._format_interjection_payload(t) for t, _ in interjections)
+            audio_paths = [a for _, a in interjections if a]
+            first_audio = audio_paths[0] if audio_paths else None
+            last_name, last_resp = function_responses[-1]
+            last_resp["result"] = f"{last_resp.get('result', '')}\n\n{combined_interjection}"
+            if first_audio:
+                existing_media = last_resp.get("media", [])
+                if isinstance(existing_media, list):
+                    last_resp["media"] = existing_media + [first_audio]
+                else:
+                    last_resp["media"] = [first_audio]
+            function_responses[-1] = (last_name, last_resp)
+
         if function_responses:
             if budget_alert:
                 last_name, last_resp = function_responses[-1]
@@ -1137,6 +1378,8 @@ class AmityOrchestrator:
         logging.warning(f"Gemini API Event: {text}")
         self.append_to_conversation("System Warning", text)
         self.finish_thinking()
+        if not self._is_truly_busy():
+            self.set_busy_state(False)
 
     def speak(self, text):
         self.speech_queue.append(text)
@@ -1160,12 +1403,15 @@ class AmityOrchestrator:
         self.tts_worker.started_playback.connect(self._on_started_playback)
         self.tts_worker.amplitude_emitted.connect(
             self.on_amplitude_emitted.emit)
+        self.tts_worker.status_emitted.connect(
+            lambda msg: self.append_to_conversation("System", msg))
         self.tts_worker.error_occurred.connect(self._on_tts_error)
         self.tts_worker.on_finished.connect(self.on_tts_finished)
         self.tts_worker.start()
 
     def _on_tts_error(self, message: str):
         self.append_to_conversation("System", message)
+        self.on_tts_finished()
 
     def on_tts_finished(self):
         self.tts_worker = None

@@ -122,6 +122,13 @@ Available Tools:
             content += f"\n[User attached image file for analysis: {image_path}]"
         if audio_path:
             content += f"\n[User attached audio file for analysis: {audio_path}]"
+            try:
+                from core.local_stt import LocalSTT
+                stt_text = LocalSTT().transcribe(audio_path)
+                if stt_text and not stt_text.startswith("Failed"):
+                    content += f"\n[Voice Message Transcription: {stt_text}]"
+            except Exception:
+                pass
 
         self.history.append({"role": "User", "content": content})
 

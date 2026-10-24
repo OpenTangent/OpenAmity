@@ -81,6 +81,127 @@ def _normalize_model_name(model_name: str) -> str:
     return m
 
 
+def _is_quota_error(err: Exception) -> bool:
+    """
+    Checks whether an error indicates that the standard AI model has reached its quota
+    or hit a rate limit (HTTP 429, 402, or explicit quota/credit exhaustion).
+    """
+    if err is None:
+        return False
+    status_code = getattr(err, "status_code", None)
+    if status_code is None and hasattr(err, "response") and err.response is not None:
+        status_code = getattr(err.response, "status_code", None)
+    if status_code in (429, 402):
+        return True
+
+    err_str = str(err).lower()
+    quota_indicators = (
+        "429",
+        "quota",
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "resource_exhausted",
+        "credits",
+        "insufficient_quota",
+        "payment required",
+        "balance is too low",
+        "credit balance",
+        "insufficient balance",
+    )
+    return any(indicator in err_str for indicator in quota_indicators)
+
+
+def _strip_multimodal_from_content(content):
+    """
+    Strips multimodal content blocks (image_url, input_audio, file) from a message's content,
+    replacing them with descriptive text placeholders.
+    If all resulting blocks are text, collapses the list into a single string to avoid schema validation errors.
+    Returns (sanitized_content, was_modified).
+    """
+    if isinstance(content, str):
+        return content, False
+    if not isinstance(content, list):
+        return content, False
+
+    new_content = []
+    modified = False
+    for part in content:
+        if isinstance(part, dict):
+            ptype = part.get("type")
+            if ptype == "input_audio":
+                text_content = "[Audio attachment stripped: multimodal audio input is unsupported or failed]"
+                audio_info = part.get("input_audio", {})
+                b64_data = audio_info.get("data") if isinstance(audio_info, dict) else None
+                if b64_data:
+                    try:
+                        import tempfile
+                        import base64
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
+                            tmp_f.write(base64.b64decode(b64_data))
+                            tmp_wav = tmp_f.name
+                        from core.local_stt import LocalSTT
+                        stt_text = LocalSTT().transcribe(tmp_wav)
+                        if os.path.exists(tmp_wav):
+                            os.remove(tmp_wav)
+                        if stt_text and not stt_text.startswith("Failed"):
+                            text_content += f"\n[Voice Message Transcription: {stt_text}]"
+                    except Exception:
+                        pass
+                new_content.append({
+                    "type": "text",
+                    "text": text_content
+                })
+                modified = True
+            elif ptype == "image_url":
+                new_content.append({
+                    "type": "text",
+                    "text": "[Image attachment stripped: multimodal image input is unsupported or failed]"
+                })
+                modified = True
+            elif ptype == "file":
+                new_content.append({
+                    "type": "text",
+                    "text": "[File attachment stripped: multimodal file input is unsupported or failed]"
+                })
+                modified = True
+            else:
+                new_content.append(part)
+        else:
+            new_content.append(part)
+
+    if not modified:
+        return content, False
+
+    if all(isinstance(p, dict) and p.get("type") == "text" for p in new_content):
+        collapsed = "\n".join(p.get("text", "") for p in new_content if p.get("text"))
+        return collapsed, True
+
+    return new_content, True
+
+
+def _strip_multimodal_from_history(history: list) -> bool:
+    """Strips multimodal content blocks in-place from history turns. Returns True if any were modified."""
+    modified_any = False
+    for msg in history:
+        if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            new_content, modified = _strip_multimodal_from_content(msg["content"])
+            if modified:
+                msg["content"] = new_content
+                modified_any = True
+    return modified_any
+
+
+def _has_multimodal_content(history: list) -> bool:
+    """Checks if any user message in history contains multimodal content blocks."""
+    for msg in history:
+        if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "input_audio", "file"):
+                    return True
+    return False
+
+
 class FunctionCallObject:
     def __init__(self, name, args):
         self.name = name
@@ -145,6 +266,7 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         self.current_model = "MiMo-V2.6-Pro"
         self.primary_model = "MiMo-V2.6-Pro"
         self.light_model = "gpt-6-luna"
+        self.multimodal_failed = False
 
         # Audio STT setup
         from .local_stt import LocalSTT
@@ -176,6 +298,7 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         if clear_history:
             self.history = []
             self.consumed_tool_call_ids = set()
+            self.multimodal_failed = False
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
@@ -227,6 +350,7 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         self.running = False
         self.history = []
         self.consumed_tool_call_ids = set()
+        self.multimodal_failed = False
         logging.info("OpenRouter session stopped.")
 
     def abort(self):
@@ -350,7 +474,7 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                     new_content = []
                     modified = False
                     for part in msg["content"]:
-                        if isinstance(part, dict) and part.get("type") in ("image_url", "file"):
+                        if isinstance(part, dict) and part.get("type") in ("image_url", "file", "input_audio"):
                             new_content.append({
                                 "type": "text",
                                 "text": "[Media attachment automatically culled to save tokens/memory]"
@@ -359,7 +483,10 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                         else:
                             new_content.append(part)
                     if modified:
-                        msg["content"] = new_content
+                        if all(isinstance(p, dict) and p.get("type") == "text" for p in new_content):
+                            msg["content"] = "\n".join(p["text"] for p in new_content if p.get("text"))
+                        else:
+                            msg["content"] = new_content
 
     def send_function_response(self, name: str, response: dict):
         self.send_function_responses([(name, response)])
@@ -414,6 +541,11 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                     "role": "user",
                     "content": "[Tool media attachments skipped: Low Token Mode is active]"
                 })
+            elif getattr(self, "multimodal_failed", False):
+                self.history.append({
+                    "role": "user",
+                    "content": f"[Tool media attachments skipped: multimodal input is unsupported or failed on this model: {', '.join(os.path.basename(m) for m in attached_media)}]"
+                })
             else:
                 user_content_blocks = [
                     {"type": "text", "text": "[Attached media from tool execution]:"}
@@ -442,6 +574,8 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         Ensures every assistant message with 'tool_calls' is followed by matching
         'tool' messages responding to each 'tool_call_id' before any subsequent
         user or assistant message, or before the end of history.
+        Also guarantees valid role alternation by inserting assistant spacers
+        if a tool message is followed by a user message, and merging consecutive user messages.
         """
         new_history = []
         i = 0
@@ -478,12 +612,61 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 i = j - 1
             i += 1
 
-        self.history = new_history
+        def _is_tool_media(msg):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                return False
+            c = msg.get("content")
+            if isinstance(c, str):
+                return c.startswith("[Attached media from tool execution]") or c.startswith("[Tool media attachments skipped")
+            if isinstance(c, list) and c:
+                first = c[0]
+                if isinstance(first, dict) and first.get("type") == "text":
+                    t = first.get("text", "")
+                    return t.startswith("[Attached media from tool execution]") or t.startswith("[Tool media attachments skipped")
+            return False
+
+        # Second pass: ensure role alternation and that unfulfilled or completed tool turns
+        # are cleanly closed with an assistant spacer before any new user/pulse turn starts.
+        sanitized_history = []
+        for m in new_history:
+            if sanitized_history:
+                prev_msg = sanitized_history[-1]
+                prev_role = prev_msg.get("role")
+                curr_role = m.get("role")
+                is_curr_tool_media = _is_tool_media(m)
+                is_prev_tool_media = _is_tool_media(prev_msg)
+
+                if curr_role == "user" and not is_curr_tool_media:
+                    # New user or pulse turn arriving after tool execution or tool media
+                    if prev_role == "tool" or is_prev_tool_media:
+                        sanitized_history.append({"role": "assistant", "content": ""})
+                    elif prev_role == "user":
+                        # Consecutive user turns: merge them if plain strings
+                        prev_c = prev_msg.get("content", "")
+                        curr_c = m.get("content", "")
+                        if isinstance(prev_c, str) and isinstance(curr_c, str):
+                            prev_msg["content"] = f"{prev_c}\n\n{curr_c}"
+                            continue
+                        else:
+                            sanitized_history.append({"role": "assistant", "content": ""})
+            sanitized_history.append(m)
+
+        self.history = sanitized_history
 
     def _process_thought(self, prompt=None, image_path=None, yolo=False, audio_path=None):
         from core.logger_config import agent_id_var
         if hasattr(self, 'agent_id'):
             agent_id_var.set(self.agent_id)
+
+        try:
+            self._process_thought_inner(prompt, image_path, yolo, audio_path)
+        except Exception as e:
+            logging.error(f"OpenRouterWorker unhandled error in _process_thought: {e}", exc_info=True)
+            self.error_occurred.emit(f"OpenRouter API Error: {e}")
+        finally:
+            self.is_processing = False
+
+    def _process_thought_inner(self, prompt=None, image_path=None, yolo=False, audio_path=None):
 
         history_snapshot_len = len(self.history)
         is_low_token = self.settings.get("core.low-token-mode", False)
@@ -501,6 +684,9 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 if is_low_token:
                     content_blocks.append(
                         {"type": "text", "text": "[Image attachment skipped: Low Token Mode is active]"})
+                elif getattr(self, "multimodal_failed", False):
+                    content_blocks.append(
+                        {"type": "text", "text": f"[Image attachment skipped: multimodal input is unsupported or failed on this model: {os.path.basename(image_path)}]"})
                 else:
                     try:
                         img_block = self._prepare_media_block(image_path)
@@ -515,6 +701,19 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 if is_low_token:
                     content_blocks.append(
                         {"type": "text", "text": "[Audio attachment skipped: Low Token Mode is active]"})
+                elif getattr(self, "multimodal_failed", False):
+                    text_placeholder = f"[Audio attachment skipped: multimodal audio input is unsupported or failed on this model: {os.path.basename(audio_path)}]"
+                    try:
+                        from core.local_stt import LocalSTT
+                        stt_text = LocalSTT().transcribe(audio_path)
+                        if stt_text and not stt_text.startswith("Failed"):
+                            text_placeholder += f"\n[Voice Message Transcription: {stt_text}]"
+                    except Exception:
+                        pass
+                    content_blocks.append({
+                        "type": "text",
+                        "text": text_placeholder
+                    })
                 else:
                     try:
                         ext = os.path.splitext(audio_path)[1].lower()
@@ -533,27 +732,43 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                             }
                         })
                     except Exception as e:
-                        self.error_occurred.emit(f"Audio load error: {e}")
-                        self.is_processing = False
-                        return
+                        logging.warning(f"Audio load error for OpenRouter: {e}, attempting LocalSTT...")
+                        try:
+                            from core.local_stt import LocalSTT
+                            stt_text = LocalSTT().transcribe(audio_path)
+                            if stt_text and not stt_text.startswith("Failed"):
+                                content_blocks.append({
+                                    "type": "text",
+                                    "text": f"[Voice Message Transcription: {stt_text}]"
+                                })
+                            else:
+                                content_blocks.append({
+                                    "type": "text",
+                                    "text": f"[Audio attachment skipped: {e}]"
+                                })
+                        except Exception:
+                            content_blocks.append({
+                                "type": "text",
+                                "text": f"[Audio attachment skipped: {e}]"
+                            })
 
-            if len(content_blocks) == 1 and content_blocks[0].get("type") == "text":
-                user_msg = {"role": "user", "content": content_blocks[0]["text"]}
+            if all(isinstance(p, dict) and p.get("type") == "text" for p in content_blocks):
+                user_msg = {"role": "user", "content": "\n".join(p["text"] for p in content_blocks if p.get("text"))}
             else:
                 user_msg = {"role": "user", "content": content_blocks}
             self.history.append(user_msg)
 
         self._reconcile_tool_calls()
         self._cull_media_from_history()
-        models_to_attempt = [self.current_model]
-        if self.current_model != self.light_model:
-            models_to_attempt.append(self.light_model)
 
-        for attempt_idx, model_name in enumerate(models_to_attempt):
+        active_model = self.current_model
+        multimodal_retried = False
+
+        while True:
             try:
-                norm_model = _normalize_model_name(model_name)
+                norm_model = _normalize_model_name(active_model)
                 logging.debug(
-                    f"Calling OpenRouter with message length {len(self.history)} using model {norm_model} (configured: {model_name})...")
+                    f"Calling OpenRouter with message length {len(self.history)} using model {norm_model} (configured: {active_model})...")
 
                 messages = [{"role": "system", "content": self.sys_instruct or ""}] + self.history
 
@@ -674,7 +889,7 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                     assistant_msg["reasoning"] = full_reasoning
 
                 self.history.append(assistant_msg)
-                self.current_model = model_name
+                self.current_model = active_model
 
                 # Token tracking (excluding static system instruction and tool declarations)
                 tokens = 0
@@ -706,12 +921,31 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 return
 
             except Exception as e:
-                is_last_attempt = (attempt_idx == len(models_to_attempt) - 1)
                 err_str = str(e)
-                if not is_last_attempt:
+
+                # 1. If Multimodal input fails on standard model: strip input and retry with standard model
+                if not multimodal_retried and active_model != self.light_model and _has_multimodal_content(self.history) and not _is_quota_error(e):
                     logging.warning(
-                        f"OpenRouter model {model_name} failed: {err_str}. Falling back to light model {self.light_model}...")
+                        f"OpenRouter model {active_model} failed with multimodal input: {err_str}. "
+                        f"Stripping multimodal input and retrying on standard model {active_model}..."
+                    )
+                    self.multimodal_failed = True
+                    _strip_multimodal_from_history(self.history)
+                    multimodal_retried = True
                     continue
+
+                # 2. Only fall back to light model if standard AI model has reached its quota
+                if active_model != self.light_model and _is_quota_error(e):
+                    logging.warning(
+                        f"OpenRouter model {active_model} reached quota: {err_str}. "
+                        f"Falling back to light model {self.light_model}..."
+                    )
+                    self.multimodal_failed = True
+                    _strip_multimodal_from_history(self.history)
+                    active_model = self.light_model
+                    continue
+
+                # 3. Non-quota error or light model failure: do not fall back to light model
                 logging.error(f"OpenRouter API Error: {err_str}", exc_info=True)
                 self.history = self.history[:history_snapshot_len]
                 self.error_occurred.emit(f"OpenRouter API Error: {err_str}")

@@ -446,10 +446,38 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                             self.history.append({"role": "user", "content": dummy_content})
                 i += 1
 
+            # Second pass: merge consecutive user messages to respect Anthropic role alternation
+            merged_history = []
+            for m in self.history:
+                if merged_history and merged_history[-1].get("role") == "user" and m.get("role") == "user":
+                    prev_c = merged_history[-1].get("content")
+                    curr_c = m.get("content")
+                    if isinstance(prev_c, list) and isinstance(curr_c, list):
+                        merged_history[-1]["content"] = prev_c + curr_c
+                    elif isinstance(prev_c, str) and isinstance(curr_c, str):
+                        merged_history[-1]["content"] = f"{prev_c}\n\n{curr_c}"
+                    elif isinstance(prev_c, list) and isinstance(curr_c, str):
+                        merged_history[-1]["content"] = prev_c + [{"type": "text", "text": curr_c}]
+                    elif isinstance(prev_c, str) and isinstance(curr_c, list):
+                        merged_history[-1]["content"] = [{"type": "text", "text": prev_c}] + curr_c
+                else:
+                    merged_history.append(m)
+            self.history = merged_history
+
     def _process_thought(self, prompt, image_path, yolo, audio_path=None):
         from core.logger_config import agent_id_var
         if hasattr(self, 'agent_id'):
             agent_id_var.set(self.agent_id)
+
+        try:
+            self._process_thought_inner(prompt, image_path, yolo, audio_path)
+        except Exception as e:
+            logging.error(f"ClaudeWorker unhandled error in _process_thought: {e}", exc_info=True)
+            self.error_occurred.emit(f"Claude API Error: {e}")
+        finally:
+            self.is_processing = False
+
+    def _process_thought_inner(self, prompt, image_path, yolo, audio_path=None):
 
         is_low_token = self.settings.get("core.low-token-mode", False)
         content_blocks = []
@@ -477,8 +505,15 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                     return
 
         if audio_path:
-            content_blocks.append(
-                {"type": "text", "text": f"[Audio attached: {audio_path}. Claude does not support direct audio input; use Media_transcribe_audio to transcribe if needed.]"})
+            text_desc = f"[Audio attached: {audio_path}. Claude does not support direct audio input; use Media_transcribe_audio to transcribe if needed.]"
+            try:
+                from core.local_stt import LocalSTT
+                stt_text = LocalSTT().transcribe(audio_path)
+                if stt_text and not stt_text.startswith("Failed"):
+                    text_desc += f"\n[Voice Message Transcription: {stt_text}]"
+            except Exception:
+                pass
+            content_blocks.append({"type": "text", "text": text_desc})
 
         # Add to history (keep reference for rollback on error)
         user_msg = {"role": "user", "content": content_blocks}

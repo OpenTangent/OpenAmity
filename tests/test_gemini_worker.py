@@ -374,6 +374,57 @@ def test_subagent_worker_send_function_responses_strips_media(monkeypatch, tmp_p
                 assert call_args["response"]["result"] == "ok"
 
 
+def test_gemini_worker_get_and_set_session_history(monkeypatch, tmp_path):
+    """Verifies that GeminiWorker exports and restores session history without name 'json' errors when tool calls and results are present."""
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path / (aid or "default")))
+    with patch.object(SettingsManager, "get_env", return_value="test_key_12345"):
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value = mock_client
+            from google.genai import types
+
+            worker = GeminiWorker(agent_id="test_gemini_history")
+            worker.available = True
+            worker.thinker_chat = MagicMock()
+
+            # Construct mock history turns
+            user_part = types.Part.from_text(text="What is the weather in Paris?")
+            turn1 = types.Content(role="user", parts=[user_part])
+
+            fc_part = types.Part.from_function_call(name="WebSearch_search", args={"query": "Paris weather"})
+            turn2 = types.Content(role="model", parts=[fc_part])
+
+            fr_part = types.Part.from_function_response(name="WebSearch_search", response={"result": "Sunny 22C"})
+            turn3 = types.Content(role="user", parts=[fr_part])
+
+            asst_part = types.Part.from_text(text="It is currently sunny and 22C in Paris.")
+            turn4 = types.Content(role="model", parts=[asst_part])
+
+            worker.thinker_chat._curated_history = [turn1, turn2, turn3, turn4]
+
+            # Test export - must NOT raise NameError: name 'json' is not defined
+            history = worker.get_session_history()
+            assert len(history) == 4
+            assert history[0]["role"] == "user"
+            assert "What is the weather in Paris?" in history[0]["content"]
+
+            assert history[1]["role"] == "assistant"
+            assert "[Tool invocation: WebSearch_search(" in history[1]["content"]
+            assert '"query": "Paris weather"' in history[1]["content"]
+
+            assert history[2]["role"] == "user"
+            assert "[Tool Result: WebSearch_search -> " in history[2]["content"]
+            assert '"result": "Sunny 22C"' in history[2]["content"]
+
+            assert history[3]["role"] == "assistant"
+            assert "It is currently sunny and 22C in Paris." in history[3]["content"]
+
+            # Test set_session_history
+            worker.set_session_history(history)
+            assert mock_client.chats.create.called
+
+
+
 
 
 

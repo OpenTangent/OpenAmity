@@ -27,6 +27,8 @@ class WhatsAppDaemon:
         self.port_file = os.path.join(self.bridge_dir, "daemon.port")
         self.node_process = None
         self.message_callback = None
+        self.status_callback = None
+        self._is_downloading_chrome = False
         self._stopping = False
 
         if port is not None:
@@ -201,9 +203,130 @@ class WhatsAppDaemon:
             except Exception as e:
                 logging.debug(f"Error scanning {base_dir} for permissions: {e}")
 
+    @property
+    def is_downloading_chrome(self) -> bool:
+        return getattr(self, "_is_downloading_chrome", False)
+
+    def _find_chrome(self) -> bool:
+        target_dirs = [
+            os.path.join(self.data_dir, "puppeteer_cache"),
+            os.path.expanduser("~/.cache/puppeteer"),
+            "/app/share/puppeteer"
+        ]
+        for bdir in target_dirs:
+            if not os.path.exists(bdir):
+                continue
+            for root, _, files in os.walk(bdir):
+                for f in files:
+                    if f in ("chrome", "chromium", "google-chrome"):
+                        fpath = os.path.join(root, f)
+                        if os.access(fpath, os.X_OK):
+                            return True
+        return False
+
+    def _download_and_extract_chrome(self) -> bool:
+        """Downloads Chrome for Testing on demand into ~/.cache/puppeteer, verified by SHA-256."""
+        import zipfile
+        import hashlib
+
+        url = "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chrome-linux64.zip"
+        expected_sha = "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8"
+
+        cache_dir = os.path.expanduser("~/.cache/puppeteer")
+        os.makedirs(cache_dir, exist_ok=True)
+        zip_path = os.path.join(cache_dir, "chrome-linux64.zip")
+
+        logging.info("Downloading Chrome for WhatsApp bridge (one-time setup, ~150 MB)...")
+        if self.status_callback:
+            try:
+                self.status_callback("[System: Downloading browser engine for WhatsApp bridge (one-time setup)...]")
+            except Exception:
+                pass
+
+        try:
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                sha = hashlib.sha256()
+                with open(zip_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                        sha.update(chunk)
+            if sha.hexdigest() != expected_sha:
+                logging.error(f"Chrome download checksum mismatch: {sha.hexdigest()} != {expected_sha}")
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                return False
+
+            logging.info("Extracting Chrome for Testing...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(cache_dir)
+
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+            # Prune WidevineCdm and non-en-US locales to save 66 MB in user home!
+            chrome_dir = os.path.join(cache_dir, "chrome-linux64")
+            widevine_dir = os.path.join(chrome_dir, "WidevineCdm")
+            if os.path.exists(widevine_dir):
+                shutil.rmtree(widevine_dir, ignore_errors=True)
+
+            locales_dir = os.path.join(chrome_dir, "locales")
+            if os.path.exists(locales_dir):
+                for lfile in os.listdir(locales_dir):
+                    if lfile != "en-US.pak":
+                        try:
+                            os.remove(os.path.join(locales_dir, lfile))
+                        except Exception:
+                            pass
+
+            self._ensure_chrome_executable_permissions()
+            logging.info("Chrome for Testing extracted and verified successfully.")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to download Chrome for WhatsApp: {e}")
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
+            return False
+
     def start(self, force_update: bool = False):
+        if not self._find_chrome():
+            self._is_downloading_chrome = True
+
+            def download_and_run():
+                try:
+                    success = self._download_and_extract_chrome()
+                    if success:
+                        if self.status_callback:
+                            try:
+                                self.status_callback("[System: WhatsApp bridge ready.]")
+                            except Exception:
+                                pass
+                        self._do_start(force_update=force_update)
+                    else:
+                        if self.status_callback:
+                            try:
+                                self.status_callback("[System: Failed to download browser engine for WhatsApp.]")
+                            except Exception:
+                                pass
+                finally:
+                    self._is_downloading_chrome = False
+
+            threading.Thread(
+                target=download_and_run,
+                daemon=True,
+                name=f"WhatsAppChromeDL-{self.agent_id}"
+            ).start()
+            return
+
+        self._do_start(force_update=force_update)
+
+    def _do_start(self, force_update: bool = False):
         os.makedirs(self.bridge_dir, exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
+
 
         # Always overwrite server.js and package.json from the immutable app to the stateful dir
         for filename in ["server.js", "package.json"]:

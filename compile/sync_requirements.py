@@ -57,7 +57,8 @@ def main():
     print("\n=== Preparing Flatpak Requirements ===")
     filtered_lines = []
     for line in desired_lines:
-        if 'pyside' not in line.lower():
+        line_clean = line.strip().lower()
+        if 'pyside' not in line_clean and 'google-antigravity' not in line_clean:
             filtered_lines.append(line)
             
     with open(FLATPAK_REQS_FILE, 'w') as f:

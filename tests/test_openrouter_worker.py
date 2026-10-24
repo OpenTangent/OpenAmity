@@ -286,7 +286,8 @@ def test_openrouter_worker_light_model_fallback(monkeypatch, tmp_path):
             model = kwargs.get("model")
             attempted_models.append(model)
             if model == "xiaomi/mimo-v2.6-pro":
-                raise Exception("503 Service Unavailable on primary model")
+                # Primary model quota exhausted (429)
+                raise Exception("429 Rate limit / Quota exceeded on primary model")
             # Success on light model
             chunk = MagicMock()
             chunk.choices = [MagicMock()]
@@ -308,6 +309,133 @@ def test_openrouter_worker_light_model_fallback(monkeypatch, tmp_path):
         assert len(emitted_thoughts) == 1
         assert "Response from fallback" in emitted_thoughts[0]
         assert worker.current_model == "gpt-6-luna"
+
+
+def test_openrouter_worker_non_quota_error_no_light_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system prompt")
+
+        attempted_models = []
+
+        def mock_create(**kwargs):
+            model = kwargs.get("model")
+            attempted_models.append(model)
+            raise Exception("503 Service Unavailable on primary model")
+
+        worker.client.chat.completions.create = mock_create
+
+        errors = []
+        worker.error_occurred.connect(lambda err: errors.append(err))
+
+        worker._process_thought(prompt="Test non-quota error")
+
+        # Must NOT have attempted light model
+        assert attempted_models == ["xiaomi/mimo-v2.6-pro"]
+        assert len(errors) == 1
+        assert "503 Service Unavailable" in errors[0]
+        assert worker.current_model == "MiMo-V2.6-Pro"
+
+
+def test_openrouter_worker_multimodal_failure_strips_input_and_retries_standard_model(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    audio_file = tmp_path / "voice_msg.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 30)
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system prompt")
+
+        attempted_calls = []
+
+        def mock_create(**kwargs):
+            model = kwargs.get("model")
+            messages = kwargs.get("messages", [])
+            attempted_calls.append((model, messages))
+            # On first attempt with audio payload, fail like Xiaomi / OpenRouter did in live environment
+            has_audio = any(
+                isinstance(m.get("content"), list) and any(
+                    isinstance(p, dict) and p.get("type") == "input_audio" for p in m["content"]
+                ) for m in messages
+            )
+            if has_audio:
+                raise Exception("Input should be a valid string")
+
+            # On stripped retry, succeed with standard model!
+            chunk = MagicMock()
+            chunk.choices = [MagicMock()]
+            chunk.choices[0].delta = MagicMock()
+            chunk.choices[0].delta.reasoning = None
+            chunk.choices[0].delta.content = "Thought after multimodal stripped"
+            chunk.choices[0].delta.tool_calls = None
+            chunk.usage = None
+            return [chunk]
+
+        worker.client.chat.completions.create = mock_create
+
+        emitted_thoughts = []
+        worker.thought_received.connect(lambda t, f: emitted_thoughts.append(t))
+
+        worker._process_thought(prompt="Hello with audio", audio_path=str(audio_file))
+
+        # Both attempts must be on standard model (xiaomi/mimo-v2.6-pro), NOT on light model (openai/gpt-6-luna)!
+        assert len(attempted_calls) == 2
+        assert attempted_calls[0][0] == "xiaomi/mimo-v2.6-pro"
+        assert attempted_calls[1][0] == "xiaomi/mimo-v2.6-pro"
+
+        # Verify retry succeeded
+        assert len(emitted_thoughts) == 1
+        assert "Thought after multimodal stripped" in emitted_thoughts[0]
+        assert worker.current_model == "MiMo-V2.6-Pro"
+        assert worker.multimodal_failed is True
+
+        # Verify history turn had audio stripped into text
+        last_user = [m for m in worker.history if m.get("role") == "user"][-1]
+        assert "Audio attachment stripped" in last_user["content"]
+
+
+def test_openrouter_worker_subsequent_turns_strip_multimodal(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    audio_file = tmp_path / "voice_msg2.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 30)
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system prompt")
+        # Simulate that multimodal failed on previous turn
+        worker.multimodal_failed = True
+
+        attempted_calls = []
+
+        def mock_create(**kwargs):
+            model = kwargs.get("model")
+            messages = kwargs.get("messages", [])
+            attempted_calls.append((model, messages))
+            chunk = MagicMock()
+            chunk.choices = [MagicMock()]
+            chunk.choices[0].delta = MagicMock()
+            chunk.choices[0].delta.reasoning = None
+            chunk.choices[0].delta.content = "Subsequent turn success"
+            chunk.choices[0].delta.tool_calls = None
+            chunk.usage = None
+            return [chunk]
+
+        worker.client.chat.completions.create = mock_create
+
+        worker._process_thought(prompt="Follow-up prompt", audio_path=str(audio_file))
+
+        assert len(attempted_calls) == 1
+        messages = attempted_calls[0][1]
+        last_user_msg = messages[-1]
+
+        # The message content should be a string (or purely text), not a list with input_audio
+        assert isinstance(last_user_msg["content"], str)
+        assert "Audio attachment skipped: multimodal audio input is unsupported or failed on this model" in last_user_msg["content"]
+        assert "Follow-up prompt" in last_user_msg["content"]
 
 
 def test_openrouter_worker_reformulate_query(monkeypatch, tmp_path):
@@ -731,6 +859,82 @@ def test_openrouter_worker_unsupported_media_error_handling(monkeypatch, tmp_pat
         assert content_blocks[1]["type"] == "text"
         assert "[Error attaching media" in content_blocks[1]["text"]
         assert "Unsupported media format" in content_blocks[1]["text"]
+
+
+def test_openrouter_worker_reconcile_tool_calls_spacer_for_pulse_turn(monkeypatch, tmp_path):
+    """Verifies that if a tool call was answered but turn errored before assistant closed it,
+    subsequent pulse prompt gets an assistant spacer to maintain strict role alternation."""
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system")
+
+        worker.history = [
+            {"role": "user", "content": "Run search"},
+            {
+                "role": "assistant",
+                "content": "Searching...",
+                "tool_calls": [{"id": "call_search_1", "type": "function", "function": {"name": "Search", "arguments": "{}"}}]
+            },
+            {"role": "tool", "tool_call_id": "call_search_1", "content": json.dumps({"result": "Found 1 result"})},
+            {"role": "user", "content": "[AGENT_PULSE] Scheduled routine"}
+        ]
+
+        worker._reconcile_tool_calls()
+
+        # The history should now be: user -> assistant -> tool -> assistant (spacer) -> user (pulse)
+        roles = [m["role"] for m in worker.history]
+        assert roles == ["user", "assistant", "tool", "assistant", "user"]
+        assert worker.history[3]["content"] == ""
+        assert worker.history[4]["content"] == "[AGENT_PULSE] Scheduled routine"
+
+
+def test_openrouter_worker_pulse_continues_normally_after_api_failure(monkeypatch, tmp_path):
+    """Verifies that if a failure occurs during an interaction, worker does not get stuck,
+    and subsequent pulse prompt continues as normal."""
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system")
+
+        # Step 1: Simulate a failed turn
+        error_signals = []
+        worker.error_occurred.connect(lambda err: error_signals.append(err))
+
+        worker.client.chat.completions.create = MagicMock(side_effect=Exception("OpenRouter 500 Internal Error"))
+        worker.send_prompt("Initial request that fails")
+        time.sleep(0.1)
+
+        # Verify error was reported and worker is NOT stuck in processing
+        assert len(error_signals) == 1
+        assert "500 Internal Error" in error_signals[0]
+        assert worker.is_processing is False
+
+        # Step 2: Now trigger an autonomy pulse
+        thought_signals = []
+        worker.thought_received.connect(lambda text, fcs: thought_signals.append((text, fcs)))
+
+        mock_chunk = MagicMock()
+        mock_chunk.usage = None
+        mock_chunk.choices = [MagicMock()]
+        mock_chunk.choices[0].delta.content = "Pulse executed successfully"
+        mock_chunk.choices[0].delta.reasoning = None
+        mock_chunk.choices[0].delta.reasoning_content = None
+        mock_chunk.choices[0].delta.reasoning_details = None
+        mock_chunk.choices[0].delta.tool_calls = None
+
+        worker.client.chat.completions.create = MagicMock(return_value=[mock_chunk])
+
+        worker.send_prompt("[AGENT_PULSE] Scheduled routine")
+        time.sleep(0.1)
+
+        # Pulse must complete normally without getting stuck
+        assert len(thought_signals) == 1
+        assert thought_signals[0][0] == "Pulse executed successfully"
+        assert worker.is_processing is False
+
 
 
 

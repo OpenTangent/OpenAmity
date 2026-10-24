@@ -1,0 +1,39 @@
+{
+    "app-id": "com.openamity.OpenAmity",
+    "runtime": "org.kde.Platform",
+    "runtime-version": "6.11",
+    "sdk": "org.kde.Sdk",
+    "base": "io.qt.PySide.BaseApp",
+    "base-version": "6.11",
+    "command": "run_installer.sh",
+    "finish-args": [
+        "--share=network",
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--talk-name=org.freedesktop.Flatpak",
+        "--filesystem=xdg-data/flatpak:ro",
+        "--filesystem=/var/lib/flatpak:ro"
+    ],
+    "modules": [
+        {
+            "name": "openamity_installer",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -D -m 755 compile/github_installer/flathub_installer.py /app/bin/flathub_installer.py",
+                "install -D -m 644 compile/com.openamity.OpenAmity.desktop /app/share/applications/com.openamity.OpenAmity.desktop",
+                "install -D -m 644 compile/com.openamity.OpenAmity.metainfo.xml /app/share/metainfo/com.openamity.OpenAmity.metainfo.xml",
+                "install -D -m 644 src/assets/com.openamity.OpenAmity.png /app/share/icons/hicolor/512x512/apps/com.openamity.OpenAmity.png",
+                "echo '#!/bin/sh' > /app/bin/run_installer.sh",
+                "echo 'python3 /app/bin/flathub_installer.py \"$@\"' >> /app/bin/run_installer.sh",
+                "chmod +x /app/bin/run_installer.sh"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "../.."
+                }
+            ]
+        }
+    ]
+}
