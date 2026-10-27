@@ -29,6 +29,10 @@ let page = null;
 let isReady = false;
 let currentQR = null;
 let isShuttingDown = false;
+let isInitializing = false;
+let lastInitError = null;
+let checkInterval = null;
+let retryTimeout = null;
 
 process.on('uncaughtException', (err) => {
     const errStr = err ? err.toString() : '';
@@ -121,11 +125,19 @@ function ensureExecutablePermissions(targetDir) {
         try {
             const entries = fs.readdirSync(dir, { withFileTypes: true });
             for (const entry of entries) {
+                if (entry.name.startsWith('.chrome-staging')) continue;
                 const full = path.join(dir, entry.name);
                 if (entry.isDirectory()) {
                     fixDir(full, depth + 1);
                 } else if (entry.isFile()) {
-                    if (helperNames.has(entry.name) || entry.name.startsWith('chrome') || entry.name.toLowerCase().includes('crashpad')) {
+                    const isHelper = (
+                        helperNames.has(entry.name) ||
+                        entry.name.startsWith('chrome') ||
+                        entry.name.toLowerCase().includes('crashpad') ||
+                        entry.name.endsWith('.so') ||
+                        entry.name.includes('.so.')
+                    );
+                    if (isHelper) {
                         try {
                             fs.chmodSync(full, 0o755);
                         } catch (e) {}
@@ -139,6 +151,16 @@ function ensureExecutablePermissions(targetDir) {
 }
 
 function findChromeExecutable() {
+    for (const explicitEnv of [process.env.CHROME_EXECUTABLE_PATH, process.env.PUPPETEER_EXECUTABLE_PATH]) {
+        if (explicitEnv && fs.existsSync(explicitEnv)) {
+            try {
+                ensureExecutablePermissions(path.dirname(explicitEnv));
+                fs.accessSync(explicitEnv, fs.constants.X_OK);
+                return explicitEnv;
+            } catch (e) {}
+        }
+    }
+
     const candidateDirs = [
         process.env.PUPPETEER_CACHE_DIR,
         process.env.XDG_CACHE_HOME ? path.join(process.env.XDG_CACHE_HOME, 'puppeteer') : null,
@@ -148,23 +170,23 @@ function findChromeExecutable() {
         '/usr/local/bin'
     ].filter(Boolean);
 
-    let candidates = [];
-    const searchDir = (current, depth = 0) => {
+    const searchDir = (current, bucket, depth = 0) => {
         if (depth > 6) return;
         try {
             const entries = fs.readdirSync(current, { withFileTypes: true });
             for (const entry of entries) {
+                if (entry.name.startsWith('.chrome-staging')) continue;
                 const full = path.join(current, entry.name);
                 if (entry.isDirectory()) {
-                    searchDir(full, depth + 1);
-                } else if (entry.isFile()) {
+                    searchDir(full, bucket, depth + 1);
+                } else if (entry.isFile() || entry.isSymbolicLink()) {
                     if (entry.name === 'chrome' || entry.name === 'chromium' || entry.name === 'google-chrome' || entry.name === 'google-chrome-stable') {
                         try {
                             try {
                                 fs.chmodSync(full, 0o755);
                             } catch (e) {}
                             fs.accessSync(full, fs.constants.X_OK);
-                            candidates.push(full);
+                            bucket.push(full);
                         } catch (e) {}
                     } else if (entry.name === 'chrome_crashpad_handler' || entry.name.toLowerCase().includes('crashpad') || entry.name === 'chrome_sandbox' || entry.name === 'chrome-wrapper') {
                         try {
@@ -177,13 +199,17 @@ function findChromeExecutable() {
     };
 
     for (const dir of candidateDirs) {
-        if (fs.existsSync(dir)) searchDir(dir);
+        if (!fs.existsSync(dir)) continue;
+        const dirCandidates = [];
+        searchDir(dir, dirCandidates);
+        if (dirCandidates.length > 0) {
+            dirCandidates.sort().reverse();
+            const chosen = dirCandidates[0];
+            ensureExecutablePermissions(path.dirname(chosen));
+            return chosen;
+        }
     }
-    if (candidates.length === 0) return null;
-    candidates.sort().reverse();
-    const chosen = candidates[0];
-    ensureExecutablePermissions(path.dirname(chosen));
-    return chosen;
+    return null;
 }
 
 async function ensureListenersAttached() {
@@ -364,7 +390,29 @@ async function ensureListenersAttached() {
     }
 }
 
+function scheduleClientRetry(delayMs = 5000) {
+    if (isShuttingDown || retryTimeout) return;
+    console.log(`Scheduling WhatsApp browser client retry in ${Math.round(delayMs / 1000)}s...`);
+    retryTimeout = setTimeout(() => {
+        retryTimeout = null;
+        if (!isShuttingDown) {
+            startClient();
+        }
+    }, delayMs);
+}
+
 async function startClient() {
+    if (isShuttingDown || isInitializing) return;
+    isInitializing = true;
+    if (retryTimeout) {
+        clearTimeout(retryTimeout);
+        retryTimeout = null;
+    }
+    if (checkInterval) {
+        clearInterval(checkInterval);
+        checkInterval = null;
+    }
+
     console.log('Starting WhatsApp Client with WPPConnect (WA-JS)...');
 
     const puppeteerArgs = [
@@ -390,22 +438,51 @@ async function startClient() {
         ensureExecutablePermissions(path.dirname(exe));
     }
 
-    // Clean any orphaned Chromium profile locks from previous runs
+    // Close any previous partial browser instance before cleaning profile locks
+    if (browser) {
+        try {
+            await browser.close();
+        } catch (e) {}
+        browser = null;
+        page = null;
+    }
+
+    // Clean any orphaned Chromium profile locks from previous runs.
+    // Note: On Linux, SingletonLock/SingletonCookie/SingletonSocket are dangling symlinks
+    // for which fs.existsSync() returns false! Remove them unconditionally.
     for (const lockFileName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
         const lockPath = path.join(sessionDir, lockFileName);
-        if (fs.existsSync(lockPath)) {
+        try {
+            fs.rmSync(lockPath, { force: true });
+        } catch (e) {
             try {
                 fs.unlinkSync(lockPath);
-            } catch (e) {}
+            } catch (e2) {}
         }
     }
 
     try {
-        browser = await puppeteer.launch({
+        const launchedBrowser = await puppeteer.launch({
             executablePath: exe || undefined,
             headless: true,
             userDataDir: sessionDir,
             args: puppeteerArgs
+        });
+        browser = launchedBrowser;
+        lastInitError = null;
+
+        launchedBrowser.on('disconnected', () => {
+            if (isShuttingDown || browser !== launchedBrowser) return;
+            console.error('WhatsApp headless browser disconnected unexpectedly. Recovering...');
+            browser = null;
+            page = null;
+            isReady = false;
+            currentQR = null;
+            if (checkInterval) {
+                clearInterval(checkInterval);
+                checkInterval = null;
+            }
+            scheduleClientRetry(5000);
         });
 
         const pages = await browser.pages();
@@ -414,8 +491,13 @@ async function startClient() {
         await page.setUserAgent('Mozilla/5.0 (X-UA-Compatible; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
         await page.setBypassCSP(true);
 
+        let lastProgressTime = Date.now();
+
         // Expose Node bridge callbacks to the browser context
         await page.exposeFunction('nodeOnQrCode', (qr) => {
+            if (qr) {
+                lastProgressTime = Date.now();
+            }
             if (qr && qr !== currentQR) {
                 currentQR = qr;
                 console.log('QR Code received. Scan with your phone:');
@@ -424,11 +506,15 @@ async function startClient() {
         });
 
         await page.exposeFunction('nodeOnAuthenticated', () => {
+            lastProgressTime = Date.now();
             console.log('WhatsApp Client is authenticated!');
         });
 
         await page.exposeFunction('nodeOnReady', () => {
-            console.log('WhatsApp Client is ready! Bridge is fully active.');
+            lastProgressTime = Date.now();
+            if (!isReady) {
+                console.log('WhatsApp Client is ready! Bridge is fully active.');
+            }
             currentQR = null;
             isReady = true;
         });
@@ -446,9 +532,10 @@ async function startClient() {
             waitUntil: 'domcontentloaded',
             timeout: 60000
         });
+        lastProgressTime = Date.now();
 
         // Continuous QR code, authentication, and listener attachment polling interval
-        const checkInterval = setInterval(async () => {
+        checkInterval = setInterval(async () => {
             if (isShuttingDown || !page) {
                 return;
             }
@@ -466,6 +553,11 @@ async function startClient() {
                         if (code && code.fullCode) {
                             return { ready: false, qr: code.fullCode };
                         }
+                        if (typeof window.WPP.conn.refreshQR === 'function') {
+                            try {
+                                await window.WPP.conn.refreshQR();
+                            } catch (e) {}
+                        }
                     }
 
                     // 2. Check DOM data-ref fallback
@@ -475,18 +567,45 @@ async function startClient() {
                         if (ref) return { ready: false, qr: ref };
                     }
 
+                    // 3. Click QR reload button if QR code expired on page
+                    const reloadBtn = document.querySelector('[data-testid="refresh-large"]') ||
+                        Array.from(document.querySelectorAll('button, div[role="button"]')).find(
+                            el => el.textContent && el.textContent.toLowerCase().includes('reload')
+                        );
+                    if (reloadBtn && typeof reloadBtn.click === 'function') {
+                        try {
+                            reloadBtn.click();
+                        } catch (e) {}
+                    }
+
                     return { ready: false, qr: null };
                 });
 
                 if (state) {
                     if (state.ready) {
+                        lastProgressTime = Date.now();
+                        if (!isReady) {
+                            console.log('WhatsApp Client is ready! Bridge is fully active.');
+                        }
                         isReady = true;
                         currentQR = null;
-                    } else if (state.qr && state.qr !== currentQR) {
-                        currentQR = state.qr;
-                        isReady = false;
-                        console.log('QR Code received. Scan with your phone:');
-                        qrcode.generate(state.qr, { small: true });
+                    } else if (state.qr) {
+                        lastProgressTime = Date.now();
+                        if (state.qr !== currentQR) {
+                            currentQR = state.qr;
+                            isReady = false;
+                            console.log('QR Code received. Scan with your phone:');
+                            qrcode.generate(state.qr, { small: true });
+                        }
+                    } else if (!isReady && !currentQR && (Date.now() - lastProgressTime > 60000)) {
+                        lastProgressTime = Date.now();
+                        console.log('WhatsApp Web produced neither session nor QR for 60s; reloading page...');
+                        await page.goto('https://web.whatsapp.com', {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 60000
+                        });
+                        await injectWaJs();
+                        await ensureListenersAttached();
                     }
                 }
             } catch (e) {}
@@ -507,14 +626,31 @@ async function startClient() {
             await new Promise(r => setTimeout(r, 2000));
         }
 
-        if (!injected) {
+        if (!injected && !isShuttingDown) {
             console.log('Attempting direct WA-JS evaluation injection...');
             await injectWaJs();
             await ensureListenersAttached();
         }
 
     } catch (err) {
+        lastInitError = err && err.message ? err.message : String(err);
         console.error('Failed to initialize WhatsApp browser client:', err);
+        isReady = false;
+        currentQR = null;
+        if (checkInterval) {
+            clearInterval(checkInterval);
+            checkInterval = null;
+        }
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (e) {}
+            browser = null;
+            page = null;
+        }
+        scheduleClientRetry(5000);
+    } finally {
+        isInitializing = false;
     }
 }
 
@@ -525,6 +661,14 @@ startClient();
 async function forceShutdown() {
     console.log('Initiating shutdown...');
     isShuttingDown = true;
+    if (retryTimeout) {
+        clearTimeout(retryTimeout);
+        retryTimeout = null;
+    }
+    if (checkInterval) {
+        clearInterval(checkInterval);
+        checkInterval = null;
+    }
     try {
         if (browser) {
             await browser.close();
@@ -904,7 +1048,13 @@ async function downloadAndSaveMedia(msgId, msgType) {
 // --- Endpoints ---
 
 app.get('/status', (req, res) => {
-    res.json({ ready: isReady, qr: currentQR });
+    res.json({
+        ready: isReady,
+        qr: currentQR,
+        browserAttached: Boolean(browser && page),
+        initializing: isInitializing,
+        error: lastInitError
+    });
 });
 
 app.post('/eval', async (req, res) => {

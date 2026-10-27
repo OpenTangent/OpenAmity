@@ -46,7 +46,13 @@ def sync_metainfo(metainfo_file: str, current_version: str):
     # 2. Check if version release tag already exists
     release_tag = f'<release version="{current_version}"'
     if release_tag not in metainfo_content:
-        new_release = f'    <release version="{current_version}" date="{today}"/>\n'
+        new_release = (
+            f'    <release version="{current_version}" date="{today}">\n'
+            f'      <description>\n'
+            f'        <p>Open Amity v{current_version} release updates and stability improvements.</p>\n'
+            f'      </description>\n'
+            f'    </release>\n'
+        )
         if '<releases>' in metainfo_content:
             metainfo_content = metainfo_content.replace(
                 '<releases>',
@@ -98,7 +104,7 @@ def generate_flathub_manifest(compile_dir: str, current_version: str, commit_sha
         f.write("\n")
 
     # Copy companion build files required by Flathub
-    companion_files = ["flathub.json", "python3-requirements.json", "node-sources.json"]
+    companion_files = ["python3-requirements.json", "node-sources.json"]
     for cf in companion_files:
         src_path = os.path.join(compile_dir, cf)
         if os.path.exists(src_path):

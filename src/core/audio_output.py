@@ -352,10 +352,18 @@ def synthesize_voice_sample(api_key: str, voice_name: str, style: str = "", text
     return b""
 
 
+_PIPER_DOWNLOAD_LOCK = threading.Lock()
+
+
 def load_piper_voice(settings=None, status_callback=None):
     """Loads and returns the configured PiperVoice instance, downloading files if necessary."""
     try:
         from config import paths
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+
         piper_dir = Path(paths.get_app_data_dir()) / "piper_voices"
         legacy_piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
         piper_dir.mkdir(parents=True, exist_ok=True)
@@ -387,42 +395,76 @@ def load_piper_voice(settings=None, status_callback=None):
         config_path = piper_dir / f"{voice_name}.onnx.json"
         legacy_model_path = legacy_piper_dir / f"{voice_name}.onnx"
         legacy_config_path = legacy_piper_dir / f"{voice_name}.onnx.json"
-        if (not model_path.exists() or not config_path.exists()) and legacy_model_path.exists() and legacy_config_path.exists():
+
+        def _files_ready(mp: Path, cp: Path) -> bool:
+            try:
+                return mp.exists() and cp.exists() and mp.stat().st_size > 0 and cp.stat().st_size > 0
+            except Exception:
+                return False
+
+        if not _files_ready(model_path, config_path) and _files_ready(legacy_model_path, legacy_config_path):
             model_path = legacy_model_path
             config_path = legacy_config_path
 
-        if not model_path.exists() or not config_path.exists():
-            if status_callback:
+        if not _files_ready(model_path, config_path):
+            lock_file_path = piper_dir / f".{voice_name}.download.lock"
+            with _PIPER_DOWNLOAD_LOCK:
+                lock_fd = None
                 try:
-                    status_callback("[System: Downloading local voice model (one-time setup)...]")
-                except Exception:
-                    pass
-            logging.getLogger("core.TTS.Piper").info(
-                f"Downloading Piper TTS model '{voice_name}'...")
-            model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx"
-            config_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx.json"
-            try:
-                with requests.get(model_url, stream=True, timeout=10) as r_model:
-                    r_model.raise_for_status()
-                    with open(model_path, 'wb') as f:
-                        for chunk in r_model.iter_content(chunk_size=8192):
-                            f.write(chunk)
+                    if fcntl is not None:
+                        lock_fd = open(lock_file_path, "w")
+                        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
 
-                with requests.get(config_url, stream=True, timeout=10) as r_config:
-                    r_config.raise_for_status()
-                    with open(config_path, 'wb') as f:
-                        for chunk in r_config.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                logging.getLogger("core.TTS.Piper").info(
-                    "Piper TTS model downloaded successfully.")
-            except requests.RequestException as e:
-                logging.getLogger("core.TTS.Piper").warning(
-                    f"Offline or failed to download Piper model: {e}")
-                if model_path.exists():
-                    model_path.unlink()
-                if config_path.exists():
-                    config_path.unlink()
-                return None
+                    if not _files_ready(model_path, config_path):
+                        if status_callback:
+                            try:
+                                status_callback("[System: Downloading local voice model (one-time setup)...]")
+                            except Exception:
+                                pass
+                        logging.getLogger("core.TTS.Piper").info(
+                            f"Downloading Piper TTS model '{voice_name}'...")
+                        model_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx"
+                        config_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{language}/{locale}/{voice}/{quality}/{voice_name}.onnx.json"
+                        tmp_suffix = f".{os.getpid()}.{threading.get_ident()}.tmp"
+                        tmp_model = piper_dir / f".{voice_name}.onnx{tmp_suffix}"
+                        tmp_config = piper_dir / f".{voice_name}.onnx.json{tmp_suffix}"
+                        try:
+                            with requests.get(model_url, stream=True, timeout=(10, 60)) as r_model:
+                                r_model.raise_for_status()
+                                with open(tmp_model, 'wb') as f:
+                                    for chunk in r_model.iter_content(chunk_size=65536):
+                                        if chunk:
+                                            f.write(chunk)
+
+                            with requests.get(config_url, stream=True, timeout=(10, 30)) as r_config:
+                                r_config.raise_for_status()
+                                with open(tmp_config, 'wb') as f:
+                                    for chunk in r_config.iter_content(chunk_size=65536):
+                                        if chunk:
+                                            f.write(chunk)
+
+                            os.replace(tmp_model, model_path)
+                            os.replace(tmp_config, config_path)
+                            logging.getLogger("core.TTS.Piper").info(
+                                "Piper TTS model downloaded successfully.")
+                        except requests.RequestException as e:
+                            logging.getLogger("core.TTS.Piper").warning(
+                                f"Offline or failed to download Piper model: {e}")
+                            for p in (tmp_model, tmp_config):
+                                if p.exists():
+                                    try:
+                                        p.unlink()
+                                    except Exception:
+                                        pass
+                            return None
+                finally:
+                    if lock_fd is not None:
+                        try:
+                            if fcntl is not None:
+                                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                            lock_fd.close()
+                        except Exception:
+                            pass
 
         from piper.voice import PiperVoice
         return PiperVoice.load(str(model_path))

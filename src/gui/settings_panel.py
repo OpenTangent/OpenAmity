@@ -1048,6 +1048,9 @@ class SettingsPanelWidget(QWidget):
             except Exception:
                 self.ui_qr_code.setPixmap(QPixmap())
                 self.ui_qr_code.setText("[Error Rendering QR]")
+        elif status == "downloading":
+            self.ui_qr_code.setPixmap(QPixmap())
+            self.ui_qr_code.setText("[Downloading WhatsApp\nBrowser Engine...]")
         elif status == "waiting":
             self.ui_qr_code.setPixmap(QPixmap())
             self.ui_qr_code.setText("[Waiting for QR...]")
@@ -1073,6 +1076,11 @@ class SettingsPanelWidget(QWidget):
         def _worker():
             try:
                 from core.whatsapp_daemon import WhatsAppDaemon
+                daemon = WhatsAppDaemon.get_instance(agent_id)
+                if daemon and getattr(daemon, "is_downloading_chrome", False):
+                    self.whatsapp_status_updated.emit("downloading", "")
+                    return
+
                 port = WhatsAppDaemon.get_port_for_agent(agent_id)
                 res = requests.get(f"http://localhost:{port}/status", timeout=1)
                 if res.status_code == 200:
@@ -1086,6 +1094,24 @@ class SettingsPanelWidget(QWidget):
                 else:
                     self.whatsapp_status_updated.emit("offline", "")
             except Exception:
+                # If the user just toggled WhatsApp on in the Social Accounts panel and the bridge
+                # hasn't been started yet, auto-start it via the agent's orchestrator so the QR code appears.
+                try:
+                    from core.whatsapp_daemon import WhatsAppDaemon
+                    if self.agent_manager and agent_id:
+                        orch = self.agent_manager.get_orchestrator(agent_id)
+                        if orch and hasattr(orch, "cerebrum") and "WhatsApp" not in orch.cerebrum.tools:
+                            if self.settings:
+                                self.settings.set("core.tools.whatsapp", True)
+                            orch.cerebrum.reload_skills()
+                            daemon = WhatsAppDaemon.get_instance(agent_id)
+                            if daemon and getattr(daemon, "is_downloading_chrome", False):
+                                self.whatsapp_status_updated.emit("downloading", "")
+                            else:
+                                self.whatsapp_status_updated.emit("waiting", "")
+                            return
+                except Exception:
+                    pass
                 self.whatsapp_status_updated.emit("offline", "")
             finally:
                 self._whatsapp_polling = False

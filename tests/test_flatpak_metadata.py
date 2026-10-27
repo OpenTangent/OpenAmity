@@ -200,10 +200,8 @@ def test_flatpak_manifest_json(repo_root):
     assert "--share=network" in finish_args
     assert "--socket=pulseaudio" in finish_args
     assert "--device=dri" in finish_args or "--device=all" in finish_args
-    assert "--filesystem=xdg-download" in finish_args
-    assert "--filesystem=xdg-documents" in finish_args
-    assert "--filesystem=xdg-pictures" in finish_args
-    assert "--filesystem=xdg-desktop" in finish_args
+    assert "--filesystem=home" in finish_args
+    assert "org.freedesktop.Sdk.Extension.node24" in manifest.get("sdk-extensions", [])
 
     # Check open_amity module installs desktop, metainfo, and icon
     modules = manifest.get("modules", [])

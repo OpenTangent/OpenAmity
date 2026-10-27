@@ -2,6 +2,7 @@ import sys
 import signal
 import os
 import logging
+import threading
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon, QFontDatabase, QFont
 from PySide6.QtCore import qInstallMessageHandler, QtMsgType
@@ -55,6 +56,9 @@ def _is_chroma_onnx_ready(base_dir: str) -> bool:
     return all(os.path.exists(os.path.join(extracted_dir, fname)) for fname in CHROMA_ONNX_FILES)
 
 
+_chroma_onnx_lock = threading.Lock()
+
+
 def _ensure_chroma_onnx_model(status_callback=None) -> bool:
     """Ensures the ChromaDB all-MiniLM-L6-v2 ONNX model is present and extracted in
     ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx, downloading it on first run
@@ -88,11 +92,16 @@ def _ensure_chroma_onnx_model(status_callback=None) -> bool:
     import hashlib
     import tarfile
     import requests
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
 
     os.makedirs(target_dir, exist_ok=True)
+    lock_file_path = os.path.join(target_dir, ".chroma_onnx.lock")
     archive_path = os.path.join(target_dir, "onnx.tar.gz")
     bundled_archive = "/app/share/chroma_onnx/all-MiniLM-L6-v2/onnx.tar.gz"
-    tmp_archive = os.path.join(target_dir, "onnx.tar.gz.tmp")
+    tmp_archive = os.path.join(target_dir, f"onnx.{os.getpid()}.{threading.get_ident()}.tar.gz.tmp")
 
     def _verify_sha256(filepath: str) -> bool:
         if not os.path.exists(filepath):
@@ -103,70 +112,87 @@ def _ensure_chroma_onnx_model(status_callback=None) -> bool:
                 sha.update(chunk)
         return sha.hexdigest() == CHROMA_ONNX_SHA256
 
-    try:
-        source_tar = None
-        if _verify_sha256(archive_path):
-            source_tar = archive_path
-        elif _verify_sha256(bundled_archive):
-            source_tar = bundled_archive
-        else:
-            logger.info("Downloading ChromaDB ONNX embedding model (all-MiniLM-L6-v2, ~79 MB)...")
-            with requests.get(CHROMA_ONNX_URL, stream=True, timeout=(10, 60)) as resp:
-                resp.raise_for_status()
-                total_bytes = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                last_reported_pct = -1
-                sha = hashlib.sha256()
-                with open(tmp_archive, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        sha.update(chunk)
-                        downloaded += len(chunk)
-                        if total_bytes > 0 and status_callback:
-                            pct = min(99, int((downloaded * 100) / total_bytes))
-                            if pct >= last_reported_pct + 5:
-                                last_reported_pct = pct
-                                try:
-                                    status_callback(f"Setting up local memory (one-time setup)... {pct}%")
-                                except Exception:
-                                    pass
+    with _chroma_onnx_lock:
+        lock_fd = None
+        try:
+            if fcntl is not None:
+                lock_fd = open(lock_file_path, "w")
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
 
-            if sha.hexdigest() != CHROMA_ONNX_SHA256:
-                logger.error(
-                    f"Chroma ONNX model SHA-256 mismatch: {sha.hexdigest()} != {CHROMA_ONNX_SHA256}"
-                )
-                if os.path.exists(tmp_archive):
+            if _is_chroma_onnx_ready(target_dir):
+                return True
+
+            source_tar = None
+            if _verify_sha256(archive_path):
+                source_tar = archive_path
+            elif _verify_sha256(bundled_archive):
+                source_tar = bundled_archive
+            else:
+                logger.info("Downloading ChromaDB ONNX embedding model (all-MiniLM-L6-v2, ~79 MB)...")
+                with requests.get(CHROMA_ONNX_URL, stream=True, timeout=(10, 60)) as resp:
+                    resp.raise_for_status()
+                    total_bytes = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    last_reported_pct = -1
+                    sha = hashlib.sha256()
+                    with open(tmp_archive, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            sha.update(chunk)
+                            downloaded += len(chunk)
+                            if total_bytes > 0 and status_callback:
+                                pct = min(99, int((downloaded * 100) / total_bytes))
+                                if pct >= last_reported_pct + 5:
+                                    last_reported_pct = pct
+                                    try:
+                                        status_callback(f"Setting up local memory (one-time setup)... {pct}%")
+                                    except Exception:
+                                        pass
+
+                if sha.hexdigest() != CHROMA_ONNX_SHA256:
+                    logger.error(
+                        f"Chroma ONNX model SHA-256 mismatch: {sha.hexdigest()} != {CHROMA_ONNX_SHA256}"
+                    )
+                    if os.path.exists(tmp_archive):
+                        os.remove(tmp_archive)
+                    return False
+                source_tar = tmp_archive
+
+            if status_callback:
+                try:
+                    status_callback("Extracting local memory model...")
+                except Exception:
+                    pass
+
+            with tarfile.open(source_tar, "r:gz") as tar:
+                tar.extractall(path=target_dir)
+
+            if os.path.exists(tmp_archive):
+                try:
                     os.remove(tmp_archive)
-                return False
-            source_tar = tmp_archive
+                except Exception:
+                    pass
 
-        if status_callback:
-            try:
-                status_callback("Extracting local memory model...")
-            except Exception:
-                pass
-
-        with tarfile.open(source_tar, "r:gz") as tar:
-            tar.extractall(path=target_dir)
-
-        if os.path.exists(tmp_archive):
-            try:
-                os.remove(tmp_archive)
-            except Exception:
-                pass
-
-        logger.info("ChromaDB ONNX embedding model ready.")
-        return _is_chroma_onnx_ready(target_dir)
-    except Exception as e:
-        logger.warning(f"Could not pre-setup ChromaDB ONNX model: {e}")
-        if os.path.exists(tmp_archive):
-            try:
-                os.remove(tmp_archive)
-            except Exception:
-                pass
-        return False
+            logger.info("ChromaDB ONNX embedding model ready.")
+            return _is_chroma_onnx_ready(target_dir)
+        except Exception as e:
+            logger.warning(f"Could not pre-setup ChromaDB ONNX model: {e}")
+            if os.path.exists(tmp_archive):
+                try:
+                    os.remove(tmp_archive)
+                except Exception:
+                    pass
+            return False
+        finally:
+            if lock_fd is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                    lock_fd.close()
+                except Exception:
+                    pass
 
 
 def main():

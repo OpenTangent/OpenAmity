@@ -239,6 +239,7 @@ class BrowserManager:
     Central thread-safe manager controlling Camoufox stealth browser instances
     via a dedicated persistent asyncio event loop thread.
     """
+    _camoufox_download_lock = threading.Lock()
 
     def __init__(self, orchestrator=None):
         self.orchestrator = orchestrator
@@ -465,46 +466,71 @@ class BrowserManager:
 
         exec_path = self._resolve_executable_path()
         if not exec_path and not self._is_camoufox_available():
-            logger.info("BrowserManager: Camoufox browser engine not installed. Initiating one-time download...")
-            if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
-                try:
-                    self.orchestrator.on_message_appended.emit(
-                        "System", "[System: Downloading stealth browser engine (one-time setup)...]"
-                    )
-                except Exception as e:
-                    logger.debug(f"Could not emit download notice: {e}")
-
             try:
-                from camoufox.pkgman import camoufox_path
-                active_dir = camoufox_path(download_if_missing=True)
-                # Prune non-Linux fonts (saving 891 MB in user home)
-                if active_dir and os.path.exists(active_dir):
-                    import shutil
-                    for extra in ["macos", "windows"]:
-                        fpath = os.path.join(active_dir, "fonts", extra)
-                        if os.path.exists(fpath):
+                import fcntl
+            except ImportError:
+                fcntl = None
+
+            cache_dir = paths.get_app_cache_dir()
+            os.makedirs(cache_dir, exist_ok=True)
+            lock_path = os.path.join(cache_dir, ".camoufox_download.lock")
+
+            with BrowserManager._camoufox_download_lock:
+                lock_fd = None
+                try:
+                    if fcntl is not None:
+                        lock_fd = open(lock_path, "w")
+                        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+
+                    if not self._is_camoufox_available():
+                        logger.info("BrowserManager: Camoufox browser engine not installed. Initiating one-time download...")
+                        if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
                             try:
-                                shutil.rmtree(fpath, ignore_errors=True)
-                            except Exception:
-                                pass
-                self._did_first_time_download = True
-                if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
-                    try:
-                        self.orchestrator.on_message_appended.emit(
-                            "System", "[System: Stealth browser engine ready.]"
-                        )
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.error(f"BrowserManager: Failed to download Camoufox: {e}")
-                if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
-                    try:
-                        self.orchestrator.on_message_appended.emit(
-                            "System", f"[System: Failed to download stealth browser engine: {e}]"
-                        )
-                    except Exception:
-                        pass
-                raise
+                                self.orchestrator.on_message_appended.emit(
+                                    "System", "[System: Downloading stealth browser engine (one-time setup)...]"
+                                )
+                            except Exception as e:
+                                logger.debug(f"Could not emit download notice: {e}")
+
+                        try:
+                            from camoufox.pkgman import camoufox_path
+                            active_dir = camoufox_path(download_if_missing=True)
+                            # Prune non-Linux fonts (saving 891 MB in user home)
+                            if active_dir and os.path.exists(active_dir):
+                                import shutil
+                                for extra in ["macos", "windows"]:
+                                    fpath = os.path.join(active_dir, "fonts", extra)
+                                    if os.path.exists(fpath):
+                                        try:
+                                            shutil.rmtree(fpath, ignore_errors=True)
+                                        except Exception:
+                                            pass
+                            self._did_first_time_download = True
+                            if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                                try:
+                                    self.orchestrator.on_message_appended.emit(
+                                        "System", "[System: Stealth browser engine ready.]"
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.error(f"BrowserManager: Failed to download Camoufox: {e}")
+                            if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                                try:
+                                    self.orchestrator.on_message_appended.emit(
+                                        "System", f"[System: Failed to download stealth browser engine: {e}]"
+                                    )
+                                except Exception:
+                                    pass
+                            raise
+                finally:
+                    if lock_fd is not None:
+                        try:
+                            if fcntl is not None:
+                                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                            lock_fd.close()
+                        except Exception:
+                            pass
 
         viewport_w = int(self._get_setting("default-viewport-width", 1280))
         viewport_h = int(self._get_setting("default-viewport-height", 800))

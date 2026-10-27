@@ -11,9 +11,9 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 | Component / Subsystem | Unoptimized | Optimized | Saved | Mechanism & Reason |
 | :--- | :---: | :---: | :---: | :--- |
 | **Camoufox Browser & Fonts** | 1,200 MB | 0 MB (in Flatpak)<br>~310 MB (in user cache) | **1,200 MB in Flatpak**<br>*(+ 891 MB in user cache)* | Camoufox bundle contained 933 MB of fonts (`fonts/macos` 569 MB, `fonts/windows` 322 MB) for spoofing non-Linux User-Agents. We pinned `os="linux"` in `BrowserManager`, moved Camoufox to an on-demand download via `CamoufoxFetcher`, and automatically prune `fonts/macos` and `fonts/windows` after extraction. |
-| **`io.qt.PySide.BaseApp` Runtime Cleanup** | 522 MB | 0 MB | **522 MB** | BaseApp bundled unneeded `QtWebEngine` (200 MB), `libLLVM` (92 MB), `libclang` (58 MB), `translations` (44 MB), `PyOpenGL` (31 MB), `libexec/webenginedriver` (23 MB), and unused Qt 3D/Charts/Graphs/Quick bindings and `.pyi` stubs. Pruned via `BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh` and explicit cleanup commands. |
+| **`io.qt.PySide.BaseApp` Runtime Cleanup** | 522 MB | 0 MB | **522 MB** | BaseApp bundled unneeded `QtWebEngine` (200 MB), `translations` (44 MB), `PyOpenGL` (31 MB), `libexec/webenginedriver` (23 MB), and unused Qt 3D/Charts/Graphs/Quick bindings and `.pyi` stubs. Pruned via `BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh` and explicit cleanup commands. |
 | **Puppeteer Chromium** | 350 MB | 0 MB (in Flatpak)<br>~285 MB (in user cache) | **350 MB in Flatpak**<br>*(+ 66 MB in user cache)* | Full Chrome for Testing was bundled statically for WhatsApp. Since WhatsApp is disabled by default, Chrome is now downloaded on demand asynchronously into `~/.cache/puppeteer` only when WhatsApp is enabled, and stripped of `WidevineCdm/` (18 MB) and 55+ unused locales (48 MB). |
-| **Playwright Node.js Deduplication** | 168 MB | 0 MB | **168 MB** | The `playwright` Python wheel bundled its own duplicate 118 MB `node` binary at `site-packages/playwright/driver/node`. We symlinked this driver to `/app/bin/node`, stripped `/app/bin/node` (saving 23 MB), and removed build-time `npm` (18 MB) and C++ headers (11 MB). |
+| **Playwright Node.js Deduplication** | 168 MB | 0 MB | **168 MB** | The `playwright` Python wheel bundled its own duplicate 118 MB `node` binary at `site-packages/playwright/driver/node`. We use Flathub's `org.freedesktop.Sdk.Extension.node24` (`/usr/lib/sdk/node24/install.sh`) which builds a stripped `node` binary linked against runtime OpenSSL/zlib/ICU, omits `npm` and C++ headers from `/app`, and symlinks `playwright/driver/node` to `/app/bin/node`. |
 | **Unused `google-antigravity` & `kubernetes`** | 197 MB | 0 MB | **197 MB** | `google-antigravity` (115 MB) was never imported by `src/` (AgyWorker calls the host `agy` CLI). `kubernetes` (82 MB) was an optional distributed cluster dependency in ChromaDB never used by local `PersistentClient`. Both removed. |
 | **`PyAV` (`av` + `av.libs`) Audio Decoding** | 104 MB | 0 MB | **104 MB** | `faster-whisper` pulled in `PyAV` (104 MB) including video encoders (`libx265`, `libx264`, `libvpx`, `libSvtAv1Enc`). We replaced PyAV with `/usr/bin/ffmpeg` (already in the KDE Platform runtime) to decode audio directly into a NumPy float32 array, stubbed `sys.modules["av"]` in `LocalSTT` so `faster_whisper.audio` imports cleanly, and removed `av` and `av.libs`. |
 | **ChromaDB ONNX Model Bundle** | 80 MB | 0 MB | **80 MB in Flatpak**<br>*(+ 80 MB duplicate copy)* | Static `onnx.tar.gz` removed from Flatpak. `InitWorker` downloads, verifies (SHA-256), and extracts `all-MiniLM-L6-v2` into persistent XDG cache (`~/.cache/chroma` symlinked to `$XDG_CACHE_HOME`) on first launch with live splash screen progress. |
@@ -34,7 +34,6 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 - **Location**: `compile/com.openamity.OpenAmity.json` (`post-install`)
 - **Behavior**:
   - `BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh` removes `QtWebEngineCore`, `QtPdf`, `QtWebView`, `qtwebengine_dictionaries`, and associated locales.
-  - `rm -rf /app/lib/libLLVM* /app/lib/libclang*` removes LLVM/Clang build artifacts.
   - `rm -rf /app/lib/python*/site-packages/OpenGL*` removes PyOpenGL.
   - We remove unused PySide6 modules: `Qt3D*`, `QtQuick*`, `QtQml*`, `QtPdf*`, `QtSensors*`, `QtPositioning*`.
   - **Preserved**: `QtCore`, `QtGui`, `QtWidgets`, `QtMultimedia`, and `QtSvg` (required for Open Amity GUI and SVG icons).
@@ -51,7 +50,7 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 ### 2.4 Node.js & Playwright Driver Deduplication
 - **Location**: `compile/com.openamity.OpenAmity.json`
 - **Behavior**:
-  - Strips debug symbols: `strip /app/bin/node`.
+  - Uses `org.freedesktop.Sdk.Extension.node24` (`/usr/lib/sdk/node24/install.sh` + `ln -sf /app/node/bin/node /app/bin/node`) which provides a stripped, shared-library-linked `node` binary for both `x86_64` and `aarch64` without bundling `npm` or C++ headers into `/app`.
   - Symlinks Playwright's bundled node binary:
     `ln -sf /app/bin/node /app/lib/python3.*/site-packages/playwright/driver/node`
 

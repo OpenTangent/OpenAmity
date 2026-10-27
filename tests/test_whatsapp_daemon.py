@@ -315,3 +315,99 @@ def test_whatsapp_daemon_parse_message_line():
     assert events[1][2]["mentioned"] is False
 
 
+def test_whatsapp_daemon_dangling_singleton_lock_cleanup(temp_agent_environment):
+    daemon = WhatsAppDaemon(agent_id="agent-lock-test")
+    session_dir = os.path.join(daemon.data_dir, ".wpp_session")
+    os.makedirs(session_dir, exist_ok=True)
+
+    lock_names = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+    for name in lock_names:
+        lock_path = os.path.join(session_dir, name)
+        # Create a dangling symlink (just like Chromium does on Linux: SingletonLock -> hostname-pid)
+        os.symlink("bwrap-host-99999", lock_path)
+        assert not os.path.exists(lock_path)
+        assert os.path.lexists(lock_path)
+
+    daemon._kill_orphaned_daemon()
+
+    for name in lock_names:
+        lock_path = os.path.join(session_dir, name)
+        assert not os.path.lexists(lock_path), f"Dangling symlink {name} was not removed"
+
+
+def test_whatsapp_daemon_concurrent_chrome_download_deduplication(temp_agent_environment, monkeypatch):
+    import io
+    import hashlib
+    import zipfile
+    import threading
+
+    cache_root = os.path.join(temp_agent_environment, "cache")
+    monkeypatch.setattr("config.paths.get_app_cache_dir", lambda: cache_root)
+
+    # Build an in-memory zip matching chrome-linux64 layout
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("chrome-linux64/chrome", "#!/bin/sh\nexit 0\n")
+        zf.writestr("chrome-linux64/chrome_crashpad_handler", "#!/bin/sh\nexit 0\n")
+        zf.writestr("chrome-linux64/libEGL.so", "dummy-so")
+        zf.writestr("chrome-linux64/locales/en-US.pak", "en")
+        zf.writestr("chrome-linux64/locales/fr.pak", "fr")
+    zip_bytes = zip_buf.getvalue()
+    actual_sha = hashlib.sha256(zip_bytes).hexdigest()
+
+    d1 = WhatsAppDaemon(agent_id="agent-dl-1")
+    d2 = WhatsAppDaemon(agent_id="agent-dl-2")
+    d3 = WhatsAppDaemon(agent_id="agent-dl-3")
+
+    # Isolated search dir so host ~/.cache/puppeteer is not matched
+    for d in (d1, d2, d3):
+        monkeypatch.setattr(d, "_get_chrome_search_dirs", lambda: [os.path.join(cache_root, "puppeteer")])
+
+    download_count = 0
+    count_lock = threading.Lock()
+
+    class FakeStreamResponse:
+        status_code = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def raise_for_status(self):
+            pass
+        def iter_content(self, chunk_size=65536):
+            yield zip_bytes
+
+    def fake_get(url, *args, **kwargs):
+        nonlocal download_count
+        with count_lock:
+            download_count += 1
+        return FakeStreamResponse()
+
+    # Patch expected_sha indirectly by patching hashlib.sha256 so the digest matches
+    real_sha256 = hashlib.sha256
+    class MatchingSha:
+        def update(self, data):
+            pass
+        def hexdigest(self):
+            return "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8"
+
+    results = []
+    with patch("requests.get", side_effect=fake_get), \
+         patch("hashlib.sha256", return_value=MatchingSha()):
+        threads = [
+            threading.Thread(target=lambda dm=dm: results.append(dm._download_and_extract_chrome()))
+            for dm in (d1, d2, d3)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+    assert results == [True, True, True]
+    assert download_count == 1, f"Expected exactly 1 download across 3 concurrent agents, got {download_count}"
+    chrome_bin = d1._find_chrome_executable()
+    assert chrome_bin is not None and os.access(chrome_bin, os.X_OK)
+    assert not os.path.exists(os.path.join(cache_root, "puppeteer", "chrome-linux64", "locales", "fr.pak"))
+    assert os.path.exists(os.path.join(cache_root, "puppeteer", "chrome-linux64", "locales", "en-US.pak"))
+
+

@@ -2,6 +2,7 @@ import os
 import sys
 import types
 import logging
+import threading
 import subprocess
 import numpy as np
 
@@ -33,50 +34,79 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 class LocalSTT:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(LocalSTT, cls).__new__(cls)
-            cls._instance.model = None
-            cls._instance.initial_prompt = "This recording explores the local colour and how we organise our town centres. It involves travelling and analysing behaviour."
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(LocalSTT, cls).__new__(cls)
+                    cls._instance.model = None
+                    cls._instance.initial_prompt = "This recording explores the local colour and how we organise our town centres. It involves travelling and analysing behaviour."
         return cls._instance
 
     def _get_model(self, status_callback=None):
-        if self.model is None:
-            if WhisperModel is None:
-                raise RuntimeError("faster-whisper is not available in this environment.")
+        if self.model is not None:
+            return self.model
 
-            from config import paths
-            candidate_caches = [
-                os.path.join(paths.get_app_cache_dir(), "huggingface", "hub"),
-                os.path.expanduser("~/.cache/huggingface/hub"),
-            ]
-            has_cache = False
-            for hf_cache in candidate_caches:
-                if os.path.exists(hf_cache):
-                    try:
-                        for item in os.listdir(hf_cache):
-                            if "tiny.en" in item or "whisper-tiny.en" in item:
-                                has_cache = True
-                                break
-                    except Exception:
-                        pass
-                if has_cache:
-                    break
+        with self._lock:
+            if self.model is None:
+                if WhisperModel is None:
+                    raise RuntimeError("faster-whisper is not available in this environment.")
 
-            if not has_cache:
-                logging.info("Downloading faster-whisper (tiny.en) model for the first time...")
-                if status_callback:
-                    try:
-                        status_callback("[System: Downloading local speech recognition model (one-time setup)...]")
-                    except Exception:
-                        pass
-            else:
-                logging.info("Initializing faster-whisper (tiny.en) from cache...")
+                from config import paths
+                try:
+                    import fcntl
+                except ImportError:
+                    fcntl = None
 
-            self.model = WhisperModel(
-                "tiny.en", device="cpu", compute_type="int8")
-            logging.info("faster-whisper loaded.")
+                cache_root = paths.get_app_cache_dir()
+                os.makedirs(cache_root, exist_ok=True)
+                lock_path = os.path.join(cache_root, ".whisper_download.lock")
+                lock_fd = None
+                try:
+                    if fcntl is not None:
+                        lock_fd = open(lock_path, "w")
+                        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+
+                    candidate_caches = [
+                        os.path.join(cache_root, "huggingface", "hub"),
+                        os.path.expanduser("~/.cache/huggingface/hub"),
+                    ]
+                    has_cache = False
+                    for hf_cache in candidate_caches:
+                        if os.path.exists(hf_cache):
+                            try:
+                                for item in os.listdir(hf_cache):
+                                    if "tiny.en" in item or "whisper-tiny.en" in item:
+                                        has_cache = True
+                                        break
+                            except Exception:
+                                pass
+                        if has_cache:
+                            break
+
+                    if not has_cache:
+                        logging.info("Downloading faster-whisper (tiny.en) model for the first time...")
+                        if status_callback:
+                            try:
+                                status_callback("[System: Downloading local speech recognition model (one-time setup)...]")
+                            except Exception:
+                                pass
+                    else:
+                        logging.info("Initializing faster-whisper (tiny.en) from cache...")
+
+                    self.model = WhisperModel(
+                        "tiny.en", device="cpu", compute_type="int8")
+                    logging.info("faster-whisper loaded.")
+                finally:
+                    if lock_fd is not None:
+                        try:
+                            if fcntl is not None:
+                                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                            lock_fd.close()
+                        except Exception:
+                            pass
         return self.model
 
     @staticmethod
