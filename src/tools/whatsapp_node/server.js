@@ -141,6 +141,7 @@ function ensureExecutablePermissions(targetDir) {
 function findChromeExecutable() {
     const candidateDirs = [
         process.env.PUPPETEER_CACHE_DIR,
+        process.env.XDG_CACHE_HOME ? path.join(process.env.XDG_CACHE_HOME, 'puppeteer') : null,
         path.join(process.env.HOME || '', '.cache', 'puppeteer'),
         '/app/share/puppeteer',
         '/usr/bin',

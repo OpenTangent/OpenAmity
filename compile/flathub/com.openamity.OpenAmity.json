@@ -71,7 +71,7 @@
                 "rm -rf /app/lib/python3.*/site-packages/PySide6/QtQuick* /app/lib/python3.*/site-packages/PySide6/QtQml* /app/lib/python3.*/site-packages/PySide6/Qt3D* /app/lib/python3.*/site-packages/PySide6/QtPdf* /app/lib/python3.*/site-packages/PySide6/QtSensors* /app/lib/python3.*/site-packages/PySide6/QtPositioning*",
                 "rm -rf /app/lib/python3.*/site-packages/kubernetes* /app/lib/python3.*/site-packages/google_antigravity*",
                 "rm -rf /app/lib/python3.*/site-packages/av* /app/lib/python3.*/site-packages/av.libs",
-                "rm -rf /app/lib/python3.*/site-packages/piper/train /app/lib/python3.*/site-packages/piper/hebrew* /app/lib/python3.*/site-packages/piper/tashkeel*",
+                "rm -rf /app/lib/python3.*/site-packages/piper/train /app/lib/python3.*/site-packages/piper/hebrew/*.onnx /app/lib/python3.*/site-packages/piper/tashkeel/*.onnx",
                 "ln -sf /app/bin/node /app/lib/python3.*/site-packages/playwright/driver/node 2>/dev/null || true",
                 "strip /app/bin/node 2>/dev/null || true",
                 "rm -rf /app/src/assets/screenshots /app/src/assets/fonts/Inter-*.ttf",
@@ -82,7 +82,7 @@
                     "type": "git",
                     "url": "https://github.com/OpenTangent/OpenAmity.git",
                     "tag": "v0.3.5",
-                    "commit": "5b4f62b8d1a52f2553fa16a605036ff9b3fbe612"
+                    "commit": "40613118edaf6edd389be0909b9504bbdd854864"
                 },
                 "node-sources.json"
             ]

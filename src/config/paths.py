@@ -7,6 +7,38 @@ def get_app_data_dir() -> str:
     return os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.var/app/com.openamity.OpenAmity/data"))
 
 
+def get_app_cache_dir() -> str:
+    """Returns the writable XDG cache directory for Open Amity"""
+    return os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+
+
+def ensure_flatpak_persistence_links() -> None:
+    """When running inside a Flatpak sandbox where $HOME is an ephemeral tmpfs,
+    ensures ~/.cache and ~/.local/share symlink to the persistent XDG_CACHE_HOME
+    and XDG_DATA_HOME directories so libraries that hardcode Path.home() / '.cache'
+    (such as ChromaDB ONNXMiniLM_L6_V2 and Puppeteer) persist across restarts."""
+    if not os.environ.get("FLATPAK_ID"):
+        return
+    try:
+        xdg_cache = os.environ.get("XDG_CACHE_HOME")
+        home_cache = os.path.expanduser("~/.cache")
+        if xdg_cache:
+            os.makedirs(xdg_cache, exist_ok=True)
+            if not os.path.exists(home_cache) and not os.path.islink(home_cache):
+                os.symlink(xdg_cache, home_cache)
+
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        home_local_share = os.path.expanduser("~/.local/share")
+        if xdg_data:
+            os.makedirs(xdg_data, exist_ok=True)
+            if not os.path.exists(home_local_share) and not os.path.islink(home_local_share):
+                os.makedirs(os.path.dirname(home_local_share), exist_ok=True)
+                os.symlink(xdg_data, home_local_share)
+    except Exception as e:
+        import logging
+        logging.getLogger("config.paths").warning(f"Failed to set up Flatpak persistence links: {e}")
+
+
 def get_agent_data_dir(agent_id: str) -> str:
     """Returns the writable data directory for a specific agent"""
     return os.path.join(get_app_data_dir(), "agents", agent_id)

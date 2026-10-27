@@ -260,6 +260,7 @@ class BrowserManager:
         self._idle_timer: Optional[threading.Timer] = None
         self._last_download_path: Optional[str] = None
         self._current_mouse_pos = (100, 100)
+        self._did_first_time_download = False
 
         # Register orchestrator pause signal listener if available
         if self.orchestrator and hasattr(self.orchestrator, "on_pause"):
@@ -327,8 +328,6 @@ class BrowserManager:
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
-
-        self._did_first_time_download = False
 
     def _is_camoufox_available(self) -> bool:
         if self._resolve_executable_path():

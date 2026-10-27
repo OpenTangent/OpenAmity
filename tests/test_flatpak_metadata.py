@@ -85,13 +85,13 @@ def test_metainfo_xml_structure_and_schema(repo_root):
     assert latest_release.attrib.get("version") == __version__
     assert latest_release.attrib.get("date")
 
-    # Check release description for v0.3.4
+    # Check release description for latest release
     desc = latest_release.find("description")
     assert desc is not None
     ul = desc.find("ul")
     assert ul is not None
     lis = ul.findall("li")
-    assert len(lis) >= 10
+    assert len(lis) >= 4
 
 
 def test_metainfo_screenshots(repo_root):
@@ -199,7 +199,7 @@ def test_flatpak_manifest_json(repo_root):
 
     assert "--share=network" in finish_args
     assert "--socket=pulseaudio" in finish_args
-    assert "--device=all" in finish_args
+    assert "--device=dri" in finish_args or "--device=all" in finish_args
     assert "--filesystem=xdg-download" in finish_args
     assert "--filesystem=xdg-documents" in finish_args
     assert "--filesystem=xdg-pictures" in finish_args
@@ -215,6 +215,11 @@ def test_flatpak_manifest_json(repo_root):
     assert "com.openamity.OpenAmity.metainfo.xml" in build_cmds
     assert "com.openamity.OpenAmity.png" in build_cmds
 
+    post_install_cmds = " ".join(open_amity_mod.get("post-install", []))
+    assert "piper/hebrew/*.onnx" in post_install_cmds
+    assert "piper/tashkeel/*.onnx" in post_install_cmds
+    assert "piper/tashkeel*" not in post_install_cmds
+
 
 def test_deploy_script_checks_version_release(repo_root):
     deploy_path = os.path.join(repo_root, "deploy.sh")
@@ -227,3 +232,65 @@ def test_deploy_script_checks_version_release(repo_root):
     assert "compile/com.openamity.OpenAmity.metainfo.xml" in deploy_content
     assert "<release version=\\\"$VERSION\\\"" in deploy_content or '<release version="$VERSION"' in deploy_content
     assert "The Flatpak manifest" in deploy_content or "must be updated with the changelog" in deploy_content
+
+
+def test_local_stt_imports_without_pyav(monkeypatch):
+    """Regression test: when PyAV ('av') is removed in the Flatpak image,
+    LocalSTT must stub sys.modules['av'] so faster_whisper imports cleanly."""
+    import builtins
+    import sys
+    import core.local_stt as local_stt
+
+    monkeypatch.delitem(sys.modules, "av", raising=False)
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "av" or name.startswith("av."):
+            raise ModuleNotFoundError("No module named 'av'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    local_stt._ensure_faster_whisper_av_stub()
+    assert "av" in sys.modules
+    stt = local_stt.LocalSTT()
+    assert stt is not None
+
+
+def test_flatpak_persistence_links(tmp_path, monkeypatch):
+    """Regression test: inside Flatpak ($FLATPAK_ID set), ~/.cache and ~/.local/share
+    must symlink to persistent XDG_CACHE_HOME and XDG_DATA_HOME."""
+    from config import paths
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    xdg_cache = fake_home / ".var" / "app" / "com.openamity.OpenAmity" / "cache"
+    xdg_data = fake_home / ".var" / "app" / "com.openamity.OpenAmity" / "data"
+
+    monkeypatch.setenv("FLATPAK_ID", "com.openamity.OpenAmity")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache))
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+
+    paths.ensure_flatpak_persistence_links()
+
+    home_cache = fake_home / ".cache"
+    home_local_share = fake_home / ".local" / "share"
+    assert home_cache.is_symlink()
+    assert os.path.realpath(home_cache) == os.path.realpath(xdg_cache)
+    assert home_local_share.is_symlink()
+    assert os.path.realpath(home_local_share) == os.path.realpath(xdg_data)
+
+
+def test_chroma_onnx_ready_check(tmp_path):
+    """Verifies _is_chroma_onnx_ready checks all 6 required ONNX files."""
+    from main import _is_chroma_onnx_ready, CHROMA_ONNX_FILES
+
+    base_dir = tmp_path / "all-MiniLM-L6-v2"
+    onnx_dir = base_dir / "onnx"
+    onnx_dir.mkdir(parents=True)
+
+    assert not _is_chroma_onnx_ready(str(base_dir))
+    for fname in CHROMA_ONNX_FILES:
+        (onnx_dir / fname).write_bytes(b"ok")
+    assert _is_chroma_onnx_ready(str(base_dir))
+

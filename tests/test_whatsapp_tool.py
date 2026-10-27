@@ -29,6 +29,7 @@ def mock_whatsapp_tool():
         daemon_instance = MagicMock()
         daemon_instance.base_url = "http://127.0.0.1:3000"
         daemon_instance.data_dir = "/tmp/dummy_wa_data"
+        daemon_instance.is_downloading_chrome = False
         mock_daemon_cls.return_value = daemon_instance
 
         with patch("requests.get", return_value=mock_status_resp):
@@ -593,4 +594,195 @@ def test_whatsapp_unread_with_multi_contact_cards(mock_whatsapp_tool):
         assert isinstance(res, str)
         assert "[Contact Cards (2): 1. Name: Alice | Phone: +111 | WhatsApp ID: 111@c.us ; 2. Name: Bob | Phone: +222 | WhatsApp ID: 222@c.us]" in res
         assert "WhatsApp_send_contact" in res
+
+
+def test_whatsapp_unread_includes_timestamp(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    # Epoch timestamp: 1729864238
+    raw_ts = 1729864238
+    expected_ts = WhatsAppSkill._format_timestamp(raw_ts)
+
+    mock_unread_resp = MagicMock()
+    mock_unread_resp.json.return_value = {
+        "unread": [
+            {
+                "id": "msg_ts_001",
+                "chatId": "123456789@c.us",
+                "chatName": "Alice",
+                "senderName": "Alice",
+                "senderNumber": "123456789",
+                "content": "Checking in on the project!",
+                "type": "chat",
+                "hasMedia": False,
+                "timestamp": raw_ts
+            }
+        ]
+    }
+
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        elif url.endswith("/unread"):
+            return mock_unread_resp
+        return MagicMock()
+
+    with patch("requests.get", side_effect=fake_get):
+        res = tool.execute("unread")
+        assert isinstance(res, str)
+        assert f"[TIMESTAMP: {expected_ts}]" in res
+        assert f"- [CHANNEL: WHATSAPP_DM] [SOURCE_ID: 123456789@c.us] [Alice] [TIMESTAMP: {expected_ts}] Alice (+123456789): Checking in on the project! (MsgID: msg_ts_001)" in res
+
+
+def test_whatsapp_recent_includes_timestamp(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    raw_ts = 1729864238
+    expected_ts = WhatsAppSkill._format_timestamp(raw_ts)
+
+    mock_recent_resp = MagicMock()
+    mock_recent_resp.json.return_value = {
+        "messages": [
+            {
+                "id": "msg_recent_001",
+                "chatId": "group123@g.us",
+                "chatName": "Developers",
+                "senderName": "Bob",
+                "senderNumber": "987654321",
+                "content": "PR is ready for review",
+                "type": "chat",
+                "hasMedia": False,
+                "timestamp": raw_ts
+            }
+        ]
+    }
+
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        elif "/recent" in url:
+            return mock_recent_resp
+        return MagicMock()
+
+    with patch("requests.get", side_effect=fake_get):
+        res = tool.execute("recent", n=10)
+        assert isinstance(res, str)
+        assert f"[TIMESTAMP: {expected_ts}]" in res
+        assert f"- [CHANNEL: WHATSAPP_GROUP] [SOURCE_ID: group123@g.us] [Developers] [TIMESTAMP: {expected_ts}] Bob (+987654321): PR is ready for review (MsgID: msg_recent_001)" in res
+
+
+def test_whatsapp_recent_chat_includes_timestamp(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    raw_ts = 1729864238
+    expected_ts = WhatsAppSkill._format_timestamp(raw_ts)
+
+    mock_recent_resp = MagicMock()
+    mock_recent_resp.json.return_value = {
+        "messages": [
+            {
+                "id": "msg_chat_001",
+                "chatId": "alice@c.us",
+                "chatName": "Alice",
+                "senderName": "Alice",
+                "senderNumber": "111222333",
+                "content": "Hey there!",
+                "type": "chat",
+                "hasMedia": False,
+                "timestamp": raw_ts
+            }
+        ]
+    }
+
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        elif "/recent" in url:
+            return mock_recent_resp
+        return MagicMock()
+
+    with patch("requests.get", side_effect=fake_get):
+        res = tool.execute("recent_chat", target="Alice", n=5)
+        assert isinstance(res, str)
+        assert f"[TIMESTAMP: {expected_ts}]" in res
+        assert f"- [CHANNEL: WHATSAPP_DM] [SOURCE_ID: alice@c.us] [Alice] [TIMESTAMP: {expected_ts}] Alice (+111222333): Hey there! (MsgID: msg_chat_001)" in res
+
+
+def test_whatsapp_message_missing_timestamp_always_included(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    mock_unread_resp = MagicMock()
+    mock_unread_resp.json.return_value = {
+        "unread": [
+            {
+                "id": "msg_no_ts",
+                "chatId": "user123@c.us",
+                "chatName": "Charlie",
+                "senderName": "Charlie",
+                "senderNumber": "444555666",
+                "content": "Message without timestamp field",
+                "type": "chat",
+                "hasMedia": False
+                # Notice: no timestamp or t field
+            }
+        ]
+    }
+
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        elif url.endswith("/unread"):
+            return mock_unread_resp
+        return MagicMock()
+
+    with patch("requests.get", side_effect=fake_get):
+        res = tool.execute("unread")
+        assert isinstance(res, str)
+        assert "[TIMESTAMP: " in res
+        assert "Charlie (+444555666): Message without timestamp field (MsgID: msg_no_ts)" in res
+
+
+def test_whatsapp_format_timestamp_varieties():
+    # 1. POSIX timestamp in seconds (int and float)
+    res_int = WhatsAppSkill._format_timestamp(1729864238)
+    assert len(res_int) == 19
+    assert res_int[4] == "-" and res_int[7] == "-" and res_int[10] == " " and res_int[13] == ":"
+
+    res_float = WhatsAppSkill._format_timestamp(1729864238.0)
+    assert res_float == res_int
+
+    # 2. POSIX timestamp in milliseconds (> 1e11)
+    res_ms = WhatsAppSkill._format_timestamp(1729864238000)
+    assert res_ms == res_int
+
+    # 3. Numeric string
+    res_str = WhatsAppSkill._format_timestamp("1729864238")
+    assert res_str == res_int
+
+    # 4. ISO 8601 string
+    res_iso = WhatsAppSkill._format_timestamp("2026-10-25T15:50:38+00:00")
+    assert len(res_iso) == 19
+    assert res_iso[4] == "-" and res_iso[7] == "-" and res_iso[10] == " "
+
+    # 5. datetime object
+    from datetime import datetime, timezone
+    now_dt = datetime.now(timezone.utc)
+    res_dt = WhatsAppSkill._format_timestamp(now_dt)
+    assert len(res_dt) == 19
+
+    # 6. Fallback cases (None, empty, negative, invalid text, overflow)
+    for invalid in [None, "", "   ", -100, "invalid-timestamp", 1e30]:
+        res_fb = WhatsAppSkill._format_timestamp(invalid)
+        assert isinstance(res_fb, str)
+        assert len(res_fb) == 19
+        assert res_fb[4] == "-" and res_fb[7] == "-" and res_fb[10] == " " and res_fb[13] == ":"
+
 

@@ -355,7 +355,9 @@ def synthesize_voice_sample(api_key: str, voice_name: str, style: str = "", text
 def load_piper_voice(settings=None, status_callback=None):
     """Loads and returns the configured PiperVoice instance, downloading files if necessary."""
     try:
-        piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
+        from config import paths
+        piper_dir = Path(paths.get_app_data_dir()) / "piper_voices"
+        legacy_piper_dir = Path.home() / ".local" / "share" / "Open Amity" / "piper_voices"
         piper_dir.mkdir(parents=True, exist_ok=True)
 
         voice_name = "en_GB-cori-high"
@@ -383,6 +385,11 @@ def load_piper_voice(settings=None, status_callback=None):
 
         model_path = piper_dir / f"{voice_name}.onnx"
         config_path = piper_dir / f"{voice_name}.onnx.json"
+        legacy_model_path = legacy_piper_dir / f"{voice_name}.onnx"
+        legacy_config_path = legacy_piper_dir / f"{voice_name}.onnx.json"
+        if (not model_path.exists() or not config_path.exists()) and legacy_model_path.exists() and legacy_config_path.exists():
+            model_path = legacy_model_path
+            config_path = legacy_config_path
 
         if not model_path.exists() or not config_path.exists():
             if status_callback:

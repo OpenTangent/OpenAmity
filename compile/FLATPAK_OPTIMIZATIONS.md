@@ -15,9 +15,9 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 | **Puppeteer Chromium** | 350 MB | 0 MB (in Flatpak)<br>~285 MB (in user cache) | **350 MB in Flatpak**<br>*(+ 66 MB in user cache)* | Full Chrome for Testing was bundled statically for WhatsApp. Since WhatsApp is disabled by default, Chrome is now downloaded on demand asynchronously into `~/.cache/puppeteer` only when WhatsApp is enabled, and stripped of `WidevineCdm/` (18 MB) and 55+ unused locales (48 MB). |
 | **Playwright Node.js Deduplication** | 168 MB | 0 MB | **168 MB** | The `playwright` Python wheel bundled its own duplicate 118 MB `node` binary at `site-packages/playwright/driver/node`. We symlinked this driver to `/app/bin/node`, stripped `/app/bin/node` (saving 23 MB), and removed build-time `npm` (18 MB) and C++ headers (11 MB). |
 | **Unused `google-antigravity` & `kubernetes`** | 197 MB | 0 MB | **197 MB** | `google-antigravity` (115 MB) was never imported by `src/` (AgyWorker calls the host `agy` CLI). `kubernetes` (82 MB) was an optional distributed cluster dependency in ChromaDB never used by local `PersistentClient`. Both removed. |
-| **`PyAV` (`av` + `av.libs`) Audio Decoding** | 104 MB | 0 MB | **104 MB** | `faster-whisper` pulled in `PyAV` (104 MB) including video encoders (`libx265`, `libx264`, `libvpx`, `libSvtAv1Enc`). We replaced PyAV with `/usr/bin/ffmpeg` (already in the KDE Platform runtime) to decode audio directly into a NumPy float32 array, removing `av` and `av.libs`. |
-| **ChromaDB ONNX Model Bundle** | 80 MB | 0 MB | **80 MB in Flatpak**<br>*(+ 80 MB duplicate copy)* | Static `onnx.tar.gz` removed from Flatpak. ChromaDB downloads and caches `all-MiniLM-L6-v2` into `~/.cache/chroma` on first launch with a minimal splash screen notification. |
-| **Non-Latin Piper Models & App Assets** | 44 MB | 0 MB | **44 MB** | Pruned `piper/hebrew` (21 MB), `piper/tashkeel` (4.7 MB), `piper/train` (0.4 MB), `/app/src/assets/screenshots` (3.4 MB), unused `Inter-*.ttf` fonts (1.6 MB), and `whatsapp_node/node_modules` typing/map files (~13 MB). |
+| **`PyAV` (`av` + `av.libs`) Audio Decoding** | 104 MB | 0 MB | **104 MB** | `faster-whisper` pulled in `PyAV` (104 MB) including video encoders (`libx265`, `libx264`, `libvpx`, `libSvtAv1Enc`). We replaced PyAV with `/usr/bin/ffmpeg` (already in the KDE Platform runtime) to decode audio directly into a NumPy float32 array, stubbed `sys.modules["av"]` in `LocalSTT` so `faster_whisper.audio` imports cleanly, and removed `av` and `av.libs`. |
+| **ChromaDB ONNX Model Bundle** | 80 MB | 0 MB | **80 MB in Flatpak**<br>*(+ 80 MB duplicate copy)* | Static `onnx.tar.gz` removed from Flatpak. `InitWorker` downloads, verifies (SHA-256), and extracts `all-MiniLM-L6-v2` into persistent XDG cache (`~/.cache/chroma` symlinked to `$XDG_CACHE_HOME`) on first launch with live splash screen progress. |
+| **Non-Latin Piper Models & App Assets** | 44 MB | 0 MB | **44 MB** | Pruned `piper/hebrew/*.onnx` (21 MB) and `piper/tashkeel/*.onnx` (4.6 MB) while retaining their Python `__init__.py` modules so `piper.voice` imports cleanly, plus `piper/train` (0.4 MB), `/app/src/assets/screenshots` (3.4 MB), unused `Inter-*.ttf` fonts (1.6 MB), and `whatsapp_node/node_modules` typing/map files (~13 MB). |
 | **Total Reduction** | **~3,550 MB** | **~880 MB** | **~2,665 MB (~2.67 GB saved)** | |
 
 ---
@@ -28,23 +28,22 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 - **Location**: `src/core/browser_manager.py`
 - **Behavior**:
   - `BrowserManager` enforces `os="linux"` when launching `AsyncCamoufox`. On Linux hosts, authentic Linux fingerprints avoid anti-bot OS/TCP-stack mismatches.
-  - If Camoufox is not yet installed, `BrowserManager` emits a one-time message `[System: Downloading stealth browser engine (one-time setup)...]` to the conversation log, sets `effective_timeout = 300s`, downloads Camoufox via `camoufox.pkgman.camoufox_path()`, and immediately deletes `fonts/macos` and `fonts/windows` from the extracted directory.
-  - A subtle note `[System Note: One-time browser engine download completed...]` is prepended to the tool output returned to the agent.
+  - If Camoufox is not yet installed, `BrowserManager` emits a one-time message `[System: Downloading stealth browser engine (one-time setup)...]` to the conversation log, sets `effective_timeout = page_timeout + 300s`, downloads Camoufox via `camoufox.pkgman.camoufox_path()`, and immediately deletes `fonts/macos` and `fonts/windows` from the extracted directory.
 
 ### 2.2 PySide6 & `io.qt.PySide.BaseApp` Cleanup (`compile/com.openamity.OpenAmity.json`)
-- **Location**: `compile/com.openamity.OpenAmity.json` (`cleanup-commands`)
+- **Location**: `compile/com.openamity.OpenAmity.json` (`post-install`)
 - **Behavior**:
   - `BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh` removes `QtWebEngineCore`, `QtPdf`, `QtWebView`, `qtwebengine_dictionaries`, and associated locales.
   - `rm -rf /app/lib/libLLVM* /app/lib/libclang*` removes LLVM/Clang build artifacts.
   - `rm -rf /app/lib/python*/site-packages/OpenGL*` removes PyOpenGL.
-  - We remove unused PySide6 modules: `Qt3D*`, `QtCharts*`, `QtGraphs*`, `QtQuick*`, `QtQml*`, `QtDesigner*`, `QtHelp*`, `QtSensors*`, `QtSerial*`, `QtBluetooth*`, `QtNfc*`, `QtPositioning*`, `QtLocation*`, `QtRemoteObjects*`, `QtScxml*`, `QtStateMachine*`, `QtTest*`, `QtUiTools*`, `QtWeb*`, `QtPdf*`, `QtOpenGL*`, `qmlls`, `qmlformat`, `assistant`, `lupdate`, `lrelease`, `*.pyi`.
+  - We remove unused PySide6 modules: `Qt3D*`, `QtQuick*`, `QtQml*`, `QtPdf*`, `QtSensors*`, `QtPositioning*`.
   - **Preserved**: `QtCore`, `QtGui`, `QtWidgets`, `QtMultimedia`, and `QtSvg` (required for Open Amity GUI and SVG icons).
 
 ### 2.3 Puppeteer Chromium for WhatsApp (`src/core/whatsapp_daemon.py`)
 - **Location**: `src/core/whatsapp_daemon.py`
 - **Behavior**:
-  - `WhatsAppDaemon.start()` checks `/app/share/puppeteer` and `~/.cache/puppeteer`.
-  - If missing, it downloads `chrome-linux64.zip` (pinned version 153.0.8010.36, SHA-256 verified) asynchronously on a background thread so the GUI never freezes.
+  - `WhatsAppDaemon.start()` checks `/app/share/puppeteer`, `$XDG_CACHE_HOME/puppeteer`, and `~/.cache/puppeteer`.
+  - If missing, it downloads `chrome-linux64.zip` (pinned version 153.0.8010.36, SHA-256 verified) asynchronously on a background thread into `paths.get_app_cache_dir() / "puppeteer"` so the GUI never freezes.
   - Immediately deletes `WidevineCdm/` and all `locales/*.pak` except `en-US.pak`.
   - Emits `[System: Downloading browser engine for WhatsApp bridge (one-time setup)...]` and `[System: WhatsApp bridge ready.]` to the conversation log.
   - If an agent invokes a `WhatsApp_*` command while the download is active, it receives an informative status notice asking it to wait a moment.
@@ -52,18 +51,22 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 ### 2.4 Node.js & Playwright Driver Deduplication
 - **Location**: `compile/com.openamity.OpenAmity.json`
 - **Behavior**:
-  - Strips debug symbols: `strip --strip-unneeded /app/bin/node`.
+  - Strips debug symbols: `strip /app/bin/node`.
   - Symlinks Playwright's bundled node binary:
-    `ln -sf /app/bin/node /app/lib/python*/site-packages/playwright/driver/node`
-  - Removes build-time `npm` and headers after `npm ci`:
-    `rm -rf /app/lib/node_modules/npm /app/bin/npm /app/bin/npx /app/include/node`
+    `ln -sf /app/bin/node /app/lib/python3.*/site-packages/playwright/driver/node`
 
-### 2.5 FFmpeg Audio Decoding in LocalSTT (`src/core/local_stt.py`)
+### 2.5 FFmpeg Audio Decoding & PyAV Stub in LocalSTT (`src/core/local_stt.py`)
 - **Location**: `src/core/local_stt.py`
 - **Behavior**:
   - `LocalSTT.transcribe()` decodes input audio using `/usr/bin/ffmpeg` (`-f s16le -ac 1 -acodec pcm_s16le -ar 16000 -`) into a 16kHz mono `np.float32` array and passes the array directly to `WhisperModel.transcribe(audio_array)`.
-  - Because `faster-whisper` only uses PyAV when a file path string is passed, passing a NumPy array bypasses `import av` entirely.
+  - Because `faster_whisper.audio` still executes `import av` at the top of the module on import, `_ensure_faster_whisper_av_stub()` registers a lightweight `types.ModuleType("av")` stub in `sys.modules["av"]` when `PyAV` is absent so `from faster_whisper import WhisperModel` succeeds without `av` installed.
   - `site-packages/av*` and `site-packages/av.libs*` (104 MB) are removed from the Flatpak.
+
+### 2.6 Flatpak Persistent Cache Symlinks & ChromaDB ONNX Setup (`run_OpenAmity.sh`, `src/config/paths.py`, `src/main.py`)
+- **Locations**: `run_OpenAmity.sh`, `src/config/paths.py`, `src/main.py`
+- **Behavior**:
+  - Because Flatpak mounts `$HOME` (`/home/$USER`) as an ephemeral `tmpfs` when `--filesystem=home` is omitted, `run_OpenAmity.sh` and `paths.ensure_flatpak_persistence_links()` symlink `~/.cache -> $XDG_CACHE_HOME` and `~/.local/share -> $XDG_DATA_HOME`. This ensures libraries that hardcode `Path.home() / ".cache"` (such as ChromaDB's `ONNXMiniLM_L6_V2`) store downloaded models on persistent disk rather than ephemeral RAM.
+  - On first launch, `_ensure_chroma_onnx_model()` in `src/main.py` streams `onnx.tar.gz` in 64 KB chunks with SHA-256 verification and live splash percentage updates, extracts `onnx/`, and removes the temporary archive.
 
 ---
 

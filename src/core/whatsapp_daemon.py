@@ -172,6 +172,7 @@ class WhatsAppDaemon:
         """Ensures chrome and companion binaries (e.g. chrome_crashpad_handler) in puppeteer cache have executable permissions."""
         target_dirs = [
             os.path.join(self.data_dir, "puppeteer_cache"),
+            os.path.join(paths.get_app_cache_dir(), "puppeteer"),
             os.path.expanduser("~/.cache/puppeteer"),
             "/app/share/puppeteer"
         ]
@@ -210,6 +211,7 @@ class WhatsAppDaemon:
     def _find_chrome(self) -> bool:
         target_dirs = [
             os.path.join(self.data_dir, "puppeteer_cache"),
+            os.path.join(paths.get_app_cache_dir(), "puppeteer"),
             os.path.expanduser("~/.cache/puppeteer"),
             "/app/share/puppeteer"
         ]
@@ -225,14 +227,14 @@ class WhatsAppDaemon:
         return False
 
     def _download_and_extract_chrome(self) -> bool:
-        """Downloads Chrome for Testing on demand into ~/.cache/puppeteer, verified by SHA-256."""
+        """Downloads Chrome for Testing on demand into XDG cache / ~/.cache/puppeteer, verified by SHA-256."""
         import zipfile
         import hashlib
 
         url = "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chrome-linux64.zip"
         expected_sha = "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8"
 
-        cache_dir = os.path.expanduser("~/.cache/puppeteer")
+        cache_dir = os.path.join(paths.get_app_cache_dir(), "puppeteer")
         os.makedirs(cache_dir, exist_ok=True)
         zip_path = os.path.join(cache_dir, "chrome-linux64.zip")
 

@@ -1,6 +1,7 @@
 import os
 import subprocess
 import requests
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 from core.cerebrum import Tool
 from core.cache_manager import CacheManager
@@ -50,12 +51,12 @@ class WhatsAppSkill(Tool):
         return [
             {
                 "name": "WhatsApp_unread",
-                "description": "Fetches all currently unread messages in your inbox.",
+                "description": "Fetches all currently unread messages in your inbox with timestamps.",
                 "parameters": {"type": "OBJECT", "properties": {}}
             },
             {
                 "name": "WhatsApp_recent",
-                "description": "Fetches the n most recent messages across all chats.",
+                "description": "Fetches the n most recent messages across all chats with timestamps.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -65,7 +66,7 @@ class WhatsAppSkill(Tool):
             },
             {
                 "name": "WhatsApp_recent_chat",
-                "description": "Fetches recent messages from a specific target (person or group).",
+                "description": "Fetches recent messages from a specific target (person or group) with timestamps.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -176,8 +177,88 @@ class WhatsAppSkill(Tool):
             pass
         return {"ready": False, "qr": None}
 
+    @classmethod
+    def _format_timestamp(cls, raw_timestamp: Any) -> str:
+        """
+        Formats a raw timestamp (Unix epoch seconds/ms, numeric string, ISO string, datetime, or None)
+        into a standardized local datetime string: YYYY-MM-DD HH:MM:SS.
+        Always returns a valid timestamp string.
+        """
+        dt = None
+        if raw_timestamp is not None:
+            if isinstance(raw_timestamp, (int, float)):
+                if raw_timestamp > 0:
+                    try:
+                        ts = raw_timestamp / 1000.0 if raw_timestamp > 1e11 else float(raw_timestamp)
+                        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+                    except Exception:
+                        dt = None
+            elif isinstance(raw_timestamp, str):
+                clean = raw_timestamp.strip()
+                if clean:
+                    if clean.lstrip("-").replace(".", "", 1).isdigit():
+                        try:
+                            val = float(clean)
+                            if val > 0:
+                                ts = val / 1000.0 if val > 1e11 else val
+                                dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+                        except Exception:
+                            dt = None
+                    else:
+                        try:
+                            iso_str = clean.replace("Z", "+00:00")
+                            dt = datetime.fromisoformat(iso_str)
+                            if dt.tzinfo:
+                                dt = dt.astimezone()
+                            else:
+                                dt = dt.replace(tzinfo=timezone.utc).astimezone()
+                        except Exception:
+                            dt = None
+            elif isinstance(raw_timestamp, datetime):
+                if raw_timestamp.tzinfo:
+                    dt = raw_timestamp.astimezone()
+                else:
+                    dt = raw_timestamp.replace(tzinfo=timezone.utc).astimezone()
+
+        if dt is None:
+            dt = datetime.now().astimezone()
+
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_message_line(self, msg: Dict[str, Any], media_files: list = None, max_media: int = None) -> str:
+        content = msg.get('content', '')
+        msg_type = msg.get('type', 'chat')
+        if msg_type in ['location', 'live_location']:
+            # Location messages are structured and omit raw map thumbnails
+            pass
+        elif msg_type in ['vcard', 'multi_vcard', 'contact']:
+            # Contact card messages are structured and omit raw vcards/media
+            pass
+        elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
+            if msg_type in ['ptt', 'audio']:
+                content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
+                if media_files is not None:
+                    if max_media is None or len(media_files) < max_media:
+                        media_files.append(msg['mediaPath'])
+            elif msg_type in ['image', 'document', 'video']:
+                content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
+            else:
+                content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
+        elif msg.get('hasMedia'):
+            content = f"[Media: {msg_type}] {content}"
+
+        chat_id = msg.get('chatId', '')
+        channel_type = "WHATSAPP_GROUP" if str(chat_id).endswith("@g.us") else "WHATSAPP_DM"
+        sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
+            'senderNumber') else msg.get('senderName', 'Unknown')
+        chat_name = msg.get('chatName', '')
+        raw_ts = msg.get('timestamp') if msg.get('timestamp') is not None else msg.get('t')
+        timestamp_str = self._format_timestamp(raw_ts)
+        msg_id = msg.get('id', '')
+        return f"- [CHANNEL: {channel_type}] [SOURCE_ID: {chat_id}] [{chat_name}] [TIMESTAMP: {timestamp_str}] {sender_display}: {content} (MsgID: {msg_id})\n"
+
     def execute(self, command: str, *args, **kwargs) -> Any:
-        if getattr(self.daemon, "is_downloading_chrome", False):
+        if getattr(self.daemon, "is_downloading_chrome", False) is True:
             return "[System Notice: WhatsApp bridge is currently completing its one-time browser engine download. Please retry in a moment.]"
 
         if command in ["unread", "recent", "recent_chat"]:
@@ -196,7 +277,7 @@ class WhatsAppSkill(Tool):
             if not status.get("ready"):
                 return "WhatsApp client is still initializing or not ready. If it is stuck, use WhatsApp_reset_connection to fix it."
         except requests.exceptions.RequestException:
-            if getattr(self.daemon, "is_downloading_chrome", False):
+            if getattr(self.daemon, "is_downloading_chrome", False) is True:
                 return "[System Notice: WhatsApp bridge is currently completing its one-time browser engine download. Please retry in a moment.]"
             return "WhatsApp bridge is not running. If it crashed, use WhatsApp_reset_connection to restart it."
 
@@ -224,30 +305,7 @@ class WhatsAppSkill(Tool):
                 output = "Unread Messages:\n"
                 media_files = []
                 for msg in unread:
-                    content = msg.get('content', '')
-                    msg_type = msg.get('type', 'chat')
-                    if msg_type in ['location', 'live_location']:
-                        # Location messages are structured and omit raw map thumbnails
-                        pass
-                    elif msg_type in ['vcard', 'multi_vcard', 'contact']:
-                        # Contact card messages are structured and omit raw vcards/media
-                        pass
-                    elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
-                        if msg_type in ['ptt', 'audio']:
-                            content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
-                            media_files.append(msg['mediaPath'])
-                        elif msg_type in ['image', 'document', 'video']:
-                            content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
-                        else:
-                            content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
-                    elif msg.get('hasMedia'):
-                        content = f"[Media: {msg_type}] {content}"
-
-                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
-                        "@g.us") else "WHATSAPP_DM"
-                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
-                        'senderNumber') else msg['senderName']
-                    output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
+                    output += self._format_message_line(msg, media_files=media_files)
 
                 if media_files:
                     output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
@@ -284,31 +342,7 @@ class WhatsAppSkill(Tool):
                 output = f"Recent Messages (Last {len(messages)}):\n"
                 media_files = []
                 for msg in messages:
-                    content = msg.get('content', '')
-                    msg_type = msg.get('type', 'chat')
-                    if msg_type in ['location', 'live_location']:
-                        # Location messages are structured and omit raw map thumbnails
-                        pass
-                    elif msg_type in ['vcard', 'multi_vcard', 'contact']:
-                        # Contact card messages are structured and omit raw vcards/media
-                        pass
-                    elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
-                        if msg_type in ['ptt', 'audio']:
-                            content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
-                            if len(media_files) < 5:
-                                media_files.append(msg['mediaPath'])
-                        elif msg_type in ['image', 'document', 'video']:
-                            content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
-                        else:
-                            content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
-                    elif msg.get('hasMedia'):
-                        content = f"[Media: {msg_type}] {content}"
-
-                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
-                        "@g.us") else "WHATSAPP_DM"
-                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
-                        'senderNumber') else msg['senderName']
-                    output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
+                    output += self._format_message_line(msg, media_files=media_files, max_media=5)
 
                 if media_files:
                     output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
@@ -363,31 +397,7 @@ class WhatsAppSkill(Tool):
                 output = f"Recent Messages for {target} (Last {len(messages)}):\n"
                 media_files = []
                 for msg in messages:
-                    content = msg.get('content', '')
-                    msg_type = msg.get('type', 'chat')
-                    if msg_type in ['location', 'live_location']:
-                        # Location messages are structured and omit raw map thumbnails
-                        pass
-                    elif msg_type in ['vcard', 'multi_vcard', 'contact']:
-                        # Contact card messages are structured and omit raw vcards/media
-                        pass
-                    elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
-                        if msg_type in ['ptt', 'audio']:
-                            content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
-                            if len(media_files) < 5:
-                                media_files.append(msg['mediaPath'])
-                        elif msg_type in ['image', 'document', 'video']:
-                            content = f"[{msg_type.capitalize()} (Path: {msg['mediaPath']})] {content}"
-                        else:
-                            content = f"[Media: {msg_type} (Path: {msg['mediaPath']})] {content}"
-                    elif msg.get('hasMedia'):
-                        content = f"[Media: {msg_type}] {content}"
-
-                    channel_type = "WHATSAPP_GROUP" if msg['chatId'].endswith(
-                        "@g.us") else "WHATSAPP_DM"
-                    sender_display = f"{msg['senderName']} (+{msg['senderNumber']})" if msg.get(
-                        'senderNumber') else msg['senderName']
-                    output += f"- [CHANNEL: {channel_type}] [SOURCE_ID: {msg['chatId']}] [{msg['chatName']}] {sender_display}: {content} (MsgID: {msg['id']})\n"
+                    output += self._format_message_line(msg, media_files=media_files, max_media=5)
 
                 if media_files:
                     output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"

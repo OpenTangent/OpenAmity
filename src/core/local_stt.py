@@ -1,8 +1,31 @@
 import os
+import sys
+import types
 import logging
 import subprocess
 import numpy as np
-from faster_whisper import WhisperModel
+
+
+def _ensure_faster_whisper_av_stub() -> None:
+    """Provides a lightweight stub for PyAV ('av') when PyAV is stripped (e.g. in the
+    optimized Flatpak build). Because LocalSTT decodes audio via system FFmpeg into a
+    NumPy array, faster_whisper never invokes PyAV at runtime, but faster_whisper.audio
+    still executes 'import av' at module import time."""
+    if "av" not in sys.modules:
+        try:
+            import av  # noqa: F401
+        except ImportError:
+            av_stub = types.ModuleType("av")
+            av_stub.__spec__ = None
+            sys.modules["av"] = av_stub
+
+
+_ensure_faster_whisper_av_stub()
+try:
+    from faster_whisper import WhisperModel
+except ImportError as _fw_err:
+    WhisperModel = None
+    logging.getLogger(__name__).warning(f"faster_whisper could not be imported: {_fw_err}")
 
 # Suppress Hugging Face Hub unauthenticated warnings
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
@@ -20,16 +43,26 @@ class LocalSTT:
 
     def _get_model(self, status_callback=None):
         if self.model is None:
-            hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
+            if WhisperModel is None:
+                raise RuntimeError("faster-whisper is not available in this environment.")
+
+            from config import paths
+            candidate_caches = [
+                os.path.join(paths.get_app_cache_dir(), "huggingface", "hub"),
+                os.path.expanduser("~/.cache/huggingface/hub"),
+            ]
             has_cache = False
-            if os.path.exists(hf_cache):
-                try:
-                    for item in os.listdir(hf_cache):
-                        if "tiny.en" in item or "whisper-tiny.en" in item:
-                            has_cache = True
-                            break
-                except Exception:
-                    pass
+            for hf_cache in candidate_caches:
+                if os.path.exists(hf_cache):
+                    try:
+                        for item in os.listdir(hf_cache):
+                            if "tiny.en" in item or "whisper-tiny.en" in item:
+                                has_cache = True
+                                break
+                    except Exception:
+                        pass
+                if has_cache:
+                    break
 
             if not has_cache:
                 logging.info("Downloading faster-whisper (tiny.en) model for the first time...")

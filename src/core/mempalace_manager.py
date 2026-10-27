@@ -77,7 +77,7 @@ class MemPalaceManager:
         # Record embedder identity to prevent MemPalace warnings after a factory reset
         try:
             from mempalace.palace import set_palace_embedder_identity
-            set_palace_embedder_identity(self.palace_path, model="minilm")
+            set_palace_embedder_identity(self.palace_path, model="minilm", dim=384)
         except Exception as e:
             logging.debug(f"Could not set embedder identity: {e}")
 
