@@ -15,6 +15,7 @@ flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flath
 flatpak info org.kde.Sdk//6.11 >/dev/null 2>&1 || flatpak install --user -y flathub org.kde.Sdk//6.11
 flatpak info org.kde.Platform//6.11 >/dev/null 2>&1 || flatpak install --user -y flathub org.kde.Platform//6.11
 flatpak info io.qt.PySide.BaseApp//6.11 >/dev/null 2>&1 || flatpak install --user -y flathub io.qt.PySide.BaseApp//6.11
+flatpak info org.freedesktop.Sdk.Extension.node24//25.08 >/dev/null 2>&1 || flatpak install --user -y flathub org.freedesktop.Sdk.Extension.node24//25.08
 
 # Check if pre-baked requirements file exists
 if [ ! -f "python3-requirements.json" ]; then
