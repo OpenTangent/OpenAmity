@@ -76,8 +76,8 @@
                 {
                     "type": "git",
                     "url": "https://github.com/OpenTangent/OpenAmity.git",
-                    "tag": "v0.3.7",
-                    "commit": "300a8ad4ea812a8b3d20e5ef561411d0952117ff"
+                    "tag": "v0.3.8",
+                    "commit": "4d26d234eef1cbb27ced186cbc758e0da26eb217"
                 },
                 "node-sources.json"
             ]
