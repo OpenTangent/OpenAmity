@@ -1,8 +1,6 @@
-name: Build and Publish Flatpak Repository
+name: Build and Publish Flatpak Migrator Repository
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -18,14 +16,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Sync Version Metadata
-        run: python3 compile/sync_version_metadata.py
-
       - name: Install flatpak-builder and dependencies
         run: |
           # Prevent APT from hanging indefinitely on stalled Azure mirror connections
@@ -37,7 +27,7 @@ jobs:
           timeout 120 sudo apt-get update || timeout 120 sudo apt-get update || true
           sudo apt-get install -y flatpak flatpak-builder
           sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          sudo flatpak install -y --noninteractive flathub org.kde.Sdk//6.11 org.kde.Platform//6.11 io.qt.PySide.BaseApp//6.11 org.freedesktop.Sdk.Extension.node24//25.08
+          sudo flatpak install -y --noninteractive flathub org.kde.Sdk//6.11 org.kde.Platform//6.11 io.qt.PySide.BaseApp//6.11
 
       - name: Import GPG Key
         id: gpg
@@ -46,11 +36,11 @@ jobs:
           gpg_private_key: ${{ secrets.FLATPAK_GPG_KEY }}
           passphrase: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
 
-      - name: Build Flatpak and Generate Repo
+      - name: Build Flatpak Migrator and Generate Repo
         uses: andyholmes/flatter@main
         with:
           files: |
-            compile/com.openamity.OpenAmity.json
+            compile/github_installer/com.openamity.OpenAmity.json
           upload-pages-artifact: true
           gpg-sign: ${{ steps.gpg.outputs.fingerprint }}
 

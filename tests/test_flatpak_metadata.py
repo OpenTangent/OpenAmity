@@ -221,7 +221,8 @@ def test_flatpak_manifest_json(repo_root):
 
 def test_deploy_script_checks_version_release(repo_root):
     deploy_path = os.path.join(repo_root, "deploy.sh")
-    assert os.path.exists(deploy_path)
+    if not os.path.exists(deploy_path):
+        pytest.skip("deploy.sh is gitignored and not present in clean checkouts")
 
     with open(deploy_path, "r", encoding="utf-8") as f:
         deploy_content = f.read()
@@ -229,7 +230,10 @@ def test_deploy_script_checks_version_release(repo_root):
     assert "src/core/version.py" in deploy_content
     assert "compile/com.openamity.OpenAmity.metainfo.xml" in deploy_content
     assert "<release version=\\\"$VERSION\\\"" in deploy_content or '<release version="$VERSION"' in deploy_content
-    assert "The Flatpak manifest" in deploy_content or "must be updated with the changelog" in deploy_content
+    assert "changelog before deploying" in deploy_content
+    assert "gh pr create" in deploy_content
+    assert "flathub/com.openamity.OpenAmity" in deploy_content
+    assert "git push origin master" not in deploy_content
 
 
 def test_local_stt_imports_without_pyav(monkeypatch):
@@ -291,4 +295,70 @@ def test_chroma_onnx_ready_check(tmp_path):
     for fname in CHROMA_ONNX_FILES:
         (onnx_dir / fname).write_bytes(b"ok")
     assert _is_chroma_onnx_ready(str(base_dir))
+
+
+def test_github_installer_manifest_and_desktop_parity(repo_root):
+    """Ensures the GitHub Pages migrator Flatpak manifest exposes run_OpenAmity.sh for .desktop Exec."""
+    manifest_path = os.path.join(
+        repo_root, "compile", "github_installer", "com.openamity.OpenAmity.json"
+    )
+    assert os.path.exists(manifest_path)
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    assert manifest["app-id"] == "com.openamity.OpenAmity"
+    assert "--talk-name=org.freedesktop.Flatpak" in manifest.get("finish-args", [])
+
+    mod = manifest["modules"][0]
+    build_cmds = "\n".join(mod.get("build-commands", []))
+    assert "flathub_installer.py" in build_cmds
+    assert "run_OpenAmity.sh" in build_cmds
+    assert "com.openamity.OpenAmity.desktop" in build_cmds
+
+
+def test_github_installer_dry_run_migration_commands(repo_root, monkeypatch):
+    """Verifies MigrationWorker runs Polkit-free --user install, non-blocking launch, and legacy cleanup."""
+    import importlib.util
+
+    installer_path = os.path.join(
+        repo_root, "compile", "github_installer", "flathub_installer.py"
+    )
+    spec = importlib.util.spec_from_file_location("flathub_installer", installer_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    executed_sync = []
+    spawned_async = []
+
+    def fake_run(cmd_list, dry_run=False):
+        executed_sync.append(list(cmd_list))
+        return True, ""
+
+    def fake_spawn(cmd_list, dry_run=False):
+        spawned_async.append(list(cmd_list))
+        return True, ""
+
+    monkeypatch.setattr(mod, "run_host_cmd", fake_run)
+    monkeypatch.setattr(mod, "spawn_host_cmd", fake_spawn)
+
+    worker = mod.MigrationWorker(dry_run=True)
+    results = []
+    worker.finished.connect(lambda ok, msg: results.append((ok, msg)))
+    worker.run()
+
+    assert results and results[0][0] is True
+    assert any(
+        cmd[:4] == ["flatpak", "remote-add", "--user", "--if-not-exists"]
+        for cmd in executed_sync
+    )
+    assert any(
+        cmd[:3] == ["flatpak", "install", "--user"] and mod.STABLE_REF in cmd
+        for cmd in executed_sync
+    )
+    assert ["flatpak", "run", mod.STABLE_REF] in spawned_async
+    cleanup_cmds = [c for c in spawned_async if c[:2] == ["sh", "-c"]]
+    assert len(cleanup_cmds) == 1
+    assert f"flatpak uninstall --user -y --noninteractive --force-remove {mod.MASTER_REF}" in cleanup_cmds[0][2]
+    assert f"flatpak remote-delete --user --force {mod.LEGACY_REMOTE}" in cleanup_cmds[0][2]
 

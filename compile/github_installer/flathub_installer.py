@@ -3,24 +3,38 @@
 Open Amity Flathub Migration Installer
 Seamlessly migrates GitHub Pages Flatpak installations of Open Amity to the official Flathub release.
 """
-import sys
 import os
 import subprocess
-import shutil
+import sys
+from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLabel, QProgressBar, QPushButton, QHBoxLayout, QFrame
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QObject
-from PySide6.QtGui import QFont, QIcon, QColor
+
+FLATHUB_REPO_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+APP_ID = "com.openamity.OpenAmity"
+STABLE_REF = f"{APP_ID}//stable"
+MASTER_REF = f"{APP_ID}//master"
+LEGACY_REMOTE = "openamity"
+
+
+def build_host_cmd(cmd_list):
+    """Wrap command with flatpak-spawn --host when executing inside a Flatpak sandbox."""
+    if os.environ.get("FLATPAK_ID"):
+        return ["flatpak-spawn", "--host"] + list(cmd_list)
+    return list(cmd_list)
 
 
 def run_host_cmd(cmd_list, dry_run=False):
-    """Executes a command on the host OS via flatpak-spawn if sandboxed, or directly if unconfined."""
-    if os.environ.get("FLATPAK_ID"):
-        full_cmd = ["flatpak-spawn", "--host"] + cmd_list
-    else:
-        full_cmd = cmd_list
-
+    """Execute a synchronous command on the host OS."""
+    full_cmd = build_host_cmd(cmd_list)
     cmd_str = " ".join(full_cmd)
     if dry_run:
         print(f"[DRY-RUN] Host Command: {cmd_str}")
@@ -32,12 +46,81 @@ def run_host_cmd(cmd_list, dry_run=False):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=True
+            check=True,
         )
         return True, proc.stdout
-    except subprocess.CalledProcessError as e:
-        err_msg = e.stderr or e.stdout or str(e)
+    except (subprocess.CalledProcessError, OSError) as e:
+        err_msg = getattr(e, "stderr", None) or getattr(e, "stdout", None) or str(e)
         return False, err_msg
+
+
+def spawn_host_cmd(cmd_list, dry_run=False):
+    """Launch a detached background command on the host OS without blocking the UI."""
+    full_cmd = build_host_cmd(cmd_list)
+    cmd_str = " ".join(full_cmd)
+    if dry_run:
+        print(f"[DRY-RUN] Host Spawn: {cmd_str}")
+        return True, f"[DRY-RUN] Spawned: {cmd_str}"
+
+    try:
+        subprocess.Popen(
+            full_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+def detect_scopes_for_ref(ref, dry_run=False):
+    """Return Flatpak scopes ('--user', '--system') where the given ref is installed."""
+    if dry_run:
+        return ["--user"] if ref == MASTER_REF else []
+
+    scopes = []
+    for scope in ("--user", "--system"):
+        ok, _ = run_host_cmd(["flatpak", "info", scope, ref], dry_run=False)
+        if ok:
+            scopes.append(scope)
+    return scopes
+
+
+def detect_scopes_for_remote(remote_name, dry_run=False):
+    """Return Flatpak scopes ('--user', '--system') where the named remote exists."""
+    if dry_run:
+        return ["--user"] if remote_name == LEGACY_REMOTE else []
+
+    scopes = []
+    for scope in ("--user", "--system"):
+        ok, out = run_host_cmd(
+            ["flatpak", "remotes", scope, "--columns=name"], dry_run=False
+        )
+        if ok and remote_name in {line.strip() for line in out.splitlines()}:
+            scopes.append(scope)
+    return scopes
+
+
+def build_cleanup_command(master_scopes, remote_scopes):
+    """Build a delayed shell command that removes legacy //master refs and the deprecated remote."""
+    steps = []
+    for scope in master_scopes:
+        if scope not in ("--user", "--system"):
+            continue
+        steps.append(
+            f"flatpak uninstall {scope} -y --noninteractive --force-remove {MASTER_REF} >/dev/null 2>&1 || true"
+        )
+    for scope in remote_scopes:
+        if scope not in ("--user", "--system"):
+            continue
+        steps.append(
+            f"flatpak remote-delete {scope} --force {LEGACY_REMOTE} >/dev/null 2>&1 || true"
+        )
+
+    if not steps:
+        return ""
+    return "sleep 2 && " + " && ".join(steps)
 
 
 class MigrationWorker(QObject):
@@ -51,42 +134,67 @@ class MigrationWorker(QObject):
     def run(self):
         try:
             self.progress.emit(10, "Verifying Flathub repository on host system...")
-            # Step 1: Ensure Flathub remote exists
-            ok, out = run_host_cmd([
-                "flatpak", "remote-add", "--if-not-exists", "flathub",
-                "https://dl.flathub.org/repo/flathub.flatpakrepo"
-            ], self.dry_run)
-            if not ok and not self.dry_run:
-                self.finished.emit(False, f"Failed to register Flathub repository:\n{out}")
-                return
+            stable_scopes = detect_scopes_for_ref(STABLE_REF, self.dry_run)
 
-            self.progress.emit(35, "Installing official Open Amity from Flathub...")
-            # Step 2: Install official Open Amity from Flathub (branch //stable)
-            ok, out = run_host_cmd([
-                "flatpak", "install", "-y", "--noninteractive", "flathub", "com.openamity.OpenAmity//stable"
-            ], self.dry_run)
-            if not ok and not self.dry_run:
-                self.finished.emit(False, f"Failed to install Open Amity from Flathub:\n{out}")
-                return
+            if not stable_scopes:
+                ok, out = run_host_cmd(
+                    [
+                        "flatpak",
+                        "remote-add",
+                        "--user",
+                        "--if-not-exists",
+                        "flathub",
+                        FLATHUB_REPO_URL,
+                    ],
+                    self.dry_run,
+                )
+                if not ok and not self.dry_run:
+                    self.finished.emit(
+                        False, f"Failed to register Flathub repository:\n{out}"
+                    )
+                    return
+
+                self.progress.emit(35, "Installing official Open Amity from Flathub...")
+                ok, out = run_host_cmd(
+                    [
+                        "flatpak",
+                        "install",
+                        "--user",
+                        "-y",
+                        "--noninteractive",
+                        "--or-update",
+                        "flathub",
+                        STABLE_REF,
+                    ],
+                    self.dry_run,
+                )
+                if not ok and not self.dry_run:
+                    self.finished.emit(
+                        False, f"Failed to install Open Amity from Flathub:\n{out}"
+                    )
+                    return
+            else:
+                self.progress.emit(35, "Official Flathub installation detected...")
 
             self.progress.emit(75, "Launching official Open Amity...")
-            # Step 3: Spawn the newly installed stable app on the host
-            run_host_cmd(["flatpak", "run", "com.openamity.OpenAmity//stable"], self.dry_run)
+            ok, out = spawn_host_cmd(["flatpak", "run", STABLE_REF], self.dry_run)
+            if not ok and not self.dry_run:
+                self.finished.emit(
+                    False, f"Failed to launch official Open Amity:\n{out}"
+                )
+                return
 
             self.progress.emit(90, "Cleaning up legacy GitHub installation...")
-            # Step 4: Schedule uninstallation of the legacy master branch on host in background
-            cleanup_script = "sleep 2 && flatpak uninstall -y --noninteractive com.openamity.OpenAmity//master >/dev/null 2>&1 &"
-            if not self.dry_run:
-                subprocess.Popen(
-                    ["flatpak-spawn", "--host", "bash", "-c", cleanup_script]
-                    if os.environ.get("FLATPAK_ID")
-                    else ["bash", "-c", cleanup_script]
-                )
-            else:
-                print(f"[DRY-RUN] Cleanup scheduled: {cleanup_script}")
+            master_scopes = detect_scopes_for_ref(MASTER_REF, self.dry_run)
+            remote_scopes = detect_scopes_for_remote(LEGACY_REMOTE, self.dry_run)
+            cleanup_script = build_cleanup_command(master_scopes, remote_scopes)
+            if cleanup_script:
+                spawn_host_cmd(["sh", "-c", cleanup_script], self.dry_run)
 
             self.progress.emit(100, "Migration complete!")
-            self.finished.emit(True, "Successfully migrated to official Flathub release.")
+            self.finished.emit(
+                True, "Successfully migrated to official Flathub release."
+            )
         except Exception as e:
             self.finished.emit(False, f"Unexpected error during migration: {e}")
 
@@ -103,7 +211,6 @@ class InstallerWindow(QWidget):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
 
-        # Title
         title_label = QLabel("Upgrading to Official Flathub Release")
         title_font = QFont("Ubuntu", 15)
         title_font.setBold(True)
@@ -111,11 +218,11 @@ class InstallerWindow(QWidget):
         title_label.setStyleSheet("color: #ffffff;")
         layout.addWidget(title_label)
 
-        # Description
         desc_text = (
             "Open Amity is now officially distributed on Flathub!\n\n"
-            "This automated updater will install the verified Flathub release "
-            "and switch your system to receive future updates directly from Flathub.\n"
+            "This automated updater will install the verified Flathub release, "
+            "remove the legacy GitHub Pages installation and remote, and switch your "
+            "system to receive future updates directly from Flathub.\n"
             "All your existing agents, memories, and settings will remain completely intact."
         )
         desc_label = QLabel(desc_text)
@@ -126,7 +233,6 @@ class InstallerWindow(QWidget):
 
         layout.addStretch()
 
-        # Status & Progress
         self.status_label = QLabel("Ready to migrate...")
         self.status_label.setFont(QFont("Ubuntu", 9))
         self.status_label.setStyleSheet("color: #999999;")
@@ -151,7 +257,6 @@ class InstallerWindow(QWidget):
         """)
         layout.addWidget(self.progress_bar)
 
-        # Action Buttons
         button_layout = QHBoxLayout()
         button_layout.addStretch()
 
@@ -200,7 +305,6 @@ class InstallerWindow(QWidget):
         if success:
             self.status_label.setText(msg)
             self.start_btn.setText("Completed")
-            # Automatically close installer after successful launch
             QApplication.instance().quit()
         else:
             self.status_label.setText(msg)
