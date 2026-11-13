@@ -1,6 +1,7 @@
 import json
 import logging
 import datetime
+from typing import Optional
 from core.cerebrum import Tool
 from core.mempalace_manager import MemPalaceManager
 from core.settings_manager import SettingsManager

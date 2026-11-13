@@ -62,3 +62,16 @@ def test_orchestrator_async_query_prep_fallback_when_name_empty(monkeypatch, tmp
     sent_prompt = mock_worker.send_prompt.call_args[0][0]
     assert "[CHANNEL: LOCAL_GUI]" in sent_prompt
     assert "[User (User)]: Hello!" in sent_prompt
+
+
+def test_orchestrator_annotations_resolve_eagerly():
+    """Ensure all AmityOrchestrator method annotations resolve cleanly (Python <=3.13 compatibility)."""
+    import inspect
+    import typing
+    import tools.mempalace_tool as mempalace_tool_mod
+
+    for name, member in inspect.getmembers(AmityOrchestrator, predicate=inspect.isfunction):
+        hints = typing.get_type_hints(member)
+        assert isinstance(hints, dict), f"Expected dict of type hints for {name}"
+
+    assert "Optional" in vars(mempalace_tool_mod)

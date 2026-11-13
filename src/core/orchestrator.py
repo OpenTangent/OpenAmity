@@ -3,6 +3,7 @@ import threading
 import json
 import time
 from datetime import datetime
+from typing import Optional
 from .events import Signal
 
 try:
