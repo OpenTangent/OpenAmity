@@ -20,6 +20,33 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Monotonically decreasing coupling weights from Sphere 1 (Self) to Sphere 10 (Universal)
+SPHERE_COUPLING_WEIGHTS: Dict[int, float] = {
+    1: 1.00,
+    2: 0.85,
+    3: 0.65,
+    4: 0.45,
+    5: 0.30,
+    6: 0.20,
+    7: 0.15,
+    8: 0.10,
+    9: 0.08,
+    10: 0.05,
+}
+
+
+def _resolve_sphere_weight(val: Any) -> float:
+    """Resolves either an integer sphere level (1..10) or a direct float weight in [0.05, 1.0]."""
+    if isinstance(val, int) and not isinstance(val, bool) and val in SPHERE_COUPLING_WEIGHTS and val >= 2:
+        return SPHERE_COUPLING_WEIGHTS[val]
+    try:
+        fval = float(val)
+        if not math.isfinite(fval):
+            return 1.0
+        return max(0.05, min(1.0, fval))
+    except (ValueError, TypeError):
+        return 1.0
+
 
 class MorphologicalMemoryLayer:
     def __init__(
@@ -35,8 +62,12 @@ class MorphologicalMemoryLayer:
         eta: float = 1.0,
         max_coactivation_set: int = 16,
     ):
-        self.palace_path = palace_path
-        self.db_path = os.path.join(palace_path, "morpho_graph.db")
+        if str(palace_path).endswith((".db", ".sqlite3")):
+            self.db_path = str(palace_path)
+            self.palace_path = os.path.dirname(self.db_path) or "."
+        else:
+            self.palace_path = str(palace_path)
+            self.db_path = os.path.join(self.palace_path, "morpho_graph.db")
         self._param_lock = threading.RLock()
 
         # Validate initial numerical parameters
@@ -682,23 +713,56 @@ class MorphologicalMemoryLayer:
             ON CONFLICT(key) DO UPDATE SET value = ?
             """, (now_iso, now_iso))
 
+    ensure_node = register_drawer
+
+    def coactivate(self, active_drawer_ids: List[str], weight_multiplier: Optional[float] = None, eta: Optional[float] = None):
+        eff_eta = eta if eta is not None else (self.eta * float(weight_multiplier) if weight_multiplier is not None else None)
+        return self.record_coactivation(active_drawer_ids, eta=eff_eta)
+
+    def register_setpoint(self, goal_key: str, drawer_ids: List[str]) -> Dict[str, Any]:
+        return self.link_setpoint(goal_key, drawer_ids)
+
     def relax_setpoint(
         self,
-        target_drawer_ids: List[str],
+        target_drawer_ids: Optional[List[str]] = None,
         n_steps: Optional[int] = None,
         top_k: Optional[int] = None,
+        sphere_weights: Optional[Dict[str, Any]] = None,
+        perspective_injections: Optional[Dict[str, Any]] = None,
+        target_drawers: Optional[List[str]] = None,
     ) -> List[Tuple[str, float]]:
         """
         Runs dynamic perturbation relaxation loop conditioned on target setpoints.
+        Target clamp potentials V_target are scaled by sphere coupling weights w_k in [0.05, 1.00].
         Returns top-k activated (drawer_id, potential) pairs, excluding target_drawer_ids.
         """
-        if not target_drawer_ids:
+        raw_targets = list(target_drawer_ids if target_drawer_ids is not None else (target_drawers or []))
+        if perspective_injections:
+            for pid in perspective_injections:
+                if pid not in raw_targets:
+                    raw_targets.append(pid)
+
+        if not raw_targets:
             return []
 
         # Canonicalize target IDs
-        canonical_targets = list(dict.fromkeys(self._canonical_id(tid) for tid in target_drawer_ids if tid))
+        canonical_targets = list(dict.fromkeys(self._canonical_id(tid) for tid in raw_targets if tid))
         if not canonical_targets:
             return []
+
+        canonical_weights: Dict[str, float] = {}
+        if sphere_weights:
+            for did, w_val in sphere_weights.items():
+                if did:
+                    cid = self._canonical_id(did)
+                    resolved = _resolve_sphere_weight(w_val)
+                    canonical_weights[cid] = max(canonical_weights.get(cid, 0.0), resolved)
+        if perspective_injections:
+            for did, w_val in perspective_injections.items():
+                if did:
+                    cid = self._canonical_id(did)
+                    resolved = _resolve_sphere_weight(w_val)
+                    canonical_weights[cid] = max(canonical_weights.get(cid, 0.0), resolved)
 
         with self._param_lock:
             p_leak = self.leak
@@ -764,15 +828,20 @@ class MorphologicalMemoryLayer:
         deg = np.sum(W, axis=1, keepdims=True) + 1e-6
         G = W / np.sqrt(deg @ deg.T)
 
-        # Initialize potentials
+        # Initialize potentials with sphere-weighted clamping
         V = np.zeros(n, dtype=float)
         V_target = np.zeros(n, dtype=float)
+        min_target_weight = 1.0
 
         for tid in canonical_targets:
             if tid in node_to_idx:
                 idx = node_to_idx[tid]
-                V_target[idx] = 1.0
-                V[idx] = 1.0
+                w = canonical_weights.get(tid, 1.0)
+                w = max(0.05, min(1.0, float(w)))
+                V_target[idx] = max(V_target[idx], w)
+                V[idx] = max(V[idx], w)
+                if w < min_target_weight:
+                    min_target_weight = w
 
         # Dynamic Euler step loop using thread-safe parameter snapshot
         for _ in range(steps):
@@ -786,6 +855,7 @@ class MorphologicalMemoryLayer:
         ranked_indices = np.argsort(-V)
         results: List[Tuple[str, float]] = []
         target_set = set(canonical_targets)
+        min_threshold = 0.10 * min_target_weight
 
         for idx in ranked_indices:
             if len(results) >= k_out:
@@ -793,7 +863,7 @@ class MorphologicalMemoryLayer:
             node_id = nodes[idx]
             if node_id in target_set:
                 continue
-            if V[idx] > 0.10:
+            if V[idx] > min_threshold:
                 results.append((node_id, float(V[idx])))
 
         return results

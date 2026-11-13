@@ -1,4 +1,9 @@
-from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+from core.prompt_context import (
+    MemoryContextWorkerMixin,
+    fit_system_prompt,
+    format_prompt_footprint,
+    inject_static_worker_instructions,
+)
 import json
 import threading
 from google import genai
@@ -175,8 +180,8 @@ class GeminiWorker(MemoryContextWorkerMixin):
         self.sys_instruct = system_instruction
         self.tools = tools
         if self.sys_instruct:
-            self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
-            self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
+            self._append_worker_static_instructions = True
+            self.sys_instruct = inject_static_worker_instructions(self.sys_instruct)
 
         try:
             is_low_token = self.settings.get("core.low-token-mode", False)
@@ -231,6 +236,7 @@ class GeminiWorker(MemoryContextWorkerMixin):
                     thinking_config = None
 
             self.sys_instruct = fit_system_prompt(self.sys_instruct or "", self.settings, self.tools)
+            logging.debug(f"GeminiWorker prompt footprint: {format_prompt_footprint(self.sys_instruct, self.tools)}")
             self.thinker_config = types.GenerateContentConfig(
                 system_instruction=self.sys_instruct,
                 tools=tool_list if tool_list else None,
@@ -282,6 +288,8 @@ class GeminiWorker(MemoryContextWorkerMixin):
                             fr = p.function_response
                             resp = dict(fr.response) if getattr(fr, "response", None) else {}
                             parts_text.append(f"[Tool Result: {fr.name} -> {json.dumps(resp, default=str)}]")
+                        elif getattr(p, "inline_data", None) or getattr(p, "file_data", None):
+                            parts_text.append("[Media attachment from earlier in session]")
                 messages.append({"role": role, "content": "\n".join(parts_text)})
             return messages
 
@@ -290,9 +298,11 @@ class GeminiWorker(MemoryContextWorkerMixin):
         if not getattr(self, 'available', False) or not self.client:
             return
         from google.genai import types
+        from core.session_cache import normalize_session_messages
+        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
         with self._chat_lock:
             sdk_history = []
-            for msg in messages:
+            for msg in norm_messages:
                 role = "user" if msg.get("role") == "user" else "model"
                 content_text = msg.get("content", "")
                 if content_text:
@@ -725,3 +735,27 @@ class GeminiWorker(MemoryContextWorkerMixin):
                 continue
 
         return user_prompt
+
+    @classmethod
+    def fetch_available_models(cls, api_key: str = None) -> list:
+        """
+        Queries Google GenAI's models.list() endpoint to fetch active generative Gemini models.
+        Returns a sorted list of model ID strings (e.g. 'gemini-3.8-flash', 'gemini-2.5-pro').
+        """
+        if not api_key:
+            raise ValueError("Gemini API key is required to fetch available models.")
+        from google import genai
+        client = genai.Client(api_key=api_key.strip())
+        models = []
+        for m in client.models.list():
+            name = getattr(m, "name", "") or ""
+            if name.startswith("models/"):
+                name = name[len("models/"):]
+            supported_actions = getattr(m, "supported_actions", None)
+            if supported_actions and "generateContent" not in supported_actions:
+                continue
+            if "gemini" in name.lower():
+                models.append(name)
+        sorted_models = sorted(list(set(models)), key=lambda s: s.lower())
+        logging.getLogger("core.GeminiWorker").info(f"Successfully fetched {len(sorted_models)} models from Gemini catalog.")
+        return sorted_models

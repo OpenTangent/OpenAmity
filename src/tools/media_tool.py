@@ -98,6 +98,13 @@ class MediaSkill(Tool):
         }
 
     def execute(self, command: str, *args, **kwargs) -> Any:
+        if self.orchestrator and getattr(self.orchestrator, 'agent_id', None):
+            try:
+                save_dir = get_generated_media_dir(self.orchestrator.agent_id)
+                CacheManager.clear_expired(save_dir, max_age_days=1.0)
+            except Exception as e:
+                logging.debug(f"MediaSkill: Failed to prune expired media cache: {e}")
+
         is_low_token = self.orchestrator.settings_manager.get(
             "core.low-token-mode", False) if hasattr(self, 'orchestrator') and self.orchestrator else False
 

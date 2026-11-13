@@ -556,6 +556,9 @@ def test_settings_panel_fetch_openrouter_models_success(qapp, monkeypatch, tmp_p
     test_cache_file = tmp_path / "openrouter_models_cache.json"
     monkeypatch.setattr("config.paths.get_default_openrouter_models_file", lambda: str(test_default_file))
     monkeypatch.setattr("config.paths.get_openrouter_models_cache_file", lambda: str(test_cache_file))
+    if "paths" in sys.modules:
+        monkeypatch.setattr("paths.get_default_openrouter_models_file", lambda: str(test_default_file))
+        monkeypatch.setattr("paths.get_openrouter_models_cache_file", lambda: str(test_cache_file))
 
     panel = SettingsPanelWidget()
     fake_models = [
@@ -567,14 +570,15 @@ def test_settings_panel_fetch_openrouter_models_success(qapp, monkeypatch, tmp_p
     with patch("core.openrouter_worker.OpenRouterWorker.fetch_available_models", return_value=fake_models):
         t = panel._fetch_openrouter_models()
         assert panel.ui_openrouter_fetch_btn.isEnabled() is False
-        assert "Fetching models..." in panel.ui_openrouter_fetch_btn.text()
+        assert panel.ui_openrouter_fetch_btn.text() == "⏳"
+        assert "Fetching models..." in panel.ui_openrouter_fetch_status.text()
 
         if t:
             t.join(timeout=2.0)
         qapp.processEvents()
 
         assert panel.ui_openrouter_fetch_btn.isEnabled() is True
-        assert "Fetch Available Models from OpenRouter" in panel.ui_openrouter_fetch_btn.text()
+        assert panel.ui_openrouter_fetch_btn.text() == "🔄"
         assert "✓ Fetched 3 models" in panel.ui_openrouter_fetch_status.text()
         assert panel.ui_openrouter_provider.findText("xiaomi") >= 0
         assert panel.ui_openrouter_provider.findText("anthropic") >= 0
@@ -601,6 +605,9 @@ def test_settings_panel_fetch_openrouter_models_error(qapp, monkeypatch, tmp_pat
     test_cache_file = tmp_path / "openrouter_models_cache_err.json"
     monkeypatch.setattr("config.paths.get_default_openrouter_models_file", lambda: str(test_default_file))
     monkeypatch.setattr("config.paths.get_openrouter_models_cache_file", lambda: str(test_cache_file))
+    if "paths" in sys.modules:
+        monkeypatch.setattr("paths.get_default_openrouter_models_file", lambda: str(test_default_file))
+        monkeypatch.setattr("paths.get_openrouter_models_cache_file", lambda: str(test_cache_file))
 
     panel = SettingsPanelWidget()
 
@@ -613,7 +620,7 @@ def test_settings_panel_fetch_openrouter_models_error(qapp, monkeypatch, tmp_pat
         qapp.processEvents()
 
         assert panel.ui_openrouter_fetch_btn.isEnabled() is True
-        assert "Fetch Available Models from OpenRouter" in panel.ui_openrouter_fetch_btn.text()
+        assert panel.ui_openrouter_fetch_btn.text() == "🔄"
         assert "❌ Error: Connection timed out" in panel.ui_openrouter_fetch_status.text()
 
         # Verify files were NOT written on error
@@ -934,6 +941,124 @@ def test_openrouter_worker_pulse_continues_normally_after_api_failure(monkeypatc
         assert len(thought_signals) == 1
         assert thought_signals[0][0] == "Pulse executed successfully"
         assert worker.is_processing is False
+
+
+def test_openrouter_model_supports_audio_input():
+    # Non-audio models
+    assert OpenRouterWorker.model_supports_audio_input("openai/gpt-6.1-sol") is False
+    assert OpenRouterWorker.model_supports_audio_input("openai/gpt-4o") is False
+    assert OpenRouterWorker.model_supports_audio_input("anthropic/claude-3.7-sonnet") is False
+    assert OpenRouterWorker.model_supports_audio_input("deepseek/deepseek-chat") is False
+    assert OpenRouterWorker.model_supports_audio_input("meta-llama/llama-3.3-70b") is False
+
+    # Audio-capable models
+    assert OpenRouterWorker.model_supports_audio_input("google/gemini-2.5-flash") is True
+    assert OpenRouterWorker.model_supports_audio_input("google/gemini-3.8-flash") is True
+    assert OpenRouterWorker.model_supports_audio_input("openai/gpt-4o-audio-preview") is True
+    assert OpenRouterWorker.model_supports_audio_input("xiaomi/mimo-v2.6-pro") is True
+
+
+def test_openrouter_tool_media_audio_auto_transcribes_for_non_audio_model(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    # Create dummy ogg file simulating WhatsApp voice message
+    ogg_file = tmp_path / "whatsapp_voice.ogg"
+    ogg_file.write_bytes(b"OggS" + b"\x00" * 30)
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.current_model = "openai/gpt-6.1-sol"
+        worker.primary_model = "openai/gpt-6.1-sol"
+
+        # Mock LocalSTT transcription
+        with patch("core.local_stt.LocalSTT.transcribe", return_value="Hello, this is a WhatsApp voice note."):
+            block = worker._prepare_media_block(str(ogg_file))
+
+            # Must return a text block with transcription, NOT input_audio!
+            assert block["type"] == "text"
+            assert "Voice Message Transcription: Hello, this is a WhatsApp voice note." in block["text"]
+            assert "whatsapp_voice.ogg" in block["text"]
+
+
+def test_openrouter_send_function_responses_with_audio_for_non_audio_model(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(tmp_path))
+
+    ogg_file = tmp_path / "group_voice.ogg"
+    ogg_file.write_bytes(b"OggS" + b"\x00" * 30)
+
+    with patch.object(SettingsManager, "get_env", return_value="sk-or-test-key-12345"):
+        worker = OpenRouterWorker(agent_id="test_openrouter_agent")
+        worker.start_session(system_instruction="Test system prompt")
+        worker.current_model = "openai/gpt-6.1-sol"
+        worker.primary_model = "openai/gpt-6.1-sol"
+
+        # Simulate assistant calling WhatsApp tool
+        worker.history.append({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_whatsapp_1",
+                "type": "function",
+                "function": {
+                    "name": "WhatsApp_recent_chat",
+                    "arguments": '{"target": "+1 Intelligence"}'
+                }
+            }]
+        })
+
+        attempted_calls = []
+
+        def mock_create(**kwargs):
+            model = kwargs.get("model")
+            messages = kwargs.get("messages", [])
+            attempted_calls.append((model, messages))
+            chunk = MagicMock()
+            chunk.choices = [MagicMock()]
+            chunk.choices[0].delta = MagicMock()
+            chunk.choices[0].delta.reasoning = None
+            chunk.choices[0].delta.content = "Checked recent WhatsApp group messages"
+            chunk.choices[0].delta.tool_calls = None
+            chunk.usage = None
+            return [chunk]
+
+        worker.client.chat.completions.create = mock_create
+
+        with patch("core.local_stt.LocalSTT.transcribe", return_value="Hey team, check out the poll."):
+            # Simulate tool response with audio media (like WhatsAppSkill returns)
+            responses = [(
+                "WhatsApp_recent_chat",
+                {
+                    "result": "Recent Messages for +1 Intelligence:\n- Alice: Hello\n",
+                    "media": [str(ogg_file)]
+                }
+            )]
+            worker.send_function_responses(responses)
+            time.sleep(0.1)
+
+        # Must execute with model openai/gpt-6.1-sol
+        assert len(attempted_calls) == 1
+        model, messages = attempted_calls[0]
+        assert model == "openai/gpt-6.1-sol"
+
+        # Ensure NO input_audio block was sent to OpenRouter!
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    assert part.get("type") != "input_audio", "Must not send input_audio to non-audio model!"
+
+        # Ensure the transcription was cleanly included in the history
+        user_msgs = [m for m in worker.history if m.get("role") == "user"]
+        assert any("Voice Message Transcription: Hey team, check out the poll." in str(m.get("content")) for m in user_msgs)
+
+
+def test_openrouter_record_unsupported_audio_model():
+    model_name = "testprovider/some-new-model"
+    assert OpenRouterWorker.model_supports_audio_input(model_name) is False
+
+    # Simulate recording it explicitly
+    OpenRouterWorker.record_unsupported_audio_model(model_name)
+    assert OpenRouterWorker.model_supports_audio_input(model_name) is False
+
 
 
 

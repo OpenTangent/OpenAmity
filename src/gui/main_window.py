@@ -258,10 +258,11 @@ class MainWindow(QMainWindow):
         self.stdout_logger.new_message.connect(self.append_to_agent_console)
         self.stderr_logger.new_message.connect(self.append_to_agent_console)
 
-        from core.logger_config import VerbosityFilter
+        from core.logger_config import VerbosityFilter, ConsoleLogFilter
         self.qt_logger = QtLoggingHandler()
         self.qt_logger.setLevel(logging.INFO)
         self.qt_logger.addFilter(VerbosityFilter())
+        self.qt_logger.addFilter(ConsoleLogFilter())
 
         self.qt_logger.signals.new_message.connect(
             self.append_to_agent_console)
@@ -860,13 +861,7 @@ class MainWindow(QMainWindow):
 
         for aid, view in self.agent_views.items():
             orch = view.orchestrator
-            fatigue = orch.get_fatigue() if hasattr(orch, 'get_fatigue') else 0.0
-            if not getattr(orch, 'is_paused', False) and fatigue >= 0.02:
-                view.append_to_conversation(
-                    "System", "Consolidating memories for graceful shutdown... please wait.")
-                orch.shutdown(force_sleep=True)
-            else:
-                orch.shutdown(force_sleep=False)
+            orch.shutdown(force_sleep=False)
 
     def check_all_shutdown(self):
         if not self._shutting_down:

@@ -19,7 +19,10 @@
 		"mirrors": [
 			{
 				"perspective": "Self",
-				"subjective_view": "System initialized. I am forming my own subjective view of myself."
+				"sphere_level": 1,
+				"entity_type": "self",
+				"subjective_view": "System initialized. I am forming my own subjective view of myself.",
+				"perspective_cone": "I am anchoring my internal coherence at Sphere 1 and preparing to model the inner worlds of those around me."
 			}
 		]
 	}

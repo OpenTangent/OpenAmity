@@ -985,6 +985,7 @@ class SettingsPanelWidget(QWidget):
     sample_synth_ready = Signal(str)
     sample_synth_failed = Signal()
     openrouter_models_fetched = Signal(object, object)
+    provider_models_fetched = Signal(str, object, object)
     openrouter_image_models_fetched = Signal(object, object)
 
     def __init__(self, parent=None):
@@ -995,6 +996,7 @@ class SettingsPanelWidget(QWidget):
         self.sample_synth_ready.connect(self._play_temp_sample_file)
         self.sample_synth_failed.connect(self._reset_play_sample_btn)
         self.openrouter_models_fetched.connect(self._on_openrouter_models_fetched)
+        self.provider_models_fetched.connect(self._on_provider_models_fetched)
         self.openrouter_image_models_fetched.connect(self._on_openrouter_image_models_fetched)
         self._openrouter_models_list = self._load_cached_openrouter_models()
         self._openrouter_light_models_list = list(self._openrouter_models_list)
@@ -2111,16 +2113,6 @@ class SettingsPanelWidget(QWidget):
         card_openrouter.body_layout.addWidget(self.ui_openrouter_api_key)
 
         self._setup_provider_model_controls("openrouter", card_openrouter.body_layout)
-
-        fetch_layout = QHBoxLayout()
-        self.ui_openrouter_fetch_btn = QPushButton("🔄 Fetch Available Models from OpenRouter")
-        self.ui_openrouter_fetch_status = QLabel("")
-        self.ui_openrouter_fetch_status.setStyleSheet("color: #888888; font-size: 11px;")
-        self.ui_openrouter_fetch_btn.clicked.connect(self._fetch_openrouter_models)
-        fetch_layout.addWidget(self.ui_openrouter_fetch_btn)
-        fetch_layout.addWidget(self.ui_openrouter_fetch_status)
-        fetch_layout.addStretch()
-        card_openrouter.body_layout.addLayout(fetch_layout)
 
         card_openrouter.clicked.connect(lambda: self._select_provider("openrouter"))
         self.provider_cards["openrouter"] = card_openrouter
@@ -3512,9 +3504,9 @@ class SettingsPanelWidget(QWidget):
         if not hasattr(self, 'ui_openrouter_fetch_btn'):
             return
         self.ui_openrouter_fetch_btn.setEnabled(False)
-        self.ui_openrouter_fetch_btn.setText("⏳ Fetching models...")
+        self.ui_openrouter_fetch_btn.setText("⏳")
         if hasattr(self, 'ui_openrouter_fetch_status'):
-            self.ui_openrouter_fetch_status.setText("")
+            self.ui_openrouter_fetch_status.setText("Fetching models...")
 
         api_key = self.ui_openrouter_api_key.text().strip() if hasattr(self, 'ui_openrouter_api_key') else ""
         from core.openrouter_worker import OpenRouterWorker
@@ -3535,7 +3527,7 @@ class SettingsPanelWidget(QWidget):
     def _on_openrouter_models_fetched(self, models: list, error: str = None):
         if hasattr(self, 'ui_openrouter_fetch_btn'):
             self.ui_openrouter_fetch_btn.setEnabled(True)
-            self.ui_openrouter_fetch_btn.setText("🔄 Fetch Available Models from OpenRouter")
+            self.ui_openrouter_fetch_btn.setText("🔄")
 
         if error:
             if hasattr(self, 'ui_openrouter_fetch_status'):
@@ -3566,6 +3558,190 @@ class SettingsPanelWidget(QWidget):
         providers_count = max(0, len(self._get_openrouter_providers(models)) - 1)
         if hasattr(self, 'ui_openrouter_fetch_status'):
             self.ui_openrouter_fetch_status.setText(f"✓ Fetched {len(models)} models across {providers_count} providers.")
+
+    def _load_cached_provider_models(self, provider_id: str) -> list:
+        if provider_id == "openrouter":
+            return self._load_cached_openrouter_models()
+        try:
+            from config import paths
+        except ImportError:
+            import paths
+        cache_file = paths.get_provider_models_cache_file(provider_id)
+        if cache_file and os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                loaded = data.get("models", []) if isinstance(data, dict) else data
+                if isinstance(loaded, list) and loaded:
+                    result = [m for m in loaded if m != "Custom..."]
+                    result.append("Custom...")
+                    return result
+            except Exception as e:
+                logging.getLogger("gui.SettingsPanel").warning(
+                    f"Error loading cached {provider_id} models from {cache_file}: {e}")
+
+        cfg = PROVIDER_MODELS.get(provider_id, {})
+        return list(cfg.get("models", ["Custom..."]))
+
+    def _save_cached_provider_models(self, provider_id: str, models: list) -> bool:
+        if provider_id == "openrouter":
+            return self._save_cached_openrouter_models(models)
+        if not models or not isinstance(models, list):
+            return False
+        try:
+            from config import paths
+        except ImportError:
+            import paths
+        try:
+            from core.file_utils import atomic_json_write
+        except ImportError:
+            from file_utils import atomic_json_write
+
+        try:
+            cache_file = paths.get_provider_models_cache_file(provider_id)
+            clean_models = [m for m in models if m != "Custom..."]
+            atomic_json_write(cache_file, clean_models, indent=2)
+            logging.getLogger("gui.SettingsPanel").info(
+                f"Successfully cached {len(clean_models)} {provider_id} models to {cache_file}")
+            return True
+        except Exception as e:
+            logging.getLogger("gui.SettingsPanel").warning(
+                f"Failed to save {provider_id} models to cache: {e}")
+            return False
+
+    def _fetch_provider_models(self, provider_id: str):
+        if provider_id == "openrouter":
+            return self._fetch_openrouter_models()
+
+        btn = getattr(self, f"ui_{provider_id}_fetch_btn", None)
+        status = getattr(self, f"ui_{provider_id}_fetch_status", None)
+        if btn:
+            btn.setEnabled(False)
+            btn.setText("⏳")
+        if status:
+            status.setText("Fetching available models...")
+
+        api_key_input = getattr(self, f"ui_{provider_id}_api_key", None)
+        api_key = api_key_input.text().strip() if api_key_input else ""
+        if not api_key and self.settings:
+            env_map = {
+                "gemini": "GEMINI_API_KEY",
+                "claude": "ANTHROPIC_API_KEY",
+                "chatgpt": "OPENAI_API_KEY",
+                "deepseek": "DEEPSEEK_API_KEY",
+            }
+            env_var = env_map.get(provider_id, "")
+            if env_var:
+                api_key = self.settings.get_env(env_var, "")
+
+        if not api_key:
+            if btn:
+                btn.setEnabled(True)
+                btn.setText("🔄")
+            if status:
+                status.setText("❌ Please enter an API key first.")
+            return
+
+        def worker():
+            try:
+                if provider_id == "gemini":
+                    from core.gemini_worker import GeminiWorker
+                    models = GeminiWorker.fetch_available_models(api_key=api_key)
+                elif provider_id == "claude":
+                    from core.claude_worker import ClaudeWorker
+                    models = ClaudeWorker.fetch_available_models(api_key=api_key)
+                elif provider_id == "chatgpt":
+                    from core.chatgpt_worker import ChatGptWorker
+                    models = ChatGptWorker.fetch_available_models(api_key=api_key)
+                elif provider_id == "deepseek":
+                    from core.deepseek_worker import DeepSeekWorker
+                    models = DeepSeekWorker.fetch_available_models(api_key=api_key)
+                else:
+                    models = []
+                self.provider_models_fetched.emit(provider_id, models, None)
+            except Exception as e:
+                logging.getLogger("gui.SettingsPanel").warning(
+                    f"Failed to fetch {provider_id} models: {e}")
+                self.provider_models_fetched.emit(provider_id, [], str(e))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return t
+
+    def _on_provider_models_fetched(self, provider_id: str, models: list, error: str = None):
+        if provider_id == "openrouter":
+            self._on_openrouter_models_fetched(models, error)
+            return
+
+        btn = getattr(self, f"ui_{provider_id}_fetch_btn", None)
+        status = getattr(self, f"ui_{provider_id}_fetch_status", None)
+        if btn:
+            btn.setEnabled(True)
+            btn.setText("🔄")
+
+        if error:
+            if status:
+                status.setText(f"❌ Error: {error}")
+            return
+
+        if not models:
+            if status:
+                status.setText("No models found.")
+            return
+
+        unique_models = []
+        for m in models:
+            if m and m != "Custom..." and m not in unique_models:
+                unique_models.append(m)
+        unique_models.append("Custom...")
+
+        self._save_cached_provider_models(provider_id, unique_models)
+
+        combo_model = getattr(self, f"ui_{provider_id}_model", None)
+        custom_model = getattr(self, f"ui_{provider_id}_custom_model", None)
+        if combo_model:
+            cur_text = combo_model.currentText()
+            combo_model.blockSignals(True)
+            combo_model.clear()
+            combo_model.addItems(unique_models)
+            idx = combo_model.findText(cur_text)
+            if idx >= 0:
+                combo_model.setCurrentIndex(idx)
+            else:
+                c_idx = combo_model.findText("Custom...")
+                if c_idx >= 0:
+                    combo_model.setCurrentIndex(c_idx)
+                if custom_model:
+                    custom_model.setText(cur_text)
+                    custom_model.setVisible(True)
+            combo_model.blockSignals(False)
+            self.configure_combobox(combo_model)
+
+        combo_light = getattr(self, f"ui_{provider_id}_light_model", None)
+        custom_light = getattr(self, f"ui_{provider_id}_custom_light_model", None)
+        if combo_light:
+            cur_light = combo_light.currentText()
+            existing_items = [combo_light.itemText(i) for i in range(combo_light.count()) if combo_light.itemText(i) != "Custom..."]
+            all_light = list(dict.fromkeys(existing_items + [m for m in unique_models if m != "Custom..."]))
+            all_light.append("Custom...")
+            combo_light.blockSignals(True)
+            combo_light.clear()
+            combo_light.addItems(all_light)
+            idx_l = combo_light.findText(cur_light)
+            if idx_l >= 0:
+                combo_light.setCurrentIndex(idx_l)
+            else:
+                c_idx = combo_light.findText("Custom...")
+                if c_idx >= 0:
+                    combo_light.setCurrentIndex(c_idx)
+                if custom_light:
+                    custom_light.setText(cur_light)
+                    custom_light.setVisible(True)
+            combo_light.blockSignals(False)
+            self.configure_combobox(combo_light)
+
+        if status:
+            status.setText(f"✓ Fetched {len(unique_models) - 1} models.")
 
     def _parse_openrouter_model_slug(self, slug: str) -> tuple:
         if not slug or slug == "Custom...":
@@ -3789,12 +3965,28 @@ class SettingsPanelWidget(QWidget):
 
         col_model = QVBoxLayout()
         col_model.addWidget(QLabel("Model:"))
+        model_input_row = QHBoxLayout()
+        model_input_row.setSpacing(6)
         combo_model = QComboBox()
         self.configure_combobox(combo_model)
-        col_model.addWidget(combo_model)
+        model_input_row.addWidget(combo_model, 1)
+
+        self.ui_openrouter_fetch_btn = QPushButton("🔄")
+        self.ui_openrouter_fetch_btn.setObjectName("iconBtn")
+        self.ui_openrouter_fetch_btn.setFixedSize(32, 32)
+        self.ui_openrouter_fetch_btn.setCursor(Qt.PointingHandCursor)
+        self.ui_openrouter_fetch_btn.setToolTip("Fetch and refresh the list of available models from OpenRouter")
+        self.ui_openrouter_fetch_btn.clicked.connect(self._fetch_openrouter_models)
+        model_input_row.addWidget(self.ui_openrouter_fetch_btn)
+        col_model.addLayout(model_input_row)
+
         row_model.addLayout(col_model, 2)
 
         layout.addLayout(row_model)
+
+        self.ui_openrouter_fetch_status = QLabel("")
+        self.ui_openrouter_fetch_status.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(self.ui_openrouter_fetch_status)
 
         custom_model = QLineEdit()
         custom_model.setPlaceholderText("Enter custom model identifier (e.g. xiaomi/mimo-v2.6-pro)...")
@@ -4208,15 +4400,40 @@ class SettingsPanelWidget(QWidget):
 
         layout.addSpacing(6)
         layout.addWidget(QLabel("AI Model:"))
+
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
+
         combo_model = QComboBox()
         self.configure_combobox(combo_model)
-        combo_model.addItems(cfg["models"])
+        models = self._load_cached_provider_models(provider_id)
+        combo_model.addItems(models)
+        model_row.addWidget(combo_model, 1)
+
+        btn_refresh = QPushButton("🔄")
+        btn_refresh.setObjectName("iconBtn")
+        btn_refresh.setFixedSize(32, 32)
+        btn_refresh.setCursor(Qt.PointingHandCursor)
+        provider_title = {
+            "gemini": "Gemini",
+            "claude": "Claude",
+            "chatgpt": "OpenAI / ChatGPT",
+            "deepseek": "DeepSeek"
+        }.get(provider_id, provider_id.capitalize())
+        btn_refresh.setToolTip(f"Fetch and refresh the list of available models from {provider_title}")
+        btn_refresh.clicked.connect(lambda _, p=provider_id: self._fetch_provider_models(p))
+        model_row.addWidget(btn_refresh)
+        layout.addLayout(model_row)
+
+        status_lbl = QLabel("")
+        status_lbl.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(status_lbl)
+
         custom_model = QLineEdit()
-        custom_model.setPlaceholderText("Enter custom model identifier...")
+        custom_model.setPlaceholderText(f"Enter custom {provider_title} model identifier...")
         custom_model.setVisible(False)
         combo_model.currentTextChanged.connect(
             lambda text, cm=custom_model: cm.setVisible(text == "Custom..."))
-        layout.addWidget(combo_model)
         layout.addWidget(custom_model)
 
         layout.addSpacing(4)
@@ -4246,6 +4463,8 @@ class SettingsPanelWidget(QWidget):
         layout.addWidget(tip_light)
 
         setattr(self, f"ui_{provider_id}_model", combo_model)
+        setattr(self, f"ui_{provider_id}_fetch_btn", btn_refresh)
+        setattr(self, f"ui_{provider_id}_fetch_status", status_lbl)
         setattr(self, f"ui_{provider_id}_custom_model", custom_model)
         setattr(self, f"ui_{provider_id}_thinking_level", combo_thinking)
         setattr(self, f"ui_{provider_id}_thinking_tip", tip_thinking)

@@ -1,4 +1,9 @@
-from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+from core.prompt_context import (
+    MemoryContextWorkerMixin,
+    fit_system_prompt,
+    format_prompt_footprint,
+    inject_static_worker_instructions,
+)
 import os
 import subprocess
 import time
@@ -121,11 +126,10 @@ class DeepSeekWorker(MemoryContextWorkerMixin):
                 "Session Start Error: DeepSeek Worker is not available")
             return
 
-        self.sys_instruct = system_instruction or ""
-        self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
-        self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
-
+        self._append_worker_static_instructions = True
+        self.sys_instruct = inject_static_worker_instructions(system_instruction or "")
         self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
+        logging.debug(f"DeepSeekWorker prompt footprint: {format_prompt_footprint(self.sys_instruct, tools)}")
         self.tools = tools
         self.openai_tools = []
         if self.tools:
@@ -161,22 +165,47 @@ class DeepSeekWorker(MemoryContextWorkerMixin):
         messages = []
         for m in self.history:
             role = m.get("role", "user")
-            content = m.get("content", "") or ""
+            raw_c = m.get("content", "") or ""
+            text_parts = []
+            if m.get("reasoning_content"):
+                text_parts.append(m["reasoning_content"])
+            if isinstance(raw_c, str):
+                if raw_c.strip():
+                    text_parts.append(raw_c)
+            elif isinstance(raw_c, list):
+                for block in raw_c:
+                    if isinstance(block, dict):
+                        b_type = block.get("type", "")
+                        if b_type == "text":
+                            t = block.get("text", "")
+                            if t:
+                                text_parts.append(t)
+                        elif b_type in ("image_url", "file"):
+                            text_parts.append("[Media attachment from earlier in session]")
+            content = "\n".join(text_parts).strip()
             if m.get("tool_calls"):
                 for tc in m["tool_calls"]:
-                    fn = tc.get("function", {})
-                    content += f"\n[Tool invocation: {fn.get('name')}({fn.get('arguments', '')})]"
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+                    if isinstance(fn, dict):
+                        name = fn.get("name", "")
+                        args = fn.get("arguments", "")
+                    else:
+                        name = getattr(fn, "name", "")
+                        args = getattr(fn, "arguments", "")
+                    content += f"\n[Tool invocation: {name}({args})]"
             if role == "tool":
-                messages.append({"role": "user", "content": f"[Tool Result: {content}]"})
+                messages.append({"role": "user", "content": f"[Tool Result: {content.strip()}]"})
             else:
-                messages.append({"role": role, "content": content})
+                messages.append({"role": role, "content": content.strip()})
         return messages
 
     def set_session_history(self, messages: list):
         """Restores chat history from normalized turns."""
+        from core.session_cache import normalize_session_messages
+        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
         self.history = []
         self.consumed_tool_call_ids = set()
-        for msg in messages:
+        for msg in norm_messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if content:
@@ -255,8 +284,20 @@ class DeepSeekWorker(MemoryContextWorkerMixin):
             except Exception as e:
                 raise ValueError(f"DeepSeek does not natively support PDF attachments, and text extraction failed: {e}")
 
-        # DeepSeek does not natively support multimodal audio input.
+        # DeepSeek does not natively support multimodal audio input. Transcribe using LocalSTT if available.
         if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            transcription = None
+            try:
+                from core.local_stt import LocalSTT
+                transcription = LocalSTT().transcribe(exp_path)
+            except Exception as e:
+                logging.debug(f"LocalSTT failed for {exp_path}: {e}")
+
+            if transcription and not transcription.startswith("Failed"):
+                return {
+                    "type": "text",
+                    "text": f"[Voice Message Audio: {os.path.basename(exp_path)}]\n[Voice Message Transcription: {transcription}]"
+                }
             return {
                 "type": "text",
                 "text": f"[Audio file attached: {exp_path}. Note: DeepSeek does not support multimodal audio input directly. To extract text or messages from this audio file, use the Media_transcribe_audio tool.]"
@@ -694,3 +735,22 @@ class DeepSeekWorker(MemoryContextWorkerMixin):
         except Exception as e:
             logging.warning(f"DeepSeek Reformulator API Error: {e}")
             return user_prompt
+
+    @classmethod
+    def fetch_available_models(cls, api_key: str = None) -> list:
+        """
+        Queries DeepSeek's models.list() endpoint to fetch active DeepSeek models.
+        Returns a sorted list of model ID strings (e.g. 'deepseek-chat', 'deepseek-reasoner').
+        """
+        if not api_key:
+            raise ValueError("DeepSeek API key is required to fetch available models.")
+        import openai
+        client = openai.OpenAI(api_key=api_key.strip(), base_url="https://api.deepseek.com")
+        models = []
+        for m in client.models.list():
+            m_id = getattr(m, "id", "")
+            if m_id:
+                models.append(m_id)
+        sorted_models = sorted(list(set(models)), key=lambda s: s.lower())
+        logging.getLogger("core.DeepSeekWorker").info(f"Successfully fetched {len(sorted_models)} models from DeepSeek catalog.")
+        return sorted_models

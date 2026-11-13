@@ -5,16 +5,25 @@ from google.genai import types
 from dotenv import load_dotenv
 from .events import Signal
 from .settings_manager import SettingsManager
+from .subagent_file_tools import SubagentFilePolicy, SubagentFileToolset
 
 load_dotenv()
 
+SUBAGENT_ALLOWED_CEREBRUM_TOOLS = frozenset({"DateTime", "WebSearch"})
+
 
 class SubagentWorker:
-    def __init__(self, subagent_id, orchestrator, model_tier="light"):
+    def __init__(self, subagent_id, orchestrator, model_tier="light", file_policy=None):
         self.subagent_id = subagent_id
         self.orchestrator = orchestrator
         self.agent_id = orchestrator.agent_id
         self.model_tier = model_tier
+        self.file_policy = file_policy if file_policy is not None else SubagentFilePolicy()
+        self.file_toolset = SubagentFileToolset(
+            self.file_policy,
+            orchestrator=self.orchestrator,
+            subagent_id=self.subagent_id,
+        )
         self.settings = SettingsManager(agent_id=self.agent_id)
         self.api_key = self.settings.get_env("GEMINI_API_KEY")
         self.thought_received = Signal()  # text, function_calls
@@ -59,14 +68,28 @@ class SubagentWorker:
         if not self.available:
             return
 
-        sys_instruct = f"You are a subagent with ID {self.subagent_id}. You operate in the background to assist the primary agent. You must be concise, objective, and task-oriented. You will not interact directly with the user. Your output is read by the primary agent, so deliver exactly what is asked."
-        sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
+        sys_instruct = (
+            f"You are a subagent with ID {self.subagent_id}. You operate in the background to assist the primary agent. "
+            "You must be concise, objective, and task-oriented. You will not interact directly with the user. "
+            "Your output is read by the primary agent, so deliver exactly what is asked."
+        )
+        sys_instruct += f"\n\n{self.file_policy.describe_for_prompt()}"
+        sys_instruct += (
+            "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). "
+            "You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. "
+            "If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
+        )
 
-        # Load restricted tools from Cerebrum
+        # Load restricted tools from Cerebrum plus optional scoped file tools
         tool_declarations = []
-        for name, tool in self.orchestrator.cerebrum.tools.items():
-            if name in ["DateTime", "WebSearch"]:
-                tool_declarations.extend(tool.get_tool_declarations())
+        cerebrum = getattr(self.orchestrator, "cerebrum", None)
+        tools_map = getattr(cerebrum, "tools", None)
+        if tools_map is not None and hasattr(tools_map, "items"):
+            for name, tool in tools_map.items():
+                if name in SUBAGENT_ALLOWED_CEREBRUM_TOOLS:
+                    tool_declarations.extend(tool.get_tool_declarations())
+
+        tool_declarations.extend(self.file_toolset.get_tool_declarations())
 
         tool_list = []
         if tool_declarations:

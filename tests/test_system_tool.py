@@ -175,3 +175,64 @@ def test_system_tool_contemplate():
     assert "Contemplation cycle completed" in cerebrum_result_kwargs
 
 
+def test_system_tool_sleep():
+    """Verify System_sleep declaration, execution, guardrails, and Cerebrum routing."""
+    from core.cerebrum import Cerebrum
+
+    tool = SystemTool(orchestrator=None)
+
+    # 1. Verify commands list
+    assert any("sleep" in cmd for cmd in tool.commands)
+
+    # 2. Verify tool declaration
+    declarations = tool.get_tool_declarations()
+    sleep_decl = next((d for d in declarations if d["name"] == "System_sleep"), None)
+    assert sleep_decl is not None
+    desc = sleep_decl["description"]
+    assert "Memory Consolidation" in desc
+    assert "idle" in desc.lower()
+    assert "fatigue" in desc.lower()
+    assert "pulses" in desc.lower()
+    assert sleep_decl["parameters"]["type"] == "OBJECT"
+    assert "reason" in sleep_decl["parameters"]["properties"]
+
+    # 3. Direct execution without orchestrator
+    result = tool.execute("sleep")
+    assert "Sleep cycle initiated" in result
+    result_with_reason = tool.execute("sleep", reason="Idle for 2 hours with 60% fatigue")
+    assert "Sleep cycle initiated" in result_with_reason
+    result_alias = tool.execute("sleep_cycle")
+    assert "Sleep cycle initiated" in result_alias
+
+    # 4. Cerebrum routing
+    cerebrum = Cerebrum(orchestrator=None)
+    cerebrum.register_skill(tool)
+    cerebrum_res = cerebrum.execute_tool_call("System_sleep", {})
+    assert "Sleep cycle initiated" in cerebrum_res
+    cerebrum_res_reason = cerebrum.execute_tool_call("System_sleep", {"reason": "Autonomous rest"})
+    assert "Sleep cycle initiated" in cerebrum_res_reason
+
+    # 5. Execution with orchestrator implementing trigger_sleep_cycle
+    mock_orch = MagicMock()
+    mock_orch._is_sleep_cycle = False
+    mock_orch.is_paused = False
+    mock_orch.trigger_sleep_cycle.return_value = True
+
+    tool_with_orch = SystemTool(orchestrator=mock_orch)
+    res_orch = tool_with_orch.execute("sleep", reason="Test sleep")
+    assert "Sleep cycle initiated" in res_orch
+    mock_orch.trigger_sleep_cycle.assert_called_once_with(reason="Test sleep")
+
+    # 6. Guardrail: Error when already in sleep cycle
+    mock_orch._is_sleep_cycle = True
+    res_already_sleeping = tool_with_orch.execute("sleep")
+    assert "already in progress" in res_already_sleeping
+
+    # 7. Guardrail: Error when paused
+    mock_orch._is_sleep_cycle = False
+    mock_orch.is_paused = True
+    res_paused = tool_with_orch.execute("sleep")
+    assert "Agent is paused" in res_paused
+
+
+

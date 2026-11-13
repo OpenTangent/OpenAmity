@@ -253,3 +253,68 @@ def test_legacy_direct_imap_when_archive_local_disabled(email_tool_fixture):
     # Should NOT have called expunge or store \Deleted
     mock_imap.expunge.assert_not_called()
     assert len(tool.archive.get_emails(folder="INBOX")) == 0
+
+
+def test_get_imap_connection_retries_on_socket_eof(email_tool_fixture):
+    tool, env, _ = email_tool_fixture
+    import imaplib
+
+    mock_imap1 = MagicMock()
+    mock_imap1.login.side_effect = imaplib.IMAP4.abort("command: LOGIN => socket error: EOF")
+    mock_imap2 = MagicMock()
+    mock_imap2.login.return_value = ("OK", [b"Logged in"])
+
+    with patch("imaplib.IMAP4_SSL", side_effect=[mock_imap1, mock_imap2]), \
+         patch("time.sleep", return_value=None) as mock_sleep:
+        success, res = tool._get_imap_connection()
+
+    assert success is True
+    assert res == mock_imap2
+    mock_sleep.assert_called_once_with(1.0)
+    mock_imap1.shutdown.assert_called_once()
+
+
+def test_fetch_emails_surfaces_sync_failure_when_no_unread_in_archive(email_tool_fixture):
+    tool, env, _ = email_tool_fixture
+
+    # Pre-populate archive with an existing read email
+    raw = create_sample_rfc822(subject="Old Read Email", body="Read body.")
+    tool.archive.save_email(folder="INBOX", raw_bytes=raw, is_read=True)
+
+    # Server sync fails with IMAP connection abort
+    err_msg = "IMAP connection or authentication error: abort: command: LOGIN => socket error: EOF"
+    with patch.object(tool, "_get_imap_connection", return_value=(False, err_msg)):
+        res = tool.execute("fetch_emails", folder="INBOX", unread_only=True)
+
+    # Must NOT swallow the error and say "No unread emails found"
+    assert "Failed to connect to IMAP server:" in res
+    assert "socket error: EOF" in res
+    assert "No unread emails found" not in res
+
+
+def test_fetch_emails_shows_notice_when_sync_fails_but_cached_unread_exist(email_tool_fixture):
+    tool, env, _ = email_tool_fixture
+
+    # Pre-populate archive with an unread email
+    raw = create_sample_rfc822(subject="Cached Unread Email", body="Unread body.")
+    tool.archive.save_email(folder="INBOX", raw_bytes=raw, is_read=False)
+
+    err_msg = "IMAP connection or authentication error: socket.timeout: timed out"
+    with patch.object(tool, "_get_imap_connection", return_value=(False, err_msg)):
+        res = tool.execute("fetch_emails", folder="INBOX", unread_only=True)
+
+    assert "[Notice: IMAP server sync failed" in res
+    assert "Found 1 unread email(s) in 'INBOX':" in res
+    assert "Cached Unread Email" in res
+
+
+def test_read_email_surfaces_sync_error_on_missing_email(email_tool_fixture):
+    tool, env, _ = email_tool_fixture
+
+    err_msg = "IMAP connection or authentication error: abort: command: LOGIN => socket error: EOF"
+    with patch.object(tool, "_get_imap_connection", return_value=(False, err_msg)):
+        res = tool.execute("read_email", email_id="9999", folder="INBOX")
+
+    assert "IMAP server sync failed" in res
+    assert "socket error: EOF" in res
+

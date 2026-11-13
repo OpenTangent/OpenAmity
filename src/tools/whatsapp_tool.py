@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import requests
@@ -21,6 +22,7 @@ class WhatsAppSkill(Tool):
         "send_voice <target> <message> (Send a text message that gets converted to voice/TTS and sent)",
         "send_location <target> <latitude> <longitude> [name] [address] [url] (Send a location pin with GPS coordinates)",
         "send_contact <target> <contact_name> <contact_phone> [organization] [email] (Send a contact card / vCard)",
+        "vote_poll <msgId> <options> (Vote in a WhatsApp poll by message ID and option ID(s) or option text(s))",
         "react <msgId> <reaction> (React to a specific message with an emoji)",
         "mark_read <chatId> (Mark a chat as read)",
         "reset_connection (Clears WhatsApp cache, checks for engine updates, and restarts the server if stuck in a QR loop)"
@@ -40,7 +42,9 @@ class WhatsAppSkill(Tool):
 
     def _on_status_notice(self, notice: str):
         if hasattr(self, 'orchestrator') and self.orchestrator:
-            if hasattr(self.orchestrator, 'on_message_appended') and self.orchestrator.on_message_appended:
+            if hasattr(self.orchestrator, 'append_to_conversation'):
+                self.orchestrator.append_to_conversation("System", notice)
+            elif hasattr(self.orchestrator, 'on_message_appended') and self.orchestrator.on_message_appended:
                 self.orchestrator.on_message_appended.emit("System", notice)
 
     def _on_message_received(self, sender_id, sender_name, **kwargs):
@@ -139,6 +143,25 @@ class WhatsAppSkill(Tool):
                 }
             },
             {
+                "name": "WhatsApp_vote_poll",
+                "description": "Casts or updates your vote in a WhatsApp poll message. Provide the poll's exact MsgID and the option(s) you want to vote for (by option localId number such as '0' or '1', or by exact option text). For single-choice polls, pass one option; for multiple-choice polls, you may pass one or more options. Pass an empty array [] to retract your vote.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "msgId": {
+                            "type": "STRING",
+                            "description": "The exact MsgID of the poll message (e.g., 'false_120363...@g.us_3EB0...')."
+                        },
+                        "options": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "List of option IDs (e.g., ['0'] or ['0', '2']) or option names (e.g., ['GTA: VI']) to vote for. Pass [] to remove your vote."
+                        }
+                    },
+                    "required": ["msgId", "options"]
+                }
+            },
+            {
                 "name": "WhatsApp_mark_read",
                 "description": "Explicitly marks a chat as read. You must do this after addressing an unread message.",
                 "parameters": {
@@ -225,6 +248,54 @@ class WhatsAppSkill(Tool):
 
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    @classmethod
+    def _format_poll_content(cls, poll: Dict[str, Any]) -> str:
+        question = poll.get("question") or poll.get("pollName") or "Untitled Poll"
+        raw_selectable = poll.get("selectableOptionsCount")
+        if raw_selectable is None:
+            raw_selectable = 0 if poll.get("allowMultipleAnswers", False) else 1
+        if raw_selectable == 1:
+            type_label = "Single Choice (max 1)"
+        elif isinstance(raw_selectable, int) and raw_selectable > 1:
+            type_label = f"Multiple Choice (max {raw_selectable})"
+        else:
+            type_label = "Multiple Choice"
+
+        options = poll.get("options") or []
+        opt_summaries = []
+        option_by_id = {}
+        my_voted_ids = list(poll.get("myVotes") or [])
+        for idx, opt in enumerate(options):
+            if isinstance(opt, dict):
+                lid = opt.get("localId", idx)
+                name = opt.get("name", f"Option {idx}")
+                vcount = opt.get("voteCount", 0)
+                voters = opt.get("voters") or []
+                if opt.get("votedByMe") and lid not in my_voted_ids:
+                    my_voted_ids.append(lid)
+            else:
+                lid = idx
+                name = str(opt)
+                vcount = 0
+                voters = []
+            option_by_id[lid] = name
+            vote_word = "1 vote" if vcount == 1 else f"{vcount} votes"
+            voter_detail = f"{vote_word}: {', '.join(str(v) for v in voters)}" if voters else vote_word
+            opt_summaries.append(f'[{lid}] "{name}" ({voter_detail})')
+
+        if my_voted_ids:
+            my_vote_summary = ", ".join(
+                f'[{lid}] "{option_by_id[lid]}"' if lid in option_by_id else f"[{lid}]"
+                for lid in my_voted_ids
+            )
+        else:
+            my_vote_summary = "None"
+
+        return (
+            f'[Poll: "{question}" | Type: {type_label} | '
+            f'Options: {" ; ".join(opt_summaries)} | Your Vote: {my_vote_summary}]'
+        )
+
     def _format_message_line(self, msg: Dict[str, Any], media_files: list = None, max_media: int = None) -> str:
         content = msg.get('content', '')
         msg_type = msg.get('type', 'chat')
@@ -234,6 +305,10 @@ class WhatsAppSkill(Tool):
         elif msg_type in ['vcard', 'multi_vcard', 'contact']:
             # Contact card messages are structured and omit raw vcards/media
             pass
+        elif msg_type in ['poll_creation', 'poll'] or isinstance(msg.get('poll'), dict):
+            # Poll messages are structured and omit media
+            if not content and isinstance(msg.get('poll'), dict):
+                content = self._format_poll_content(msg['poll'])
         elif msg.get('mediaPath') and os.path.exists(msg['mediaPath']):
             if msg_type in ['ptt', 'audio']:
                 content = f"[Voice Message (Path: {msg['mediaPath']})] {content}"
@@ -308,13 +383,13 @@ class WhatsAppSkill(Tool):
                     output += self._format_message_line(msg, media_files=media_files)
 
                 if media_files:
-                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, WhatsApp_send_contact, or WhatsApp_vote_poll.]"
                     return {
                         "result": output,
                         "media": media_files
                     }
                 else:
-                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, WhatsApp_send_contact, or WhatsApp_vote_poll.]"
                     return output
             except Exception as e:
                 return f"Failed to fetch unread messages: {e}"
@@ -345,13 +420,13 @@ class WhatsAppSkill(Tool):
                     output += self._format_message_line(msg, media_files=media_files, max_media=5)
 
                 if media_files:
-                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, WhatsApp_send_contact, or WhatsApp_vote_poll.]"
                     return {
                         "result": output,
                         "media": media_files
                     }
                 else:
-                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, WhatsApp_send_contact, or WhatsApp_vote_poll.]"
                     return output
             except Exception as e:
                 return f"Failed to fetch recent messages: {e}"
@@ -400,13 +475,13 @@ class WhatsAppSkill(Tool):
                     output += self._format_message_line(msg, media_files=media_files, max_media=5)
 
                 if media_files:
-                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    output += "\n[SYSTEM NOTE: Voice message audio has been attached to your multimodal context. If your multimodal audio input fails to understand or process it, use the Media_transcribe_audio tool to transcribe the voice note. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, WhatsApp_send_contact, or WhatsApp_vote_poll.]"
                     return {
                         "result": output,
                         "media": media_files
                     }
                 else:
-                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, or WhatsApp_send_contact.]"
+                    output += "\n[SYSTEM NOTE: If you need to view or listen to any media attachments, use the Media_read tool. To respond, use WhatsApp_send, WhatsApp_send_voice, WhatsApp_send_location, WhatsApp_send_contact, or WhatsApp_vote_poll.]"
                     return output
             except Exception as e:
                 return f"Failed: {e}"
@@ -660,7 +735,6 @@ class WhatsAppSkill(Tool):
                     except Exception:
                         pass
 
-                import json
                 if isinstance(contacts, str):
                     try:
                         contacts = json.loads(contacts)
@@ -691,6 +765,97 @@ class WhatsAppSkill(Tool):
                 return f"Contact card for {label} sent to {target} successfully."
             except Exception as e:
                 return f"Failed to send contact card: {e}"
+
+        elif command in ["vote_poll", "vote"]:
+            msg_id = (
+                kwargs.get("msgId")
+                or kwargs.get("msg_id")
+                or kwargs.get("poll_id")
+            )
+            has_options_kwarg = "options" in kwargs or "option" in kwargs
+            raw_options = (
+                kwargs.get("options")
+                if "options" in kwargs
+                else kwargs.get("option")
+            )
+
+            if not msg_id and len(args) >= 1:
+                msg_id = args[0]
+                if not has_options_kwarg and len(args) >= 2:
+                    raw_options = list(args[1:])
+                    has_options_kwarg = True
+
+            if not msg_id or not has_options_kwarg or raw_options is None or isinstance(raw_options, bool):
+                return "Usage: vote_poll <msgId> <options>"
+
+            normalized_options: list[str] = []
+            if isinstance(raw_options, (int, float)):
+                normalized_options = [str(int(raw_options))]
+            elif isinstance(raw_options, str):
+                stripped = raw_options.strip()
+                if not stripped:
+                    return "Usage: vote_poll <msgId> <options>"
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    try:
+                        parsed = json.loads(stripped)
+                        if isinstance(parsed, list):
+                            normalized_options = [
+                                str(int(x)) if isinstance(x, (int, float)) and not isinstance(x, bool) else str(x).strip()
+                                for x in parsed
+                                if x is not None and not isinstance(x, bool) and str(x).strip()
+                            ]
+                        else:
+                            normalized_options = [stripped]
+                    except Exception:
+                        normalized_options = [stripped]
+                else:
+                    normalized_options = [stripped]
+            elif isinstance(raw_options, (list, tuple, set)):
+                for item in raw_options:
+                    if item is None or isinstance(item, bool):
+                        continue
+                    if isinstance(item, (int, float)):
+                        normalized_options.append(str(int(item)))
+                    else:
+                        item_str = str(item).strip()
+                        if item_str:
+                            normalized_options.append(item_str)
+            else:
+                return "Usage: vote_poll <msgId> <options>"
+
+            try:
+                res = requests.post(
+                    f"{self.base_url}/vote_poll",
+                    json={"msgId": msg_id, "options": normalized_options},
+                    timeout=15,
+                )
+                data = res.json()
+                if "error" in data:
+                    return f"Error: {data['error']}"
+
+                poll_question = data.get("question") or ""
+                selected_opts = data.get("selectedOptions")
+                if isinstance(selected_opts, list):
+                    if not selected_opts:
+                        if poll_question:
+                            return f'Retracted vote from poll "{poll_question}" successfully.'
+                        return "Retracted vote from poll successfully."
+                    labels = [
+                        f'[{opt.get("localId")}] "{opt.get("name")}"'
+                        if isinstance(opt, dict) and opt.get("localId") is not None
+                        else str(opt.get("name") if isinstance(opt, dict) else opt)
+                        for opt in selected_opts
+                    ]
+                    joined = ", ".join(labels)
+                    if poll_question:
+                        return f'Voted for {joined} in poll "{poll_question}" successfully.'
+                    return f"Voted for {joined} successfully."
+
+                if not normalized_options:
+                    return "Retracted vote from poll successfully."
+                return f"Voted for {', '.join(normalized_options)} successfully."
+            except Exception as e:
+                return f"Failed to vote in poll: {e}"
 
         elif command == "react":
             msg_id = kwargs.get('msgId')

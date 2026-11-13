@@ -58,8 +58,10 @@ class AgentManager:
             "identity.txt",
             "short_term_mem.json",
             "trajectory.json",
+            "trajectory.db",
             "completed_trajectory_archive.json",
             "pulses.db",
+            "session_cache.json",
             ".env",
             "address_book.json"
         ]

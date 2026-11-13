@@ -1,4 +1,9 @@
-from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+from core.prompt_context import (
+    MemoryContextWorkerMixin,
+    fit_system_prompt,
+    format_prompt_footprint,
+    inject_static_worker_instructions,
+)
 import os
 import base64
 import mimetypes
@@ -116,11 +121,10 @@ class ChatGptWorker(MemoryContextWorkerMixin):
                 "Session Start Error: ChatGPT Worker is not available")
             return
 
-        self.sys_instruct = system_instruction or ""
-        self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
-        self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
-
+        self._append_worker_static_instructions = True
+        self.sys_instruct = inject_static_worker_instructions(system_instruction or "")
         self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
+        logging.debug(f"ChatGptWorker prompt footprint: {format_prompt_footprint(self.sys_instruct, tools)}")
         self.tools = tools
         self.openai_tools = []
         if self.tools:
@@ -156,22 +160,45 @@ class ChatGptWorker(MemoryContextWorkerMixin):
         messages = []
         for m in self.history:
             role = m.get("role", "user")
-            content = m.get("content", "") or ""
+            raw_c = m.get("content", "") or ""
+            text_parts = []
+            if isinstance(raw_c, str):
+                if raw_c.strip():
+                    text_parts.append(raw_c)
+            elif isinstance(raw_c, list):
+                for block in raw_c:
+                    if isinstance(block, dict):
+                        b_type = block.get("type", "")
+                        if b_type == "text":
+                            t = block.get("text", "")
+                            if t:
+                                text_parts.append(t)
+                        elif b_type in ("image_url", "file", "input_audio"):
+                            text_parts.append("[Media attachment from earlier in session]")
+            content = "\n".join(text_parts).strip()
             if m.get("tool_calls"):
                 for tc in m["tool_calls"]:
-                    fn = tc.get("function", {})
-                    content += f"\n[Tool invocation: {fn.get('name')}({fn.get('arguments', '')})]"
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+                    if isinstance(fn, dict):
+                        name = fn.get("name", "")
+                        args = fn.get("arguments", "")
+                    else:
+                        name = getattr(fn, "name", "")
+                        args = getattr(fn, "arguments", "")
+                    content += f"\n[Tool invocation: {name}({args})]"
             if role == "tool":
-                messages.append({"role": "user", "content": f"[Tool Result: {content}]"})
+                messages.append({"role": "user", "content": f"[Tool Result: {content.strip()}]"})
             else:
-                messages.append({"role": role, "content": content})
+                messages.append({"role": role, "content": content.strip()})
         return messages
 
     def set_session_history(self, messages: list):
         """Restores chat history from normalized turns."""
+        from core.session_cache import normalize_session_messages
+        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
         self.history = []
         self.consumed_tool_call_ids = set()
-        for msg in messages:
+        for msg in norm_messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if content:
@@ -245,8 +272,28 @@ class ChatGptWorker(MemoryContextWorkerMixin):
                 }
             }
 
-        # Handle Audio files via native multimodal audio input
+        # Handle Audio files (native multimodal input for audio models, LocalSTT for standard models)
         if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            active_model = getattr(self, "current_model", "") or ""
+            if "-audio-" not in active_model.lower():
+                transcription = None
+                try:
+                    from core.local_stt import LocalSTT
+                    transcription = LocalSTT().transcribe(exp_path)
+                except Exception as e:
+                    logging.debug(f"LocalSTT failed for {exp_path}: {e}")
+
+                if transcription and not transcription.startswith("Failed"):
+                    return {
+                        "type": "text",
+                        "text": f"[Voice Message Audio: {os.path.basename(exp_path)}]\n[Voice Message Transcription: {transcription}]"
+                    }
+                else:
+                    return {
+                        "type": "text",
+                        "text": f"[Audio file attached: {os.path.basename(exp_path)}. Note: Model {active_model} does not support multimodal audio input directly. To extract text or messages from this audio file, use the Media_transcribe_audio tool.]"
+                    }
+
             fmt = ext.lstrip(".").lower()
             if fmt in ["wav", "mp3"]:
                 with open(exp_path, "rb") as f:
@@ -728,3 +775,28 @@ class ChatGptWorker(MemoryContextWorkerMixin):
         except Exception as e:
             logging.warning(f"ChatGPT Reformulator API Error: {e}")
             return user_prompt
+
+    @classmethod
+    def fetch_available_models(cls, api_key: str = None) -> list:
+        """
+        Queries OpenAI's models.list() endpoint to fetch active GPT/chat models.
+        Returns a sorted list of model ID strings (e.g. 'gpt-4o', 'o3-mini').
+        """
+        if not api_key:
+            raise ValueError("OpenAI API key is required to fetch available models.")
+        import openai
+        client = openai.OpenAI(api_key=api_key.strip())
+        models = []
+        excluded_prefixes = ("whisper", "tts", "dall-e", "text-embedding", "embedding", "moderation", "babbage", "davinci")
+        for m in client.models.list():
+            m_id = getattr(m, "id", "")
+            if not m_id:
+                continue
+            lower_id = m_id.lower()
+            if any(lower_id.startswith(ex) for ex in excluded_prefixes):
+                continue
+            if any(p in lower_id for p in ["gpt", "o1", "o3", "chat"]):
+                models.append(m_id)
+        sorted_models = sorted(list(set(models)), key=lambda s: s.lower())
+        logging.getLogger("core.ChatGptWorker").info(f"Successfully fetched {len(sorted_models)} models from OpenAI catalog.")
+        return sorted_models

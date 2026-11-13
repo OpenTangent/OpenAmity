@@ -7,7 +7,14 @@ class SubagentSkill(Tool):
     icon = "🤖"
     color = "#E040FB"
     async_commands = ["spawn"]
-    description = "Delegate background tasks to LLM subagents. Subagents run in a separate thread, do not share context, and are not persistent. They default to cheap 'light' models. Use this to parallelize research or offload isolated thinking. When a subagent finishes, its response will be added to your context via a [System Feedback] message. Subagents only have access to DateTime and WebSearch tools."
+    description = (
+        "Delegate background tasks to LLM subagents. Subagents run in a separate thread, "
+        "do not share context, and are not persistent. They default to cheap 'light' models. "
+        "Use this to parallelize research, offload isolated thinking, or delegate scoped file tasks. "
+        "When a subagent finishes, its response will be added to your context via a [System Feedback] message. "
+        "Subagents only have access to DateTime/WebSearch tools, plus optional File_read/File_edit access "
+        "strictly limited to paths you permit via allowed_files."
+    )
     commands = ["spawn", "message", "dispose", "status"]
 
     def execute(self, command: str, *args, **kwargs) -> Any:
@@ -22,10 +29,13 @@ class SubagentSkill(Tool):
         if command == "spawn":
             task = kwargs.get("task_description")
             model_tier = kwargs.get("model_tier", "light")
+            allowed_files = kwargs.get("allowed_files")
             call_id = kwargs.get("_call_id")
             if not task:
                 return "Error: task_description is required."
-            return self.orchestrator.spawn_subagent(task, model_tier, call_id=call_id)
+            return self.orchestrator.spawn_subagent(
+                task, model_tier, call_id=call_id, allowed_files=allowed_files
+            )
 
         elif command == "message":
             sid = kwargs.get("subagent_id")
@@ -54,7 +64,12 @@ class SubagentSkill(Tool):
         return [
             {
                 "name": "Subagent_spawn",
-                "description": "Spawn a new background subagent to perform a task. Returns a subagent_id. Use model_tier 'light' (default) for most tasks, or 'standard' for complex reasoning.",
+                "description": (
+                    "Spawn a new background subagent to perform a task. Returns a subagent_id. "
+                    "Use model_tier 'light' (default) for most tasks, or 'standard' for complex reasoning. "
+                    "Optionally pass allowed_files to grant File_read and File_edit access strictly to specific "
+                    "file paths or directories; all other files remain blocked."
+                ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -66,6 +81,17 @@ class SubagentSkill(Tool):
                             "type": "STRING",
                             "description": "Either 'light' or 'standard'. Defaults to 'light'.",
                             "enum": ["light", "standard"]
+                        },
+                        "allowed_files": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "STRING"
+                            },
+                            "description": (
+                                "Optional list of file or directory paths the subagent is permitted to read and edit "
+                                "(absolute, relative to ~/Documents, or starting with '~'). Listing a directory grants "
+                                "recursive access to files inside it. If omitted or empty, the subagent cannot access files."
+                            )
                         }
                     },
                     "required": ["task_description"]

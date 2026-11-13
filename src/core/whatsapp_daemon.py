@@ -322,8 +322,8 @@ class WhatsAppDaemon:
         except ImportError:
             fcntl = None
 
-        url = "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chrome-linux64.zip"
-        expected_sha = "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8"
+        url = "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.38/linux64/chrome-linux64.zip"
+        expected_sha = "8cdeb344e9b2cefe59f4aea8d1d93d5d93054c03cde217665c16fc1f62e72a66"
 
         cache_dir = os.path.join(paths.get_app_cache_dir(), "puppeteer")
         os.makedirs(cache_dir, exist_ok=True)

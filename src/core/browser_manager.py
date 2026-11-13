@@ -270,6 +270,12 @@ class BrowserManager:
             except Exception as e:
                 logger.warning(f"Could not connect to orchestrator on_pause signal: {e}")
 
+        # Prune expired browser cache and screenshots older than 24h
+        try:
+            self.clear_expired_cache(max_age_days=1.0)
+        except Exception as e:
+            logger.debug(f"Could not clear expired browser cache on init: {e}")
+
     # =========================================================================
     # Configuration Helpers
     # =========================================================================
@@ -484,11 +490,16 @@ class BrowserManager:
 
                     if not self._is_camoufox_available():
                         logger.info("BrowserManager: Camoufox browser engine not installed. Initiating one-time download...")
-                        if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                        if self.orchestrator:
                             try:
-                                self.orchestrator.on_message_appended.emit(
-                                    "System", "[System: Downloading stealth browser engine (one-time setup)...]"
-                                )
+                                if hasattr(self.orchestrator, "append_to_conversation"):
+                                    self.orchestrator.append_to_conversation(
+                                        "System", "[System: Downloading stealth browser engine (one-time setup)...]"
+                                    )
+                                elif hasattr(self.orchestrator, "on_message_appended"):
+                                    self.orchestrator.on_message_appended.emit(
+                                        "System", "[System: Downloading stealth browser engine (one-time setup)...]"
+                                    )
                             except Exception as e:
                                 logger.debug(f"Could not emit download notice: {e}")
 
@@ -506,20 +517,30 @@ class BrowserManager:
                                         except Exception:
                                             pass
                             self._did_first_time_download = True
-                            if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                            if self.orchestrator:
                                 try:
-                                    self.orchestrator.on_message_appended.emit(
-                                        "System", "[System: Stealth browser engine ready.]"
-                                    )
+                                    if hasattr(self.orchestrator, "append_to_conversation"):
+                                        self.orchestrator.append_to_conversation(
+                                            "System", "[System: Stealth browser engine ready.]"
+                                        )
+                                    elif hasattr(self.orchestrator, "on_message_appended"):
+                                        self.orchestrator.on_message_appended.emit(
+                                            "System", "[System: Stealth browser engine ready.]"
+                                        )
                                 except Exception:
                                     pass
                         except Exception as e:
                             logger.error(f"BrowserManager: Failed to download Camoufox: {e}")
-                            if self.orchestrator and hasattr(self.orchestrator, "on_message_appended"):
+                            if self.orchestrator:
                                 try:
-                                    self.orchestrator.on_message_appended.emit(
-                                        "System", f"[System: Failed to download stealth browser engine: {e}]"
-                                    )
+                                    if hasattr(self.orchestrator, "append_to_conversation"):
+                                        self.orchestrator.append_to_conversation(
+                                            "System", f"[System: Failed to download stealth browser engine: {e}]"
+                                        )
+                                    elif hasattr(self.orchestrator, "on_message_appended"):
+                                        self.orchestrator.on_message_appended.emit(
+                                            "System", f"[System: Failed to download stealth browser engine: {e}]"
+                                        )
                                 except Exception:
                                     pass
                             raise
@@ -1116,8 +1137,14 @@ class BrowserManager:
 
     async def _screenshot_async(self, high_res: bool = False, show_overlay_cues: bool = True, full_page: bool = False) -> Any:
         await self._ensure_browser_async()
-        media_dir = os.path.join(paths.get_agent_data_dir(self.agent_id), "media")
+        media_dir = paths.get_browser_screenshot_dir(self.agent_id)
         os.makedirs(media_dir, exist_ok=True)
+
+        # Automatically prune screenshots and browser cache older than 24 hours
+        try:
+            self.clear_expired_cache(max_age_days=1.0)
+        except Exception as e:
+            logger.warning(f"Failed to clear expired browser cache: {e}")
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
         file_path = os.path.join(media_dir, f"browser_screenshot_{timestamp}.png")
@@ -1152,10 +1179,17 @@ class BrowserManager:
                     logger.warning(f"Failed to downscale screenshot: {e}")
 
             if is_low_token:
-                return f"Screenshot saved to {file_path} (Low Token Mode active, media attachment omitted)."
+                return (
+                    f"Screenshot saved to {file_path} (Low Token Mode active, media attachment omitted). "
+                    "Note: Screenshots are temporary cache files and will be automatically deleted after 24 hours."
+                )
 
             return {
-                "result": f"Screenshot successfully saved to {file_path} (Set-of-Marks cues={'enabled' if show_overlay_cues else 'disabled'}).",
+                "result": (
+                    f"Screenshot successfully saved to {file_path} (Set-of-Marks cues={'enabled' if show_overlay_cues else 'disabled'}). "
+                    "Note: Screenshots are temporary cache files and will be automatically deleted after 24 hours. "
+                    "Be sure to use or copy the screenshot to permanent storage (e.g. ~/Pictures/<YourName>/) if you need to retain it."
+                ),
                 "media": [file_path]
             }
         except Exception as e:
@@ -1253,9 +1287,48 @@ class BrowserManager:
                 if os.path.exists(cache_dir):
                     import shutil
                     shutil.rmtree(cache_dir, ignore_errors=True)
-                return "All browser cookies and persistent cache cleared."
+
+                # Clear screenshot files in media directory
+                screenshot_dir = paths.get_browser_screenshot_dir(self.agent_id)
+                if os.path.exists(screenshot_dir):
+                    import shutil
+                    shutil.rmtree(screenshot_dir, ignore_errors=True)
+                    os.makedirs(screenshot_dir, exist_ok=True)
+
+                # Clear Camoufox internal HTTP cache and startup cache
+                data_dir = paths.get_browser_data_dir(self.agent_id)
+                for sub in ["cache2", "startupCache"]:
+                    sdir = os.path.join(data_dir, sub)
+                    if os.path.exists(sdir):
+                        import shutil
+                        shutil.rmtree(sdir, ignore_errors=True)
+
+                return "All browser cookies, screenshots, and persistent cache cleared."
         except Exception as e:
             return f"Error clearing cache: {e}"
+
+    def clear_expired_cache(self, max_age_days: float = 1.0) -> None:
+        """Prunes browser screenshots and cached assets older than max_age_days (default 24h)."""
+        from core.cache_manager import CacheManager
+        try:
+            # 1. Prune screenshots in media directory
+            screenshot_dir = paths.get_browser_screenshot_dir(self.agent_id)
+            if os.path.exists(screenshot_dir):
+                CacheManager.clear_expired(screenshot_dir, max_age_days=max_age_days)
+
+            # 2. Prune browser cache directory
+            cache_dir = paths.get_browser_cache_dir(self.agent_id)
+            if os.path.exists(cache_dir):
+                CacheManager.clear_expired(cache_dir, max_age_days=max_age_days, recursive=True)
+
+            # 3. Prune Camoufox internal HTTP cache and startup cache in browser_data
+            data_dir = paths.get_browser_data_dir(self.agent_id)
+            for sub_name in ["cache2", "startupCache"]:
+                sub_dir = os.path.join(data_dir, sub_name)
+                if os.path.exists(sub_dir):
+                    CacheManager.clear_expired(sub_dir, max_age_days=max_age_days, recursive=True)
+        except Exception as e:
+            logger.warning(f"BrowserManager: Error clearing expired cache: {e}")
 
     def close(self) -> str:
         """Closes the browser session to immediately reclaim memory."""

@@ -1,6 +1,7 @@
 import re
 import html
 from html.parser import HTMLParser
+from typing import Dict, Optional
 import markdown
 from PySide6.QtWidgets import QTextBrowser
 from PySide6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QTextOption
@@ -103,6 +104,103 @@ def render_user_message_content(text: str) -> str:
     return render_markdown_to_html(text)
 
 
+_THOUGHT_TOOL_CALL_RE = re.compile(
+    r"^(?:(?P<icon>[^\sA-Za-z0-9_<>]+)\s+)?"
+    r"(?P<func>[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+)"
+    r"(?P<parens>\(\)\s*$|:(?P<args>.*))$"
+)
+
+
+def _get_tool_class(tool_name: str):
+    """Resolves a registered Tool class by prefix without hard-failing outside full runtime."""
+    try:
+        from core.cerebrum import Tool
+        return Tool.get_tool_class(tool_name)
+    except ImportError:
+        try:
+            from src.core.cerebrum import Tool
+            return Tool.get_tool_class(tool_name)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _format_thought_card_line(line: str, tool_colors: Optional[Dict[str, str]] = None) -> str:
+    """Formats one line of a thoughts card, adding tool emoji + color on tool call signatures."""
+    match = _THOUGHT_TOOL_CALL_RE.match(line)
+    if not match:
+        return html.escape(line)
+
+    raw_icon = match.group("icon")
+    # Reject ASCII prefixes such as markdown bullets ('-', '*') mistaken for icons.
+    if raw_icon is not None and any(ord(ch) <= 127 for ch in raw_icon):
+        return html.escape(line)
+
+    func_name = match.group("func")
+    tool_name = func_name.split("_", 1)[0]
+    tool_cls = _get_tool_class(tool_name)
+    override_color = tool_colors.get(tool_name) if tool_colors else None
+
+    if raw_icon is None and tool_cls is None and not override_color:
+        return html.escape(line)
+
+    icon = raw_icon if raw_icon is not None else getattr(tool_cls, "icon", "🔧")
+    color = override_color or (getattr(tool_cls, "color", "#888888") if tool_cls is not None else "#888888")
+    safe_icon = html.escape(icon)
+    safe_color = html.escape(color, quote=True)
+
+    args_part = match.group("args")
+    if args_part is None:
+        return f'{safe_icon} <span style="color: {safe_color};">{html.escape(func_name)}()</span>'
+    return f'{safe_icon} <span style="color: {safe_color};">{html.escape(func_name)}</span>:{html.escape(args_part)}'
+
+
+def _format_thought_card_body(content: str, tool_colors: Optional[Dict[str, str]] = None) -> str:
+    """Formats expanded thoughts-card text line by line into safe HTML."""
+    lines = content.strip().split("\n")
+    return "<br>".join(_format_thought_card_line(line, tool_colors=tool_colors) for line in lines)
+
+
+def render_thought_card_html(
+    card_id,
+    content: str,
+    collapsed: bool = True,
+    tool_colors: Optional[Dict[str, str]] = None,
+) -> str:
+    """Renders a collapsible Thoughts card with styled tool calls and monospace thought text."""
+    chevron = "▶" if collapsed else "▼"
+    safe_id = html.escape(str(card_id), quote=True)
+    header_html = (
+        f'<div style="text-align: left;">'
+        f'<a href="thought:toggle:{safe_id}" '
+        f'style="color: #8c8c94; text-decoration: none; font-weight: bold; font-size: 13px;">'
+        f'<span style="color: #8c8c94;">{chevron} Thoughts</span>'
+        f'</a>'
+        f'</div>'
+    )
+
+    body_html = ""
+    if not collapsed and content:
+        escaped_body = _format_thought_card_body(content, tool_colors=tool_colors)
+        body_html = (
+            f'<div style="margin-top: 6px; color: #9c9ca4; '
+            f'font-family: \'Ubuntu Mono\', monospace; font-size: 13px; line-height: 1.5;">'
+            f'{escaped_body}'
+            f'</div>'
+        )
+
+    padding = "8px 14px" if collapsed else "10px 16px"
+    return wrap_in_isolated_container(
+        header_html + body_html,
+        margin_bottom=10,
+        bg_color="#161618",
+        border_color="#28282c",
+        border_radius=8,
+        padding=padding,
+    )
+
+
 def wrap_in_isolated_container(
     inner_html: str,
     margin_bottom: int = 14,
@@ -175,4 +273,8 @@ def setup_chat_browser(browser: QTextBrowser):
 
     scroll_bar = browser.verticalScrollBar()
     if scroll_bar:
-        scroll_bar.rangeChanged.connect(lambda min_val, max_val: scroll_bar.setValue(max_val))
+        scroll_bar.rangeChanged.connect(
+            lambda min_val, max_val: scroll_bar.setValue(max_val)
+            if getattr(browser, "_auto_scroll_on_range_change", True)
+            else None
+        )

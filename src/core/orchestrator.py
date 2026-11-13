@@ -14,7 +14,8 @@ try:
     from core.cerebrum import Cerebrum
     from core.pulse_engine import PulseEngine
     from core.settings_manager import SettingsManager
-    from core.subagent_worker import SubagentWorker
+    from core.subagent_worker import SubagentWorker, SUBAGENT_ALLOWED_CEREBRUM_TOOLS
+    from core.subagent_file_tools import SubagentFilePolicy, SubagentFileToolset
     from core.config_manager import ConfigManager
 except ImportError:
     from .gemini_worker import GeminiWorker
@@ -25,7 +26,8 @@ except ImportError:
     from .cerebrum import Cerebrum
     from .pulse_engine import PulseEngine
     from .settings_manager import SettingsManager
-    from .subagent_worker import SubagentWorker
+    from .subagent_worker import SubagentWorker, SUBAGENT_ALLOWED_CEREBRUM_TOOLS
+    from .subagent_file_tools import SubagentFilePolicy, SubagentFileToolset
     from .config_manager import ConfigManager
 
 
@@ -45,8 +47,10 @@ class AmityOrchestrator:
         agent_id_var.set(self.agent_id)
 
         self.on_message_appended = Signal()  # sender, text
+        self.on_thought_card_updated = Signal()  # card_id, content, is_collapsed
         self.on_busy_state_changed = Signal()  # is_busy, is_speaking
         self.on_amplitude_emitted = Signal()  # float
+        self.on_waveform_emitted = Signal()  # list[list[float]]
         self.on_paused_state_changed = Signal()  # is_paused (bool)
         self.on_pause_pending = Signal()  # is_pending (bool)
         self.on_tool_started = Signal()  # call_id, tool_name, icon, color, call_text, is_async
@@ -57,6 +61,8 @@ class AmityOrchestrator:
         self.settings_manager = SettingsManager(agent_id=self.agent_id)
         self.config_manager = ConfigManager()
         self.mempalace_manager = MemPalaceManager(agent_id=self.agent_id)
+        from core.chat_history_manager import ChatHistoryManager
+        self.chat_history_manager = ChatHistoryManager(agent_id=self.agent_id)
         self.cerebrum = Cerebrum(
             orchestrator=self, settings_manager=self.settings_manager)
 
@@ -66,32 +72,67 @@ class AmityOrchestrator:
         self.is_busy = False
         self.is_thinking = False
         self._pending_settings_reload = False
+        self._is_sleep_cycle = False
+        self._sleep_cycle_error = False
+        self._in_flight_prompt = None
+
+        from core.session_cache import load_session_cache, save_session_cache, clear_session_cache
+        self._session_cache_data = load_session_cache(self.agent_id) if not self.is_paused else None
+
         now = datetime.now().astimezone()
         tz_str = f" ({now.tzname()})" if now.tzname() else ""
         now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
-        self.last_action_result = (
-            f"[LIFECYCLE EVENT: Current time: {now_str}. "
-            "Open Amity initialized and ready. "
-            "Orient yourself with Trajectory_get_bearings before taking action.]"
-        )
+
+        self.on_shutdown_complete = Signal()
+        self.budget_lock = threading.Lock()
+
+        if self._session_cache_data:
+            self.session_fatigue_tokens = int(self._session_cache_data.get("session_fatigue_tokens", 0))
+            self._last_notified_fatigue_threshold = int(self._session_cache_data.get("last_notified_fatigue_threshold", 0))
+            self._hard_fatigue_limit_hit = bool(self._session_cache_data.get("hard_fatigue_limit_hit", False))
+            self.current_task_weight = self.session_fatigue_tokens
+            cached_recent = self._session_cache_data.get("recent_history")
+            if isinstance(cached_recent, list) and cached_recent:
+                self.recent_history = [tuple(item) for item in cached_recent]
+            else:
+                self.recent_history = []
+            self._restored_session_messages = self._session_cache_data.get("messages", [])
+            fatigue_pct = self.get_fatigue() * 100.0
+            num_turns = len(self._restored_session_messages)
+            self.last_action_result = (
+                f"[LIFECYCLE EVENT: Current time: {now_str}. "
+                f"Application restarted; your active session context ({num_turns} turns, fatigue: {fatigue_pct:.1f}%) "
+                "was seamlessly restored from disk cache. "
+                "Orient yourself with Trajectory_get_bearings before taking action.]"
+            )
+        else:
+            self.session_fatigue_tokens = 0
+            self._last_notified_fatigue_threshold = 0
+            self._hard_fatigue_limit_hit = False
+            self.current_task_weight = 0
+            self.recent_history = []
+            self._restored_session_messages = None
+            self.last_action_result = (
+                f"[LIFECYCLE EVENT: Current time: {now_str}. "
+                "Open Amity initialized and ready. "
+                "Orient yourself with Trajectory_get_bearings before taking action.]"
+            )
+
+        self._write_somatic_state()
         self.current_user_prompt = ""
-        self.recent_history = []
         self._is_user_interaction = False
         self._speaker_invoked_in_cycle = False
         self._user_turn_nudged = False
 
-        self.on_shutdown_complete = Signal()
-        # Somatic & Fatigue State
-        self.budget_lock = threading.Lock()
-        self.session_fatigue_tokens = 0
-        self._last_notified_fatigue_threshold = 0
-        self._hard_fatigue_limit_hit = False
         self._last_notified_weight_threshold = 0  # Compatibility
-        self.current_task_weight = 0  # Compatibility
         self.current_loop_count = 0
         self.last_executed_command = None
         self.duplicate_command_count = 0
         self.accumulated_thoughts = ""
+        self._thought_card_lock = threading.RLock()
+        self._active_thought_card_id = None
+        self._active_thought_entries = []
+        self._fallback_thought_card_seq = -1
         self.speech_queue = []
         self.event_queue = []
         self._pending_interjections = []
@@ -103,12 +144,10 @@ class AmityOrchestrator:
         self._shutdown_flag = False
         self._start_subagent_gc()
 
-        # Proactively prune expired audio cache files (>24h) and generated media (>24h)
+        # Proactively prune expired audio cache files (>24h), generated media (>24h), browser cache & screenshots (>24h)
         try:
             from core.cache_manager import CacheManager
-            from config import paths
-            CacheManager.clear_expired(paths.get_audio_cache_dir(self.agent_id), max_age_days=1.0)
-            CacheManager.clear_expired(paths.get_generated_media_dir(self.agent_id), max_age_days=1.0)
+            CacheManager.clear_all_agent_expired_caches(self.agent_id, max_age_days=1.0)
         except Exception:
             pass
 
@@ -116,6 +155,10 @@ class AmityOrchestrator:
 
         self.pulse_engine = PulseEngine(self)
         self.pulse_engine.trigger_pulse.connect(self.process_pulse)
+        if self._session_cache_data:
+            pulse_state = self._session_cache_data.get("pulse_state")
+            if isinstance(pulse_state, dict) and "last_interaction_time" in pulse_state:
+                self.pulse_engine.last_interaction_time = float(pulse_state["last_interaction_time"])
 
         wa_skill = self.cerebrum.tools.get("WhatsApp")
         if wa_skill:
@@ -172,6 +215,15 @@ class AmityOrchestrator:
         if not getattr(self, 'is_paused', False) and getattr(self.gemini_worker, 'available', False):
             tools = self.cerebrum.get_all_tool_declarations()
             self.gemini_worker.start_session(self.system_prompt, tools=tools)
+            if getattr(self, '_restored_session_messages', None) and hasattr(self.gemini_worker, 'set_session_history'):
+                try:
+                    self.gemini_worker.set_session_history(self._restored_session_messages)
+                    logging.info(
+                        f"Restored {len(self._restored_session_messages)} session turns into cognitive worker for Agent {self.agent_id}")
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to restore cached session turns into worker for Agent {self.agent_id}: {e}")
+                self._restored_session_messages = None
 
     def _get_interjection_lock(self):
         if not hasattr(self, '_interjection_lock') or self._interjection_lock is None:
@@ -183,14 +235,101 @@ class AmityOrchestrator:
             self._pending_interjections = []
         return self._pending_interjections
 
+    def _get_thought_card_lock(self):
+        if not hasattr(self, '_thought_card_lock') or self._thought_card_lock is None:
+            self._thought_card_lock = threading.RLock()
+        return self._thought_card_lock
+
+    def _append_to_thought_card(self, entry_text: str):
+        """Appends a thought or tool execution line to the active thoughts card."""
+        clean_entry = entry_text.strip() if entry_text else ""
+        if not clean_entry:
+            return
+        with self._get_thought_card_lock():
+            entries = getattr(self, '_active_thought_entries', None)
+            if entries is None:
+                entries = []
+                self._active_thought_entries = entries
+            entries.append(clean_entry)
+            combined = "\n\n".join(entries)
+
+            card_id = getattr(self, '_active_thought_card_id', None)
+            history_mgr = getattr(self, 'chat_history_manager', None)
+            if card_id is None:
+                if history_mgr:
+                    try:
+                        record = history_mgr.add_message(sender="Thoughts", content=combined)
+                        card_id = record.get("id")
+                    except Exception as e:
+                        logging.error(f"Failed to persist thoughts card: {e}", exc_info=True)
+                if card_id is None:
+                    seq = getattr(self, '_fallback_thought_card_seq', -1)
+                    card_id = seq
+                    self._fallback_thought_card_seq = seq - 1
+                self._active_thought_card_id = card_id
+            else:
+                if history_mgr and isinstance(card_id, int) and card_id > 0:
+                    try:
+                        history_mgr.update_message(card_id, content=combined)
+                    except Exception as e:
+                        logging.error(f"Failed to update thoughts card: {e}", exc_info=True)
+
+            sig = getattr(self, 'on_thought_card_updated', None)
+            if sig is not None:
+                sig.emit(card_id, combined, False)
+
+    def _collapse_active_thought_card(self):
+        """Collapses and seals the currently active thoughts card, if one is open."""
+        with self._get_thought_card_lock():
+            card_id = getattr(self, '_active_thought_card_id', None)
+            if card_id is None:
+                return
+            entries = getattr(self, '_active_thought_entries', None) or []
+            combined = "\n\n".join(entries)
+            self._active_thought_card_id = None
+            self._active_thought_entries = []
+
+            sig = getattr(self, 'on_thought_card_updated', None)
+            if sig is not None:
+                sig.emit(card_id, combined, True)
+
+    def _dispatch_speaker_payload(self, name: str, result_str: str):
+        """Processes Speaker speak_aloud/output_text JSON payload immediately, returning replacement text."""
+        if not name.startswith("Speaker_") or not isinstance(result_str, str):
+            return None
+        stripped = result_str.lstrip()
+        if not stripped.startswith("{"):
+            return None
+        try:
+            payload = json.loads(stripped)
+        except Exception as e:
+            logging.debug(
+                f"Expected valid JSON from Speaker tool but failed to parse: {e}")
+            return None
+
+        action = payload.get("action")
+        if action == "trigger_speak_aloud":
+            self._speaker_invoked_in_cycle = True
+            self._collapse_active_thought_card()
+            self.handle_gemini_speech(payload.get("text", ""))
+            return "Speech queued."
+        if action == "trigger_output_text":
+            self._speaker_invoked_in_cycle = True
+            self._collapse_active_thought_card()
+            self.append_to_conversation("Agent", payload.get("text", ""))
+            return "Text output to GUI."
+        return None
+
     def _format_interjection_payload(self, text: str) -> str:
         return (
             f"[USER INTERJECTION]\n"
             f"{text}\n\n"
             f"[CRITICAL CONTINUITY DIRECTIVE: This is a user interjection submitted while you were working. "
-            f"Address or incorporate this interjection cleanly. Do NOT let this interjection derail your ongoing thought process, "
-            f"active task, or intended actions unless the user explicitly instructed you to stop, cancel, or change course. "
-            f"If previous tool calls were paused, verify if their parameters need updating; if still appropriate, re-invoke them immediately.]"
+            f"Address or incorporate this interjection cleanly (if answering a question, reply briefly and resume; "
+            f"if given a parameter correction such as filename/path/number, apply it to your next calls). "
+            f"Do NOT let this interjection derail your ongoing thought process, active task, or intended actions "
+            f"unless the user explicitly instructed you to stop, cancel, or switch tasks. "
+            f"If tool calls were paused, re-invoke them immediately with updated arguments unless cancelled.]"
         )
 
     @property
@@ -204,14 +343,44 @@ class AmityOrchestrator:
         return uid
 
     def build_system_prompt(self):
-        self.system_prompt = self.mempalace_manager.wake_up()
-        self.system_prompt += f"\n\n[AGENT IDENTIFIER: Your unique agent ID (phone number) is {self.agent_uid}]"
-        self.system_prompt += "\n" + self.cerebrum.get_agent_manual()
+        from core.prompt_context import MEMORY_BEGIN, fit_system_prompt, format_prompt_footprint
+
+        parts = []
+        dynamic_memory = ""
+        if hasattr(self.mempalace_manager, "get_l0_identity") and hasattr(self.mempalace_manager, "wake_up_dynamic"):
+            l0 = self.mempalace_manager.get_l0_identity()
+            if l0:
+                parts.append(l0)
+            dynamic_memory = self.mempalace_manager.wake_up_dynamic()
+        else:
+            wake_text = self.mempalace_manager.wake_up()
+            idx = wake_text.find(MEMORY_BEGIN)
+            if idx >= 0:
+                head = wake_text[:idx].rstrip()
+                if head:
+                    parts.append(head)
+                dynamic_memory = wake_text[idx:]
+            elif wake_text:
+                parts.append(wake_text)
+
+        parts.append(f"[AGENT IDENTIFIER: Your unique agent ID (phone number) is {self.agent_uid}]")
+        manual = self.cerebrum.get_agent_manual()
+        if manual:
+            parts.append(manual.rstrip())
         if self.settings_manager.get("core.low-token-mode", False):
-            self.system_prompt += "\n\n[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]"
-        from core.prompt_context import fit_system_prompt
-        self.system_prompt = fit_system_prompt(self.system_prompt, self.settings_manager,
-                                              self.cerebrum.get_all_tool_declarations())
+            parts.append(
+                "[SYSTEM STATE: LOW TOKEN MODE IS ACTIVE]\n"
+                "- Keep spoken and text responses brief.\n"
+                "- Multimodal processing is disabled (text-only LLM mode).\n"
+                "- Fatigue limit is halved and subagents are disabled; keep cycles short."
+            )
+        if dynamic_memory:
+            parts.append(dynamic_memory)
+
+        self.system_prompt = "\n\n".join(parts)
+        tools = self.cerebrum.get_all_tool_declarations()
+        self.system_prompt = fit_system_prompt(self.system_prompt, self.settings_manager, tools)
+        logging.info(f"Built system prompt: {format_prompt_footprint(self.system_prompt, tools)}")
 
     def deliver_memory_refresh(self, context):
         """Replace worker system memory before continuing a refresh tool round trip."""
@@ -352,6 +521,7 @@ class AmityOrchestrator:
         self.session_fatigue_tokens = getattr(self, 'session_fatigue_tokens', 0) + tokens
         self.current_task_weight = self.session_fatigue_tokens
         self._write_somatic_state()
+        self.save_session_state()
 
     def get_fatigue(self) -> float:
         limit = self.settings_manager.get("core.somatic.token-usage-limit") if hasattr(self, 'settings_manager') and self.settings_manager else None
@@ -398,6 +568,50 @@ class AmityOrchestrator:
         except Exception as e:
             logging.debug(f"Failed to write somatic state: {e}")
 
+    def save_session_state(self):
+        """Atomically persists active session messages and somatic/pulse state to session_cache.json."""
+        if getattr(self, 'is_paused', False) or getattr(self, '_is_sleep_cycle', False):
+            return
+        if not hasattr(self, 'agent_id') or not self.agent_id:
+            return
+
+        try:
+            messages = []
+            if self.gemini_worker and hasattr(self.gemini_worker, 'get_session_history'):
+                try:
+                    messages = self.gemini_worker.get_session_history() or []
+                except Exception as e:
+                    logging.debug(f"Error fetching session history from worker: {e}")
+
+            from core.session_cache import normalize_session_messages, save_session_cache
+            in_flight = getattr(self, '_in_flight_prompt', None)
+            norm_messages = normalize_session_messages(messages, in_flight_prompt=in_flight)
+
+            last_interaction = getattr(self.pulse_engine, 'last_interaction_time', time.time()) if hasattr(self, 'pulse_engine') and self.pulse_engine else time.time()
+
+            data = {
+                "messages": norm_messages,
+                "session_fatigue_tokens": getattr(self, 'session_fatigue_tokens', 0),
+                "last_notified_fatigue_threshold": getattr(self, '_last_notified_fatigue_threshold', 0),
+                "hard_fatigue_limit_hit": getattr(self, '_hard_fatigue_limit_hit', False),
+                "current_task_weight": getattr(self, 'current_task_weight', 0),
+                "recent_history": getattr(self, 'recent_history', []),
+                "pulse_state": {
+                    "last_interaction_time": last_interaction
+                }
+            }
+            save_session_cache(self.agent_id, data)
+        except Exception as e:
+            logging.debug(f"Error in save_session_state for agent {self.agent_id}: {e}")
+
+    def clear_session_state(self):
+        """Deletes session_cache.json when memory consolidation has succeeded."""
+        try:
+            from core.session_cache import clear_session_cache
+            clear_session_cache(self.agent_id)
+        except Exception as e:
+            logging.debug(f"Error clearing session cache for agent {self.agent_id}: {e}")
+
     def user_interacted(self):
         self.pulse_engine.user_interacted()
 
@@ -441,6 +655,7 @@ class AmityOrchestrator:
         self.speech_queue.clear()
         self.event_queue.clear()
         self.is_thinking = False
+        self._collapse_active_thought_card()
         logging.info("System: Processing aborted by user.")
         self.set_busy_state(False)
 
@@ -471,7 +686,8 @@ class AmityOrchestrator:
                 title = "Sleep Cycle (Memory Consolidation)"
                 context = (
                     "You are pausing. It is time for a Sleep Cycle. Review your active session history. "
-                    "Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. "
+                    "Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important, "
+                    "and update your Mirrors (`MemPalace_update_mirror`) across your Concentric Spheres of Consciousness (`S1..S10`, both `subjective_view` and `perspective_cone`) if new insights emerged. "
                     "Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. "
                     "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
                 )
@@ -517,6 +733,7 @@ class AmityOrchestrator:
                 logging.debug(f"Error stopping worker session on pause: {e}")
 
         self.session_fatigue_tokens = 0
+        self.clear_session_state()
         self.set_busy_state(False)
         self.on_paused_state_changed.emit(True)
         self.append_to_conversation(
@@ -548,6 +765,44 @@ class AmityOrchestrator:
         self.on_paused_state_changed.emit(False)
         self.append_to_conversation(
             "System", "[Agent Resumed - Autonomy online]")
+
+    def trigger_sleep_cycle(self, reason: Optional[str] = None) -> bool:
+        """
+        Triggers an autonomous Memory Consolidation (Sleep Cycle) for the agent.
+        Can be invoked directly or via SystemTool (System_sleep).
+        """
+        if getattr(self, '_is_sleep_cycle', False):
+            logging.warning("trigger_sleep_cycle called while sleep cycle already in progress.")
+            return False
+        if getattr(self, 'is_paused', False):
+            logging.warning("trigger_sleep_cycle called while agent is paused.")
+            return False
+
+        title = "Sleep Cycle (Memory Consolidation)"
+        context = (
+            f"You have explicitly initiated an autonomous Memory Consolidation (Sleep Cycle)"
+            + (f": {reason}. " if reason else ". ")
+            + "It is time to consolidate and clear your active session memory. "
+            "Follow the Two-Beat Protocol:\n"
+            "1. Beat 1 — Factual & Episodic Epoch: Review lived events of this session, commit objective facts and milestones via MemPalace_add_memory, update task/aspiration statuses, and prune obsolete short-term memories.\n"
+            "2. Beat 2 — Subjective & Concentric Empathy Synthesis:\n"
+            "   - Sphere 1 (Self): How did my actions align with my core values? Update MemPalace_update_mirror(perspective='Self', sphere_level=1, ...) if self-understanding shifted.\n"
+            "   - Sphere 2 (Immediate Others): For each person or agent interacted with today, update both subjective_view (how they perceive me) and perspective_cone (how they experienced today's interactions, their pressures, umwelt_horizon, epistemic_boundary, and prediction_error_note if an expectation was contradicted).\n"
+            "   - Outer Spheres (S3..S10): If today's work affected a broader community, project, or long-term horizon, update or create the corresponding outer-sphere mirror entry and ripple_notes.\n"
+            "   - Teleological Trajectory Check: Ensure active aspirations carry a clear 'why' and 'sphere_level'.\n"
+            "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
+            "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
+            "Use only MemPalace, Trajectory, or Pulse tools to record your insights. "
+            "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
+        )
+
+        if hasattr(self, 'pulse_engine') and self.pulse_engine:
+            self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
+            if hasattr(self, 'settings_manager') and self.settings_manager:
+                self.settings_manager.set("core.auto-pulse.last-sleep-cycle", time.time())
+                self.settings_manager.save()
+            return True
+        return False
 
     def _is_truly_busy(self) -> bool:
         worker_busy = bool(self.gemini_worker and getattr(self.gemini_worker, 'is_processing', False))
@@ -601,6 +856,8 @@ class AmityOrchestrator:
     def finish_thinking(self):
         logging.debug("finish_thinking called")
         self.is_thinking = False
+        self._in_flight_prompt = None
+        self._collapse_active_thought_card()
 
         # Drain any pending interjections that arrived right as thinking was finishing
         interjections = []
@@ -619,6 +876,8 @@ class AmityOrchestrator:
                 self.mempalace_manager.flush_turn_coactivation(is_sleep_cycle=is_sleep)
             except Exception as e:
                 logging.warning(f"Error flushing turn coactivation in finish_thinking: {e}")
+
+        self.save_session_state()
         self.check_cycle_completion()
 
     @with_agent_context
@@ -633,49 +892,63 @@ class AmityOrchestrator:
 
             if getattr(self, '_is_sleep_cycle', False):
                 self._is_sleep_cycle = False
-                logging.info("System: Memory consolidation complete. Resetting active session context...")
-                self.session_fatigue_tokens = 0
-                self._last_notified_fatigue_threshold = 0
-                self.current_task_weight = 0
-                self._write_somatic_state()
-                try:
-                    from core.cache_manager import CacheManager
-                    from config import paths
-                    CacheManager.clear_expired(paths.get_audio_cache_dir(self.agent_id), max_age_days=1.0)
-                    CacheManager.clear_expired(paths.get_generated_media_dir(self.agent_id), max_age_days=1.0)
-                except Exception:
-                    pass
-                self.build_system_prompt()
-
-                now = datetime.now().astimezone()
-                tz_str = f" ({now.tzname()})" if now.tzname() else ""
-                now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
-
-                if getattr(self, '_hard_fatigue_limit_hit', False):
-                    self.last_action_result = (
-                        f"[LIFECYCLE EVENT: Current time: {now_str}. "
-                        "You have completed memory consolidation after exceeding your maximum fatigue limit (100%). "
-                        "You failed to adequately halt cognition before your fatigue limit was reached. You must manage your fatigue more proactively in future—"
-                        "break up heavy workloads and defer tasks into future scheduled pulses when fatigue reaches 50%-90%. "
-                        "Your Layer 1 short-term continuity and mirrors have been synthesized, and your fatigue has been restored to 0%. "
-                        "Orient yourself with Trajectory_get_bearings before taking new action.]"
+                if getattr(self, '_sleep_cycle_error', False):
+                    self._sleep_cycle_error = False
+                    logging.warning(
+                        "System: Memory consolidation (Sleep Cycle) failed due to an error. "
+                        "Preserving active session context and fatigue for retry."
                     )
-                    self._hard_fatigue_limit_hit = False
+                    if self.gemini_worker and hasattr(self.gemini_worker, 'set_session_history'):
+                        from core.session_cache import load_session_cache
+                        cache_data = load_session_cache(self.agent_id)
+                        if cache_data and "messages" in cache_data:
+                            try:
+                                self.gemini_worker.set_session_history(cache_data["messages"])
+                            except Exception as e:
+                                logging.warning(f"Error restoring cached session turns after failed sleep cycle: {e}")
                 else:
-                    self.last_action_result = (
-                        f"[LIFECYCLE EVENT: Current time: {now_str}. "
-                        "You have completed memory consolidation and awoken to a new waking cycle. "
-                        "Your Layer 1 short-term continuity and mirrors have been synthesized, and your fatigue has been restored to 0%. "
-                        "Orient yourself with Trajectory_get_bearings before taking new action.]"
-                    )
+                    logging.info("System: Memory consolidation complete. Resetting active session context...")
+                    self.session_fatigue_tokens = 0
+                    self._last_notified_fatigue_threshold = 0
+                    self.current_task_weight = 0
+                    self._write_somatic_state()
+                    self.clear_session_state()
+                    try:
+                        from core.cache_manager import CacheManager
+                        CacheManager.clear_all_agent_expired_caches(self.agent_id, max_age_days=1.0)
+                    except Exception:
+                        pass
+                    self.build_system_prompt()
 
-                if self.gemini_worker:
-                    tools = self.cerebrum.get_all_tool_declarations()
-                    if hasattr(self.gemini_worker, 'stop_session'):
-                        self.gemini_worker.stop_session()
-                    if hasattr(self.gemini_worker, 'start_session'):
-                        if not getattr(self, '_pausing_in_progress', False) and not getattr(self, '_shutdown_flag', False):
-                            self.gemini_worker.start_session(self.system_prompt, tools=tools, clear_history=True)
+                    now = datetime.now().astimezone()
+                    tz_str = f" ({now.tzname()})" if now.tzname() else ""
+                    now_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
+
+                    if getattr(self, '_hard_fatigue_limit_hit', False):
+                        self.last_action_result = (
+                            f"[LIFECYCLE EVENT: Current time: {now_str}. "
+                            "You have completed memory consolidation after exceeding your maximum fatigue limit (100%). "
+                            "You failed to adequately halt cognition before your fatigue limit was reached. You must manage your fatigue more proactively in future—"
+                            "break up heavy workloads, defer tasks into future scheduled pulses when fatigue reaches 50%-90%, or explicitly invoke System_sleep to manage your memory consolidation with intention. "
+                            "Your Layer 1 short-term continuity and mirrors have been synthesized, and your fatigue has been restored to 0%. "
+                            "Orient yourself with Trajectory_get_bearings before taking new action.]"
+                        )
+                        self._hard_fatigue_limit_hit = False
+                    else:
+                        self.last_action_result = (
+                            f"[LIFECYCLE EVENT: Current time: {now_str}. "
+                            "You have completed memory consolidation and awoken to a new waking cycle. "
+                            "Your Layer 1 short-term continuity and mirrors have been synthesized, and your fatigue has been restored to 0%. "
+                            "Orient yourself with Trajectory_get_bearings before taking new action.]"
+                        )
+
+                    if self.gemini_worker:
+                        tools = self.cerebrum.get_all_tool_declarations()
+                        if hasattr(self.gemini_worker, 'stop_session'):
+                            self.gemini_worker.stop_session()
+                        if hasattr(self.gemini_worker, 'start_session'):
+                            if not getattr(self, '_pausing_in_progress', False) and not getattr(self, '_shutdown_flag', False):
+                                self.gemini_worker.start_session(self.system_prompt, tools=tools, clear_history=True)
 
             if getattr(self, '_pending_settings_reload', False):
                 self._pending_settings_reload = False
@@ -696,6 +969,14 @@ class AmityOrchestrator:
             logging.debug(
                 "check_cycle_completion calling set_busy_state(True)")
             self.set_busy_state(True, speaking=is_speaking)
+
+    def prune_expired_caches(self, max_age_days: float = 1.0) -> None:
+        """Prunes all temporary cache files (audio, media, browser screenshots/cache) older than max_age_days."""
+        try:
+            from core.cache_manager import CacheManager
+            CacheManager.clear_all_agent_expired_caches(self.agent_id, max_age_days=max_age_days)
+        except Exception as e:
+            logging.warning(f"Orchestrator: Failed to prune expired caches: {e}")
 
     @with_agent_context
     def process_input(self, text, audio_path=None, sender="User"):
@@ -822,11 +1103,14 @@ class AmityOrchestrator:
                     logging.debug(f"Proactive entity recall check error: {e}")
 
             prompt += f"[{user_name} (User)]: {self.current_user_prompt}"
+            self._in_flight_prompt = prompt
+            self.save_session_state()
             logging.debug(
                 f"Calling gemini_worker.send_prompt with prompt length {len(prompt)}...")
             self.gemini_worker.send_prompt(prompt, audio_path=audio_path)
             logging.debug("gemini_worker.send_prompt returned.")
         except Exception as e:
+            self._in_flight_prompt = None
             logging.error(f"Error in _async_query_prep: {e}", exc_info=True)
             self.append_to_conversation("System Warning", f"Query preparation failed: {e}")
             self.finish_thinking()
@@ -916,6 +1200,8 @@ class AmityOrchestrator:
                 category = "Scheduled routine"
 
         self._is_sleep_cycle = ("Sleep Cycle" in text or category == "Memory consolidation cycle")
+        if self._is_sleep_cycle:
+            self._sleep_cycle_error = False
         if "You are shutting down." not in text:
             self.append_to_conversation("System", f"[Autonomy Pulse: {category}]")
         self.is_thinking = True
@@ -939,15 +1225,26 @@ class AmityOrchestrator:
             prompt_payload = f"[System Feedback from previous turn]: {self.last_action_result}\n\n{text}"
             self.last_action_result = None
 
+        if not self._is_sleep_cycle:
+            self._in_flight_prompt = prompt_payload
+            self.save_session_state()
+
         try:
             self.gemini_worker.send_prompt(prompt_payload)
         except Exception as e:
+            self._in_flight_prompt = None
             logging.error(f"Failed to dispatch prompt to worker in process_pulse: {e}", exc_info=True)
             self.append_to_conversation("System Warning", f"Pulse prompt dispatch failed: {e}")
             self.finish_thinking()
             self.set_busy_state(False)
 
     def append_to_conversation(self, sender, text):
+        self._collapse_active_thought_card()
+        if hasattr(self, 'chat_history_manager') and self.chat_history_manager:
+            try:
+                self.chat_history_manager.add_message(sender=sender, content=text)
+            except Exception as e:
+                logging.error(f"Failed to persist chat message: {e}", exc_info=True)
         self.recent_history.append((sender, text))
         max_history = 6 if self.settings_manager.get(
             "core.low-token-mode", False) else 10
@@ -958,8 +1255,9 @@ class AmityOrchestrator:
     def on_audio_initialized(self):
         logging.info("System: Ready.")
         if not self.is_paused and self.gemini_worker and getattr(self.gemini_worker, 'available', False):
-            tools = self.cerebrum.get_all_tool_declarations()
-            self.gemini_worker.start_session(self.system_prompt, tools=tools)
+            if not getattr(self.gemini_worker, 'running', False):
+                tools = self.cerebrum.get_all_tool_declarations()
+                self.gemini_worker.start_session(self.system_prompt, tools=tools)
 
     def on_listening_start(self):
         if hasattr(self, 'on_listening_state_changed'):
@@ -998,6 +1296,7 @@ class AmityOrchestrator:
 
     @with_agent_context
     def handle_gemini_thought(self, text: str, function_calls: list):
+        self._in_flight_prompt = None
         logging.debug(
             f"handle_gemini_thought called with text length: {len(text)}, function_calls count: {len(function_calls) if function_calls else 0}")
 
@@ -1014,10 +1313,13 @@ class AmityOrchestrator:
                 worker_type = "chatgptworker"
             elif provider == "deepseek":
                 worker_type = "deepseekworker"
+            elif provider == "openrouter":
+                worker_type = "openrouterworker"
             else:
                 worker_type = "geminiworker"
             logging.getLogger(f"{worker_type}.Thoughts").info(clean_text)
             self.accumulated_thoughts += clean_text + "\n"
+            self._append_to_thought_card(clean_text)
 
         # Check for pending interjections arrived during thought generation
         interjections = []
@@ -1170,7 +1472,7 @@ class AmityOrchestrator:
 
                 if getattr(self, '_is_sleep_cycle', False):
                     allowed_sleep_prefixes = ("MemPalace_", "Trajectory_", "Pulse_")
-                    is_allowed = (function_name in ("System_contemplate",) or any(function_name.startswith(p) for p in allowed_sleep_prefixes))
+                    is_allowed = (function_name in ("System_contemplate", "System_read_manual") or any(function_name.startswith(p) for p in allowed_sleep_prefixes))
                     if not is_allowed:
                         logging.warning(f"System: Disallowed tool '{function_name}' invoked during Sleep Cycle. Intercepting.")
                         msg = (
@@ -1187,9 +1489,19 @@ class AmityOrchestrator:
 
                 executed_tool_sig = f"{function_name}({json.dumps(args, sort_keys=True)})"
                 executed_tools.append(executed_tool_sig)
+                is_speaker_output = function_name in ("Speaker_speak_aloud", "Speaker_output_text")
+                if not is_speaker_output:
+                    thought_call_text = f"{icon} {raw_call_text}" if icon else raw_call_text
+                    self._append_to_thought_card(thought_call_text)
                 try:
                     skill_result = self.cerebrum.execute_tool_call(function_name, args, call_id=call_id)
-                    if isinstance(skill_result, dict):
+                    if is_speaker_output and isinstance(skill_result, str):
+                        dispatched = self._dispatch_speaker_payload(function_name, skill_result)
+                        if dispatched is not None:
+                            function_responses.append((function_name, {"result": dispatched}))
+                        else:
+                            function_responses.append((function_name, {"result": str(skill_result)}))
+                    elif isinstance(skill_result, dict):
                         function_responses.append((function_name, skill_result))
                     else:
                         function_responses.append(
@@ -1221,22 +1533,10 @@ class AmityOrchestrator:
         for i, (name, resp) in enumerate(function_responses):
             if name.startswith("Speaker_"):
                 self._speaker_invoked_in_cycle = True
-                result_str = resp.get("result", "")
-                try:
-                    payload = json.loads(result_str)
-                    action = payload.get("action")
-                    if action == "trigger_speak_aloud":
-                        text = payload.get("text", "")
-                        self.handle_gemini_speech(text)
-                        resp["result"] = "Speech queued."
-                    elif action == "trigger_output_text":
-                        text = payload.get("text", "")
-                        self.append_to_conversation("Agent", text)
-                        resp["result"] = "Text output to GUI."
-                except Exception as e:
-                    logging.debug(
-                        f"Expected valid JSON from Speaker tool but failed to parse: {e}")
-                function_responses[i] = (name, resp)
+                dispatched = self._dispatch_speaker_payload(name, resp.get("result", ""))
+                if dispatched is not None:
+                    resp["result"] = dispatched
+                    function_responses[i] = (name, resp)
 
         fatigue = self.get_fatigue()
         percent = fatigue * 100.0
@@ -1276,12 +1576,23 @@ class AmityOrchestrator:
                 "You have reached 100% context fatigue. It is time for Memory Consolidation (Sleep Cycle). "
                 "Follow the Two-Beat Protocol:\n"
                 "1. Factual Epoch: Review the lived events of this session, noting milestones achieved, people engaged with, and tools used.\n"
-                "2. Subjective Synthesis: Reflect on what this day meant—how your character developed, lessons learned from errors or friction, and how your priorities or mirrors should adjust.\n"
+                "2. Subjective Synthesis: Reflect on what this day meant—how your character developed, lessons learned from errors or friction, and how your priorities or mirrors across your Concentric Spheres of Consciousness (`S1:Self`, `S2:Immediate`, and outer spheres `S3..S10`, including both `subjective_view` and `perspective_cone`) should adjust.\n"
                 "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
                 "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
                 "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
             )
             self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
+            self.finish_thinking()
+            return
+
+        # Check if agent explicitly initiated a sleep cycle via System_sleep
+        has_sleep_command = any(name in ("System_sleep", "System_sleep_cycle") for name, _ in function_responses)
+        if has_sleep_command and not is_sleep:
+            logging.info("System: Agent explicitly invoked sleep cycle. Breaking active turn to begin Memory Consolidation.")
+            self.append_to_conversation(
+                "System",
+                "[SYSTEM NOTICE: Memory consolidation (Sleep Cycle) explicitly initiated by agent.]"
+            )
             self.finish_thinking()
             return
 
@@ -1301,7 +1612,7 @@ class AmityOrchestrator:
                 self._last_notified_fatigue_threshold = 90
                 budget_alert = (
                     f"\n[SYSTEM ALERT: Fatigue is at {percent:.0f}% ({tokens:,}/{int(max_tokens):,} tokens). "
-                    "Critical fatigue reached—you are almost at the absolute limit. You must conclude cognition immediately and allow a sleep cycle to run.]"
+                    "Critical fatigue reached—you are almost at the absolute limit. You must conclude cognition immediately and allow a sleep cycle to run, or explicitly invoke System_sleep.]"
                 )
             elif percent >= 50 and last_alerted < 50:
                 self._last_notified_fatigue_threshold = 50
@@ -1339,6 +1650,7 @@ class AmityOrchestrator:
                 last_resp["result"] = f"{last_resp['result']}{budget_alert}"
                 function_responses[-1] = (last_name, last_resp)
             self.gemini_worker.send_function_responses(function_responses)
+            self.save_session_state()
 
         # Flush turn co-activation in morphological memory layer (§9.3)
         if hasattr(self, 'mempalace_manager') and self.mempalace_manager:
@@ -1376,6 +1688,9 @@ class AmityOrchestrator:
     @with_agent_context
     def handle_gemini_error(self, text):
         logging.warning(f"Gemini API Event: {text}")
+        if getattr(self, '_is_sleep_cycle', False):
+            self._sleep_cycle_error = True
+            logging.warning("System: Memory consolidation sleep cycle encountered an API error. Preserving active session context for retry.")
         self.append_to_conversation("System Warning", text)
         self.finish_thinking()
         if not self._is_truly_busy():
@@ -1403,6 +1718,9 @@ class AmityOrchestrator:
         self.tts_worker.started_playback.connect(self._on_started_playback)
         self.tts_worker.amplitude_emitted.connect(
             self.on_amplitude_emitted.emit)
+        if hasattr(self.tts_worker, "waveform_emitted") and hasattr(self, "on_waveform_emitted"):
+            self.tts_worker.waveform_emitted.connect(
+                self.on_waveform_emitted.emit)
         self.tts_worker.status_emitted.connect(
             lambda msg: self.append_to_conversation("System", msg))
         self.tts_worker.error_occurred.connect(self._on_tts_error)
@@ -1421,36 +1739,13 @@ class AmityOrchestrator:
         self.set_busy_state(self.is_busy, speaking=True)
 
     def shutdown(self, force_sleep=False):
-        if self.is_paused:
-            self._finalize_shutdown()
-            return
-
-        fatigue = self.get_fatigue()
-        
-        if force_sleep and fatigue >= 0.02:
-            logging.info("System: Initiating graceful shutdown sleep cycle...")
-            title = "Sleep Cycle (Memory Consolidation)"
-            context = "You are shutting down. It is time for a Sleep Cycle. Review your active session history. Synthesize this episodic memory into generalized facts and store them in the Sanctuary or Deep Search (Chroma) if they are important. Then, update your short-term memory (using MemPalace) so that you have a condensed summary of your current state and ongoing tasks before this session is archived. You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
-            self.pulse_engine.fire_pulse(title, context, "sleep_cycle")
-            self.settings_manager.set(
-                "core.auto-pulse.last-sleep-cycle", time.time())
-            self.settings_manager.set("core.paused", getattr(self, 'is_paused', False))
-            self.settings_manager.save()
-
-            def check_busy():
-                if not self.is_busy and not self.is_thinking:
-                    self._finalize_shutdown()
-                else:
-                    threading.Timer(1.0, check_busy).start()
-
-            threading.Timer(2.0, check_busy).start()
-            return
-
         self._finalize_shutdown()
 
     def _finalize_shutdown(self):
         logging.info("System: Shutting down orchestrator...")
         self._shutdown_flag = True
+        if not getattr(self, 'is_paused', False) and not getattr(self, '_is_sleep_cycle', False):
+            self.save_session_state()
         for sid in list(self.active_subagents.keys()):
             try:
                 self.dispose_subagent(sid)
@@ -1485,15 +1780,20 @@ class AmityOrchestrator:
                     self.dispose_subagent(sid)
         threading.Thread(target=gc_loop, daemon=True).start()
 
-    def spawn_subagent(self, task_description, model_tier="light", call_id=None):
+    def spawn_subagent(self, task_description, model_tier="light", call_id=None, allowed_files=None):
         if self.is_paused:
             return "Error: Agent is currently paused."
         if len(self.active_subagents) >= 6:
             return "Error: Maximum concurrent subagents (6) reached."
 
+        try:
+            file_policy = SubagentFilePolicy.from_paths(allowed_files)
+        except (TypeError, ValueError) as e:
+            return f"Error: {e}"
+
         import uuid
         sid = str(uuid.uuid4())[:8]
-        worker = SubagentWorker(sid, self, model_tier)
+        worker = SubagentWorker(sid, self, model_tier, file_policy=file_policy)
 
         worker.thought_received.connect(
             lambda text, funcs, s=sid: self.handle_subagent_thought(s, text, funcs))
@@ -1506,6 +1806,8 @@ class AmityOrchestrator:
             self.subagent_call_ids[sid] = call_id
 
         worker.send_prompt(task_description)
+        if file_policy.has_permissions:
+            return f"Subagent {sid} spawned (permitted files: {file_policy.summary()})."
         return f"Subagent {sid} spawned."
 
     def message_subagent(self, sid, message):
@@ -1531,7 +1833,25 @@ class AmityOrchestrator:
     def list_subagents(self):
         if not self.active_subagents:
             return "No active subagents."
-        return "Active subagents: " + ", ".join(self.active_subagents.keys())
+        entries = []
+        for sid, worker in self.active_subagents.items():
+            policy = getattr(worker, "file_policy", None)
+            if policy is not None and policy.has_permissions:
+                entries.append(f"{sid} (files: {policy.summary()})")
+            else:
+                entries.append(f"{sid} (no file access)")
+        return "Active subagents: " + "; ".join(entries)
+
+    def _is_subagent_cerebrum_tool_allowed(self, function_name: str) -> bool:
+        if not function_name or "_" not in function_name:
+            return False
+        skill_prefix = function_name.split("_", 1)[0]
+        allowed_lower = {t.lower() for t in SUBAGENT_ALLOWED_CEREBRUM_TOOLS}
+        if skill_prefix.lower() in allowed_lower:
+            return True
+        if skill_prefix.lower().endswith("tool") and skill_prefix.lower()[:-4] in allowed_lower:
+            return True
+        return False
 
     @with_agent_context
     def handle_subagent_thought(self, sid, text, function_calls):
@@ -1566,8 +1886,30 @@ class AmityOrchestrator:
             function_name = call.name
             args = call.args or {}
             try:
-                skill_result = self.cerebrum.execute_tool_call(
-                    function_name, args)
+                if function_name in SubagentFileToolset.TOOL_NAMES:
+                    file_toolset = getattr(subagent, "file_toolset", None)
+                    if not isinstance(file_toolset, SubagentFileToolset):
+                        file_toolset = SubagentFileToolset(
+                            SubagentFilePolicy(),
+                            orchestrator=self,
+                            subagent_id=sid,
+                        )
+                    skill_result = file_toolset.execute_tool_call(function_name, args)
+                elif self._is_subagent_cerebrum_tool_allowed(function_name):
+                    skill_result = self.cerebrum.execute_tool_call(
+                        function_name, args)
+                else:
+                    logging.warning(
+                        f"[Subagent {sid}] Blocked disallowed tool call: {function_name}"
+                    )
+                    function_responses.append(
+                        (
+                            function_name,
+                            {"error": f"Permission denied: Tool '{function_name}' is not available to subagents."},
+                        )
+                    )
+                    continue
+
                 if isinstance(skill_result, dict):
                     function_responses.append((function_name, skill_result))
                 else:

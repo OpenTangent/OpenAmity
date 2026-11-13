@@ -45,6 +45,7 @@ def test_whatsapp_tool_declarations(mock_whatsapp_tool):
     assert "WhatsApp_send" in names
     assert "WhatsApp_send_location" in names
     assert "WhatsApp_send_contact" in names
+    assert "WhatsApp_vote_poll" in names
     assert "WhatsApp_unread" in names
 
 
@@ -784,5 +785,206 @@ def test_whatsapp_format_timestamp_varieties():
         assert isinstance(res_fb, str)
         assert len(res_fb) == 19
         assert res_fb[4] == "-" and res_fb[7] == "-" and res_fb[10] == " " and res_fb[13] == ":"
+
+
+def test_whatsapp_unread_poll_creation_message(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    mock_unread_resp = MagicMock()
+    mock_unread_resp.json.return_value = {
+        "unread": [
+            {
+                "id": "false_120363024851923214@g.us_3EB06A0D0FACB842E129_196477657813247@lid",
+                "chatId": "120363024851923214@g.us",
+                "chatName": "+1 Intelligence",
+                "senderName": "Chris",
+                "senderNumber": "27739992353",
+                "timestamp": 1776158101,
+                "type": "poll_creation",
+                "hasMedia": False,
+                "content": (
+                    '[Poll: "Which release is a bigger gaming event to you?" | '
+                    'Type: Single Choice (max 1) | '
+                    'Options: [0] "GTA: VI" (0 votes) ; [1] "Elder Scrolls VI: Sentinel" (1 vote: Chris) | '
+                    'Your Vote: None]'
+                ),
+                "poll": {
+                    "question": "Which release is a bigger gaming event to you?",
+                    "selectableOptionsCount": 1,
+                    "allowMultipleAnswers": False,
+                    "totalVotes": 1,
+                    "myVotes": [],
+                    "options": [
+                        {"localId": 0, "name": "GTA: VI", "voteCount": 0, "voters": [], "selectedByMe": False},
+                        {"localId": 1, "name": "Elder Scrolls VI: Sentinel", "voteCount": 1, "voters": ["Chris"], "selectedByMe": False},
+                    ],
+                },
+            }
+        ]
+    }
+
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        elif url.endswith("/unread"):
+            return mock_unread_resp
+        return MagicMock()
+
+    with patch("requests.get", side_effect=fake_get):
+        with patch("requests.post") as mock_post:
+            res = tool.execute("unread")
+            assert isinstance(res, str)
+            assert 'Which release is a bigger gaming event to you?' in res
+            assert 'Type: Single Choice (max 1)' in res
+            assert '[0] "GTA: VI" (0 votes)' in res
+            assert '[1] "Elder Scrolls VI: Sentinel" (1 vote: Chris)' in res
+            assert 'Your Vote: None' in res
+            assert "MsgID: false_120363024851923214@g.us_3EB06A0D0FACB842E129_196477657813247@lid" in res
+            assert "WhatsApp_vote_poll" in res
+            mock_post.assert_not_called()
+
+
+def test_whatsapp_recent_poll_structured_fallback(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    mock_recent_resp = MagicMock()
+    mock_recent_resp.json.return_value = {
+        "messages": [
+            {
+                "id": "poll_multi_001",
+                "chatId": "group999@g.us",
+                "chatName": "Dev Team",
+                "senderName": "Alice",
+                "senderNumber": "111222333",
+                "timestamp": 1776158200,
+                "type": "poll_creation",
+                "hasMedia": True,  # Even if True, poll_creation must not trigger media download
+                "content": "",  # Empty content tests Python _format_poll_content fallback
+                "poll": {
+                    "question": "Which days work for the sprint retro?",
+                    "selectableOptionsCount": 0,
+                    "allowMultipleAnswers": True,
+                    "totalVotes": 3,
+                    "myVotes": [1],
+                    "options": [
+                        {"localId": 0, "name": "Monday", "voteCount": 1, "voters": ["Alice"], "selectedByMe": False},
+                        {"localId": 1, "name": "Wednesday", "voteCount": 2, "voters": ["Alice", "You"], "selectedByMe": True},
+                    ],
+                },
+            }
+        ]
+    }
+
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        elif "/recent" in url:
+            return mock_recent_resp
+        return MagicMock()
+
+    with patch("requests.get", side_effect=fake_get):
+        with patch("requests.post") as mock_post:
+            res = tool.execute("recent", count=5)
+            assert isinstance(res, str)
+            assert '[Poll: "Which days work for the sprint retro?"' in res
+            assert "Type: Multiple Choice" in res
+            assert '[0] "Monday" (1 vote: Alice)' in res
+            assert '[1] "Wednesday" (2 votes: Alice, You)' in res
+            assert 'Your Vote: [1] "Wednesday"' in res
+            mock_post.assert_not_called()
+
+
+def test_whatsapp_vote_poll_by_option_id_and_text(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    mock_post_resp = MagicMock()
+    mock_post_resp.json.return_value = {
+        "success": True,
+        "msgId": "poll_msg_123",
+        "question": "Which release is a bigger gaming event to you?",
+        "selectedOptions": [
+            {"localId": 1, "name": "Elder Scrolls VI: Sentinel"}
+        ],
+    }
+
+    with patch("requests.get", return_value=mock_status_resp):
+        with patch("requests.post", return_value=mock_post_resp) as mock_post:
+            # 1. Vote using list of integer option IDs
+            res = tool.execute("vote_poll", msgId="poll_msg_123", options=[1])
+            assert res == 'Voted for [1] "Elder Scrolls VI: Sentinel" in poll "Which release is a bigger gaming event to you?" successfully.'
+            mock_post.assert_called_once_with(
+                "http://127.0.0.1:3000/vote_poll",
+                json={"msgId": "poll_msg_123", "options": ["1"]},
+                timeout=15,
+            )
+
+            # 2. Vote using single option string
+            mock_post.reset_mock()
+            res2 = tool.execute("vote_poll", msgId="poll_msg_123", options="Elder Scrolls VI: Sentinel")
+            assert 'Voted for [1] "Elder Scrolls VI: Sentinel"' in res2
+            mock_post.assert_called_once_with(
+                "http://127.0.0.1:3000/vote_poll",
+                json={"msgId": "poll_msg_123", "options": ["Elder Scrolls VI: Sentinel"]},
+                timeout=15,
+            )
+
+            # 3. Vote using JSON array string
+            mock_post.reset_mock()
+            res3 = tool.execute("vote_poll", msgId="poll_msg_123", options='["0", "1"]')
+            assert "Voted for" in res3
+            mock_post.assert_called_once_with(
+                "http://127.0.0.1:3000/vote_poll",
+                json={"msgId": "poll_msg_123", "options": ["0", "1"]},
+                timeout=15,
+            )
+
+
+def test_whatsapp_vote_poll_retract_vote(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    mock_post_resp = MagicMock()
+    mock_post_resp.json.return_value = {
+        "success": True,
+        "msgId": "poll_msg_123",
+        "question": "Which release is a bigger gaming event to you?",
+        "selectedOptions": [],
+    }
+
+    with patch("requests.get", return_value=mock_status_resp):
+        with patch("requests.post", return_value=mock_post_resp) as mock_post:
+            res = tool.execute("vote_poll", msgId="poll_msg_123", options=[])
+            assert res == 'Retracted vote from poll "Which release is a bigger gaming event to you?" successfully.'
+            mock_post.assert_called_once_with(
+                "http://127.0.0.1:3000/vote_poll",
+                json={"msgId": "poll_msg_123", "options": []},
+                timeout=15,
+            )
+
+
+def test_whatsapp_vote_poll_missing_params_and_error(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    with patch("requests.get", return_value=mock_status_resp):
+        assert tool.execute("vote_poll") == "Usage: vote_poll <msgId> <options>"
+        assert tool.execute("vote_poll", msgId="poll_msg_123") == "Usage: vote_poll <msgId> <options>"
+        assert tool.execute("vote_poll", msgId="poll_msg_123", options="   ") == "Usage: vote_poll <msgId> <options>"
+
+        mock_err_resp = MagicMock()
+        mock_err_resp.json.return_value = {
+            "error": 'Poll only allows selecting up to 1 option(s), but 2 were provided.'
+        }
+        with patch("requests.post", return_value=mock_err_resp):
+            res = tool.execute("vote_poll", msgId="poll_msg_123", options=["0", "1"])
+            assert res == "Error: Poll only allows selecting up to 1 option(s), but 2 were provided."
 
 

@@ -1,4 +1,10 @@
-from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+from core.prompt_context import (
+    MemoryContextWorkerMixin,
+    fit_system_prompt,
+    format_prompt_footprint,
+    inject_static_worker_instructions,
+    split_system_prompt_for_caching,
+)
 import os
 import base64
 import mimetypes
@@ -112,11 +118,10 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                 "Session Start Error: Claude Worker is not available")
             return
 
-        self.sys_instruct = system_instruction or ""
-        self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
-        self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
-
+        self._append_worker_static_instructions = True
+        self.sys_instruct = inject_static_worker_instructions(system_instruction or "")
         self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
+        logging.debug(f"ClaudeWorker prompt footprint: {format_prompt_footprint(self.sys_instruct, tools)}")
         self.tools = tools
         self.anthropic_tools = []
         if self.tools:
@@ -161,21 +166,43 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                     texts = []
                     for item in c:
                         if isinstance(item, dict):
-                            if item.get("type") == "text":
+                            b_type = item.get("type")
+                            if b_type == "text":
                                 texts.append(item.get("text", ""))
-                            elif item.get("type") == "tool_use":
-                                texts.append(f"[Tool invocation: {item.get('name')}({json.dumps(item.get('input', {}))})]")
-                            elif item.get("type") == "tool_result":
-                                texts.append(f"[Tool Result: {json.dumps(item.get('content', ''))}]")
+                            elif b_type in ("image", "document"):
+                                texts.append("[Media attachment from earlier in session]")
+                            elif b_type == "tool_use":
+                                texts.append(f"[Tool invocation: {item.get('name')}({json.dumps(item.get('input', {}), default=str)})]")
+                            elif b_type == "tool_result":
+                                texts.append(f"[Tool Result: {json.dumps(item.get('content', ''), default=str)}]")
+                        else:
+                            b_type = getattr(item, "type", None)
+                            if b_type == "text":
+                                texts.append(getattr(item, "text", ""))
+                            elif b_type == "thinking":
+                                th = getattr(item, "thinking", "")
+                                if th:
+                                    texts.append(th)
+                            elif b_type in ("image", "document"):
+                                texts.append("[Media attachment from earlier in session]")
+                            elif b_type == "tool_use":
+                                name = getattr(item, "name", "")
+                                inp = getattr(item, "input", {})
+                                texts.append(f"[Tool invocation: {name}({json.dumps(inp, default=str)})]")
+                            elif b_type == "tool_result":
+                                res = getattr(item, "content", "")
+                                texts.append(f"[Tool Result: {json.dumps(res, default=str)}]")
                     messages.append({"role": role, "content": "\n".join(texts)})
             return messages
 
     def set_session_history(self, messages: list):
         """Restores chat history from normalized turns."""
+        from core.session_cache import normalize_session_messages
+        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
         with self._history_lock:
             self.history = []
             self.consumed_tool_use_ids = set()
-            for msg in messages:
+            for msg in norm_messages:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if content:
@@ -231,8 +258,20 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                 }
             }
 
-        # Claude does not natively support multimodal audio input.
+        # Claude does not natively support multimodal audio input. Transcribe using LocalSTT if available.
         if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            transcription = None
+            try:
+                from core.local_stt import LocalSTT
+                transcription = LocalSTT().transcribe(exp_path)
+            except Exception as e:
+                logging.debug(f"LocalSTT failed for {exp_path}: {e}")
+
+            if transcription and not transcription.startswith("Failed"):
+                return {
+                    "type": "text",
+                    "text": f"[Voice Message Audio: {os.path.basename(exp_path)}]\n[Voice Message Transcription: {transcription}]"
+                }
             return {
                 "type": "text",
                 "text": f"[Audio file attached: {exp_path}. Note: Claude does not support multimodal audio input directly. To extract text or messages from this audio file, use the Media_transcribe_audio tool.]"
@@ -531,14 +570,20 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                 logging.debug(
                     f"Calling Claude with message length {len(self.history)} using model {model_name}...")
 
-                # Enable Anthropic Prompt Caching on system instructions
+                # Enable Anthropic Prompt Caching on the immutable static prefix; keep dynamic memory uncached after it
+                static_prefix, dynamic_block = split_system_prompt_for_caching(self.sys_instruct or "")
                 system_payload = [
                     {
                         "type": "text",
-                        "text": self.sys_instruct or "",
+                        "text": static_prefix,
                         "cache_control": {"type": "ephemeral"}
                     }
                 ]
+                if dynamic_block:
+                    system_payload.append({
+                        "type": "text",
+                        "text": dynamic_block
+                    })
 
                 # Configure adaptive thinking effort level
                 effort = self.settings.get("core.claude.thinking-level", "")
@@ -670,3 +715,23 @@ class ClaudeWorker(MemoryContextWorkerMixin):
         except Exception as e:
             logging.warning(f"Reformulator API Error: {e}")
             return user_prompt
+
+    @classmethod
+    def fetch_available_models(cls, api_key: str = None) -> list:
+        """
+        Queries Anthropic's models.list() endpoint to fetch active Claude models.
+        Returns a sorted list of model ID strings (e.g. 'claude-3-7-sonnet-20250219').
+        """
+        if not api_key:
+            raise ValueError("Claude API key is required to fetch available models.")
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key.strip())
+        page = client.models.list(limit=100)
+        models = []
+        for m in page.data:
+            m_id = getattr(m, "id", None) or getattr(m, "name", "")
+            if m_id:
+                models.append(m_id)
+        sorted_models = sorted(list(set(models)), key=lambda s: s.lower())
+        logging.getLogger("core.ClaudeWorker").info(f"Successfully fetched {len(sorted_models)} models from Claude catalog.")
+        return sorted_models

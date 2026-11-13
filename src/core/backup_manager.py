@@ -42,18 +42,19 @@ DISALLOWED_SENSITIVE_HOME_ENTRIES = (
 
 EXCLUDED_DIR_NAMES = {
     "node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__",
-    "browser_data", "audio_cache", "generated_media",
+    "browser_data", "audio_cache", "generated_media", "media", "web_cache",
     "whatsapp_data", "whatsapp_bridge"
 }
 EXCLUDED_FILE_NAMES = {
     "SingletonLock", "SingletonCookie", "SingletonSocket",
-    "daemon.pid", "daemon.port", ".last_engine_update"
+    "daemon.pid", "daemon.port", ".last_engine_update",
+    "chat_history.db", "session_cache.json", "somatic_state.json"
 }
 EXCLUDED_FILE_SUFFIXES = {".db-wal", ".db-shm", ".sqlite3-wal", ".sqlite3-shm"}
 EXCLUDED_EXTERNAL_DIR_NAMES = {
     "node_modules", "puppeteer_cache", ".wwebjs_cache", "__pycache__",
     ".git", ".venv", "venv", ".cache", "audio_cache", "generated_media",
-    "whatsapp_data", "whatsapp_bridge"
+    "browser_data", "media", "web_cache", "whatsapp_data", "whatsapp_bridge"
 }
 
 PRECOMPRESSED_EXTENSIONS = {
@@ -69,7 +70,7 @@ CORE_MEMORY_INVENTORY = [
     "mempalace/identity.txt", "mempalace/mirrors.json", "mempalace/short_term_mem.json",
     "mempalace/short_term_archive.json", "mempalace/identity_approvals.json",
     "mempalace/identity_delta_journal.json", "mempalace/corpus_meta.json",
-    "mempalace/morpho_graph.db", "mempalace/chroma.sqlite3"
+    "mempalace/morpho_graph.db", "mempalace/chroma.sqlite3", "trajectory.db"
 ]
 
 
@@ -779,6 +780,7 @@ def _create_agent_backup_from_source(
     store_versions = {}
     for db_rel, db_key in [
         ("pulses.db", "pulses_db"),
+        ("trajectory.db", "trajectory_db"),
         ("mempalace/chroma.sqlite3", "chroma_db"),
         ("mempalace/morpho_graph.db", "morpho_graph_db"),
     ]:
@@ -802,6 +804,24 @@ def _create_agent_backup_from_source(
                 row = cur.execute("SELECT value FROM morpho_meta WHERE key = 'corpus_revision'").fetchone()
                 if row:
                     store_versions["corpus_revision"] = int(row[0])
+        except Exception:
+            pass
+
+    # Mirrors empathy schema state
+    mirrors_f = os.path.join(agent_dir, "mempalace", "mirrors.json")
+    if os.path.exists(mirrors_f):
+        try:
+            with open(mirrors_f, "rb") as mf:
+                raw_m = mf.read()
+                store_versions["mirrors_hash"] = hashlib.sha256(raw_m).hexdigest()
+                m_obj = json.loads(raw_m.decode("utf-8"))
+                if isinstance(m_obj, dict):
+                    store_versions["mirrors_count"] = len(m_obj)
+                    has_v2 = any(
+                        isinstance(v, dict) and ("sphere_level" in v or "perspective_cone" in v)
+                        for v in m_obj.values()
+                    )
+                    store_versions["mirrors_schema_version"] = 2 if has_v2 else 1
         except Exception:
             pass
 
@@ -1420,11 +1440,40 @@ def verify_snapshot_restore(backup_path: str, target_dir: Optional[str] = None) 
             except Exception as se:
                 return {"valid": False, "error": f"Invalid settings.json in archive: {se}"}
 
+        # Verify empathy & mind structures (mempalace/mirrors.json, trajectory.db) when present
+        empathy_verified = True
+        mirrors_check_path = os.path.join(actual_root, "mempalace", "mirrors.json")
+        if os.path.exists(mirrors_check_path):
+            try:
+                with open(mirrors_check_path, "r", encoding="utf-8") as mf:
+                    mirrors_data = json.load(mf)
+                if not isinstance(mirrors_data, dict):
+                    return {"valid": False, "error": "Invalid mempalace/mirrors.json root type: expected dict"}
+                for p_key, p_val in mirrors_data.items():
+                    if not isinstance(p_val, dict):
+                        return {"valid": False, "error": f"Invalid mirror entry for '{p_key}' in mempalace/mirrors.json"}
+            except Exception as me:
+                return {"valid": False, "error": f"Failed validating mempalace/mirrors.json: {me}"}
+
+        traj_db_check_path = os.path.join(actual_root, "trajectory.db")
+        if os.path.exists(traj_db_check_path):
+            try:
+                with sqlite3.connect(f"file:{os.path.abspath(traj_db_check_path)}?mode=ro", uri=True) as conn:
+                    cols = {row[1] for row in conn.execute("PRAGMA table_info(aspirations)").fetchall()}
+                    if cols and not {"id", "description", "why", "sphere_level"}.issubset(cols):
+                        return {
+                            "valid": False,
+                            "error": f"trajectory.db aspirations table missing required columns: {cols}",
+                        }
+            except Exception as te:
+                return {"valid": False, "error": f"Failed validating trajectory.db schema: {te}"}
+
         return {
             "valid": True,
             "databases_checked": dbs_checked,
             "json_files_checked": json_checked,
             "hashes_verified": hashes_verified,
+            "empathy_structures_verified": empathy_verified,
             "extract_path": extract_dir
         }
     finally:

@@ -1,6 +1,7 @@
 import os
 import re
 import ssl
+import socket
 import time
 import json
 import email
@@ -184,8 +185,21 @@ class EmailTool(Tool):
             return True
         return False
 
+    @staticmethod
+    def _safe_close_imap(imap: Any) -> None:
+        """Safely terminates an IMAP client socket."""
+        if not imap:
+            return
+        try:
+            if hasattr(imap, "shutdown"):
+                imap.shutdown()
+            elif hasattr(imap, "sock") and imap.sock:
+                imap.sock.close()
+        except Exception:
+            pass
+
     def _get_imap_connection(self) -> Tuple[bool, Any]:
-        """Establishes an authenticated IMAP client session."""
+        """Establishes an authenticated IMAP client session with transient retry logic."""
         cfg = self._get_settings()
         if not cfg["imap_host"]:
             logger.error("IMAP connection aborted: EMAIL_IMAP_HOST is not configured.")
@@ -194,52 +208,79 @@ class EmailTool(Tool):
             logger.error("IMAP connection aborted: EMAIL_ADDRESS is not configured.")
             return False, "Email address is not configured. Please set EMAIL_ADDRESS in settings."
 
-        logger.debug(f"Connecting to IMAP server {cfg['imap_host']}:{cfg['imap_port']} (Security: {cfg['imap_security']}, Auth: {cfg['auth_type']})")
-        try:
-            if "SSL" in cfg["imap_security"] or cfg["imap_port"] == 993:
-                context = ssl.create_default_context()
-                imap = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=context)
-            else:
-                imap = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"])
-                if "STARTTLS" in cfg["imap_security"]:
-                    imap.starttls(ssl_context=ssl.create_default_context())
+        max_attempts = 2
+        timeout = 20
+        last_error = ""
 
-            # Authentication
-            if cfg["auth_type"] == "oauth2":
-                logger.debug(f"Retrieving OAuth2 access token for IMAP user: {cfg['email_address']}...")
-                success, token_or_err = self._token_manager.get_access_token(
-                    cfg["oauth_client_id"],
-                    cfg["oauth_client_secret"],
-                    cfg["oauth_refresh_token"]
-                )
-                if not success:
-                    imap.logout()
-                    logger.error(f"IMAP OAuth2 token refresh failed: {token_or_err}")
-                    return False, f"IMAP OAuth2 Authentication error: {token_or_err}"
+        for attempt in range(1, max_attempts + 1):
+            imap = None
+            try:
+                logger.debug(f"Connecting to IMAP server {cfg['imap_host']}:{cfg['imap_port']} (Attempt {attempt}/{max_attempts}, Security: {cfg['imap_security']}, Auth: {cfg['auth_type']})")
+                if "SSL" in cfg["imap_security"] or cfg["imap_port"] == 993:
+                    context = ssl.create_default_context()
+                    imap = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=context, timeout=timeout)
+                else:
+                    imap = imaplib.IMAP4(cfg["imap_host"], cfg["imap_port"], timeout=timeout)
+                    if "STARTTLS" in cfg["imap_security"]:
+                        imap.starttls(ssl_context=ssl.create_default_context())
 
-                auth_str = build_xoauth2_string(cfg["email_address"], token_or_err, as_base64=False)
-                logger.debug(f"Authenticating IMAP via XOAUTH2...")
-                res, data = imap.authenticate("XOAUTH2", lambda x: auth_str)
-                logger.debug(f"IMAP XOAUTH2 response: res={res}, data={data}")
-                if res != "OK":
-                    imap.logout()
-                    logger.error(f"IMAP XOAUTH2 authentication rejected: {data}")
-                    return False, f"IMAP XOAUTH2 authentication rejected: {data}"
-                logger.info(f"IMAP authenticated successfully via XOAUTH2 for {cfg['email_address']}")
-            else:
-                if not cfg["password"]:
-                    imap.logout()
-                    logger.error("IMAP connection aborted: EMAIL_PASSWORD is not configured.")
-                    return False, "Email password is not configured. Please set EMAIL_PASSWORD in settings."
-                logger.debug(f"Authenticating IMAP via password for user: {cfg['username']}...")
-                imap.login(cfg["username"], cfg["password"])
-                logger.info(f"IMAP authenticated successfully via password for {cfg['username']}")
+                # Authentication
+                if cfg["auth_type"] == "oauth2":
+                    logger.debug(f"Retrieving OAuth2 access token for IMAP user: {cfg['email_address']}...")
+                    success, token_or_err = self._token_manager.get_access_token(
+                        cfg["oauth_client_id"],
+                        cfg["oauth_client_secret"],
+                        cfg["oauth_refresh_token"]
+                    )
+                    if not success:
+                        try:
+                            imap.logout()
+                        except Exception:
+                            self._safe_close_imap(imap)
+                        logger.error(f"IMAP OAuth2 token refresh failed: {token_or_err}")
+                        return False, f"IMAP OAuth2 Authentication error: {token_or_err}"
 
-            return True, imap
+                    auth_str = build_xoauth2_string(cfg["email_address"], token_or_err, as_base64=False)
+                    logger.debug(f"Authenticating IMAP via XOAUTH2...")
+                    res, data = imap.authenticate("XOAUTH2", lambda x: auth_str)
+                    logger.debug(f"IMAP XOAUTH2 response: res={res}, data={data}")
+                    if res != "OK":
+                        try:
+                            imap.logout()
+                        except Exception:
+                            self._safe_close_imap(imap)
+                        logger.error(f"IMAP XOAUTH2 authentication rejected: {data}")
+                        return False, f"IMAP XOAUTH2 authentication rejected: {data}"
+                    logger.info(f"IMAP authenticated successfully via XOAUTH2 for {cfg['email_address']}")
+                else:
+                    if not cfg["password"]:
+                        try:
+                            imap.logout()
+                        except Exception:
+                            self._safe_close_imap(imap)
+                        logger.error("IMAP connection aborted: EMAIL_PASSWORD is not configured.")
+                        return False, "Email password is not configured. Please set EMAIL_PASSWORD in settings."
+                    logger.debug(f"Authenticating IMAP via password for user: {cfg['username']}...")
+                    imap.login(cfg["username"], cfg["password"])
+                    logger.info(f"IMAP authenticated successfully via password for {cfg['username']}")
 
-        except Exception as e:
-            logger.error(f"IMAP connection failed: {type(e).__name__}: {str(e)}", exc_info=True)
-            return False, f"IMAP connection or authentication error: {type(e).__name__}: {str(e)}"
+                return True, imap
+
+            except (imaplib.IMAP4.abort, ConnectionResetError, ssl.SSLEOFError, socket.timeout, TimeoutError, OSError) as e:
+                last_error = f"{type(e).__name__}: {str(e)}"
+                self._safe_close_imap(imap)
+                if attempt < max_attempts:
+                    logger.warning(f"Transient IMAP connection failure on attempt {attempt}/{max_attempts} ({last_error}). Retrying in 1s...")
+                    time.sleep(1.0)
+                    continue
+                logger.error(f"IMAP connection failed after {max_attempts} attempts: {last_error}", exc_info=True)
+                return False, f"IMAP connection or authentication error: {last_error}"
+            except Exception as e:
+                self._safe_close_imap(imap)
+                logger.error(f"IMAP connection failed: {type(e).__name__}: {str(e)}", exc_info=True)
+                return False, f"IMAP connection or authentication error: {type(e).__name__}: {str(e)}"
+
+        return False, f"IMAP connection failed: {last_error}"
 
     def _get_smtp_connection(self) -> Tuple[bool, Any]:
         """Establishes an authenticated SMTP client session with proper EHLO sequencing."""
@@ -407,7 +448,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return False, 0, f"Error syncing IMAP to local archive: {type(e).__name__}: {str(e)}"
 
     def execute(self, command: str, *args, **kwargs) -> str:
@@ -610,14 +651,15 @@ class EmailTool(Tool):
                     )
                 logger.info(f"Fetched {len(results)} email(s) from '{folder}' (local archive)")
                 header_text = f"Found {len(results)} {'unread ' if unread_only else ''}email(s) in '{folder}':"
-                return header_text + "\n" + "\n".join(results)
+                res_body = header_text + "\n" + "\n".join(results)
+                if not sync_ok:
+                    res_body = f"[Notice: IMAP server sync failed ({sync_msg}). Showing cached emails from local archive.]\n" + res_body
+                return res_body
 
             # No emails in local archive for criteria
-            if not sync_ok and count == 0:
-                all_archived = self.archive.get_emails(folder=folder, limit=1, unread_only=False)
-                if not all_archived:
-                    logger.error(f"fetch_emails failed: {sync_msg}")
-                    return f"Failed to connect to IMAP server: {sync_msg}"
+            if not sync_ok:
+                logger.error(f"fetch_emails failed: {sync_msg}")
+                return f"Failed to connect to IMAP server: {sync_msg}"
 
             logger.info(f"No {'unread ' if unread_only else ''}emails found in '{folder}'.")
             return f"No {'unread ' if unread_only else ''}emails found in '{folder}'."
@@ -682,7 +724,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return f"Error fetching emails: {type(e).__name__}: {str(e)}"
 
     def _execute_read_email(self, params: dict) -> str:
@@ -699,9 +741,11 @@ class EmailTool(Tool):
 
         if cfg.get("archive_local", True):
             em = self.archive.get_email(email_id, folder=folder)
+            sync_ok = True
+            sync_msg = ""
             if not em:
                 # Sync in case it's on server but not yet retrieved
-                self._sync_imap_to_archive(folder=folder)
+                sync_ok, _, sync_msg = self._sync_imap_to_archive(folder=folder)
                 em = self.archive.get_email(email_id, folder=folder)
 
             if em:
@@ -733,6 +777,10 @@ class EmailTool(Tool):
                     f"--- Body ---\n"
                     f"{body_text}"
                 )
+
+            if not sync_ok:
+                logger.error(f"read_email failed: ID '{email_id}' not found locally and IMAP sync failed: {sync_msg}")
+                return f"Error: Email with UID '{email_id}' was not found in local archive, and IMAP server sync failed ({sync_msg})."
 
             logger.error(f"read_email failed: ID '{email_id}' not found in local archive or on server in folder '{folder}'.")
             return f"Error: Email with UID '{email_id}' not found in folder '{folder}'."
@@ -826,7 +874,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return f"Error reading email '{email_id}': {type(e).__name__}: {str(e)}"
 
     def _execute_search_emails(self, params: dict) -> str:
@@ -856,7 +904,7 @@ class EmailTool(Tool):
 
         if cfg.get("archive_local", True):
             # Sync any new incoming emails first
-            self._sync_imap_to_archive(folder=folder)
+            sync_ok, _, sync_msg = self._sync_imap_to_archive(folder=folder)
 
             matches = self.archive.search_emails(
                 folder=folder,
@@ -869,6 +917,9 @@ class EmailTool(Tool):
             )
 
             if not matches:
+                if not sync_ok:
+                    logger.warning(f"search_emails IMAP sync failed: {sync_msg}")
+                    return f"[Notice: IMAP server sync failed ({sync_msg}).]\nNo emails matched criteria '{search_criteria}' in '{folder}' (local archive)."
                 logger.info(f"No emails matched criteria '{search_criteria}' in '{folder}' (local archive).")
                 return f"No emails matched criteria '{search_criteria}' in '{folder}'."
 
@@ -881,7 +932,8 @@ class EmailTool(Tool):
                 results.append(f"- [ID: {eid}] From: {sndr} | Subject: '{subj}' | Date: {dt}")
 
             logger.info(f"Search matched {len(results)} email(s) in '{folder}' (local archive)")
-            return f"Found {len(results)} match(es) for criteria '{search_criteria}':\n" + "\n".join(results)
+            prefix = f"[Notice: IMAP server sync failed ({sync_msg}). Showing results from local archive.]\n" if not sync_ok else ""
+            return prefix + f"Found {len(results)} match(es) for criteria '{search_criteria}':\n" + "\n".join(results)
 
         # Fallback to direct IMAP search
         success, imap_or_err = self._get_imap_connection()
@@ -935,7 +987,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return f"Error searching emails: {type(e).__name__}: {str(e)}"
 
     def _execute_download_attachment(self, params: dict) -> str:
@@ -955,13 +1007,18 @@ class EmailTool(Tool):
 
         if cfg.get("archive_local", True):
             em = self.archive.get_email(email_id, folder=folder)
+            sync_ok = True
+            sync_msg = ""
             if not em:
-                self._sync_imap_to_archive(folder=folder)
+                sync_ok, _, sync_msg = self._sync_imap_to_archive(folder=folder)
                 em = self.archive.get_email(email_id, folder=folder)
 
             if not em:
+                if not sync_ok:
+                    logger.error(f"download_attachment failed: Email ID '{email_id}' not found locally and IMAP sync failed: {sync_msg}")
+                    return f"Error: Email with UID '{email_id}' was not found in local archive, and IMAP server sync failed ({sync_msg})."
                 logger.error(f"download_attachment failed: Email ID '{email_id}' not found.")
-                return f"Error: Email with UID '{email_id}' not found."
+                return f"Error: Email with UID '{email_id}' not found in folder '{folder}'."
 
             raw_bytes = em.get("raw_msg")
             if not raw_bytes:
@@ -1108,7 +1165,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return f"Error downloading attachment: {type(e).__name__}: {str(e)}"
 
     def _execute_mark_as_read(self, params: dict) -> str:
@@ -1149,7 +1206,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return f"Error: {type(e).__name__}: {str(e)}"
 
     def _execute_delete_email(self, params: dict) -> str:
@@ -1176,7 +1233,7 @@ class EmailTool(Tool):
                         imap.expunge()
                     imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(locals().get("imap"))
             logger.info(f"Deleted email UID '{email_id}' from '{folder}'")
             return f"Email '{email_id}' deleted successfully from folder '{folder}'."
 
@@ -1200,7 +1257,7 @@ class EmailTool(Tool):
             try:
                 imap.logout()
             except Exception:
-                pass
+                self._safe_close_imap(imap)
             return f"Error: {type(e).__name__}: {str(e)}"
 
     def _execute_list_folders(self, params: dict) -> str:
@@ -1224,7 +1281,7 @@ class EmailTool(Tool):
                 try:
                     imap.logout()
                 except Exception:
-                    pass
+                    self._safe_close_imap(imap)
         elif not cfg.get("archive_local", True):
             logger.error(f"list_folders IMAP connection failed: {imap_or_err}")
             return f"Failed to connect to IMAP server: {imap_or_err}"

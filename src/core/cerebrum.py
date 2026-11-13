@@ -3,8 +3,168 @@ import importlib
 import inspect
 import os
 import logging
+import re
 import threading
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Set
+
+
+DEFAULT_MANUAL_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "memory", "agent_manual.md")
+)
+DEFAULT_MANUAL_DIR = os.path.join(os.path.dirname(DEFAULT_MANUAL_PATH), "manual")
+
+MANUAL_TOPICS: Dict[str, Dict[str, Any]] = {
+    "memory": {
+        "file": "memory.md",
+        "summary": "MemPalace wings/rooms, S1..S10 Empathy Cone, Two-Beat Sleep Consolidation, and MemPalace_apply_identity_delta.",
+        "tools": ("MemPalace",),
+    },
+    "browser": {
+        "file": "browser.md",
+        "summary": "WebSearch vs Browser, ephemeral element IDs, Set-of-Marks screenshots, uploads, tabs, 4s waits, downloads, and 24h cache.",
+        "tools": ("Browser", "WebSearch"),
+    },
+    "terminal_files": {
+        "file": "terminal_files.md",
+        "summary": "Terminal_read_file search/paging options, host .sh script delegation with logging, sandbox paths, and xdg-open.",
+        "tools": ("Terminal",),
+    },
+    "channels": {
+        "file": "channels.md",
+        "summary": "LOCAL_GUI GFM formatting, Gemini 3.8 TTS angle-bracket cues, 24h audio/media TTLs, CHATROOM rooms/DMs, and WhatsApp contacts.",
+        "tools": ("Speaker", "Chatroom", "WhatsApp", "Media", "Contacts", "Email"),
+    },
+    "agency_pulses": {
+        "file": "agency_pulses.md",
+        "summary": "Trajectory why/sphere_level grounding, 5-step [AGENT_PULSE] flow, fatigue/System_sleep heuristics, and Subagent_spawn scoping.",
+        "tools": ("Trajectory", "Pulse", "Subagent", "System"),
+    },
+    "backups_api": {
+        "file": "backups_api.md",
+        "summary": ".oaa backup flagging/management, positive TTS voice guidelines, and Pulse Hook API workflow (System_api_docs).",
+        "tools": ("System", "Terminal"),
+    },
+}
+
+MANUAL_TOPIC_ALIASES: Dict[str, str] = {
+    "mempalace": "memory",
+    "mirrors": "memory",
+    "mirror": "memory",
+    "sleep": "memory",
+    "identity": "memory",
+    "spheres": "memory",
+    "web": "browser",
+    "websearch": "browser",
+    "browsing": "browser",
+    "som": "browser",
+    "terminal": "terminal_files",
+    "files": "terminal_files",
+    "shell": "terminal_files",
+    "scripts": "terminal_files",
+    "read_file": "terminal_files",
+    "sandbox": "terminal_files",
+    "speaker": "channels",
+    "chatroom": "channels",
+    "whatsapp": "channels",
+    "media": "channels",
+    "tts": "channels",
+    "formatting": "channels",
+    "contacts": "channels",
+    "pulses": "agency_pulses",
+    "pulse": "agency_pulses",
+    "trajectory": "agency_pulses",
+    "fatigue": "agency_pulses",
+    "subagent": "agency_pulses",
+    "subagents": "agency_pulses",
+    "agency": "agency_pulses",
+    "contemplate": "agency_pulses",
+    "backup": "backups_api",
+    "backups": "backups_api",
+    "api": "backups_api",
+    "hooks": "backups_api",
+    "voice": "backups_api",
+}
+
+
+def resolve_manual_path(manual_path: str = "src/memory/agent_manual.md") -> str:
+    """Resolve the manual path cleanly regardless of process working directory."""
+    if os.path.exists(manual_path):
+        return os.path.abspath(manual_path)
+    if manual_path == "src/memory/agent_manual.md" and os.path.exists(DEFAULT_MANUAL_PATH):
+        return DEFAULT_MANUAL_PATH
+    return os.path.abspath(manual_path)
+
+
+def is_manual_topic_enabled(topic_key: str, enabled_tools: Optional[Set[str]]) -> bool:
+    """Return True when at least one relevant tool is loaded, or tool set is empty."""
+    meta = MANUAL_TOPICS.get(topic_key)
+    if not meta:
+        return False
+    if not enabled_tools:
+        return True
+    req_tools = meta.get("tools", ())
+    return not req_tools or any(t in enabled_tools for t in req_tools)
+
+
+def filter_manual_index_for_tools(manual_text: str, enabled_tools: Optional[Set[str]]) -> str:
+    """Omit topic index table rows whose backing tools are all disabled."""
+    if not enabled_tools or not manual_text:
+        return manual_text
+    disabled = [k for k in MANUAL_TOPICS if not is_manual_topic_enabled(k, enabled_tools)]
+    if not disabled:
+        return manual_text
+    patterns = [re.compile(rf"^\|\s*`?{re.escape(k)}`?\s*\|") for k in disabled]
+    kept = [
+        line for line in manual_text.splitlines()
+        if not any(pat.match(line.strip()) for pat in patterns)
+    ]
+    trailing_nl = "\n" if manual_text.endswith("\n") else ""
+    return "\n".join(kept) + trailing_nl
+
+
+def resolve_manual_topic_key(topic: str = "") -> str:
+    """Normalize a manual topic name or alias to its canonical key (or 'index')."""
+    norm = (topic or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if norm in ("", "index", "list", "topics", "overview", "help"):
+        return "index"
+    if norm in MANUAL_TOPICS:
+        return norm
+    return MANUAL_TOPIC_ALIASES.get(norm, norm)
+
+
+def read_manual_topic(
+    manual_dir: str = DEFAULT_MANUAL_DIR,
+    topic: str = "",
+    enabled_tools: Optional[Set[str]] = None,
+) -> str:
+    """Read a detailed manual topic guide or return the topic directory index."""
+    resolved = resolve_manual_topic_key(topic)
+    if resolved == "index":
+        lines = ["Available Agent Manual Topics (call System_read_manual with topic='<key>'):"]
+        for key, meta in MANUAL_TOPICS.items():
+            if not is_manual_topic_enabled(key, enabled_tools):
+                continue
+            lines.append(f"- `{key}`: {meta['summary']}")
+        return "\n".join(lines)
+
+    meta = MANUAL_TOPICS.get(resolved)
+    if not meta:
+        valid = ", ".join(MANUAL_TOPICS.keys())
+        return (
+            f"Error: Unknown manual topic '{topic}'. Valid topics: index, {valid}. "
+            f"(Aliases such as web, mempalace, speaker, chatroom, whatsapp, pulses, trajectory, backup, api also work.)"
+        )
+
+    topic_path = os.path.join(manual_dir, meta["file"])
+    if not os.path.exists(topic_path):
+        return f"Error: Manual topic file missing for '{resolved}' at {topic_path}."
+
+    try:
+        with open(topic_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        logging.error(f"Error reading manual topic '{resolved}': {e}", exc_info=True)
+        return f"Error reading manual topic '{resolved}': {e}"
 
 
 class Tool:
@@ -17,6 +177,7 @@ class Tool:
     async_commands: List[str] = []
 
     _tool_classes: Dict[str, Any] = {}
+    _tools_discovered: bool = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -33,6 +194,7 @@ class Tool:
     @classmethod
     def discover_tool_classes(cls):
         """Discovers tool classes from the tools directory if not yet loaded."""
+        cls._tools_discovered = True
         src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         tools_dir = os.path.join(src_dir, "tools")
         if not os.path.exists(tools_dir):
@@ -49,19 +211,27 @@ class Tool:
                     pass
 
     @classmethod
+    def _lookup_registered_tool_class(cls, clean: str) -> Any:
+        if clean in cls._tool_classes:
+            return cls._tool_classes[clean]
+        for k, v in cls._tool_classes.items():
+            if k.lower() == clean.lower():
+                return v
+        return None
+
+    @classmethod
     def get_tool_class(cls, name: str) -> Any:
         if not name:
             return None
         clean = name
         if clean.startswith("tool."):
             clean = clean[5:]
-        if not cls._tool_classes:
+        tool_cls = cls._lookup_registered_tool_class(clean)
+        if tool_cls is not None:
+            return tool_cls
+        if not cls._tools_discovered:
             cls.discover_tool_classes()
-        if clean in cls._tool_classes:
-            return cls._tool_classes[clean]
-        for k, v in cls._tool_classes.items():
-            if k.lower() == clean.lower():
-                return v
+            return cls._lookup_registered_tool_class(clean)
         return None
 
     @classmethod
@@ -107,7 +277,9 @@ class Cerebrum:
         self._tools_lock = threading.RLock()
         self.tools: Dict[str, Tool] = {}
         self.skills_dir = skills_dir
-        self.manual_path = os.path.abspath(manual_path)
+        self.manual_path = resolve_manual_path(manual_path)
+        candidate_manual_dir = os.path.join(os.path.dirname(self.manual_path), "manual")
+        self.manual_dir = candidate_manual_dir if os.path.isdir(candidate_manual_dir) else DEFAULT_MANUAL_DIR
         self.load_skills()
 
     def load_skills(self):
@@ -155,8 +327,27 @@ class Cerebrum:
         with self._tools_lock:
             self.tools[tool.name] = tool
 
+    def list_manual_topics(self, enabled_only: bool = True) -> List[str]:
+        """Returns canonical manual topic keys, optionally filtered to loaded tools."""
+        with self._tools_lock:
+            enabled_tools = set(self.tools.keys()) if (enabled_only and self.tools) else None
+        return [
+            key for key in MANUAL_TOPICS
+            if not enabled_only or is_manual_topic_enabled(key, enabled_tools)
+        ]
+
+    def read_manual(self, topic: str = "") -> str:
+        """Reads a detailed Agent Manual topic guide or returns the topic index."""
+        with self._tools_lock:
+            enabled_tools = set(self.tools.keys()) if self.tools else None
+        return read_manual_topic(
+            manual_dir=self.manual_dir,
+            topic=topic,
+            enabled_tools=enabled_tools,
+        )
+
     def get_agent_manual(self, include_tool_entries: bool = False) -> str:
-        """Generates the Agent Manual from loaded tools and the manual file."""
+        """Generates the Agent Manual from loaded tools and the manual index file."""
         manual = ""
         if os.path.exists(self.manual_path):
             try:
@@ -165,9 +356,11 @@ class Cerebrum:
             except Exception as e:
                 logging.error(f"Error loading manual file: {e}", exc_info=True)
 
-        if include_tool_entries:
-            manual += "### Available Tools\n"
-            with self._tools_lock:
+        with self._tools_lock:
+            enabled_tools = set(self.tools.keys()) if self.tools else None
+            manual = filter_manual_index_for_tools(manual, enabled_tools)
+            if include_tool_entries:
+                manual += "### Available Tools\n"
                 for tool in self.tools.values():
                     manual += tool.get_manual_entry() + "\n"
         return manual
@@ -252,6 +445,8 @@ class Cerebrum:
                         skill_instance = obj(orchestrator=self.orchestrator)
                         self.register_skill(skill_instance)
                         logging.info(f"Dynamically enabled tool: {skill_name}")
+                    elif is_enabled and skill_name in self.tools:
+                        self.tools[skill_name].__class__ = obj
                     elif not is_enabled and skill_name in self.tools:
                         logging.info(f"Dynamically disabling tool: {skill_name}")
                         tool = self.tools.pop(skill_name)

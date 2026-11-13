@@ -800,9 +800,11 @@ async function serializeMsgInBrowser(msg, chat) {
     let msgType = msg.type || 'chat';
     const isLocation = msgType === 'location' || msgType === 'live_location' || (typeof msg.lat === 'number' && typeof msg.lng === 'number');
     const isContact = msgType === 'vcard' || msgType === 'multi_vcard' || msgType === 'contact';
+    const isPoll = msgType === 'poll_creation' || Boolean(msg.pollName && Array.isArray(msg.pollOptions) && msg.pollOptions.length > 0);
 
     let locationData = null;
     let contactData = null;
+    let pollData = null;
     let content = '';
 
     if (isLocation) {
@@ -966,6 +968,159 @@ async function serializeMsgInBrowser(msg, chat) {
         } else {
             content = '[Contact Card]';
         }
+    } else if (isPoll) {
+        msgType = 'poll_creation';
+        const pollName = msg.pollName || msg.body || msg.caption || 'Untitled Poll';
+        const rawOptions = Array.isArray(msg.pollOptions)
+            ? msg.pollOptions
+            : (msg.pollOptions && typeof msg.pollOptions.toArray === 'function' ? msg.pollOptions.toArray() : []);
+
+        const normalizedOptions = rawOptions.map((opt, idx) => ({
+            localId: (opt && typeof opt.localId === 'number') ? opt.localId : idx,
+            name: (opt && opt.name != null) ? String(opt.name) : ('Option ' + idx),
+            voteCount: 0,
+            voters: [],
+            votedByMe: false
+        }));
+
+        const serWid = (w) => (w && (w._serialized || (typeof w === 'string' ? w : (w.id || '')))) || '';
+        const myIds = new Set();
+        try { myIds.add(serWid(window.WPP.conn.getMyUserId())); } catch (e) {}
+        try { if (window.WPP.conn.getMyUserLid) myIds.add(serWid(window.WPP.conn.getMyUserLid())); } catch (e) {}
+        myIds.delete('');
+
+        const voterMap = new Map();
+
+        try {
+            const h = window.WPP.loader && window.WPP.loader.loadModule && window.WPP.loader.loadModule('WAWebAddonHydrationUtils');
+            const mt = window.WPP.loader && window.WPP.loader.loadModule && window.WPP.loader.loadModule('WAWebMsgType');
+            if (h && typeof h.hydrateAddons === 'function' && msg.id) {
+                await h.hydrateAddons({
+                    ids: [msg.id],
+                    hydrationType: (mt && mt.MSG_TYPE && mt.MSG_TYPE.POLL_UPDATE) || 'poll_update'
+                });
+            }
+        } catch (e) {}
+
+        try {
+            if (window.WPP.chat && typeof window.WPP.chat.getVotes === 'function' && msgIdStr) {
+                const voteRes = await window.WPP.chat.getVotes(msgIdStr);
+                if (voteRes && Array.isArray(voteRes.votes)) {
+                    for (const v of voteRes.votes) {
+                        if (!v) continue;
+                        const sId = serWid(v.sender);
+                        if (!sId) continue;
+                        const voterKey = myIds.has(sId) ? '__ME__' : sId;
+                        const ts = Number(v.timestamp || v.senderTimestampMs || 0);
+                        let localIds = [];
+                        if (Array.isArray(v.selectedOptionLocalIds)) {
+                            localIds = v.selectedOptionLocalIds.filter(x => typeof x === 'number');
+                        } else if (Array.isArray(v.selectedOptions)) {
+                            localIds = v.selectedOptions.filter(Boolean).map(o => typeof o === 'object' ? o.localId : Number(o)).filter(x => !isNaN(x));
+                        }
+                        const existing = voterMap.get(voterKey);
+                        if (!existing || ts >= existing.timestamp) {
+                            voterMap.set(voterKey, { senderId: sId, timestamp: ts, selectedLocalIds: localIds });
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+
+        try {
+            const pvc = window.WPP.loader && window.WPP.loader.loadModule && window.WPP.loader.loadModule('WAWebPollsPollVoteCollection');
+            if (pvc && pvc.PollVoteCollection && typeof pvc.PollVoteCollection.getForParentAddressingModeInsensitive === 'function' && msg.id) {
+                const cols = pvc.PollVoteCollection.getForParentAddressingModeInsensitive([msg.id]);
+                const col = Array.isArray(cols) ? cols[0] : null;
+                const arr = col && typeof col.toArray === 'function' ? col.toArray() : [];
+                for (const v of arr) {
+                    if (!v) continue;
+                    const sId = serWid(v.sender);
+                    if (!sId) continue;
+                    const voterKey = myIds.has(sId) ? '__ME__' : sId;
+                    const ts = Number(v.senderTimestampMs || v.timestamp || 0);
+                    const localIds = Array.isArray(v.selectedOptionLocalIds) ? v.selectedOptionLocalIds.filter(x => typeof x === 'number') : [];
+                    const existing = voterMap.get(voterKey);
+                    if (!existing || ts >= existing.timestamp) {
+                        voterMap.set(voterKey, { senderId: sId, timestamp: ts, selectedLocalIds: localIds });
+                    }
+                }
+            }
+        } catch (e) {}
+
+        const optionById = new Map(normalizedOptions.map(o => [o.localId, o]));
+        let activeVotersCount = 0;
+        let myVotedOptionIds = [];
+
+        for (const [voterKey, voteEntry] of voterMap.entries()) {
+            if (!voteEntry.selectedLocalIds || voteEntry.selectedLocalIds.length === 0) continue;
+            activeVotersCount++;
+            const isMe = voterKey === '__ME__' || myIds.has(voteEntry.senderId);
+            let voterLabel = isMe ? 'You' : '';
+            if (!isMe && voteEntry.senderId) {
+                try {
+                    const entry = await window.WPP.contact.getPnLidEntry(voteEntry.senderId);
+                    if (entry && entry.contact) {
+                        voterLabel = entry.contact.name || entry.contact.pushname || entry.contact.shortName || '';
+                    }
+                } catch (e) {}
+                if (!voterLabel) {
+                    try {
+                        const c = await window.WPP.contact.get(voteEntry.senderId);
+                        if (c) {
+                            voterLabel = c.name || c.pushname || c.shortName || c.formattedName || '';
+                        }
+                    } catch (e) {}
+                }
+                if (!voterLabel) {
+                    voterLabel = voteEntry.senderId.split('@')[0];
+                }
+            }
+            for (const lid of voteEntry.selectedLocalIds) {
+                const opt = optionById.get(lid);
+                if (opt) {
+                    opt.voteCount++;
+                    if (voterLabel) opt.voters.push(voterLabel);
+                    if (isMe) {
+                        opt.votedByMe = true;
+                        if (!myVotedOptionIds.includes(lid)) {
+                            myVotedOptionIds.push(lid);
+                        }
+                    }
+                }
+            }
+        }
+
+        const rawSelectable = typeof msg.pollSelectableOptionsCount === 'number' ? msg.pollSelectableOptionsCount : 0;
+        const allowMultiple = rawSelectable !== 1;
+        const typeLabel = rawSelectable === 1
+            ? 'Single Choice (max 1)'
+            : (rawSelectable > 1 ? 'Multiple Choice (max ' + rawSelectable + ')' : 'Multiple Choice');
+
+        const optionSummaries = normalizedOptions.map(o => {
+            const voteWord = o.voteCount === 1 ? '1 vote' : (o.voteCount + ' votes');
+            const voterDetail = o.voters.length > 0 ? (voteWord + ': ' + o.voters.join(', ')) : voteWord;
+            return '[' + o.localId + '] "' + o.name + '" (' + voterDetail + ')';
+        });
+
+        const myVoteSummary = myVotedOptionIds.length > 0
+            ? myVotedOptionIds.map(id => {
+                  const o = optionById.get(id);
+                  return o ? ('[' + o.localId + '] "' + o.name + '"') : ('[' + id + ']');
+              }).join(', ')
+            : 'None';
+
+        pollData = {
+            question: pollName,
+            selectableOptionsCount: rawSelectable,
+            allowMultipleAnswers: allowMultiple,
+            invalidated: Boolean(msg.pollInvalidated),
+            totalVoters: activeVotersCount,
+            myVotes: myVotedOptionIds,
+            options: normalizedOptions
+        };
+
+        content = '[Poll: "' + pollName + '" | Type: ' + typeLabel + ' | Options: ' + optionSummaries.join(' ; ') + ' | Your Vote: ' + myVoteSummary + ']';
     } else {
         if (msg.isMedia) {
             if (!msgType || msgType === 'chat') msgType = 'document';
@@ -973,7 +1128,7 @@ async function serializeMsgInBrowser(msg, chat) {
         content = msg.body || msg.caption || '';
     }
 
-    const hasMedia = !isLocation && !isContact && Boolean(msg.hasMedia || msg.isMedia || msgType === 'ptt' || msgType === 'audio' || msgType === 'image' || msgType === 'video' || msgType === 'document');
+    const hasMedia = !isLocation && !isContact && !isPoll && Boolean(msg.hasMedia || msg.isMedia || msgType === 'ptt' || msgType === 'audio' || msgType === 'image' || msgType === 'video' || msgType === 'document');
 
     return {
         id: msgIdStr,
@@ -990,7 +1145,8 @@ async function serializeMsgInBrowser(msg, chat) {
         hasMedia: hasMedia,
         type: msgType,
         location: locationData,
-        contacts: contactData
+        contacts: contactData,
+        poll: pollData
     };
 }
 `;
@@ -1520,6 +1676,212 @@ app.post('/send_contact', async (req, res) => {
         }, resolvedChatId, contactPayload, sendOptions);
 
         res.json({ success: true, target: resolvedChatId });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/vote_poll', async (req, res) => {
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const { msgId, options } = req.body;
+
+    if (!msgId) {
+        return res.status(400).json({ error: 'Missing required field: msgId' });
+    }
+    if (options === undefined || options === null) {
+        return res.status(400).json({ error: 'Missing required field: options' });
+    }
+
+    try {
+        const result = await page.evaluate(async (id, rawOptions) => {
+            let msg = null;
+            try {
+                msg = await window.WPP.chat.getMessageById(id);
+            } catch (e) {}
+
+            if (!msg && window.WPP.loader && window.WPP.loader.loadModule) {
+                try {
+                    const mc = window.WPP.loader.loadModule('WAWebMsgCollection');
+                    if (mc && mc.MsgCollection) {
+                        msg = mc.MsgCollection.get(id);
+                        if (!msg && typeof mc.MsgCollection.getModelsArray === 'function') {
+                            msg = mc.MsgCollection.getModelsArray().find(m => {
+                                const mid = (m.id && (m.id._serialized || m.id)) || '';
+                                const stanza = (m.id && m.id.id) || '';
+                                return mid === id || stanza === id;
+                            }) || null;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            if (!msg) {
+                return { error: `Poll message not found: ${id}` };
+            }
+
+            const rawPollOptions = Array.isArray(msg.pollOptions)
+                ? msg.pollOptions
+                : (msg.pollOptions && typeof msg.pollOptions.toArray === 'function' ? msg.pollOptions.toArray() : []);
+
+            const isPollMsg = msg.type === 'poll_creation' || Boolean(msg.pollName && rawPollOptions.length > 0);
+            if (!isPollMsg) {
+                return { error: `Message ${id} is not a poll` };
+            }
+
+            if (msg.pollInvalidated) {
+                return { error: 'This poll is no longer valid' };
+            }
+
+            const pollOptions = rawPollOptions.map((opt, idx) => ({
+                localId: (opt && typeof opt.localId === 'number') ? opt.localId : idx,
+                name: (opt && opt.name != null) ? String(opt.name) : ('Option ' + idx)
+            }));
+
+            function matchSingleOption(val) {
+                if (typeof val === 'number' && Number.isInteger(val)) {
+                    return pollOptions.find(o => o.localId === val) || pollOptions[val] || null;
+                }
+                if (typeof val === 'string') {
+                    const s = val.trim();
+                    if (!s) return null;
+
+                    // 1. Exact option name match (case-sensitive then case-insensitive)
+                    let m = pollOptions.find(o => o.name === s) || pollOptions.find(o => o.name.trim().toLowerCase() === s.toLowerCase());
+                    if (m) return m;
+
+                    // 2. Pure integer string (e.g. "0", "1")
+                    if (/^\d+$/.test(s)) {
+                        const num = parseInt(s, 10);
+                        m = pollOptions.find(o => o.localId === num) || pollOptions[num];
+                        if (m) return m;
+                    }
+
+                    // 3. Formatted "[0] Option Name" or "[0]"
+                    const bracketMatch = s.match(/^\[(\d+)\](?:\s*(.*))?$/);
+                    if (bracketMatch) {
+                        const num = parseInt(bracketMatch[1], 10);
+                        m = pollOptions.find(o => o.localId === num) || pollOptions[num];
+                        if (m) return m;
+                    }
+
+                    // 4. Unquoted option name match
+                    const unquoted = s.replace(/^["']|["']$/g, '').trim();
+                    if (unquoted && unquoted !== s) {
+                        m = pollOptions.find(o => o.name === unquoted) || pollOptions.find(o => o.name.trim().toLowerCase() === unquoted.toLowerCase());
+                        if (m) return m;
+                    }
+
+                    // 5. Unambiguous case-insensitive substring match
+                    if (unquoted) {
+                        const partialMatches = pollOptions.filter(o => o.name.toLowerCase().includes(unquoted.toLowerCase()));
+                        if (partialMatches.length === 1) return partialMatches[0];
+                    }
+                }
+                return null;
+            }
+
+            const inputList = Array.isArray(rawOptions) ? rawOptions : [rawOptions];
+            const selectedLocalIds = [];
+            const selectedOptionsDetails = [];
+
+            for (const item of inputList) {
+                if (item === null || item === undefined || item === '') continue;
+                let matched = matchSingleOption(item);
+                if (matched) {
+                    if (!selectedLocalIds.includes(matched.localId)) {
+                        selectedLocalIds.push(matched.localId);
+                        selectedOptionsDetails.push({ localId: matched.localId, name: matched.name });
+                    }
+                    continue;
+                }
+
+                // If a single string did not match any option directly and contains commas, try splitting on commas
+                if (typeof item === 'string' && item.includes(',')) {
+                    const subParts = item.split(',').map(p => p.trim()).filter(Boolean);
+                    let allSubMatched = subParts.length > 0;
+                    const tempMatched = [];
+                    for (const sp of subParts) {
+                        const sm = matchSingleOption(sp);
+                        if (!sm) {
+                            allSubMatched = false;
+                            break;
+                        }
+                        tempMatched.push(sm);
+                    }
+                    if (allSubMatched) {
+                        for (const sm of tempMatched) {
+                            if (!selectedLocalIds.includes(sm.localId)) {
+                                selectedLocalIds.push(sm.localId);
+                                selectedOptionsDetails.push({ localId: sm.localId, name: sm.name });
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                const availableDesc = pollOptions.map(o => `[${o.localId}] "${o.name}"`).join(', ');
+                return { error: `Invalid poll option: "${item}". Available options: ${availableDesc}` };
+            }
+
+            const selectableCount = typeof msg.pollSelectableOptionsCount === 'number' ? msg.pollSelectableOptionsCount : 0;
+            if (selectableCount === 1 && selectedLocalIds.length > 1) {
+                return { error: `This is a single-choice poll (max 1 option), but ${selectedLocalIds.length} options were provided.` };
+            }
+            if (selectableCount > 1 && selectedLocalIds.length > selectableCount) {
+                return { error: `This poll allows selecting at most ${selectableCount} options, but ${selectedLocalIds.length} options were provided.` };
+            }
+
+            // Hydrate existing poll vote addons so previous vote state is synchronized
+            try {
+                const h = window.WPP.loader && window.WPP.loader.loadModule && window.WPP.loader.loadModule('WAWebAddonHydrationUtils');
+                const mt = window.WPP.loader && window.WPP.loader.loadModule && window.WPP.loader.loadModule('WAWebMsgType');
+                if (h && typeof h.hydrateAddons === 'function' && msg.id) {
+                    await h.hydrateAddons({
+                        ids: [msg.id],
+                        hydrationType: (mt && mt.MSG_TYPE && mt.MSG_TYPE.POLL_UPDATE) || 'poll_update'
+                    });
+                }
+            } catch (e) {}
+
+            if (window.WPP.loader && typeof window.WPP.loader.ensureLazyModule === 'function') {
+                try {
+                    await window.WPP.loader.ensureLazyModule('WAWebPollsSendVoteMsgAction');
+                } catch (e) {}
+            }
+
+            let sendVoteMod = window.WPP.loader && window.WPP.loader.loadModule
+                ? window.WPP.loader.loadModule('WAWebPollsSendVoteMsgAction')
+                : null;
+            if (!sendVoteMod || typeof sendVoteMod.sendVote !== 'function') {
+                if (window.WPP.loader && typeof window.WPP.loader.search === 'function') {
+                    sendVoteMod = window.WPP.loader.search(
+                        m => m && typeof m.sendVote === 'function' && typeof m.resendVote === 'function',
+                        false,
+                        /PollsSendVote/
+                    );
+                }
+            }
+
+            if (!sendVoteMod || typeof sendVoteMod.sendVote !== 'function') {
+                return { error: 'WhatsApp poll voting module (WAWebPollsSendVoteMsgAction) is not available' };
+            }
+
+            const safeMsg = typeof msg.safe === 'function' ? msg.safe() : { id: msg.id, unsafe: () => msg };
+            const selectedSet = new Set(selectedLocalIds);
+            await sendVoteMod.sendVote(safeMsg, selectedSet);
+
+            return {
+                success: true,
+                msgId: (msg.id && (msg.id._serialized || msg.id)) || id,
+                question: msg.pollName || '',
+                selectedOptions: selectedOptionsDetails
+            };
+        }, msgId, options);
+
+        if (result && result.error) {
+            return res.status(400).json({ error: result.error });
+        }
+        res.json(result || { success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

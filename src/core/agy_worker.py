@@ -72,7 +72,9 @@ Available Tools:
 
         schema_instruct += "\nCRITICAL INSTRUCTION: You are fully autonomous. You must output raw JSON. If you wish to speak, invoke the Speaker tool. If no tools are needed, return an empty array for tool_calls."
 
-        self.sys_instruct = fit_system_prompt(base_instruct + "\n\n" + schema_instruct, self.settings, tools)
+        # schema_instruct already embeds the serialized tool definitions in the prompt text,
+        # so do not pass tools a second time to fit_system_prompt (which would double-count them).
+        self.sys_instruct = fit_system_prompt(base_instruct + "\n\n" + schema_instruct, self.settings)
         if clear_history:
             self.history = []
 
@@ -95,14 +97,26 @@ Available Tools:
 
     def get_session_history(self) -> list:
         """Exports active chat history into a normalized list of turns."""
-        return [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in self.history]
+        messages = []
+        for m in self.history:
+            role = "assistant" if str(m.get("role", "")).lower() in ("model", "assistant") else "user"
+            content = m.get("content", "")
+            if content:
+                messages.append({"role": role, "content": content})
+        return messages
 
     def set_session_history(self, messages: list):
         """Restores chat history from normalized turns."""
-        self.history = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages if m.get("content")]
+        from core.session_cache import normalize_session_messages
+        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
+        self.history = [
+            {"role": "assistant" if m.get("role") == "assistant" else "user", "content": m.get("content", "")}
+            for m in norm_messages if m.get("content")
+        ]
 
     def stop_session(self):
         self.running = False
+        self.history = []
         logging.info("AgyWorker stopped.")
 
     def abort(self):

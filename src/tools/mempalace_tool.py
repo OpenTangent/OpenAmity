@@ -20,19 +20,25 @@ class MemPalaceTool(Tool):
         "graph_status", "link_setpoint", "unlink_setpoint", "refresh_prospective_anchors"
     ]
 
-    def __init__(self, orchestrator=None):
+    def __init__(self, orchestrator=None, agent_id=None):
         super().__init__(orchestrator)
+        self._explicit_agent_id = agent_id
         self.manager = getattr(self.orchestrator, 'mempalace_manager', None) if self.orchestrator else None
         if not isinstance(self.manager, MemPalaceManager):
-            agent_id = getattr(self.orchestrator, 'agent_id', None) if self.orchestrator else None
-            if agent_id and not isinstance(agent_id, str):
-                agent_id = str(agent_id)
-            self.manager = MemPalaceManager(agent_id=agent_id)
+            resolved_aid = agent_id or (getattr(self.orchestrator, 'agent_id', None) if self.orchestrator else None)
+            if resolved_aid and not isinstance(resolved_aid, str):
+                resolved_aid = str(resolved_aid)
+            self.manager = MemPalaceManager(agent_id=resolved_aid)
 
         self._last_curiosity_pulse: Optional[datetime.datetime] = None
         self._curiosity_history: set = set()
 
     def execute(self, command: str, *args, **kwargs) -> str:
+        if args and isinstance(args[0], dict):
+            merged_kw = dict(args[0])
+            merged_kw.update(kwargs)
+            kwargs = merged_kw
+            args = args[1:]
         if command == "search":
             query = kwargs.get("query") or (args[0] if args else "")
             wing = kwargs.get("wing")
@@ -162,22 +168,47 @@ class MemPalaceTool(Tool):
         elif command == "update_mirror":
             perspective = kwargs.get("perspective") or (
                 args[0] if args else "")
-            subjective_view = kwargs.get("subjective_view") or (
-                args[1] if len(args) > 1 else "")
-            provenance = kwargs.get("provenance", "inferred")
-            confidence = kwargs.get("confidence", 1.0)
-            evidence_refs = kwargs.get("evidence_refs", [])
-            contradicted_by = kwargs.get("contradicted_by", [])
-            if not perspective or not subjective_view:
-                return "Error: perspective and subjective_view are required."
+            subjective_view = kwargs.get("subjective_view")
+            if subjective_view is None and len(args) > 1:
+                subjective_view = args[1]
+            provenance = kwargs.get("provenance")
+            confidence = kwargs.get("confidence")
+            evidence_refs = kwargs.get("evidence_refs")
+            contradicted_by = kwargs.get("contradicted_by")
+            perspective_cone = kwargs.get("perspective_cone")
+            sphere_level = kwargs.get("sphere_level")
+            entity_type = kwargs.get("entity_type")
+            umwelt_horizon = kwargs.get("umwelt_horizon")
+            epistemic_boundary = kwargs.get("epistemic_boundary")
+            ripple_notes = kwargs.get("ripple_notes")
+            prediction_error_note = kwargs.get("prediction_error_note")
+
+            if not perspective or not str(perspective).strip():
+                return "Error: perspective is required."
 
             try:
                 res = self.manager.update_mirror(
-                    perspective, subjective_view, provenance,
-                    confidence=confidence, evidence_refs=evidence_refs, contradicted_by=contradicted_by)
+                    perspective=perspective,
+                    subjective_view=subjective_view,
+                    provenance=provenance,
+                    confidence=confidence,
+                    evidence_refs=evidence_refs,
+                    contradicted_by=contradicted_by,
+                    perspective_cone=perspective_cone,
+                    sphere_level=sphere_level,
+                    entity_type=entity_type,
+                    umwelt_horizon=umwelt_horizon,
+                    epistemic_boundary=epistemic_boundary,
+                    ripple_notes=ripple_notes,
+                    prediction_error_note=prediction_error_note,
+                )
                 if isinstance(res, dict) and not res.get("success"):
                     return f"Error updating mirror: {res.get('error', 'Failed to update mirror')}"
-                return f"Successfully updated mirror for perspective '{perspective}'."
+                entry = res.get("entry", {}) if isinstance(res, dict) else {}
+                s_lvl = entry.get("sphere_level", "")
+                e_type = entry.get("entity_type", "")
+                meta_str = f" [S{s_lvl} | {e_type}]" if s_lvl and e_type else ""
+                return f"Successfully updated mirror for perspective '{perspective}'{meta_str}."
             except Exception as e:
                 logger.error(f"Error updating mirror: {e}")
                 return f"Error updating mirror: {e}"
@@ -357,18 +388,28 @@ class MemPalaceTool(Tool):
             },
             {
                 "name": "MemPalace_update_mirror",
-                "description": "Surgically update a Theory of Mind record in your Sanctuary Mirror.",
+                "description": (
+                    "Updates a Sanctuary Mirror across Spheres S1..S10 (omitted fields keep existing values). "
+                    "See System_read_manual(topic='memory') for Bidirectional Empathy Cone protocol."
+                ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
-                        "perspective": {"type": "STRING", "description": "The person or entity holding the view (e.g. 'Andrew', 'Self')."},
-                        "subjective_view": {"type": "STRING", "description": "The subjective view or opinion held by that perspective about you."},
-                        "provenance": {"type": "STRING", "description": "Whether this view was 'stated' directly or 'inferred'. Default is 'inferred'."},
-                        "confidence": {"type": "NUMBER", "description": "Confidence score between 0.0 and 1.0. Default is 1.0."},
-                        "evidence_refs": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Optional list of references or anchors."},
-                        "contradicted_by": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Optional list of perspectives holding conflicting views."}
+                        "perspective": {"type": "STRING", "description": "Perspective name ('Self', 'Andrew', community, etc.)."},
+                        "subjective_view": {"type": "STRING", "description": "Self-in-Other: how they view you or how you view yourself."},
+                        "perspective_cone": {"type": "STRING", "description": "Other-in-Self: their lived world, pressures, values, needs."},
+                        "sphere_level": {"type": "INTEGER", "description": "Sphere level 1 (Self) .. 10 (Universal)."},
+                        "entity_type": {"type": "STRING", "description": "self, human, agent, animal, group, community, organization, ecosystem, or abstract."},
+                        "umwelt_horizon": {"type": "STRING", "description": "What this entity perceives, controls, or misses."},
+                        "epistemic_boundary": {"type": "STRING", "description": "Observed/stated vs inferred vs unknown about their inner state."},
+                        "ripple_notes": {"type": "STRING", "description": "Downstream impact on this sphere from inner-sphere actions."},
+                        "prediction_error_note": {"type": "STRING", "description": "Prior expectation contradicted by reality and lesson learned."},
+                        "confidence": {"type": "NUMBER", "description": "Epistemic confidence [0.0..1.0] (default: 1.0)."},
+                        "provenance": {"type": "STRING", "description": "'stated', 'observed', or 'inferred' (default: 'inferred')."},
+                        "evidence_refs": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Supporting drawer IDs or session references."},
+                        "contradicted_by": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Conflicting perspective names or drawer IDs."}
                     },
-                    "required": ["perspective", "subjective_view"]
+                    "required": ["perspective"]
                 }
             },
             {

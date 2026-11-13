@@ -303,7 +303,10 @@ def synthesize_voice_sample(api_key: str, voice_name: str, style: str = "", text
     """Synthesizes a short audition audio sample using gemini-3.8-flash-tts."""
     if not text:
         text = f"Hello, I am {voice_name}, one of the Gemini voices."
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1beta")
+    )
     if hasattr(types, "SpeechMetadata") and style:
         part = types.Part(text=text, speech_metadata=types.SpeechMetadata(style=style))
         contents = [types.Content(role="user", parts=[part])]
@@ -518,11 +521,111 @@ def normalize_gemini_voice_models(voice_models) -> list:
     return normalized
 
 
+def extract_oscilloscope_frames(
+    pcm_bytes: bytes,
+    sample_rate: int = 24000,
+    fps: int = 60,
+    num_points: int = 96,
+    flush: bool = False,
+) -> tuple[list[list[float]], bytes]:
+    """
+    Slices raw 16-bit signed little-endian PCM bytes into 60-FPS oscilloscope
+    waveform frames aligned to rising zero-crossings, returning (frames, leftover_bytes).
+    Silent slices return an empty list [] so the visualizer snaps flat between syllables.
+    """
+    from array import array
+    import sys
+
+    if not pcm_bytes or len(pcm_bytes) < 2:
+        return [], pcm_bytes or b""
+
+    sample_rate = max(8000, int(sample_rate or 24000))
+    frame_samples = max(1, int(round(sample_rate / float(fps))))
+    frame_bytes = frame_samples * 2
+
+    frames: list[list[float]] = []
+    offset = 0
+    total_len = len(pcm_bytes)
+
+    while offset + frame_bytes <= total_len or (flush and offset + 2 <= total_len):
+        end_offset = min(total_len, offset + frame_bytes)
+        usable_len = ((end_offset - offset) // 2) * 2
+        if usable_len <= 0:
+            break
+
+        chunk = pcm_bytes[offset:offset + usable_len]
+        offset += usable_len
+
+        arr = array("h")
+        arr.frombytes(chunk)
+        if sys.byteorder != "little":
+            arr.byteswap()
+
+        n = len(arr)
+        if n <= 0:
+            continue
+
+        sum_sq = 0
+        peak = 0
+        for s in arr:
+            abs_s = -s if s < 0 else s
+            if abs_s > peak:
+                peak = abs_s
+            sum_sq += s * s
+
+        rms = math.sqrt(sum_sq / n) / 32768.0
+        peak_norm = peak / 32768.0
+
+        # Silence / micro-pause gate between syllables and words
+        if rms < 0.006 and peak_norm < 0.018:
+            frames.append([])
+            continue
+
+        win_len = min(n, max(min(n, num_points), int(n * 0.65)))
+        search_limit = max(0, n - win_len)
+
+        # Rising zero-crossing trigger for oscilloscope stability
+        trigger_idx = 0
+        best_slope = -1
+        for i in range(search_limit):
+            s0 = arr[i]
+            s1 = arr[i + 1]
+            if s0 <= 0 and s1 > 0:
+                slope = s1 - s0
+                if slope > best_slope:
+                    best_slope = slope
+                    trigger_idx = i
+
+        frame_pts: list[float] = []
+        for k in range(num_points):
+            start_i = trigger_idx + int(k * win_len / num_points)
+            end_i = max(start_i + 1, trigger_idx + int((k + 1) * win_len / num_points))
+            end_i = min(n, end_i)
+            start_i = min(start_i, end_i - 1)
+
+            extreme_s = arr[start_i]
+            max_mag = -extreme_s if extreme_s < 0 else extreme_s
+            for j in range(start_i + 1, end_i):
+                cand = arr[j]
+                mag = -cand if cand < 0 else cand
+                if mag > max_mag:
+                    max_mag = mag
+                    extreme_s = cand
+
+            # Soft-knee voice normalization for vivid conversational articulation
+            frame_pts.append(math.tanh((extreme_s / 32768.0) * 2.6))
+
+        frames.append(frame_pts)
+
+    return frames, pcm_bytes[offset:]
+
+
 class TTSWorker(threading.Thread):
     def __init__(self, text, voice=None, daemon=True, agent_id=None):
         super().__init__(daemon=daemon)
         self.started_playback = Signal()
         self.amplitude_emitted = Signal()
+        self.waveform_emitted = Signal()
         self.error_occurred = Signal()
         self.status_emitted = Signal()
         self.agent_id = agent_id
@@ -649,7 +752,10 @@ class TTSWorker(threading.Thread):
                 "[System: Gemini voice synthesis unavailable - API key is not configured.]")
             return
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(api_version="v1beta")
+        )
 
         raw_voice_models = self.settings.get(
             "core.gemini.voice-models", [
@@ -723,8 +829,12 @@ class TTSWorker(threading.Thread):
         )
 
         self.process = subprocess.Popen(
-            ["ffplay", "-f", "s16le", "-ar", "24000",
-                "-nodisp", "-autoexit", "-i", "-"],
+            [
+                "ffplay", "-f", "s16le", "-ar", "24000",
+                "-fflags", "nobuffer", "-flags", "low_delay",
+                "-probesize", "32", "-analyzeduration", "0",
+                "-nodisp", "-autoexit", "-i", "-"
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
@@ -734,6 +844,8 @@ class TTSWorker(threading.Thread):
         abort_event = threading.Event()
 
         def writer_thread():
+            pcm_remainder = b""
+            first_batch = True
             try:
                 while not self._is_stopped:
                     try:
@@ -741,11 +853,29 @@ class TTSWorker(threading.Thread):
                     except queue.Empty:
                         continue
                     if data is None:
+                        if pcm_remainder and not self._is_stopped:
+                            frames, pcm_remainder = extract_oscilloscope_frames(
+                                pcm_remainder, sample_rate=24000, flush=True
+                            )
+                            if frames:
+                                if first_batch:
+                                    frames = ([[]] * 5) + frames
+                                    first_batch = False
+                                self.waveform_emitted.emit(frames)
                         break
 
                     if self.process and self.process.stdin:
                         self.process.stdin.write(data)
                         self.process.stdin.flush()
+
+                        frames, pcm_remainder = extract_oscilloscope_frames(
+                            pcm_remainder + data, sample_rate=24000, flush=False
+                        )
+                        if frames:
+                            if first_batch:
+                                frames = ([[]] * 5) + frames
+                                first_batch = False
+                            self.waveform_emitted.emit(frames)
 
                         samples = len(data) // 2
                         if samples > 0:
@@ -769,7 +899,7 @@ class TTSWorker(threading.Thread):
             finally:
                 if self.process and self.process.stdin and not self._is_stopped:
                     try:
-                        self.process.stdin.write(b'\x00' * 48000)
+                        self.process.stdin.write(b'\x00' * 7200)
                         self.process.stdin.flush()
                     except Exception:
                         pass
@@ -883,16 +1013,23 @@ class TTSWorker(threading.Thread):
                 return
 
             self.process = subprocess.Popen(
-                ["ffplay", "-f", "s16le", "-ar",
-                    str(voice.config.sample_rate), "-nodisp", "-autoexit", "-i", "-"],
+                [
+                    "ffplay", "-f", "s16le", "-ar", str(voice.config.sample_rate),
+                    "-fflags", "nobuffer", "-flags", "low_delay",
+                    "-probesize", "32", "-analyzeduration", "0",
+                    "-nodisp", "-autoexit", "-i", "-"
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
 
             audio_queue = queue.Queue()
+            piper_sample_rate = int(getattr(voice.config, "sample_rate", 22050) or 22050)
 
             def writer_thread():
+                pcm_remainder = b""
+                first_batch = True
                 try:
                     while not self._is_stopped:
                         try:
@@ -900,11 +1037,29 @@ class TTSWorker(threading.Thread):
                         except queue.Empty:
                             continue
                         if data is None:
+                            if pcm_remainder and not self._is_stopped:
+                                frames, pcm_remainder = extract_oscilloscope_frames(
+                                    pcm_remainder, sample_rate=piper_sample_rate, flush=True
+                                )
+                                if frames:
+                                    if first_batch:
+                                        frames = ([[]] * 5) + frames
+                                        first_batch = False
+                                    self.waveform_emitted.emit(frames)
                             break
 
                         if self.process and self.process.stdin:
                             self.process.stdin.write(data)
                             self.process.stdin.flush()
+
+                            frames, pcm_remainder = extract_oscilloscope_frames(
+                                pcm_remainder + data, sample_rate=piper_sample_rate, flush=False
+                            )
+                            if frames:
+                                if first_batch:
+                                    frames = ([[]] * 5) + frames
+                                    first_batch = False
+                                self.waveform_emitted.emit(frames)
 
                             samples = len(data) // 2
                             if samples > 0:
@@ -929,7 +1084,7 @@ class TTSWorker(threading.Thread):
                     if self.process and self.process.stdin and not self._is_stopped:
                         try:
                             self.process.stdin.write(
-                                b'\x00' * (voice.config.sample_rate * 2))
+                                b'\x00' * (int(piper_sample_rate * 0.15) * 2))
                             self.process.stdin.flush()
                         except Exception:
                             pass
@@ -1077,7 +1232,10 @@ def _synthesize_gemini_to_opus(text: str, output_path: str, settings, agent_id: 
     ) if settings else []
     voice_models = normalize_gemini_voice_models(raw_voice_models)
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1beta")
+    )
     max_attempts = max(2, len(voice_models))
     last_err = None
 

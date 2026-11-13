@@ -264,7 +264,9 @@ class BrowserSkill(Tool):
                 "name": "Browser_screenshot",
                 "description": (
                     "Captures a visual screenshot of the current page with Set-of-Marks numbered bounding badges overlaying interactive controls. "
-                    "The image is downscaled to max 1024px by default to save tokens and injected directly into multimodal context."
+                    "The image is downscaled to max 1024px by default to save tokens and injected directly into multimodal context. "
+                    "IMPORTANT: Browser screenshots and cached assets are temporary and automatically deleted after 24 hours. "
+                    "Do not rely on cache for storage; you must take action to save any screenshots you wish to keep permanently (e.g. saving to ~/Pictures/<YourName>/) before they expire."
                 ),
                 "parameters": {
                     "type": "OBJECT",
@@ -370,6 +372,13 @@ class BrowserSkill(Tool):
 
     def execute(self, command: str, *args, **kwargs) -> Any:
         try:
+            # Automatically prune browser screenshots and cache older than 24 hours
+            if hasattr(self, "manager") and self.manager:
+                try:
+                    self.manager.clear_expired_cache(max_age_days=1.0)
+                except Exception as e:
+                    logger.debug(f"Failed to clear expired browser cache in execute: {e}")
+
             if command == "navigate":
                 url = kwargs.get("url") or (args[0] if args else None)
                 if not url:

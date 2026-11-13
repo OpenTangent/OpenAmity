@@ -236,6 +236,7 @@ def test_post_sleep_reset_and_reprimand(tmp_path):
     # Reprimand notice should be present in last_action_result
     assert orch.last_action_result is not None
     assert "You failed to adequately halt cognition before your fatigue limit was reached" in orch.last_action_result
+    assert "System_sleep" in orch.last_action_result
 
     # Case B: Post-sleep after normal scheduled sleep cycle
     orch._is_sleep_cycle = True
@@ -340,3 +341,56 @@ def test_somatic_voice_modulation_subdued(tmp_path):
                 somatic_state_text = "Slightly subdued and contemplative due to moderate fatigue."
 
         assert somatic_state_text == "Slightly tired, weary, and subdued due to cognitive fatigue."
+
+
+def test_explicit_sleep_cycle_trigger(tmp_path):
+    """Verify orchestrator trigger_sleep_cycle fires sleep pulse, sets timestamp, and validates guards."""
+    orch = _create_mock_orchestrator(tmp_path, token_limit=400000)
+
+    # 1. Normal invocation with reason
+    success = orch.trigger_sleep_cycle(reason="Idle for 1.5 hours with 60% fatigue")
+    assert success is True
+    assert orch.pulse_engine.fire_pulse.called
+    call_args = orch.pulse_engine.fire_pulse.call_args
+    assert "Sleep Cycle (Memory Consolidation)" in call_args[0][0]
+    assert "Idle for 1.5 hours with 60% fatigue" in call_args[0][1]
+    assert call_args[0][2] == "sleep_cycle"
+
+    # Verify settings timestamp updated
+    assert orch.settings_manager.set.called
+    set_args = orch.settings_manager.set.call_args[0]
+    assert set_args[0] == "core.auto-pulse.last-sleep-cycle"
+    assert set_args[1] > 0
+    assert orch.settings_manager.save.called
+
+    # 2. Guard: Cannot trigger when already in sleep cycle
+    orch._is_sleep_cycle = True
+    assert orch.trigger_sleep_cycle() is False
+
+    # 3. Guard: Cannot trigger when paused
+    orch._is_sleep_cycle = False
+    orch.is_paused = True
+    assert orch.trigger_sleep_cycle() is False
+
+
+def test_on_tool_execution_finished_breaks_on_system_sleep(tmp_path):
+    """Verify on_tool_execution_finished immediately breaks active turn on System_sleep without redundant LLM call."""
+    orch = _create_mock_orchestrator(tmp_path, token_limit=400000)
+
+    func_responses = [
+        ("MemPalace_add_memory", {"result": "Memory added."}),
+        ("System_sleep", {"result": "Sleep cycle initiated."})
+    ]
+    executed_tools = ["MemPalace_add_memory()", "System_sleep()"]
+
+    orch.on_tool_execution_finished(func_responses, executed_tools)
+
+    # Must call finish_thinking to conclude waking turn
+    assert orch.finish_thinking.called
+
+    # Must NOT call send_function_responses to prevent extra prompt tokens / model loops
+    assert not orch.gemini_worker.send_function_responses.called
+
+    # Must append system notice to conversation
+    assert any("Memory consolidation (Sleep Cycle) explicitly initiated by agent" in msg[1] for msg in orch._appended_messages)
+

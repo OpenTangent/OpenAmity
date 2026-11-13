@@ -870,6 +870,176 @@ def test_silence_ffmpeg_logs_runs_cleanly():
     silence_ffmpeg_logs()
 
 
+def test_extract_oscilloscope_frames_silence_and_voice():
+    import math
+    from array import array
+    from core.audio_output import extract_oscilloscope_frames
+
+    # 1. Pure silence frame (400 samples at 24kHz = 1 frame at 60 FPS)
+    silent_pcm = b"\x00\x00" * 400
+    frames, rem = extract_oscilloscope_frames(silent_pcm, sample_rate=24000, fps=60, num_points=96)
+    assert len(frames) == 1
+    assert frames[0] == []
+    assert rem == b""
+
+    # 2. Active voice harmonic wave (850 samples -> 2 frames + 50 samples remainder)
+    samples = array("h", [
+        int(12000 * math.sin(2 * math.pi * 220 * (i / 24000.0)) + 5000 * math.sin(2 * math.pi * 660 * (i / 24000.0)))
+        for i in range(850)
+    ])
+    voice_pcm = samples.tobytes()
+    frames, rem = extract_oscilloscope_frames(voice_pcm, sample_rate=24000, fps=60, num_points=96)
+    assert len(frames) == 2
+    assert len(rem) == 50 * 2
+    for f in frames:
+        assert len(f) == 96
+        assert any(abs(v) > 0.2 for v in f)
+        assert all(-1.0 <= v <= 1.0 for v in f)
+
+
+def test_oscilloscope_visualizer_and_agent_view_bottom_placement(qapp, temp_agent_dir):
+    import math
+    from core.events import Signal
+    from gui.agent_view import AgentView
+    from gui.visualizer import SoundWaveVisualizer
+
+    orch = MagicMock()
+    orch.agent_id = "test_osc_agent"
+    orch.is_paused = False
+    orch.is_busy = False
+    orch.is_thinking = False
+    orch.settings_manager = SettingsManager(agent_id="test_osc_agent")
+    orch.on_message_appended = Signal()
+    orch.on_busy_state_changed = Signal()
+    orch.on_amplitude_emitted = Signal()
+    orch.on_waveform_emitted = Signal()
+    orch.on_paused_state_changed = Signal()
+    orch.on_pause_pending = Signal()
+    orch.on_tool_started = Signal()
+    orch.on_tool_finished = Signal()
+    orch.on_listening_state_changed = Signal()
+
+    with patch("gui.main_window.SpellCheckHighlighter"):
+        view = AgentView(orch)
+
+    view.resize(700, 500)
+    view.show()
+    qapp.processEvents()
+
+    # 1. Verify visualizer height is 100px and placed below conversation_log, just above footer_widget
+    assert isinstance(view.visualizer, SoundWaveVisualizer)
+    assert view.visualizer.height() == 100
+
+    layout_widgets = [
+        view.main_layout.itemAt(i).widget()
+        for i in range(view.main_layout.count())
+        if view.main_layout.itemAt(i).widget() is not None
+    ]
+    log_idx = layout_widgets.index(view.conversation_log)
+    vis_idx = layout_widgets.index(view.visualizer)
+    footer_idx = layout_widgets.index(view.footer_widget)
+    assert log_idx < vis_idx < footer_idx
+
+    # 2. Populate conversation log so it has vertical scroll range and is scrolled to bottom
+    for i in range(30):
+        view.append_to_conversation("Agent", f"Line {i}: Speaking test paragraph to fill vertical viewport height.")
+    qapp.processEvents()
+
+    scroll_bar = view.conversation_log.verticalScrollBar()
+    assert scroll_bar.maximum() > 0
+    assert scroll_bar.value() == scroll_bar.maximum()
+
+    # 3. Trigger speaking state: oscilloscope appears and pushes chat log upward while keeping it scrolled to bottom
+    view.set_busy_state(True, speaking=True)
+    qapp.processEvents()
+
+    assert view.visualizer.isVisible() is True
+    assert view.visualizer.is_active is True
+    assert scroll_bar.value() == scroll_bar.maximum()
+
+    # 4. Feed waveform frames and trigger animation/paint
+    sample_frame = [math.sin(2 * math.pi * i / 24.0) * 0.75 for i in range(96)]
+    orch.on_waveform_emitted.emit([sample_frame])
+    qapp.processEvents()
+    view.visualizer.update_animation()
+    view.visualizer.repaint()
+    assert any(abs(v) > 0.1 for v in view.visualizer.current_waveform)
+
+    # 5. Stop speaking: visualizer resets and hides
+    view.set_busy_state(False, speaking=False)
+    qapp.processEvents()
+    assert view.visualizer.isVisible() is False
+    assert view.visualizer.is_active is False
+    view.close()
+
+
+def test_gemini_tts_client_uses_v1beta_http_options(temp_agent_dir):
+    """Ensures Gemini TTS calls specify api_version='v1beta' in http_options to support speechConfig and speechMetadata."""
+    from core.audio_output import TTSWorker, synthesize_voice_sample, _synthesize_gemini_to_opus
+
+    # 1. Test TTSWorker._stream_and_play_gemini
+    worker = TTSWorker("Testing v1beta endpoint configuration")
+    worker.settings.set("core.tts.provider", "gemini")
+    worker.settings.save()
+
+    with patch("core.audio_output.genai.Client") as mock_client_cls, \
+         patch.object(worker.settings, "get_env", return_value="fake-api-key"), \
+         patch.object(worker, "_stream_gemini_attempt"):
+        worker._stream_and_play_gemini()
+
+    mock_client_cls.assert_called_once()
+    kwargs = mock_client_cls.call_args.kwargs
+    assert "http_options" in kwargs
+    opts = kwargs["http_options"]
+    api_ver = opts.api_version if hasattr(opts, "api_version") else opts.get("api_version")
+    assert api_ver == "v1beta"
+
+    # 2. Test synthesize_voice_sample
+    with patch("core.audio_output.genai.Client") as mock_client_cls:
+        mock_response = MagicMock()
+        mock_response.candidates = []
+        mock_client_cls.return_value.models.generate_content.return_value = mock_response
+        synthesize_voice_sample(api_key="fake-key", voice_name="Puck")
+
+    mock_client_cls.assert_called_once()
+    kwargs = mock_client_cls.call_args.kwargs
+    assert "http_options" in kwargs
+    opts = kwargs["http_options"]
+    api_ver = opts.api_version if hasattr(opts, "api_version") else opts.get("api_version")
+    assert api_ver == "v1beta"
+
+    # 3. Test _synthesize_gemini_to_opus
+    test_out_file = os.path.join(temp_agent_dir, "test_out.opus")
+    with open(test_out_file, "wb") as f:
+        f.write(b"dummy-opus-data")
+    with patch("core.audio_output.genai.Client") as mock_client_cls, \
+         patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = b""
+        mock_proc.returncode = 0
+        mock_proc.poll.return_value = 0
+        mock_proc.wait.return_value = 0
+        mock_popen.return_value = mock_proc
+        mock_client_cls.return_value.models.generate_content_stream.return_value = []
+
+        _synthesize_gemini_to_opus(
+            text="Testing opus v1beta",
+            output_path=str(test_out_file),
+            settings=worker.settings,
+            api_key="fake-key"
+        )
+
+    mock_client_cls.assert_called_once()
+    kwargs = mock_client_cls.call_args.kwargs
+    assert "http_options" in kwargs
+    opts = kwargs["http_options"]
+    api_ver = opts.api_version if hasattr(opts, "api_version") else opts.get("api_version")
+    assert api_ver == "v1beta"
+
+
+
 
 
 

@@ -102,6 +102,45 @@ class BaseFormatter(logging.Formatter):
             return "other"
 
 
+_CONSOLE_SOURCE_RESOLVER = BaseFormatter()
+
+
+class ConsoleLogFilter(logging.Filter):
+    """Excludes agent thoughts and routine tool execution logs from console streams.
+
+    Thoughts and tool invocations are displayed in Conversation Thoughts Cards and
+    preserved in rolling disk logs (open_amity.log), keeping the console uncluttered
+    for warnings, errors, and lifecycle diagnostics.
+    """
+
+    def filter(self, record):
+        if record.levelno > logging.INFO:
+            return True
+
+        name = getattr(record, "name", "") or ""
+        if name.endswith(".Thoughts"):
+            return False
+
+        if getattr(record, "is_thought_or_tool", False):
+            return False
+
+        if name == "primp" or name.startswith(("tool.", "tools.")):
+            return False
+
+        if _CONSOLE_SOURCE_RESOLVER.get_source(record).startswith("tool."):
+            return False
+
+        if name.startswith("subagent."):
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = str(getattr(record, "msg", ""))
+            if "] Thought:" in msg or "] Function Calls:" in msg or msg.startswith(("Thought:", "Function Calls:")):
+                return False
+
+        return True
+
+
 class FileFormatter(BaseFormatter):
     def format(self, record):
         source = self.get_source(record)
@@ -307,6 +346,7 @@ def setup_logging(retention_days=7, debug_logging=False):
     console_handler.setLevel(logging.DEBUG if debug_logging else logging.INFO)
     console_handler.setFormatter(ColorFormatter())
     console_handler.addFilter(verbosity_filter)
+    console_handler.addFilter(ConsoleLogFilter())
 
     root_logger.addHandler(dispatch_handler)
     root_logger.addHandler(console_handler)

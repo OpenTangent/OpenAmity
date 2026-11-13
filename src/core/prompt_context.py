@@ -10,6 +10,57 @@ import re
 MEMORY_BEGIN = "[OPENAMITY_MEMORY_BEGIN]"
 MEMORY_END = "[OPENAMITY_MEMORY_END]"
 
+WORKER_CRITICAL_INSTRUCTION = (
+    "CRITICAL INSTRUCTION: Output your internal reasoning as plain text BEFORE invoking any tool(s), "
+    "and emit native tool call(s) in the EXACT SAME TURN—never end a turn with reasoning alone when acting."
+)
+WORKER_AUTONOMOUS_SPEECH_INSTRUCTION = (
+    "AUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech and will NOT speak automatically. "
+    "To reply to the user on the GUI, you MUST explicitly call Speaker_speak_aloud (or Speaker_output_text strictly for non-speakable text) "
+    "using a first-person perspective—otherwise you remain completely silent."
+)
+WORKER_STATIC_INSTRUCTIONS = (
+    f"{WORKER_CRITICAL_INSTRUCTION}\n\n{WORKER_AUTONOMOUS_SPEECH_INSTRUCTION}"
+)
+
+
+def inject_static_worker_instructions(system_instruction: str, extra: str = "") -> str:
+    """Insert static worker directives before MEMORY_BEGIN so dynamic memory stays trailing."""
+    base = system_instruction or ""
+    directive = extra or WORKER_STATIC_INSTRUCTIONS
+    if "CRITICAL INSTRUCTION:" in base and "AUTONOMOUS SPEECH INSTRUCTION:" in base:
+        return base
+    idx = base.find(MEMORY_BEGIN)
+    if idx >= 0:
+        prefix = base[:idx].rstrip()
+        suffix = base[idx:]
+        return f"{prefix}\n\n{directive}\n\n{suffix}" if prefix else f"{directive}\n\n{suffix}"
+    return f"{base}\n\n{directive}" if base else directive
+
+
+def split_system_prompt_for_caching(system_instruction: str):
+    """Split prompt into (static_prefix, dynamic_memory_block) at MEMORY_BEGIN."""
+    text = system_instruction or ""
+    idx = text.find(MEMORY_BEGIN)
+    if idx <= 0:
+        return text, ""
+    return text[:idx].rstrip("\n"), text[idx:]
+
+
+def format_prompt_footprint(system_instruction: str, tool_declarations=None) -> str:
+    """Summarize UTF-8 bytes and estimated tokens for static prefix, dynamic block, and tools."""
+    static_part, dynamic_part = split_system_prompt_for_caching(system_instruction or "")
+    static_b = len(static_part.encode("utf-8"))
+    dynamic_b = len(dynamic_part.encode("utf-8"))
+    tools_b = len(json.dumps(tool_declarations or [], ensure_ascii=False).encode("utf-8"))
+    total_b = static_b + dynamic_b + tools_b
+    return (
+        f"Static={static_b}B (~{len(static_part)//4} tok) | "
+        f"Dynamic={dynamic_b}B (~{len(dynamic_part)//4} tok) | "
+        f"Tools={tools_b}B (~{tools_b//4} tok) | "
+        f"Total={total_b}B (~{total_b//4} tok)"
+    )
+
 
 def selected_provider(settings):
     if settings.get("core.antigravity.agy-mode", False):
@@ -80,6 +131,8 @@ def replace_memory_context(prompt, context):
 class MemoryContextWorkerMixin:
     def update_system_instruction(self, system_instruction):
         """Update system policy without dropping tool-call/result history."""
+        if getattr(self, "_append_worker_static_instructions", False):
+            system_instruction = inject_static_worker_instructions(system_instruction or "")
         text = fit_system_prompt(system_instruction, self.settings, getattr(self, "tools", None))
         # Gemini chat config is captured at creation; recreate with unchanged
         # history so the next function response uses the updated system block.

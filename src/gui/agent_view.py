@@ -1,14 +1,15 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QTextEdit, QTextBrowser, QProgressBar)
-from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QTextCursor, QTextBlockFormat
+from PySide6.QtCore import Signal, Qt, QTimer, QUrl
+from PySide6.QtGui import QTextCursor, QTextBlockFormat, QDesktopServices
 
 from gui.visualizer import SoundWaveVisualizer
 from gui.chat_formatter import (
     setup_chat_browser,
     render_markdown_to_html,
     render_user_message_content,
+    render_thought_card_html,
     wrap_in_isolated_container,
     insert_message_into_log,
 )
@@ -26,8 +27,10 @@ except ImportError:
 
 class AgentView(QWidget):
     ui_message_appended = Signal(str, str)
+    ui_thought_card_updated = Signal(object, str, bool)
     ui_busy_state_changed = Signal(bool, bool)
     ui_amplitude_emitted = Signal(float)
+    ui_waveform_emitted = Signal(object)
     ui_paused_state_changed = Signal(bool)
     ui_pause_pending_changed = Signal(bool)
     ui_tool_started = Signal(str, str, str, str, str, bool)
@@ -39,6 +42,14 @@ class AgentView(QWidget):
         self.orchestrator = orchestrator
         self.settings_manager = orchestrator.settings_manager
         self.config_manager = ConfigManager()
+        self.chat_history_manager = getattr(orchestrator, 'chat_history_manager', None)
+        self.BATCH_SIZE = 50
+        self.MAX_GUI_MESSAGES = 150
+        self._loaded_messages = []
+        self._expanded_thought_cards = set()
+        self._has_more_history = True
+        self._is_loading_history = False
+        self._at_bottom = True
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -56,22 +67,29 @@ class AgentView(QWidget):
         """)
         self.main_layout.addWidget(self.loading_bar)
 
+        # Conversation Log
+        self.conversation_log = QTextBrowser()
+        self.conversation_log._auto_scroll_on_range_change = False
+        setup_chat_browser(self.conversation_log)
+        self.conversation_log.setOpenExternalLinks(False)
+        self.conversation_log.setOpenLinks(False)
+        self.conversation_log.anchorClicked.connect(self.on_anchor_clicked)
+        self.conversation_log.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
+        self.conversation_log.verticalScrollBar().rangeChanged.connect(self._on_scroll_range_changed)
+        self.main_layout.addWidget(self.conversation_log, 1)
+
+        # Oscilloscope Voice Visualizer (positioned at the bottom of the chat log, just above the user input footer)
         self.visualizer = SoundWaveVisualizer()
         self.visualizer.hide()
         self.main_layout.addWidget(self.visualizer)
 
-        # Conversation Log
-        self.conversation_log = QTextBrowser()
-        setup_chat_browser(self.conversation_log)
-        self.conversation_log.setOpenExternalLinks(True)
-        self.main_layout.addWidget(self.conversation_log, 1)
-
         # Floating Tool-Call Pip Manager
         self.pip_manager = ToolPipManager(self.conversation_log, self)
 
-        # Console Log
+        # Console Log (limited to 1,000 blocks for memory conservation)
         self.console_log = QTextEdit()
         self.console_log.setReadOnly(True)
+        self.console_log.document().setMaximumBlockCount(1000)
         self.console_log.setStyleSheet(f"""
             QTextEdit {{
                 background-color: #000;
@@ -127,7 +145,7 @@ class AgentView(QWidget):
         self.btn_mute.setFixedSize(40, 40)
         self.btn_mute.setCheckable(True)
         self.btn_mute.clicked.connect(self.toggle_mute)
-        is_muted = self.settings_manager.get("core.mute", False)
+        is_muted = bool(self.settings_manager.get("core.mute", False))
         self.btn_mute.setChecked(is_muted)
         if is_muted:
             self.btn_mute.setText("🔇︎")
@@ -147,11 +165,19 @@ class AgentView(QWidget):
         self.ui_message_appended.connect(self.append_to_conversation)
         self.orchestrator.on_message_appended.connect(self.ui_message_appended.emit)
 
+        self.ui_thought_card_updated.connect(self.update_thought_card)
+        if hasattr(self.orchestrator, 'on_thought_card_updated'):
+            self.orchestrator.on_thought_card_updated.connect(self.ui_thought_card_updated.emit)
+
         self.ui_busy_state_changed.connect(self.set_busy_state)
         self.orchestrator.on_busy_state_changed.connect(self.ui_busy_state_changed.emit)
 
         self.ui_amplitude_emitted.connect(self.visualizer.set_amplitude)
         self.orchestrator.on_amplitude_emitted.connect(self.ui_amplitude_emitted.emit)
+
+        self.ui_waveform_emitted.connect(self.visualizer.enqueue_waveform_frames)
+        if hasattr(self.orchestrator, 'on_waveform_emitted'):
+            self.orchestrator.on_waveform_emitted.connect(self.ui_waveform_emitted.emit)
 
         self.ui_paused_state_changed.connect(self.set_paused_state)
         self.orchestrator.on_paused_state_changed.connect(self.ui_paused_state_changed.emit)
@@ -170,12 +196,17 @@ class AgentView(QWidget):
             self.orchestrator.on_listening_state_changed.connect(self.ui_listening_state_changed.emit)
 
         self.set_paused_state(self.orchestrator.is_paused)
+        self.load_history()
 
     def cleanup(self):
         try:
             self.orchestrator.on_message_appended.disconnect(self.ui_message_appended.emit)
+            if hasattr(self.orchestrator, 'on_thought_card_updated'):
+                self.orchestrator.on_thought_card_updated.disconnect(self.ui_thought_card_updated.emit)
             self.orchestrator.on_busy_state_changed.disconnect(self.ui_busy_state_changed.emit)
             self.orchestrator.on_amplitude_emitted.disconnect(self.ui_amplitude_emitted.emit)
+            if hasattr(self.orchestrator, 'on_waveform_emitted'):
+                self.orchestrator.on_waveform_emitted.disconnect(self.ui_waveform_emitted.emit)
             self.orchestrator.on_paused_state_changed.disconnect(self.ui_paused_state_changed.emit)
             self.orchestrator.on_pause_pending.disconnect(self.ui_pause_pending_changed.emit)
             self.orchestrator.on_tool_started.disconnect(self.ui_tool_started.emit)
@@ -239,6 +270,13 @@ class AgentView(QWidget):
             else:
                 self.set_busy_state(False)
 
+    def _scroll_conversation_to_bottom(self):
+        self._at_bottom = True
+        self.main_layout.activate()
+        scroll_bar = self.conversation_log.verticalScrollBar()
+        if scroll_bar:
+            scroll_bar.setValue(scroll_bar.maximum())
+
     def set_busy_state(self, busy: bool, speaking: bool = False):
         if self.orchestrator.is_paused:
             self.loading_bar.hide()
@@ -267,9 +305,12 @@ class AgentView(QWidget):
                 )
 
             if speaking:
+                self._at_bottom = True
                 self.loading_bar.hide()
                 self.visualizer.show()
                 self.visualizer.set_active(True)
+                self._scroll_conversation_to_bottom()
+                QTimer.singleShot(0, self._scroll_conversation_to_bottom)
             else:
                 self.visualizer.set_active(False)
                 self.visualizer.hide()
@@ -347,7 +388,205 @@ class AgentView(QWidget):
         scroll_bar = self.console_log.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.maximum())
 
-    def append_to_conversation(self, sender, text):
+    def _on_scroll_value_changed(self, value: int):
+        scroll_bar = self.conversation_log.verticalScrollBar()
+        if scroll_bar and not self._is_loading_history:
+            self._at_bottom = (scroll_bar.maximum() - value) <= 60
+        if value <= 5 and self._has_more_history and not self._is_loading_history and self._loaded_messages:
+            self.load_older_messages()
+
+    def _on_scroll_range_changed(self, min_val: int, max_val: int):
+        if not self._is_loading_history and getattr(self, '_at_bottom', True):
+            scroll_bar = self.conversation_log.verticalScrollBar()
+            if scroll_bar:
+                scroll_bar.setValue(max_val)
+
+    def load_history(self):
+        if not self.chat_history_manager:
+            return
+        self._is_loading_history = True
+        try:
+            self._loaded_messages = []
+            self._has_more_history = True
+            messages = self.chat_history_manager.get_messages(limit=self.BATCH_SIZE)
+            if len(messages) < self.BATCH_SIZE:
+                self._has_more_history = False
+
+            self._loaded_messages = messages
+            self._render_all_loaded_messages()
+
+            scroll_bar = self.conversation_log.verticalScrollBar()
+            if scroll_bar:
+                scroll_bar.setValue(scroll_bar.maximum())
+            self._at_bottom = True
+        finally:
+            self._is_loading_history = False
+
+    def load_older_messages(self):
+        if not self._loaded_messages or not self._has_more_history or self._is_loading_history or not self.chat_history_manager:
+            return
+        self._is_loading_history = True
+        try:
+            oldest_id = None
+            for m in self._loaded_messages:
+                if m.get("id") is not None:
+                    oldest_id = m["id"]
+                    break
+
+            if oldest_id is None:
+                self._has_more_history = False
+                return
+
+            older_msgs = self.chat_history_manager.get_messages(
+                limit=self.BATCH_SIZE,
+                before_id=oldest_id
+            )
+            if not older_msgs:
+                self._has_more_history = False
+                return
+            if len(older_msgs) < self.BATCH_SIZE:
+                self._has_more_history = False
+
+            scroll_bar = self.conversation_log.verticalScrollBar()
+            old_max = scroll_bar.maximum() if scroll_bar else 0
+            old_val = scroll_bar.value() if scroll_bar else 0
+
+            self._loaded_messages = older_msgs + self._loaded_messages
+            self._render_all_loaded_messages()
+
+            if scroll_bar:
+                new_max = scroll_bar.maximum()
+                scroll_bar.setValue(old_val + (new_max - old_max))
+        finally:
+            self._is_loading_history = False
+
+    def _render_all_loaded_messages(self):
+        self.conversation_log.clear()
+        for m in self._loaded_messages:
+            self._render_message(m)
+
+    def _rerender_messages(self, scroll_to_bottom: bool = False):
+        scroll_bar = self.conversation_log.verticalScrollBar()
+        old_val = scroll_bar.value() if scroll_bar else 0
+        prev_loading = self._is_loading_history
+        self._is_loading_history = True
+        try:
+            self._render_all_loaded_messages()
+            if scroll_bar:
+                if scroll_to_bottom:
+                    self._at_bottom = True
+                    scroll_bar.setValue(scroll_bar.maximum())
+                else:
+                    target_val = min(old_val, scroll_bar.maximum())
+                    scroll_bar.setValue(target_val)
+                    self._at_bottom = (scroll_bar.maximum() - target_val) <= 60
+        finally:
+            self._is_loading_history = prev_loading
+
+    def on_anchor_clicked(self, url: QUrl):
+        url_str = url.toString()
+        if url_str.startswith("thought:toggle:"):
+            card_id_str = url_str[len("thought:toggle:"):]
+            self.toggle_thought_card(card_id_str)
+            return
+        if url.scheme() in ("http", "https", "mailto", "file"):
+            QDesktopServices.openUrl(url)
+
+    def toggle_thought_card(self, card_id_str: str):
+        for m in self._loaded_messages:
+            if m.get("sender") == "Thoughts" and m.get("id") is not None and str(m.get("id")) == str(card_id_str):
+                currently_collapsed = m.get("collapsed", str(m.get("id")) not in self._expanded_thought_cards)
+                new_collapsed = not currently_collapsed
+                m["collapsed"] = new_collapsed
+                key = str(m.get("id"))
+                if new_collapsed:
+                    self._expanded_thought_cards.discard(key)
+                else:
+                    self._expanded_thought_cards.add(key)
+                self._rerender_messages(scroll_to_bottom=False)
+                return
+
+    def update_thought_card(self, card_id, content: str, is_collapsed: bool):
+        key = str(card_id)
+        if is_collapsed:
+            self._expanded_thought_cards.discard(key)
+        else:
+            self._expanded_thought_cards.add(key)
+
+        scroll_bar = self.conversation_log.verticalScrollBar()
+        was_at_bottom = True
+        old_val = 0
+        if scroll_bar:
+            old_val = scroll_bar.value()
+            was_at_bottom = (scroll_bar.maximum() - old_val) <= 60
+        self._at_bottom = was_at_bottom
+
+        existing = None
+        for m in reversed(self._loaded_messages):
+            if m.get("sender") == "Thoughts" and m.get("id") is not None and str(m.get("id")) == key:
+                existing = m
+                break
+
+        if existing is not None:
+            existing["content"] = content
+            existing["collapsed"] = is_collapsed
+            self._rerender_messages(scroll_to_bottom=was_at_bottom)
+            return
+
+        if not content:
+            return
+
+        msg = {
+            "id": card_id,
+            "sender": "Thoughts",
+            "content": content,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "collapsed": is_collapsed,
+        }
+        self._loaded_messages.append(msg)
+        if len(self._loaded_messages) > self.MAX_GUI_MESSAGES:
+            self._loaded_messages = self._loaded_messages[-self.MAX_GUI_MESSAGES:]
+            self._has_more_history = True
+            self._rerender_messages(scroll_to_bottom=was_at_bottom)
+        else:
+            self._render_message(msg)
+            if scroll_bar:
+                if was_at_bottom:
+                    self._at_bottom = True
+                    scroll_bar.setValue(scroll_bar.maximum())
+                else:
+                    scroll_bar.setValue(min(old_val, scroll_bar.maximum()))
+
+    def _render_message(self, m: dict):
+        sender = m.get("sender", "Agent")
+        text = m.get("content", "")
+        timestamp_str = m.get("timestamp", "")
+
+        if sender == "Thoughts":
+            card_id = m.get("id")
+            if "collapsed" in m:
+                collapsed = bool(m["collapsed"])
+            else:
+                collapsed = card_id is None or str(card_id) not in self._expanded_thought_cards
+            tools_map = getattr(getattr(self.orchestrator, "cerebrum", None), "tools", None)
+            tool_colors = (
+                {
+                    k: v.color
+                    for k, v in tools_map.items()
+                    if isinstance(getattr(v, "color", None), str) and v.color
+                }
+                if isinstance(tools_map, dict)
+                else None
+            )
+            isolated_html = render_thought_card_html(
+                card_id=card_id,
+                content=text,
+                collapsed=collapsed,
+                tool_colors=tool_colors,
+            )
+            insert_message_into_log(self.conversation_log, isolated_html)
+            return
+
         user_name = "User"
         try:
             user_name = self.config_manager.get("user-full-name", "").strip() or "User"
@@ -384,7 +623,20 @@ class AgentView(QWidget):
             border_color = "#36363b"
             formatted_text = render_markdown_to_html(text)
 
-        timestamp = datetime.now().strftime("%H:%M")
+        time_display = ""
+        if timestamp_str:
+            try:
+                dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                now_dt = datetime.now().astimezone()
+                local_dt = dt.astimezone()
+                if local_dt.date() == now_dt.date():
+                    time_display = local_dt.strftime("%H:%M")
+                else:
+                    time_display = local_dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                time_display = timestamp_str[:16].replace("T", " ")
+        else:
+            time_display = datetime.now().strftime("%H:%M")
 
         inner_html = f"""
         <div style="margin-bottom: 4px; text-align: left;">
@@ -394,7 +646,7 @@ class AgentView(QWidget):
             {formatted_text}
         </div>
         <div style="text-align: right; color: #555555; font-size: 11px; margin-top: 6px;">
-            {timestamp}
+            {time_display}
         </div>
         """
         isolated_html = wrap_in_isolated_container(
@@ -406,3 +658,32 @@ class AgentView(QWidget):
             padding="12px 18px",
         )
         insert_message_into_log(self.conversation_log, isolated_html)
+
+    def append_to_conversation(self, sender, text):
+        msg = {
+            "sender": sender,
+            "content": text,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        scroll_bar = self.conversation_log.verticalScrollBar()
+        was_at_bottom = True
+        old_val = 0
+        if scroll_bar:
+            old_val = scroll_bar.value()
+            was_at_bottom = (scroll_bar.maximum() - old_val) <= 60
+        self._at_bottom = was_at_bottom
+
+        self._loaded_messages.append(msg)
+        if len(self._loaded_messages) > self.MAX_GUI_MESSAGES:
+            self._loaded_messages = self._loaded_messages[-self.MAX_GUI_MESSAGES:]
+            self._has_more_history = True
+            self._rerender_messages(scroll_to_bottom=was_at_bottom)
+        else:
+            self._render_message(msg)
+            if scroll_bar:
+                if was_at_bottom:
+                    self._at_bottom = True
+                    scroll_bar.setValue(scroll_bar.maximum())
+                else:
+                    scroll_bar.setValue(min(old_val, scroll_bar.maximum()))
+

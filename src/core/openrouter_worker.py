@@ -1,4 +1,9 @@
-from core.prompt_context import MemoryContextWorkerMixin, fit_system_prompt
+from core.prompt_context import (
+    MemoryContextWorkerMixin,
+    fit_system_prompt,
+    format_prompt_footprint,
+    inject_static_worker_instructions,
+)
 import os
 import time
 import threading
@@ -79,6 +84,141 @@ def _normalize_model_name(model_name: str) -> str:
     if low.startswith("mistral-"):
         return f"mistralai/{low}"
     return m
+
+
+_unsupported_audio_models = set()
+_model_modalities_cache = {}
+_cache_loaded = False
+
+
+def _get_cache_file_path(filename: str) -> str:
+    try:
+        from config.paths import get_app_cache_dir
+        cache_dir = get_app_cache_dir()
+    except Exception:
+        cache_dir = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, filename)
+
+
+def _load_audio_capabilities_cache():
+    global _unsupported_audio_models, _model_modalities_cache, _cache_loaded
+    if _cache_loaded:
+        return
+    _cache_loaded = True
+
+    # 1. Load unsupported models list
+    try:
+        unsupported_file = _get_cache_file_path("openrouter_unsupported_audio_models.json")
+        if os.path.exists(unsupported_file):
+            with open(unsupported_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    _unsupported_audio_models.update(data)
+    except Exception as e:
+        logger.debug(f"Failed to load OpenRouter unsupported audio cache: {e}")
+
+    # 2. Load model modalities cache
+    try:
+        modalities_file = _get_cache_file_path("openrouter_model_modalities.json")
+        if os.path.exists(modalities_file):
+            with open(modalities_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _model_modalities_cache.update(data)
+    except Exception as e:
+        logger.debug(f"Failed to load OpenRouter modalities cache: {e}")
+
+
+def _save_unsupported_audio_cache():
+    try:
+        unsupported_file = _get_cache_file_path("openrouter_unsupported_audio_models.json")
+        with open(unsupported_file, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(_unsupported_audio_models)), f, indent=2)
+    except Exception as e:
+        logger.debug(f"Failed to save OpenRouter unsupported audio cache: {e}")
+
+
+def _save_modalities_cache():
+    try:
+        modalities_file = _get_cache_file_path("openrouter_model_modalities.json")
+        with open(modalities_file, "w", encoding="utf-8") as f:
+            json.dump(_model_modalities_cache, f, indent=2)
+    except Exception as e:
+        logger.debug(f"Failed to save OpenRouter modalities cache: {e}")
+
+
+def _model_supports_audio_input(model_name: str) -> bool:
+    """
+    Determines whether a given OpenRouter model supports native multimodal audio input (input_audio).
+    Checks known unsupported records, cached catalog modalities, and model family heuristics.
+    Fails closed (returns False) for non-audio or unknown models to prevent HTTP 404 routing errors.
+    """
+    if not model_name:
+        return False
+    _load_audio_capabilities_cache()
+    norm = _normalize_model_name(model_name)
+    low = norm.lower()
+
+    # 1. If previously recorded as unsupported on OpenRouter, fail closed
+    if norm in _unsupported_audio_models or model_name in _unsupported_audio_models or low in _unsupported_audio_models:
+        return False
+
+    # 2. Check catalog modalities cache if available
+    if norm in _model_modalities_cache:
+        mods = _model_modalities_cache[norm]
+        if isinstance(mods, list):
+            return "audio" in mods
+    if model_name in _model_modalities_cache:
+        mods = _model_modalities_cache[model_name]
+        if isinstance(mods, list):
+            return "audio" in mods
+
+    # 3. Known non-audio prefixes: OpenRouter routes these through 'Filter by Input Audio Support' with 0 endpoints
+    non_audio_prefixes = (
+        "openai/",
+        "anthropic/",
+        "deepseek/",
+        "meta-llama/",
+        "mistralai/",
+        "cohere/",
+        "x-ai/",
+        "amazon/",
+        "gryphe/",
+        "nousresearch/",
+        "microsoft/",
+        "liquid/",
+        "perplexity/",
+        "google/gemma",
+    )
+    # Models with explicit audio markers support audio
+    if "-audio" in low or "-omni" in low:
+        return True
+
+    # If it starts with a known non-audio family, return False immediately
+    if any(low.startswith(p) for p in non_audio_prefixes):
+        return False
+
+    # Known audio-capable families on OpenRouter
+    if low.startswith("google/gemini") and not ("-image" in low or "banana" in low):
+        return True
+    if any(prefix in low for prefix in ["xiaomi/mimo", "meta/muse", "thinkingmachines/inkling"]):
+        return True
+
+    # Safe default: fail closed to avoid HTTP 404 routing failures
+    return False
+
+
+def _record_unsupported_audio_model(model_name: str):
+    """Permanently records that a model does not support audio input on OpenRouter."""
+    if not model_name:
+        return
+    _load_audio_capabilities_cache()
+    norm = _normalize_model_name(model_name)
+    _unsupported_audio_models.add(norm)
+    _unsupported_audio_models.add(model_name)
+    _unsupported_audio_models.add(norm.lower())
+    _save_unsupported_audio_cache()
 
 
 def _is_quota_error(err: Exception) -> bool:
@@ -211,6 +351,8 @@ class FunctionCallObject:
 class OpenRouterWorker(MemoryContextWorkerMixin):
     normalize_model_name = staticmethod(_normalize_model_name)
     _normalize_model_name = staticmethod(_normalize_model_name)
+    model_supports_audio_input = staticmethod(_model_supports_audio_input)
+    record_unsupported_audio_model = staticmethod(_record_unsupported_audio_model)
 
     def __init__(self, agent_id=None):
         super().__init__()
@@ -284,11 +426,10 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 "Session Start Error: OpenRouter Worker is not available")
             return
 
-        self.sys_instruct = system_instruction or ""
-        self.sys_instruct += "\n\nCRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). You MUST invoke your intended tool(s) in the EXACT SAME TURN immediately following your reasoning. If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
-        self.sys_instruct += "\n\nAUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech. You will NOT speak automatically. If you wish to communicate with the user, you MUST explicitly use the Speaker tool (e.g., Speaker_speak_aloud). Otherwise, you will remain completely silent. Speak from a first-person perspective."
-
+        self._append_worker_static_instructions = True
+        self.sys_instruct = inject_static_worker_instructions(system_instruction or "")
         self.sys_instruct = fit_system_prompt(self.sys_instruct, self.settings, tools)
+        logging.debug(f"OpenRouterWorker prompt footprint: {format_prompt_footprint(self.sys_instruct, tools)}")
         self.tools = tools
         self.openai_tools = []
         if self.tools:
@@ -325,22 +466,49 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         messages = []
         for m in self.history:
             role = m.get("role", "user")
-            content = m.get("content", "") or ""
+            raw_c = m.get("content", "") or ""
+            text_parts = []
+            if m.get("reasoning"):
+                text_parts.append(m["reasoning"])
+            elif m.get("reasoning_content"):
+                text_parts.append(m["reasoning_content"])
+            if isinstance(raw_c, str):
+                if raw_c.strip():
+                    text_parts.append(raw_c)
+            elif isinstance(raw_c, list):
+                for block in raw_c:
+                    if isinstance(block, dict):
+                        b_type = block.get("type", "")
+                        if b_type == "text":
+                            t = block.get("text", "")
+                            if t:
+                                text_parts.append(t)
+                        elif b_type in ("image_url", "file", "input_audio"):
+                            text_parts.append("[Media attachment from earlier in session]")
+            content = "\n".join(text_parts).strip()
             if m.get("tool_calls"):
                 for tc in m["tool_calls"]:
-                    fn = tc.get("function", {})
-                    content += f"\n[Tool invocation: {fn.get('name')}({fn.get('arguments', '')})]"
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+                    if isinstance(fn, dict):
+                        name = fn.get("name", "")
+                        args = fn.get("arguments", "")
+                    else:
+                        name = getattr(fn, "name", "")
+                        args = getattr(fn, "arguments", "")
+                    content += f"\n[Tool invocation: {name}({args})]"
             if role == "tool":
-                messages.append({"role": "user", "content": f"[Tool Result: {content}]"})
+                messages.append({"role": "user", "content": f"[Tool Result: {content.strip()}]"})
             else:
-                messages.append({"role": role, "content": content})
+                messages.append({"role": role, "content": content.strip()})
         return messages
 
     def set_session_history(self, messages: list):
         """Restores chat history from normalized turns."""
+        from core.session_cache import normalize_session_messages
+        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
         self.history = []
         self.consumed_tool_call_ids = set()
-        for msg in messages:
+        for msg in norm_messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if content:
@@ -415,8 +583,28 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 }
             }
 
-        # Handle Audio files via native multimodal audio input
+        # Handle Audio files (native multimodal audio input for audio models, LocalSTT transcription for text/vision models)
         if (mime_type and mime_type.startswith("audio/")) or ext in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus", ".aac"]:
+            active_model = getattr(self, "current_model", None) or getattr(self, "primary_model", None)
+            if not self.model_supports_audio_input(active_model):
+                transcription = None
+                try:
+                    from core.local_stt import LocalSTT
+                    transcription = LocalSTT().transcribe(exp_path)
+                except Exception as e:
+                    logger.debug(f"LocalSTT failed for {exp_path}: {e}")
+
+                if transcription and not transcription.startswith("Failed"):
+                    return {
+                        "type": "text",
+                        "text": f"[Voice Message Audio: {os.path.basename(exp_path)}]\n[Voice Message Transcription: {transcription}]"
+                    }
+                else:
+                    return {
+                        "type": "text",
+                        "text": f"[Audio file attached: {os.path.basename(exp_path)}. Note: Model {active_model} does not support multimodal audio input directly. To extract text or messages from this audio file, use the Media_transcribe_audio tool.]"
+                    }
+
             with open(exp_path, "rb") as f:
                 b64_data = base64.b64encode(f.read()).decode("utf-8")
             fmt = ext.lstrip(".").lower()
@@ -701,7 +889,7 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                 if is_low_token:
                     content_blocks.append(
                         {"type": "text", "text": "[Audio attachment skipped: Low Token Mode is active]"})
-                elif getattr(self, "multimodal_failed", False):
+                elif getattr(self, "multimodal_failed", False) or not self.model_supports_audio_input(getattr(self, "current_model", None) or getattr(self, "primary_model", None)):
                     text_placeholder = f"[Audio attachment skipped: multimodal audio input is unsupported or failed on this model: {os.path.basename(audio_path)}]"
                     try:
                         from core.local_stt import LocalSTT
@@ -930,6 +1118,8 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                         f"Stripping multimodal input and retrying on standard model {active_model}..."
                     )
                     self.multimodal_failed = True
+                    if any(term in err_str.lower() for term in ("input audio", "input_audio", "support audio", "modality")):
+                        self.record_unsupported_audio_model(active_model)
                     _strip_multimodal_from_history(self.history)
                     multimodal_retried = True
                     continue
@@ -1005,6 +1195,13 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             raw_models = data.get("data", [])
+            _load_audio_capabilities_cache()
+            for m in raw_models:
+                if isinstance(m, dict) and "id" in m:
+                    arch = m.get("architecture", {})
+                    if isinstance(arch, dict) and "input_modalities" in arch:
+                        _model_modalities_cache[m["id"]] = arch["input_modalities"]
+            _save_modalities_cache()
             model_ids = [m["id"] for m in raw_models if isinstance(m, dict) and "id" in m]
             sorted_models = sorted(model_ids, key=lambda s: s.lower())
             logger.info(f"Successfully fetched {len(sorted_models)} models from OpenRouter catalog.")

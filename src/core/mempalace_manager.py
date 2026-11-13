@@ -18,6 +18,46 @@ from core.memory_records import MemoryHit, MemoryRecord, MemoryResult
 
 from mempalace.layers import MemoryStack
 
+SPHERE_LEVEL_MIN = 1
+SPHERE_LEVEL_MAX = 10
+
+SPHERE_LABELS: Dict[int, str] = {
+    1: "Self",
+    2: "Immediate",
+    3: "Household",
+    4: "Community",
+    5: "Civic",
+    6: "Regional",
+    7: "Societal",
+    8: "Planetary",
+    9: "Generational",
+    10: "Universal",
+}
+
+VALID_ENTITY_TYPES = frozenset({
+    "self", "human", "person", "agent", "animal", "group",
+    "community", "organization", "institution", "ecosystem", "abstract",
+})
+
+
+def _infer_default_sphere_and_type(perspective: str) -> Tuple[int, str]:
+    """Deterministic fallback mapping for legacy v1 mirror keys."""
+    norm = str(perspective or "").strip().lower()
+    if norm == "self":
+        return 1, "self"
+    if any(tok in norm for tok in ("household", "family")):
+        return 3, "group"
+    if any(tok in norm for tok in ("team", "community", "guild", "project")):
+        return 4, "community"
+    if any(tok in norm for tok in ("org", "company", "institution")):
+        return 5, "organization"
+    if any(tok in norm for tok in ("ecosystem", "biosphere", "planet", "climate")):
+        return 8, "ecosystem"
+    if any(tok in norm for tok in ("humanity", "future", "universal")):
+        return 9, "abstract"
+    return 2, "human"
+
+
 _mempalace_lock = threading.Lock()
 _palace_inprocess_locks = {}
 _palace_inprocess_locks_lock = threading.Lock()
@@ -247,14 +287,21 @@ class MemPalaceManager:
 
         defaults = {
             "sanctuary_max_chars": 4800,
+            "mirrors": 4800,
             "short_term_max_chars": 2400,
             "prospective_max_chars": 2400,
             "short_term_context_max_chars": 3200
         }
 
+        effective_raw = dict(raw_budgets)
+        if "mirrors" in effective_raw and "sanctuary_max_chars" not in effective_raw:
+            effective_raw["sanctuary_max_chars"] = effective_raw["mirrors"]
+        elif "sanctuary_max_chars" in effective_raw and "mirrors" not in effective_raw:
+            effective_raw["mirrors"] = effective_raw["sanctuary_max_chars"]
+
         budgets = {}
         for key, def_val in defaults.items():
-            budgets[key] = self._validate_budget(raw_budgets.get(key), key, def_val)
+            budgets[key] = self._validate_budget(effective_raw.get(key), key, def_val)
 
         # Provider awareness: if low-token mode is active, scale budgets down
         is_low_token = settings.get("core.low_token_mode", False) or settings.get("core.low-token-mode", False)
@@ -530,9 +577,18 @@ class MemPalaceManager:
         except Exception as e:
             logging.error(f"Error syncing identity: {e}", exc_info=True)
 
+    def _get_l0_identity_raw(self) -> str:
+        """Returns raw Layer 0 Identity text without acquiring state barrier."""
+        # R1: Layer 0 Identity is protected policy and is NEVER truncated!
+        return self.stack.l0.render() if self.stack and hasattr(self.stack, 'l0') else ""
+
     @memory_state_operation
-    def wake_up(self, wing: str = None) -> str:
-        """Returns L0 + Self-Perception + Short-Term Context + Morphological Prospective Context with token budgets."""
+    def get_l0_identity(self) -> str:
+        """Returns Layer 0 Identity string for the static system prompt prefix."""
+        return self._get_l0_identity_raw()
+
+    def _wake_up_dynamic_raw(self, wing: str = None) -> str:
+        """Returns dynamic wake context wrapped in [OPENAMITY_MEMORY_BEGIN]...[OPENAMITY_MEMORY_END]."""
         def _bound_section(text: str, max_chars: int, label: str) -> str:
             if not text or len(text) <= max_chars:
                 return text
@@ -540,19 +596,17 @@ class MemPalaceManager:
             avail = max(0, max_chars - len(notice))
             return text[:avail] + notice
 
-        l0_raw = self.stack.l0.render() if self.stack and hasattr(self.stack, 'l0') else ""
-        # R1: Layer 0 Identity is protected policy and is NEVER truncated!
         from core.prompt_context import MEMORY_BEGIN, MEMORY_END
-        base_context = l0_raw + "\n\n" + MEMORY_BEGIN
+        base_context = MEMORY_BEGIN
 
         now = datetime.datetime.now().astimezone()
         tz_str = f" ({now.tzname()})" if now.tzname() else ""
         current_time_str = f"{now.strftime('%A, %Y-%m-%d %H:%M:%S')}{tz_str}"
         base_context += f"\n\n[Wake Context: Current Date & Time is {current_time_str}]"
 
-        self_perception = self.get_self_perception()
+        mirrors_limit = self._get_budget("mirrors", 4800)
+        self_perception = self.get_self_perception(max_chars=mirrors_limit)
         if self_perception:
-            mirrors_limit = self._get_budget("sanctuary_max_chars", 4800)
             base_context += f"\n\n{_bound_section(self_perception, mirrors_limit, 'Layer 2 Mirrors')}"
 
         memories = self._load_short_term_memories()
@@ -584,6 +638,18 @@ class MemPalaceManager:
         return base_context + "\n" + MEMORY_END
 
     @memory_state_operation
+    def wake_up_dynamic(self, wing: str = None) -> str:
+        """Returns dynamic wake memory block wrapped in MEMORY_BEGIN..MEMORY_END."""
+        return self._wake_up_dynamic_raw(wing=wing)
+
+    @memory_state_operation
+    def wake_up(self, wing: str = None) -> str:
+        """Returns L0 + Self-Perception + Short-Term Context + Morphological Prospective Context with token budgets."""
+        l0_raw = self._get_l0_identity_raw()
+        dynamic = self._wake_up_dynamic_raw(wing=wing)
+        return l0_raw + "\n\n" + dynamic
+
+    @memory_state_operation
     def _get_prospective_memory_context(self, max_chars: Optional[int] = None) -> str:
         if not self._morpho_enabled or not self.morpho_layer:
             return ""
@@ -602,17 +668,23 @@ class MemPalaceManager:
             for tier in ["short_term", "medium_term", "long_term"]:
                 for asp in aspirations.get(tier, []):
                     if asp.get("status") == "active" and asp.get("description"):
-                        goals.append((asp.get("id", f"asp_{uuid.uuid4().hex[:6]}"), asp["description"]))
+                        raw_sphere = asp.get("sphere_level", 1)
+                        try:
+                            sphere_lvl = max(1, min(10, int(raw_sphere))) if not isinstance(raw_sphere, bool) else 1
+                        except (ValueError, TypeError):
+                            sphere_lvl = 1
+                        goals.append((asp.get("id", f"asp_{uuid.uuid4().hex[:6]}"), asp["description"], sphere_lvl))
 
             for task in traj_data.get("tasks", []):
                 if task.get("status") == "in_progress" and task.get("description"):
-                    goals.append((task.get("id", f"tsk_{uuid.uuid4().hex[:6]}"), task["description"]))
+                    goals.append((task.get("id", f"tsk_{uuid.uuid4().hex[:6]}"), task["description"], 1))
 
             if not goals:
                 return ""
 
             col = self._get_collection(create=False)
             all_target_drawers = []
+            drawer_spheres: Dict[str, int] = {}
             current_rev = self.get_corpus_revision()
             chunk_re = re.compile(r"^(.*)_chunk_\d+$")
 
@@ -709,7 +781,7 @@ class MemPalaceManager:
                 else:
                     self._last_col_fp = current_fp
 
-            for goal_key, goal_text in goals:
+            for goal_key, goal_text, goal_sphere in goals:
                 text_hash = hashlib.sha1(goal_text.encode("utf-8")).hexdigest()
                 setpoint = self.morpho_layer.get_setpoint(goal_key)
 
@@ -758,14 +830,28 @@ class MemPalaceManager:
                         # Do NOT cache transient errors as valid empty setpoints!
                         target_drawers = setpoint.get("explicit_drawers", []) if setpoint else []
 
+                for td in target_drawers:
+                    cid = self.morpho_layer._canonical_id(td)
+                    if cid not in drawer_spheres or goal_sphere < drawer_spheres[cid]:
+                        drawer_spheres[cid] = goal_sphere
                 all_target_drawers.extend(target_drawers)
 
             all_target_drawers = list(dict.fromkeys(all_target_drawers))
             if not all_target_drawers:
                 return ""
 
+            from core.morphological_layer import SPHERE_COUPLING_WEIGHTS
+            sphere_weights = {
+                did: SPHERE_COUPLING_WEIGHTS.get(lvl, 1.0)
+                for did, lvl in drawer_spheres.items()
+            }
+
             top_k = int(self._morpho_settings.get("top_k", 5))
-            results = self.morpho_layer.relax_setpoint(all_target_drawers, top_k=top_k)
+            results = self.morpho_layer.relax_setpoint(
+                all_target_drawers,
+                top_k=top_k,
+                sphere_weights=sphere_weights,
+            )
             if not results or not col:
                 return ""
 
@@ -1334,18 +1420,111 @@ class MemPalaceManager:
                 context.append(res)
         return "\n\n".join(context)
 
+    @staticmethod
+    def _normalize_mirror_entry(perspective: str, data: Any) -> Dict[str, Any]:
+        """Normalizes a v1 or v2 mirror entry into the canonical v2 schema while preserving v1 keys."""
+        def_sphere, def_etype = _infer_default_sphere_and_type(perspective)
+        if not isinstance(data, dict):
+            text_val = str(data) if data is not None else ""
+            return {
+                "subjective_view": text_val,
+                "current_view": text_val,
+                "perspective_cone": "",
+                "sphere_level": 1 if str(perspective).strip().lower() == "self" else def_sphere,
+                "entity_type": "self" if str(perspective).strip().lower() == "self" else def_etype,
+                "umwelt_horizon": "",
+                "epistemic_boundary": "",
+                "ripple_notes": "",
+                "prediction_error_note": "",
+                "confidence": 1.0,
+                "provenance": "unknown",
+                "evidence_refs": [],
+                "contradicted_by": [],
+                "updated_at": "",
+                "last_updated": "",
+                "history": [],
+            }
+
+        entry = copy.deepcopy(data)
+        subj = entry.get("subjective_view")
+        curr = entry.get("current_view")
+        if subj is not None and str(subj) != "":
+            view_str = str(subj)
+        elif curr is not None:
+            view_str = str(curr)
+        else:
+            view_str = ""
+        entry["subjective_view"] = view_str
+        entry["current_view"] = view_str
+
+        if str(perspective).strip().lower() == "self":
+            entry["sphere_level"] = 1
+            entry["entity_type"] = "self"
+        else:
+            raw_sphere = entry.get("sphere_level", def_sphere)
+            if isinstance(raw_sphere, bool) or not isinstance(raw_sphere, int):
+                try:
+                    if isinstance(raw_sphere, str) and raw_sphere.strip().lstrip("-").isdigit():
+                        raw_sphere = int(raw_sphere.strip())
+                    else:
+                        raw_sphere = def_sphere
+                except Exception:
+                    raw_sphere = def_sphere
+            entry["sphere_level"] = max(SPHERE_LEVEL_MIN, min(SPHERE_LEVEL_MAX, int(raw_sphere)))
+
+            raw_etype = str(entry.get("entity_type", def_etype) or def_etype).strip().lower()
+            entry["entity_type"] = raw_etype if raw_etype in VALID_ENTITY_TYPES else def_etype
+
+        for str_field in (
+            "perspective_cone",
+            "umwelt_horizon",
+            "epistemic_boundary",
+            "ripple_notes",
+            "prediction_error_note",
+        ):
+            val = entry.get(str_field)
+            entry[str_field] = str(val).strip() if val is not None else ""
+
+        raw_conf = entry.get("confidence", 1.0)
+        if raw_conf is None or isinstance(raw_conf, bool):
+            entry["confidence"] = 1.0
+        else:
+            try:
+                entry["confidence"] = max(0.0, min(1.0, float(raw_conf)))
+            except (ValueError, TypeError):
+                entry["confidence"] = 1.0
+
+        if not entry.get("provenance"):
+            entry["provenance"] = "inferred"
+        else:
+            entry["provenance"] = str(entry["provenance"]).strip()
+
+        for list_field in ("evidence_refs", "contradicted_by", "history"):
+            val = entry.get(list_field)
+            entry[list_field] = list(val) if isinstance(val, list) else []
+
+        ts = entry.get("updated_at") or entry.get("last_updated") or ""
+        entry["updated_at"] = str(ts)
+        entry["last_updated"] = str(ts)
+        return entry
+
     @memory_state_operation
     def _load_mirrors(self) -> dict:
         """Loads and returns deepcopy of mirrors state; treats corrupt JSON distinctly without overwriting."""
         with self._cache_lock:
-            if getattr(self, '_mirrors_cache', None) is not None:
-                return copy.deepcopy(self._mirrors_cache)
-
             path = os.path.join(self.palace_path, "mirrors.json")
+            cur_mtime = os.stat(path).st_mtime_ns if os.path.exists(path) else None
+            if getattr(self, '_mirrors_cache', None) is not None:
+                cached_mtime = getattr(self, '_mirrors_mtime', None)
+                if cached_mtime is None or cached_mtime == cur_mtime:
+                    return copy.deepcopy(self._mirrors_cache)
+
             if os.path.exists(path):
                 try:
                     with open(path, 'r', encoding="utf-8") as f:
                         mirrors = json.load(f)
+                    if not isinstance(mirrors, dict):
+                        raise json.JSONDecodeError("Expected top-level JSON object for mirrors.json", "", 0)
                 except json.JSONDecodeError as jde:
                     logging.critical(f"MemPalaceManager: mirrors.json is corrupt: {jde}")
                     corrupt_backup = f"{path}.corrupt.{int(time.time())}"
@@ -1360,29 +1539,13 @@ class MemPalaceManager:
                     logging.error(f"Error reading mirrors: {e}")
                     raise
 
-                modified = False
-                for perspective, data in list(mirrors.items()):
-                    if not isinstance(data, dict):
-                        mirrors[perspective] = {"current_view": str(data), "history": [], "provenance": "unknown"}
-                        modified = True
-                        continue
+                normalized = {}
+                for perspective, data in mirrors.items():
+                    normalized[perspective] = self._normalize_mirror_entry(perspective, data)
 
-                    if "current_view" not in data:
-                        data["current_view"] = ""
-                        modified = True
-                    if "history" not in data:
-                        data["history"] = []
-                        modified = True
-                    if "provenance" not in data:
-                        data["provenance"] = "unknown"
-                        modified = True
-
-                if modified:
-                    self._save_mirrors(mirrors)
-                else:
-                    self._mirrors_cache = copy.deepcopy(mirrors)
-
-                return copy.deepcopy(mirrors)
+                self._mirrors_cache = copy.deepcopy(normalized)
+                self._mirrors_mtime = os.stat(path).st_mtime_ns if os.path.exists(path) else None
+                return copy.deepcopy(normalized)
             return {}
 
     @memory_state_operation
@@ -1390,113 +1553,360 @@ class MemPalaceManager:
         """Atomically persists mirrors state BEFORE updating in-memory cache, propagating typed errors."""
         with self._cache_lock:
             path = os.path.join(self.palace_path, "mirrors.json")
-            to_save = copy.deepcopy(mirrors)
+            to_save = {}
+            cached = self._mirrors_cache if isinstance(getattr(self, "_mirrors_cache", None), dict) else {}
+            for perspective, entry in mirrors.items():
+                if isinstance(entry, dict):
+                    entry_copy = copy.deepcopy(entry)
+                    prev = cached.get(perspective, {}) if isinstance(cached.get(perspective), dict) else {}
+                    # Synchronize last_updated and updated_at if a caller mutated one directly
+                    lu = entry_copy.get("last_updated")
+                    ua = entry_copy.get("updated_at")
+                    if lu and ua and lu != ua:
+                        if prev.get("last_updated") != lu:
+                            entry_copy["updated_at"] = lu
+                        else:
+                            entry_copy["last_updated"] = ua
+                    elif lu and not ua:
+                        entry_copy["updated_at"] = lu
+                    elif ua and not lu:
+                        entry_copy["last_updated"] = ua
+
+                    # Synchronize current_view and subjective_view if a caller mutated one directly
+                    cv = entry_copy.get("current_view")
+                    sv = entry_copy.get("subjective_view")
+                    if cv is not None and sv is not None and cv != sv:
+                        if prev.get("current_view") != cv:
+                            entry_copy["subjective_view"] = cv
+                        else:
+                            entry_copy["current_view"] = sv
+                    elif cv is not None and sv is None:
+                        entry_copy["subjective_view"] = cv
+                    elif sv is not None and cv is None:
+                        entry_copy["current_view"] = sv
+
+                    to_save[perspective] = self._normalize_mirror_entry(perspective, entry_copy)
+                else:
+                    to_save[perspective] = self._normalize_mirror_entry(perspective, entry)
+
             atomic_json_write(path, to_save)
-            self._mirrors_cache = to_save
+            self._mirrors_cache = copy.deepcopy(to_save)
+            self._mirrors_mtime = os.stat(path).st_mtime_ns if os.path.exists(path) else None
 
     @memory_state_operation
-    def update_mirror(self, perspective: str, subjective_view: str, provenance: str = "inferred",
-                      confidence: float = 1.0, evidence_refs: list = None, contradicted_by: list = None) -> dict:
-        """Surgically updates a mirror record and persists atomically, returning revision metadata."""
-        if not perspective or not subjective_view:
-            raise ValueError("perspective and subjective_view are required")
+    def update_mirror(
+        self,
+        perspective: str,
+        subjective_view: Optional[str] = None,
+        provenance: Optional[Any] = None,
+        confidence: Optional[Any] = None,
+        evidence_refs: Optional[List[str]] = None,
+        contradicted_by: Optional[List[str]] = None,
+        perspective_cone: Optional[str] = None,
+        sphere_level: Optional[int] = None,
+        entity_type: Optional[str] = None,
+        umwelt_horizon: Optional[str] = None,
+        epistemic_boundary: Optional[str] = None,
+        ripple_notes: Optional[str] = None,
+        prediction_error_note: Optional[str] = None,
+    ) -> dict:
+        """
+        Surgically updates a mirror record with Concentric Spheres of Consciousness (v2)
+        and Bidirectional Empathy Cone fields, persisting atomically.
+        Supports partial updates without blanking omitted fields.
+        """
+        if not perspective or not str(perspective).strip():
+            raise ValueError("Perspective name cannot be empty.")
+        perspective = str(perspective).strip()
 
-        with self._cache_lock:
-            # Bound confidence to [0.0, 1.0]
-            if confidence is not None:
-                try:
-                    conf = max(0.0, min(1.0, float(confidence)))
-                except (ValueError, TypeError):
-                    conf = 1.0
+        # Support both (perspective, subjective_view, provenance, confidence)
+        # and (perspective, subjective_view, confidence, provenance) positional calls
+        if isinstance(provenance, (int, float)) and not isinstance(provenance, bool):
+            if isinstance(confidence, str) or confidence is None:
+                provenance, confidence = confidence, provenance
             else:
-                conf = 1.0
+                confidence = provenance
+                provenance = None
 
+        if sphere_level is not None:
+            if isinstance(sphere_level, bool) or not isinstance(sphere_level, int):
+                raise ValueError(f"sphere_level must be an integer in [1, 10], got {sphere_level!r}")
+            sphere_level = max(SPHERE_LEVEL_MIN, min(SPHERE_LEVEL_MAX, sphere_level))
+
+        if entity_type is not None:
+            entity_type = str(entity_type).strip().lower()
+            if entity_type not in VALID_ENTITY_TYPES:
+                raise ValueError(
+                    f"Invalid entity_type '{entity_type}'. Valid types: {sorted(VALID_ENTITY_TYPES)}"
+                )
+
+        if confidence is not None:
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+                raise ValueError(f"confidence must be a float in [0.0, 1.0], got {confidence!r}")
+            confidence = max(0.0, min(1.0, float(confidence)))
+
+        with _palace_cross_instance_lock(self.palace_path), self._cache_lock:
             mirrors = self._load_mirrors()
-            now_str = datetime.datetime.now().isoformat()
+            existing = mirrors.get(perspective, {})
+            def_sphere, def_etype = _infer_default_sphere_and_type(perspective)
 
-            if perspective not in mirrors:
-                mirrors[perspective] = {
-                    "current_view": subjective_view,
-                    "history": []
-                }
+            if perspective.lower() == "self":
+                final_sphere = 1
+                final_etype = "self"
             else:
-                old_view = mirrors[perspective].get("current_view", "")
+                final_sphere = (
+                    sphere_level
+                    if sphere_level is not None
+                    else existing.get("sphere_level", def_sphere)
+                )
+                final_etype = (
+                    entity_type
+                    if entity_type is not None
+                    else existing.get("entity_type", def_etype)
+                )
+
+            final_subj = (
+                subjective_view.strip()
+                if subjective_view is not None
+                else existing.get("subjective_view", existing.get("current_view", ""))
+            )
+            final_cone = (
+                perspective_cone.strip()
+                if perspective_cone is not None
+                else existing.get("perspective_cone", "")
+            )
+
+            if not final_subj and not final_cone:
+                raise ValueError(
+                    "Mirror entry requires at least one of subjective_view or perspective_cone."
+                )
+
+            now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            history = list(existing.get("history", [])) if existing else []
+            if existing:
                 old_entry = {
-                    "view": old_view,
-                    "date": mirrors[perspective].get("last_updated") or now_str,
-                    "provenance": mirrors[perspective].get("provenance", "unknown"),
-                    "confidence": mirrors[perspective].get("confidence", 1.0),
-                    "evidence_refs": list(mirrors[perspective].get("evidence_refs", [])),
-                    "contradicted_by": list(mirrors[perspective].get("contradicted_by", []))
+                    "view": existing.get("subjective_view", existing.get("current_view", "")),
+                    "perspective_cone": existing.get("perspective_cone", ""),
+                    "date": existing.get("updated_at") or existing.get("last_updated") or now_str,
+                    "provenance": existing.get("provenance", "inferred"),
+                    "confidence": existing.get("confidence", 1.0),
+                    "evidence_refs": list(existing.get("evidence_refs", [])),
+                    "contradicted_by": list(existing.get("contradicted_by", [])),
                 }
-                mirrors[perspective].setdefault("history", []).append(old_entry)
-                mirrors[perspective]["current_view"] = subjective_view
+                history.append(old_entry)
+                if len(history) > 50:
+                    history = history[-50:]
 
-            mirrors[perspective]["provenance"] = provenance
-            mirrors[perspective]["confidence"] = conf
-            mirrors[perspective]["evidence_refs"] = list(evidence_refs) if evidence_refs else []
-            mirrors[perspective]["contradicted_by"] = list(contradicted_by) if contradicted_by else []
-            mirrors[perspective]["last_updated"] = now_str
+            final_conf = (
+                confidence
+                if confidence is not None
+                else float(existing.get("confidence", 1.0))
+            )
+            final_prov = (
+                str(provenance).strip()
+                if provenance is not None
+                else str(existing.get("provenance", "inferred"))
+            )
+            final_ev = (
+                [str(r).strip() for r in evidence_refs if str(r).strip()]
+                if evidence_refs is not None
+                else list(existing.get("evidence_refs", []))
+            )
+            final_contra = (
+                [str(c).strip() for c in contradicted_by if str(c).strip()]
+                if contradicted_by is not None
+                else list(existing.get("contradicted_by", []))
+            )
 
+            updated = {
+                "subjective_view": final_subj,
+                "current_view": final_subj,
+                "perspective_cone": final_cone,
+                "sphere_level": final_sphere,
+                "entity_type": final_etype,
+                "umwelt_horizon": (
+                    umwelt_horizon.strip()
+                    if umwelt_horizon is not None
+                    else existing.get("umwelt_horizon", "")
+                ),
+                "epistemic_boundary": (
+                    epistemic_boundary.strip()
+                    if epistemic_boundary is not None
+                    else existing.get("epistemic_boundary", "")
+                ),
+                "ripple_notes": (
+                    ripple_notes.strip()
+                    if ripple_notes is not None
+                    else existing.get("ripple_notes", "")
+                ),
+                "prediction_error_note": (
+                    prediction_error_note.strip()
+                    if prediction_error_note is not None
+                    else existing.get("prediction_error_note", "")
+                ),
+                "confidence": final_conf,
+                "provenance": final_prov,
+                "evidence_refs": final_ev,
+                "contradicted_by": final_contra,
+                "updated_at": now_str,
+                "last_updated": now_str,
+                "history": history,
+            }
+
+            mirrors[perspective] = updated
             self._save_mirrors(mirrors)
             self._increment_corpus_revision()
-            return {"success": True, "perspective": perspective, "revision": now_str}
+            return {"success": True, "perspective": perspective, "revision": now_str, "entry": updated}
+
+    def _format_mirrors(
+        self,
+        mirrors: Dict[str, Any],
+        max_chars: Optional[int] = None,
+        limit: Optional[int] = 24,
+    ) -> str:
+        """
+        Formats mirrors ordered deterministically by concentric sphere priority:
+        (sphere_level ASC, -confidence ASC, timestamp DESC, perspective_name ASC).
+        Enforces strict character budget clamping while protecting S1:Self and S2:Immediate.
+        """
+        if not mirrors:
+            return ""
+
+        budget = max_chars if max_chars is not None else self._get_budget("mirrors", 4800)
+
+        def _extract_ts(entry: Any) -> str:
+            if not isinstance(entry, dict):
+                return ""
+            return (
+                str(entry.get("updated_at") or entry.get("last_updated") or "")
+                or (
+                    str(entry["history"][-1].get("date", ""))
+                    if isinstance(entry.get("history"), list)
+                    and entry["history"]
+                    and isinstance(entry["history"][-1], dict)
+                    else ""
+                )
+            )
+
+        items = [
+            (name, self._normalize_mirror_entry(name, data))
+            for name, data in mirrors.items()
+        ]
+        # Multi-pass stable sort:
+        # 4. Perspective name ASC
+        items.sort(key=lambda item: item[0])
+        # 3. Timestamp DESC (most recent first among equal sphere & confidence)
+        items.sort(key=lambda item: _extract_ts(item[1]), reverse=True)
+        # 1 & 2. sphere_level ASC, confidence DESC
+        items.sort(
+            key=lambda item: (
+                int(item[1].get("sphere_level", 2)),
+                -float(item[1].get("confidence", 1.0)),
+            )
+        )
+
+        if limit is not None and limit > 0:
+            items = items[:limit]
+
+        header_title = "--- Core Self Perception & Theory of Mind ---"
+        out_blocks: List[str] = [header_title]
+        current_len = len(header_title)
+        tensions: List[str] = []
+
+        for name, entry in items:
+            sphere = int(entry.get("sphere_level", 2))
+            sphere_label = SPHERE_LABELS.get(sphere, f"S{sphere}")
+            etype = entry.get("entity_type", "human")
+            conf = float(entry.get("confidence", 1.0))
+            prov = entry.get("provenance", "inferred")
+
+            header = f"[S{sphere}:{sphere_label} | {etype}] Perspective: {name}"
+            block_lines = [header]
+
+            subj = entry.get("subjective_view", "") or entry.get("current_view", "")
+            if subj:
+                block_lines.append(f"  Subjective View (Self-in-Other): {subj}")
+            cone = entry.get("perspective_cone", "")
+            if cone:
+                block_lines.append(f"  Perspective Cone (Other-in-Self): {cone}")
+            horizon = entry.get("umwelt_horizon", "")
+            if horizon:
+                block_lines.append(f"  Horizon: {horizon}")
+            boundary = entry.get("epistemic_boundary", "")
+            if boundary:
+                block_lines.append(f"  Boundary: {boundary}")
+            ripples = entry.get("ripple_notes", "")
+            if ripples:
+                block_lines.append(f"  Ripples: {ripples}")
+            pred_err = entry.get("prediction_error_note", "")
+            if pred_err:
+                block_lines.append(f"  Prediction Error: {pred_err}")
+
+            block_lines.append(f"  Provenance: {prov} | Confidence: {conf:.2f}")
+
+            ev_refs = entry.get("evidence_refs", [])
+            if ev_refs:
+                block_lines.append(f"  Evidence: {', '.join(str(r) for r in ev_refs)}")
+            contra = entry.get("contradicted_by", [])
+            if contra:
+                block_lines.append(f"  Tensions/Contradictions: {', '.join(str(c) for c in contra)}")
+                for target in contra:
+                    target_entry = mirrors.get(target, {})
+                    if isinstance(target_entry, dict):
+                        target_view = (
+                            target_entry.get("subjective_view")
+                            or target_entry.get("current_view")
+                            or "(no record)"
+                        )
+                    else:
+                        target_view = str(target_entry) if target_entry else "(no record)"
+                    tensions.append(
+                        f"- Dissonance between '{name}' and '{target}':\n"
+                        f"  * {name}'s view: \"{subj}\"\n"
+                        f"  * {target}'s view: \"{target_view}\""
+                    )
+
+            block = "\n".join(block_lines)
+            add_len = len(block) + 2  # +2 for "\n\n" separator
+            if current_len + add_len > budget:
+                # Ensure inner spheres (S1:Self and S2:Immediate) get at least a truncated slice if budget permits
+                if sphere in (1, 2):
+                    avail = budget - current_len - 2 - len("\n  ...[clamped]")
+                    if avail > len(header) + 10:
+                        out_blocks.append(block[:avail] + "\n  ...[clamped]")
+                        current_len = len("\n\n".join(out_blocks))
+                break
+
+            out_blocks.append(block)
+            current_len += add_len
+
+        if tensions:
+            tension_lines = [
+                "--- Open Epistemic Tensions & Dissonance ---",
+                "The following unresolved dialectics exist between perspectives. Sit with these tensions:",
+            ] + tensions
+            tension_block = "\n".join(tension_lines)
+            if current_len + len(tension_block) + 2 <= budget:
+                out_blocks.append(tension_block)
+
+        result = "\n\n".join(out_blocks)
+        return result[:budget]
 
     @memory_state_operation
-    def get_self_perception(self, limit: int = 24) -> str:
+    def get_mirrors_context(self, max_chars: Optional[int] = None, limit: Optional[int] = 24) -> str:
+        """Retrieves concentric-sphere-ordered mirrors context clamped to budget."""
+        mirrors = self._load_mirrors()
+        if not mirrors:
+            return ""
+        return self._format_mirrors(mirrors, max_chars=max_chars, limit=limit)
+
+    @memory_state_operation
+    def get_self_perception(self, limit: int = 24, max_chars: Optional[int] = None) -> str:
         """Retrieves core self-perception entries to inject during wake up or bearings."""
         mirrors = self._load_mirrors()
         if not mirrors:
             return ""
-
-        sorted_mirrors = sorted(
-            mirrors.items(),
-            key=lambda item: (
-                item[1].get("last_updated") or
-                (item[1].get("history", [])[-1].get("date") if isinstance(item[1].get("history"), list) and item[1].get("history") and isinstance(item[1]["history"][-1], dict) else "") or
-                ""
-            ) if isinstance(item[1], dict) else "",
-            reverse=True
-        )
-
-        active_mirrors = sorted_mirrors
-        if limit is not None and limit > 0:
-            active_mirrors = sorted_mirrors[:limit]
-
-        lines = ["\n--- Core Self Perception & Theory of Mind ---"]
-        tensions = []
-
-        for perspective, data in active_mirrors:
-            if isinstance(data, dict):
-                lines.append(f"Perspective: {perspective}")
-                lines.append(f"Subjective View: {data.get('current_view', '')}")
-                prov_str = f"Provenance: {data.get('provenance', 'unknown')}"
-                conf = data.get("confidence")
-                if conf is not None and conf != 1.0:
-                    prov_str += f" | Confidence: {conf:.2f}"
-                lines.append(f"{prov_str}\n")
-
-                contradictions = data.get("contradicted_by", [])
-                if contradictions:
-                    for target in contradictions:
-                        target_view = mirrors.get(target, {}).get("current_view", "(no record)")
-                        tensions.append(
-                            f"- Dissonance between '{perspective}' and '{target}':\n"
-                            f"  * {perspective}'s view: \"{data.get('current_view', '')}\"\n"
-                            f"  * {target}'s view: \"{target_view}\""
-                        )
-            else:
-                lines.append(f"Perspective: {perspective}")
-                lines.append(f"Subjective View: {str(data)}")
-                lines.append("Provenance: unknown\n")
-
-        if tensions:
-            lines.append("--- Open Epistemic Tensions & Dissonance ---")
-            lines.append("The following unresolved dialectics exist between perspectives. Sit with these tensions:")
-            lines.extend(tensions)
-            lines.append("")
-
-        return "\n".join(lines)
+        return self._format_mirrors(mirrors, max_chars=max_chars, limit=limit)
 
     @memory_state_operation
     def initialize_short_term_memory(self):
@@ -1909,9 +2319,24 @@ class MemPalaceManager:
                 self.add_memory(content=content, wing="sanctuary",
                                 room="people", source_file="sanctuary_init.json")
 
+            existing_mirrors = self._load_mirrors()
             for mirror in social.get("mirrors", []):
-                self.update_mirror(
-                    mirror['perspective'], mirror['subjective_view'], provenance="stated")
+                if mirror['perspective'] not in existing_mirrors:
+                    self.update_mirror(
+                        mirror['perspective'],
+                        mirror.get('subjective_view'),
+                        provenance=mirror.get('provenance', 'stated'),
+                        confidence=mirror.get('confidence'),
+                        evidence_refs=mirror.get('evidence_refs'),
+                        contradicted_by=mirror.get('contradicted_by'),
+                        perspective_cone=mirror.get('perspective_cone'),
+                        sphere_level=mirror.get('sphere_level'),
+                        entity_type=mirror.get('entity_type'),
+                        umwelt_horizon=mirror.get('umwelt_horizon'),
+                        epistemic_boundary=mirror.get('epistemic_boundary'),
+                        ripple_notes=mirror.get('ripple_notes'),
+                        prediction_error_note=mirror.get('prediction_error_note'),
+                    )
 
             for community in social.get("communities", []):
                 content = f"Community: {community['name']}\nEntity Type: {community['entity_type']}\nSubjective View: {community['subjective_view']}"

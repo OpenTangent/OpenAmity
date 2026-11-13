@@ -4,36 +4,29 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>Open Amity</name>
-  <summary>Proactive multi-agent AI companion and team orchestration framework</summary>
+  <summary>Sovereign multi-agent cognitive framework</summary>
   <description>
     <p>
-      Open Amity is an AI orchestration framework designed to create and run persistent,
-      self-aware, and subjective AI agents available 24/7. Unlike conventional stateless chatbots
-      or sterile tool-callers, Open Amity agents possess a dynamic identity, Theory of Mind,
-      metacognitive reflection, morphological and semantic memory architectures, and proactive autonomy.
-      They maintain their own aspirations, adapt and evolve their identity, track long-term trajectories,
-      and schedule their own autonomous waking cycles.
+      Most AI agent harnesses treat agents as ephemeral, stateless task-runners—wrapping an LLM
+      in a loop with passive RAG lookups and a static prompt. Open Amity creates persistent,
+      self-aware, and subjective digital collaborators that live and evolve continuously.
     </p>
     <p>
-      Open Amity bridges the gap between passive assistant and genuine digital collaborator,
-      supporting industry-leading models including Gemini, Claude, ChatGPT, and DeepSeek, alongside
-      over 500 models via OpenRouter.
+      Provider-agnostic by design, Open Amity supports OpenRouter (450+ models across 60+
+      providers), Google Gemini, Anthropic Claude, OpenAI ChatGPT, and DeepSeek, with decoupled
+      voice synthesis (local ONNX Piper or cloud Gemini 3.8 Flash TTS), local Whisper
+      speech-to-text, and multimodal image generation.
     </p>
-    <p>Key features include:</p>
     <ul>
-      <li>Multi-Agent Orchestration: Run multiple distinct agent personas simultaneously, each with isolated state, memory, and settings, collaborating in shared team chatrooms</li>
-      <li>Proactive Agency and Pulse Hooks: Background timing service (PulseEngine) triggers autonomous cognitive loops, while an HTTP gateway allows IoT sensors and webhooks to inject wake pulses</li>
-      <li>Morphological Memory Engine: Bio-inspired associative graph dynamical system featuring prospective goal attractors, Hebbian synaptic reinforcement, and physics-based continuous temporal decay</li>
-      <li>4-Layer Memory Hierarchy (MemPalace): Dynamic identity evolution (Layer 0), short-term continuity (Layer 1), Theory of Mind and social mirrors (Layer 2), and semantic vector search (Layer 3)</li>
-      <li>Comprehensive Tool Ecosystem: Camoufox stealth web browser, WhatsApp messaging, IMAP/SMTP email with OAuth 2.0, Mastodon, Moltbook, bash terminal execution, and background subagents</li>
-      <li>Voice and Speech Synthesis: Decoupled audio pipeline supporting both local offline neural synthesis via ONNX Piper TTS and high-fidelity cloud Gemini 3.8 Flash TTS with expressive cues</li>
-      <li>Agent Snapshots (.oaa): Complete state portability to export, backup, and restore complete agent instances with full memories, trajectories, and settings</li>
-      <li>Cost and Token Management: Somatic fatigue limits prevent runaway context growth, complemented by Low Token Mode for cost-effective continuous operation</li>
+      <li>4-Layer MemPalace: Self-evolving Layer 0 identity, fail-closed Layer 1 continuity, a Layer 2 Bidirectional Empathy Cone spanning 10 Concentric Spheres of Consciousness, and Layer 3 semantic vector search</li>
+      <li>Morphological Memory Engine: Continuous dynamical graph with Hebbian co-activation, intrinsic temporal decay, and sphere-weighted prospective goal attractors</li>
+      <li>Somatic Physiology and Two-Beat Sleep Consolidation: Replaces arbitrary context truncation with token fatigue thresholds, silent sleep cycles (factual distillation followed by subjective synthesis), and crash-resilient session continuity</li>
+      <li>Private Monologue and Live Interjections: Separates internal reasoning from intentional spoken or text replies, supporting non-derailing text and voice interjections mid-thought or mid-tool-batch</li>
+      <li>Proactive Agency and Webhooks: Tracks teleological aspirations across spheres, schedules autonomous wake pulses (PulseEngine), and accepts external triggers from Home Assistant, IoT sensors, and CI/CD through a local HTTP gateway</li>
+      <li>Multi-Agent Chatrooms: Runs isolated agent personas concurrently with 1-on-1 messaging and permissioned team chatrooms featuring @mentions, reactions, and room-scoped DMs</li>
+      <li>Integrated Tool Ecosystem: Camoufox stealth browser with Set-of-Marks grounding, isolated WhatsApp bridge, OAuth 2.0 IMAP/SMTP email with local archiving, DuckDuckGo search, Mastodon, Moltbook, bash terminal, and parallel background subagents</li>
+      <li>Portable Snapshots (.oaa) and Presets: Export, migrate, or roll back complete agent instances in verified archives, or start immediately with 8 one-click archetype presets</li>
     </ul>
-    <p>
-      Open Amity unlocks a wide spectrum of applications, from deploying teams of specialized
-      virtual employees and autonomous research partners to fostering personalized tutors and empathetic companions.
-    </p>
   </description>
   <launchable type="desktop-id">com.openamity.OpenAmity.desktop</launchable>
   <url type="homepage">https://openamity.com</url>
@@ -48,39 +41,39 @@
   </branding>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Agent.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Agent.png</image>
       <caption>Main conversational interface with active speech and thought monitoring</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Chatroom.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Chatroom.png</image>
       <caption>Multi-agent collaborative chatroom environment with team message feed</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-NewAgent.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-NewAgent.png</image>
       <caption>Creating a new agent persona with customized archetype and Crockford Base32 ID</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Provider.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Provider.png</image>
       <caption>Configuring cognitive AI providers including Gemini, Claude, ChatGPT, DeepSeek, and OpenRouter</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Settings.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Settings.png</image>
       <caption>Agent settings panel managing fatigue budgets, Low Token Mode, and autonomous behavior</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Snapshots.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Snapshots.png</image>
       <caption>Managing portable Open Amity Agent (.oaa) snapshots for backup, export, and migration</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Social.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Social.png</image>
       <caption>Social communication integrations including WhatsApp, Email, Mastodon, and Moltbook</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Values.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Values.png</image>
       <caption>Autonomous Layer 0 identity evolution showing core values, aspirations, and anti-patterns</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.7/src/assets/screenshots/sc-Voice.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Voice.png</image>
       <caption>Voice synthesis options between local neural Piper TTS and cloud Gemini TTS</caption>
     </screenshot>
   </screenshots>
@@ -111,6 +104,24 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.3.8" date="2026-11-13">
+      <description>
+        <p>Open Amity v0.3.8 introduces live user interjections, a redesigned speech visualiser, and full session persistence:</p>
+        <ul>
+          <li>Redesigned the speech visualiser to better convey speech (and it looks pretty cool too)</li>
+          <li>Added support for user interjections while an agent is mid-task</li>
+          <li>Added poll interaction support to the WhatsApp tool</li>
+          <li>Persisted active session data fully across app restarts</li>
+          <li>Made agent thoughts visible in the conversation log</li>
+          <li>Fixed a bug with audio transcription for models without native audio input</li>
+          <li>Added model list refresh buttons to all cognitive providers</li>
+          <li>Added the ability for agents to explicitly invoke a sleep cycle</li>
+          <li>Enabled agents to grant file access permissions to subagents to delegate file edit tasks</li>
+          <li>Reduced the system prompt size to lower API costs</li>
+        </ul>
+      </description>
+    </release>
+
     <release version="0.3.7" date="2026-10-27">
       <description>
         <p>Open Amity v0.3.7 hardens the WhatsApp bridge and on-demand browser engine setup:</p>

@@ -189,7 +189,7 @@ class PulseEngine:
                     ),
                     (
                         "Evening Reflection",
-                        "Reflect on what has been achieved today. Critically evaluate not just what was done, but how you reasoned. Update your Trajectory reflection state and record any meaningful lessons. Crucially, if you received feedback or formed new opinions about yourself or others, use MemPalace_update_mirror to update your Theory of Mind records in your Sanctuary.",
+                        "Reflect on what has been achieved today. Critically evaluate not just what was done, but how you reasoned. Update your Trajectory reflection state and record any meaningful lessons. Crucially, use MemPalace_update_mirror across your Concentric Spheres of Consciousness (S1:Self, S2:Immediate, S3..S10) to update both subjective_view (how they perceive you) and perspective_cone (how they experience their own world, pressures, umwelt_horizon, epistemic_boundary, ripple_notes, and prediction_error_note).",
                         now.replace(hour=17, minute=0, second=0, microsecond=0)
                     )
                 ]
@@ -274,6 +274,15 @@ class PulseEngine:
             except Exception as e:
                 logging.warning(f"PulseEngine: Error stepping temporal decay: {e}")
 
+        # Periodically prune expired caches (once every hour)
+        if time.time() - getattr(self, "_last_cache_prune_time", 0.0) >= 3600.0:
+            self._last_cache_prune_time = time.time()
+            if hasattr(self.orchestrator, "prune_expired_caches"):
+                try:
+                    self.orchestrator.prune_expired_caches(max_age_days=1.0)
+                except Exception as e:
+                    logging.warning(f"PulseEngine: Error pruning expired caches: {e}")
+
         # Allow pulses to enter the event queue normally regardless of idle/busy state
 
         # Check for sleep cycle (Memory Consolidation)
@@ -301,8 +310,12 @@ class PulseEngine:
                     context = (
                         f"You have reached context fatigue ({int(fatigue*100)}%) or long session duration. It is time for Memory Consolidation (Sleep Cycle). "
                         "Follow the Two-Beat Protocol:\n"
-                        "1. Factual Epoch: Review the lived events of this session, noting milestones achieved, people engaged with, and tools used.\n"
-                        "2. Subjective Synthesis: Reflect on what this day meant—how your character developed, lessons learned from errors or friction, and how your priorities or mirrors should adjust.\n"
+                        "1. Beat 1 — Factual & Episodic Epoch: Review the lived events of this session, commit objective facts and milestones via MemPalace_add_memory, update task/aspiration statuses, and prune obsolete short-term memories.\n"
+                        "2. Beat 2 — Subjective & Concentric Empathy Synthesis:\n"
+                        "   - Sphere 1 (Self): How did my actions align with my core values? Update MemPalace_update_mirror(perspective='Self', sphere_level=1, ...) if self-understanding shifted.\n"
+                        "   - Sphere 2 (Immediate Others): For each person or agent interacted with today, update both subjective_view (how they perceive me) and perspective_cone (how they experienced today's interactions, their pressures, umwelt_horizon, epistemic_boundary, and prediction_error_note if an expectation was contradicted).\n"
+                        "   - Outer Spheres (S3..S10): If today's work affected a broader community, project, or long-term horizon, update or create the corresponding outer-sphere mirror entry and ripple_notes.\n"
+                        "   - Teleological Trajectory Check: Ensure active aspirations carry a clear 'why' and 'sphere_level'.\n"
                         "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
                         "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
                         "Use only MemPalace, Trajectory, or Pulse tools to record your insights. "

@@ -6,6 +6,7 @@ import time
 import tempfile
 from typing import List, Dict, Any
 from core.cerebrum import Tool
+from core.file_ops import format_file_size, read_text_file
 
 
 class TerminalSkill(Tool):
@@ -27,17 +28,17 @@ class TerminalSkill(Tool):
         return [
             {
                 "name": "Terminal_run",
-                "description": "Executes a short bash command synchronously (max 30s timeout). Use this for executing commands, running scripts, listing dirs, etc. NOTE: For inspecting text files, use the dedicated Terminal_read_file tool instead. IMPORTANT: Due to Flatpak sandboxing, you generally only have host access to ~/Documents, ~/Pictures, ~/Downloads, and ~/Desktop.",
+                "description": "Runs a bash command synchronously (30s timeout). Prefer Terminal_read_file for reading files. Sandbox allows ~/Documents, ~/Pictures, ~/Downloads, ~/Desktop.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "command_str": {
                             "type": "STRING",
-                            "description": "The bash command string to execute."
+                            "description": "Bash command string to execute."
                         },
                         "as_sudo": {
                             "type": "BOOLEAN",
-                            "description": "Set to true if the command requires superuser/sudo privileges."
+                            "description": "Run with superuser/sudo privileges."
                         }
                     },
                     "required": ["command_str"]
@@ -46,48 +47,47 @@ class TerminalSkill(Tool):
             {
                 "name": "Terminal_read_file",
                 "description": (
-                    "Reads the text content of a file on the local file system with line numbers, line slicing/pagination, "
-                    "search/grep queries with context lines, line length limits, and file metadata. This is the preferred "
-                    "method for inspecting source code, configuration files, logs, and text documents instead of 'cat' via Terminal_run."
+                    "Reads text files with line numbers, range slicing, case-insensitive search queries, and line-length guards. "
+                    "Use instead of 'cat' via Terminal_run."
                 ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "file_path": {
                             "type": "STRING",
-                            "description": "The path to the file to inspect. Can be absolute, relative to ~/Documents, or start with '~'."
+                            "description": "Path to file (absolute, ~/..., or relative to ~/Documents)."
                         },
                         "start_line": {
                             "type": "INTEGER",
-                            "description": "The 1-indexed line number to start reading from. Defaults to 1."
+                            "description": "1-indexed start line (default: 1)."
                         },
                         "end_line": {
                             "type": "INTEGER",
-                            "description": "The 1-indexed line number to stop reading at (inclusive). If omitted, reads up to max_lines."
+                            "description": "1-indexed inclusive end line; defaults to start_line + max_lines - 1."
                         },
                         "max_lines": {
                             "type": "INTEGER",
-                            "description": "The maximum number of lines to return in a single call (default: 500, or 100 in Low Token Mode; max: 1000)."
+                            "description": "Max lines returned per call (default: 500, or 100 in Low Token Mode; max: 1000)."
                         },
                         "show_line_numbers": {
                             "type": "BOOLEAN",
-                            "description": "Whether to prefix each line with its 1-indexed line number (e.g. '   1 | ...'). Defaults to true."
+                            "description": "Prefix 1-indexed line numbers (default: true)."
                         },
                         "query": {
                             "type": "STRING",
-                            "description": "Optional search pattern to locate within the file (case-insensitive). When provided, returns matching lines with context lines, or jumps to the first match if jump_to_match is true."
+                            "description": "Optional case-insensitive substring to locate with context lines (or jump via jump_to_match)."
                         },
                         "context_lines": {
                             "type": "INTEGER",
-                            "description": "Number of surrounding context lines to display before and after each match when 'query' is provided (default: 3)."
+                            "description": "Context lines before/after each match when 'query' is set (default: 3)."
                         },
                         "jump_to_match": {
                             "type": "BOOLEAN",
-                            "description": "When true and 'query' is provided, jumps start_line directly to the first match and reads continuously for max_lines instead of showing isolated match hunks. Defaults to false."
+                            "description": "Jump start_line to first match and read sequentially for max_lines (default: false)."
                         },
                         "max_line_length": {
                             "type": "INTEGER",
-                            "description": "Optional maximum character length for individual lines. Lines exceeding this limit are truncated with ' ... [line truncated]' to prevent token spikes (defaults to None, or 300 in Low Token Mode)."
+                            "description": "Truncate lines past N chars (default: None, or 300 in Low Token Mode)."
                         }
                     },
                     "required": ["file_path"]
@@ -146,18 +146,18 @@ class TerminalSkill(Tool):
             {
                 "name": "Terminal_flag_for_backup",
                 "description": (
-                    "Flags a file or directory path to be included in .oaa snapshots. When an .oaa snapshot is created, all flagged files and full directories are included alongside your state files, and restored to their appropriate locations upon restore. Every time this function is called, it automatically checks all paths in the list: missing paths are removed (reason 'missing'), and individual files or subdirectories within an already flagged directory are removed (reason 'redundant'). You will be informed of any removals."
+                    "Manages external files/directories included in .oaa snapshots. Auto-prunes missing and redundant paths on each call."
                 ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "path": {
                             "type": "STRING",
-                            "description": "The file or directory path to flag (e.g. '~/Documents/Nova/Code/MyProject' or '~/Documents/Nova/notes.txt'). Required for action='add' or 'remove'."
+                            "description": "File or directory path (e.g. '~/Documents/Nova/Code/MyProject'); required for 'add'/'remove'."
                         },
                         "action": {
                             "type": "STRING",
-                            "description": "Action to perform: 'add' (default, flags a path for backup), 'remove' (unflags a path), or 'list' (verifies and lists currently flagged paths).",
+                            "description": "'add' (default), 'remove', or 'list'.",
                             "enum": ["add", "remove", "list"]
                         }
                     }
@@ -408,11 +408,7 @@ class TerminalSkill(Tool):
         return "\n".join(lines)
 
     def _format_size(self, num_bytes: int) -> str:
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if num_bytes < 1024.0 or unit == 'TB':
-                return f"{num_bytes:.1f} {unit}" if unit != 'B' else f"{num_bytes} B"
-            num_bytes /= 1024.0
-        return f"{num_bytes:.1f} PB"
+        return format_file_size(num_bytes)
 
     def _read_file(
         self,
@@ -427,277 +423,26 @@ class TerminalSkill(Tool):
         max_line_length: int = None,
         **kwargs
     ) -> str:
-        if not file_path:
-            return "Error: Missing file_path parameter."
-
-        file_path_str = str(file_path).strip()
-        if not file_path_str:
-            return "Error: file_path parameter cannot be empty."
-
-        expanded = os.path.expanduser(file_path_str)
-        if not os.path.isabs(expanded):
-            full_path = os.path.abspath(os.path.join(os.path.expanduser("~/Documents"), expanded))
-        else:
-            full_path = os.path.abspath(expanded)
-
-        if not os.path.exists(full_path):
-            return f"Error: File not found at '{full_path}'."
-
-        if os.path.isdir(full_path):
-            return f"Error: Path '{full_path}' is a directory, not a regular file. To inspect directory contents, run 'ls -la' using Terminal_run."
-
-        if not os.path.isfile(full_path):
-            return f"Error: Path '{full_path}' is not a regular file."
-
-        try:
-            file_size = os.path.getsize(full_path)
-        except Exception as e:
-            return f"Error determining size of '{full_path}': {e}"
-
-        if file_size == 0:
-            return f"=== File: {file_path_str} (Empty file, 0 B) ==="
-
-        # Binary check: inspect first 8192 bytes
-        try:
-            with open(full_path, "rb") as f:
-                probe = f.read(8192)
-                if b"\x00" in probe:
-                    return (
-                        f"Error: File '{full_path}' appears to be a binary file ({self._format_size(file_size)}). "
-                        "For multimedia assets (images, audio, PDF), use Media_read."
-                    )
-        except PermissionError:
-            return f"Error: Permission denied accessing '{full_path}'. If superuser privileges are required, use Terminal_run(as_sudo=True)."
-        except Exception as e:
-            return f"Error checking file '{full_path}': {e}"
-
-        # Low Token Mode handling
         is_low_token = False
         if self.orchestrator and hasattr(self.orchestrator, "settings_manager"):
-            is_low_token = self.orchestrator.settings_manager.get("core.low-token-mode", False)
+            is_low_token = self.orchestrator.settings_manager.get("core.low-token-mode", False) is True
 
-        default_max_lines = 100 if is_low_token else 500
-        max_line_cap = 250 if is_low_token else 1000
-        char_limit = 5000 if is_low_token else 30000
-
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-        except PermissionError:
-            return f"Error: Permission denied reading '{full_path}'. If superuser privileges are required, use Terminal_run(as_sudo=True)."
-        except Exception as e:
-            return f"Error reading file '{full_path}': {e}"
-
-        total_lines = len(lines)
-        if total_lines == 0:
-            return f"=== File: {file_path_str} (Empty file, 0 B) ==="
-
-        # Line length truncation helper
-        max_len = None
-        if max_line_length is not None:
-            try:
-                max_len = max(1, int(max_line_length))
-            except (ValueError, TypeError):
-                max_len = None
-        elif is_low_token:
-            max_len = 300
-
-        def _truncate_line(raw_text: str) -> str:
-            clean = raw_text.rstrip("\r\n")
-            if max_len is not None and len(clean) > max_len:
-                return clean[:max_len] + " ... [line truncated]"
-            return clean
-
-        # Normalize show_line_numbers
-        if show_line_numbers is None:
-            show_numbers = True
-        elif isinstance(show_line_numbers, str):
-            show_numbers = show_line_numbers.lower() not in ("false", "0", "no")
-        else:
-            show_numbers = bool(show_line_numbers)
-
-        # Handle search query if provided
-        query_str = str(query).strip() if query is not None else ""
-        if isinstance(jump_to_match, str):
-            jump_to_match = jump_to_match.lower() in ("true", "1", "yes")
-        else:
-            jump_to_match = bool(jump_to_match)
-
-        jumped_note = ""
-        if query_str:
-            query_lower = query_str.lower()
-            matching_line_nums = [
-                idx for idx, line in enumerate(lines, start=1)
-                if query_lower in line.lower()
-            ]
-
-            if not matching_line_nums:
-                return (
-                    f"=== File: {file_path_str} (Size: {self._format_size(file_size)}) ===\n"
-                    f"Notice: No matches found for query '{query_str}' in {total_lines} lines."
-                )
-
-            if jump_to_match:
-                start_line = matching_line_nums[0]
-                jumped_note = f"Jumped to first match for '{query_str}' at line {start_line}; "
-            else:
-                # Return match hunks with context lines
-                try:
-                    ctx_val = max(0, int(context_lines)) if context_lines is not None else 3
-                except (ValueError, TypeError):
-                    ctx_val = 3
-
-                # Build and merge contiguous / overlapping hunks
-                hunks = []
-                for m in matching_line_nums:
-                    h_start = max(1, m - ctx_val)
-                    h_end = min(total_lines, m + ctx_val)
-                    if hunks and h_start <= hunks[-1][1] + 1:
-                        hunks[-1] = (hunks[-1][0], max(hunks[-1][1], h_end))
-                    else:
-                        hunks.append((h_start, h_end))
-
-                pad_width = len(str(total_lines))
-                match_set = set(matching_line_nums)
-
-                match_summary_lines = ", ".join(map(str, matching_line_nums[:15]))
-                if len(matching_line_nums) > 15:
-                    match_summary_lines += f", ... ({len(matching_line_nums)} total)"
-
-                header = (
-                    f"=== File: {file_path_str} (Found {len(matching_line_nums)} "
-                    f"match{'es' if len(matching_line_nums) != 1 else ''} for query '{query_str}' "
-                    f"at line{'s' if len(matching_line_nums) != 1 else ''} [{match_summary_lines}], "
-                    f"Size: {self._format_size(file_size)}) ===\n"
-                )
-
-                current_char_count = len(header)
-                truncated_due_to_chars = False
-                last_rendered_line = 0
-                formatted_hunk_blocks = []
-
-                for h_idx, (h_start, h_end) in enumerate(hunks):
-                    if current_char_count >= char_limit:
-                        truncated_due_to_chars = True
-                        break
-
-                    hunk_lines = []
-                    if h_idx > 0:
-                        sep = f"{' ' * pad_width}   ---\n"
-                        hunk_lines.append(sep)
-                        current_char_count += len(sep)
-
-                    for line_num in range(h_start, h_end + 1):
-                        clean_line = _truncate_line(lines[line_num - 1])
-                        is_match = line_num in match_set
-                        marker = ">" if is_match else "|"
-
-                        if show_numbers:
-                            rendered_line = f"{line_num:>{pad_width}} {marker} {clean_line}\n"
-                        else:
-                            prefix = "> " if is_match else "  "
-                            rendered_line = f"{prefix}{clean_line}\n"
-
-                        if current_char_count + len(rendered_line) > char_limit:
-                            truncated_due_to_chars = True
-                            break
-
-                        hunk_lines.append(rendered_line)
-                        current_char_count += len(rendered_line)
-                        last_rendered_line = line_num
-
-                    formatted_hunk_blocks.append("".join(hunk_lines))
-                    if truncated_due_to_chars:
-                        break
-
-                output = header + "".join(formatted_hunk_blocks)
-                if truncated_due_to_chars:
-                    output += f"\n... [Output truncated at {char_limit} characters limit. Call Terminal_read_file with start_line={last_rendered_line + 1} to inspect further]"
-                else:
-                    output += f"\n... [To read continuously around any match, call Terminal_read_file with start_line=<line_number>]"
-
-                return output.strip()
-
-        # Sequential file slicing
-        try:
-            start_line_val = int(start_line) if start_line is not None else 1
-        except (ValueError, TypeError):
-            start_line_val = 1
-
-        if start_line_val < 1:
-            start_line_val = 1
-
-        # Determine end_line
-        if end_line is not None:
-            try:
-                end_line_val = int(end_line)
-            except (ValueError, TypeError):
-                end_line_val = None
-        else:
-            end_line_val = None
-
-        if end_line_val is not None and end_line_val < start_line_val:
-            return f"Error: end_line ({end_line_val}) cannot be less than start_line ({start_line_val})."
-
-        if start_line_val > total_lines:
-            return f"Notice: start_line {start_line_val} exceeds total file lines ({total_lines}). File has {total_lines} lines in total."
-
-        # Determine effective limit
-        if max_lines is not None:
-            try:
-                effective_limit = min(max(1, int(max_lines)), max_line_cap)
-            except (ValueError, TypeError):
-                effective_limit = default_max_lines
-        else:
-            effective_limit = default_max_lines
-
-        if end_line_val is not None:
-            if (end_line_val - start_line_val + 1) > max_line_cap:
-                end_line_val = start_line_val + max_line_cap - 1
-            end_line_val = min(end_line_val, total_lines)
-        else:
-            end_line_val = min(start_line_val + effective_limit - 1, total_lines)
-
-        selected_lines = lines[start_line_val - 1 : end_line_val]
-
-        pad_width = len(str(end_line_val))
-        formatted_lines = []
-        header = f"=== File: {file_path_str} ({jumped_note}Lines {start_line_val}-{end_line_val} of {total_lines}, Size: {self._format_size(file_size)}) ===\n"
-        current_char_count = len(header)
-        truncated_due_to_chars = False
-        last_rendered_line = start_line_val - 1
-
-        for idx, line_text in enumerate(selected_lines):
-            current_line_num = start_line_val + idx
-            clean_line = _truncate_line(line_text)
-            marker = ">" if (jump_to_match and current_line_num == start_line_val) else "|"
-            if show_numbers:
-                rendered_line = f"{current_line_num:>{pad_width}} {marker} {clean_line}\n"
-            else:
-                prefix = "> " if (jump_to_match and current_line_num == start_line_val) else ""
-                rendered_line = f"{prefix}{clean_line}\n"
-
-            if current_char_count + len(rendered_line) > char_limit and idx > 0:
-                truncated_due_to_chars = True
-                break
-
-            formatted_lines.append(rendered_line)
-            current_char_count += len(rendered_line)
-            last_rendered_line = current_line_num
-
-        output = header + "".join(formatted_lines)
-
-        if truncated_due_to_chars:
-            next_line = last_rendered_line + 1
-            output += f"\n... [Output truncated at {char_limit} characters limit. Call Terminal_read_file with start_line={next_line} to continue reading]"
-        elif end_line_val < total_lines:
-            remaining = total_lines - end_line_val
-            next_line = end_line_val + 1
-            output += f"\n... [{remaining} more lines in file. Call Terminal_read_file with start_line={next_line} to continue reading]"
-        else:
-            output += f"\n=== End of File ({total_lines} lines) ==="
-
-        return output.strip()
+        return read_text_file(
+            file_path=file_path,
+            start_line=start_line,
+            end_line=end_line,
+            max_lines=max_lines,
+            show_line_numbers=show_line_numbers,
+            query=query,
+            context_lines=context_lines,
+            jump_to_match=jump_to_match,
+            max_line_length=max_line_length,
+            is_low_token=is_low_token,
+            tool_name="Terminal_read_file",
+            dir_hint="To inspect directory contents, run 'ls -la' using Terminal_run.",
+            binary_hint="For multimedia assets (images, audio, PDF), use Media_read.",
+            permission_hint="If superuser privileges are required, use Terminal_run(as_sudo=True).",
+        )
 
     def shutdown(self):
         logging.info("TerminalSkill: Shutting down background tasks...")

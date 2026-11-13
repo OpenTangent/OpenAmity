@@ -62,9 +62,13 @@ def test_provider_gui_controls_exist(qapp, monkeypatch, tmp_path):
         light_combo = getattr(widget, f"ui_{prov}_light_model", None)
         light_custom = getattr(widget, f"ui_{prov}_custom_light_model", None)
         light_tip = getattr(widget, f"ui_{prov}_light_model_tip", None)
+        fetch_btn = getattr(widget, f"ui_{prov}_fetch_btn", None)
+        fetch_status = getattr(widget, f"ui_{prov}_fetch_status", None)
 
         assert model_combo is not None, f"Missing model combo for {prov}"
         assert model_custom is not None, f"Missing model custom line edit for {prov}"
+        assert fetch_btn is not None, f"Missing fetch button for {prov}"
+        assert fetch_status is not None, f"Missing fetch status label for {prov}"
         assert thinking_combo is not None, f"Missing thinking combo for {prov}"
         assert thinking_tip is not None, f"Missing thinking tip for {prov}"
         assert light_combo is not None, f"Missing light model combo for {prov}"
@@ -182,3 +186,145 @@ def test_load_and_save_custom_model_settings(qapp, monkeypatch, tmp_path):
     assert sm.get("core.claude.model") == "claude-custom-v2"
     assert sm.get("core.claude.thinking-level") == "low"
     assert sm.get("core.claude.light-model") == "claude-custom-light-v2"
+
+
+def test_provider_refresh_buttons_styling_and_tooltips(qapp, monkeypatch, tmp_path):
+    """Verify refresh button sizing, iconBtn objectName, and standard Open Amity tooltip across all providers."""
+    agent_dir = tmp_path / "test_gui_agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(agent_dir))
+
+    sm = SettingsManager(agent_id="test_gui_agent")
+    widget = SettingsPanelWidget()
+    widget.load_settings(settings_manager=sm)
+
+    expected_providers = {
+        "openrouter": "OpenRouter",
+        "gemini": "Gemini",
+        "claude": "Claude",
+        "chatgpt": "OpenAI / ChatGPT",
+        "deepseek": "DeepSeek"
+    }
+
+    for prov, display_name in expected_providers.items():
+        btn = getattr(widget, f"ui_{prov}_fetch_btn", None)
+        assert btn is not None, f"Missing fetch button for {prov}"
+        assert btn.text() == "🔄", f"Button for {prov} does not have refresh icon"
+        assert btn.objectName() == "iconBtn"
+        assert btn.width() == 32 and btn.height() == 32
+        tooltip = btn.toolTip()
+        assert "Fetch and refresh the list of available models from" in tooltip
+        assert display_name in tooltip
+
+
+def test_provider_fetch_missing_api_key(qapp, monkeypatch, tmp_path):
+    """Verify that clicking refresh without an API key presents a helpful inline warning."""
+    agent_dir = tmp_path / "test_gui_agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(agent_dir))
+
+    sm = SettingsManager(agent_id="test_gui_agent")
+    widget = SettingsPanelWidget()
+    widget.load_settings(settings_manager=sm)
+
+    # For providers requiring keys, verify missing key message
+    for prov in ["gemini", "claude", "chatgpt", "deepseek"]:
+        key_input = getattr(widget, f"ui_{prov}_api_key", None)
+        if key_input:
+            key_input.setText("")
+        widget._fetch_provider_models(prov)
+        status = getattr(widget, f"ui_{prov}_fetch_status")
+        assert "Please enter an API key first" in status.text()
+        btn = getattr(widget, f"ui_{prov}_fetch_btn")
+        assert btn.isEnabled()
+        assert btn.text() == "🔄"
+
+
+def test_provider_fetch_models_success_and_caching(qapp, monkeypatch, tmp_path):
+    """Verify that successfully fetched models update the combobox, preserve selection, and save to cache."""
+    agent_dir = tmp_path / "test_gui_agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(agent_dir))
+    monkeypatch.setattr("config.paths.get_app_data_dir", lambda: str(tmp_path))
+
+    sm = SettingsManager(agent_id="test_gui_agent")
+    widget = SettingsPanelWidget()
+    widget.load_settings(settings_manager=sm)
+
+    # Simulate fetched models signal
+    new_models = ["gemini-4.0-ultra", "gemini-4.0-flash"]
+    widget._on_provider_models_fetched("gemini", new_models, None)
+
+    combo = widget.ui_gemini_model
+    items = [combo.itemText(i) for i in range(combo.count())]
+    assert "gemini-4.0-ultra" in items
+    assert "gemini-4.0-flash" in items
+    assert items[-1] == "Custom..."
+    assert "✓ Fetched 2 models." in widget.ui_gemini_fetch_status.text()
+
+    # Check cache file written to disk
+    import json
+    cache_file = tmp_path / "gemini_models.json"
+    assert cache_file.exists()
+    with open(cache_file, "r") as f:
+        cached = json.load(f)
+    assert "gemini-4.0-ultra" in cached
+    assert "gemini-4.0-flash" in cached
+
+
+def test_worker_fetch_available_models_methods():
+    """Verify that worker classes expose fetch_available_models and parse responses correctly."""
+    from core.gemini_worker import GeminiWorker
+    from core.claude_worker import ClaudeWorker
+    from core.chatgpt_worker import ChatGptWorker
+    from core.deepseek_worker import DeepSeekWorker
+
+    # 1. Missing API key raises ValueError
+    with pytest.raises(ValueError, match="Gemini API key is required"):
+        GeminiWorker.fetch_available_models("")
+    with pytest.raises(ValueError, match="Claude API key is required"):
+        ClaudeWorker.fetch_available_models("")
+    with pytest.raises(ValueError, match="OpenAI API key is required"):
+        ChatGptWorker.fetch_available_models("")
+    with pytest.raises(ValueError, match="DeepSeek API key is required"):
+        DeepSeekWorker.fetch_available_models("")
+
+    # 2. Mocked Gemini fetch
+    with patch("google.genai.Client") as mock_client:
+        mock_m1 = MagicMock(name="models/gemini-2.5-flash", supported_actions=["generateContent"])
+        mock_m1.name = "models/gemini-2.5-flash"
+        mock_m2 = MagicMock(name="models/text-embedding-004", supported_actions=["embedContent"])
+        mock_m2.name = "models/text-embedding-004"
+        mock_client.return_value.models.list.return_value = [mock_m1, mock_m2]
+
+        models = GeminiWorker.fetch_available_models("test-key")
+        assert models == ["gemini-2.5-flash"]
+
+    # 3. Mocked Claude fetch
+    with patch("anthropic.Anthropic") as mock_client:
+        mock_item1 = MagicMock(id="claude-3-7-sonnet-20250219")
+        mock_page = MagicMock(data=[mock_item1])
+        mock_client.return_value.models.list.return_value = mock_page
+
+        models = ClaudeWorker.fetch_available_models("test-key")
+        assert models == ["claude-3-7-sonnet-20250219"]
+
+    # 4. Mocked ChatGPT fetch
+    with patch("openai.OpenAI") as mock_client:
+        mock_m1 = MagicMock(id="gpt-4o")
+        mock_m2 = MagicMock(id="whisper-1")
+        mock_m3 = MagicMock(id="text-embedding-3-small")
+        mock_m4 = MagicMock(id="o3-mini")
+        mock_client.return_value.models.list.return_value = [mock_m1, mock_m2, mock_m3, mock_m4]
+
+        models = ChatGptWorker.fetch_available_models("test-key")
+        assert models == ["gpt-4o", "o3-mini"]
+
+    # 5. Mocked DeepSeek fetch
+    with patch("openai.OpenAI") as mock_client:
+        mock_m1 = MagicMock(id="deepseek-chat")
+        mock_m2 = MagicMock(id="deepseek-reasoner")
+        mock_client.return_value.models.list.return_value = [mock_m1, mock_m2]
+
+        models = DeepSeekWorker.fetch_available_models("test-key")
+        assert models == ["deepseek-chat", "deepseek-reasoner"]

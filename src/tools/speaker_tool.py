@@ -16,12 +16,15 @@ class SpeakerTool(Tool):
     color = "#03A9F4"
     async_commands = []
     description = (
-        "Use this tool to speak aloud to the user, output text, or synthesize speech directly to an audio file (.opus). YOU ARE FULLY AUTONOMOUS regarding your speech. If you do not use this tool, you will remain completely silent. You must explicitly use this tool to communicate your thoughts to the user. Speak from a first-person perspective ('I'). Open Amity is an agentic system with rapid back-and-forth communication with the user. In normal day-to-day communication, your responses—whether spoken aloud or output as text—must be kept brief to allow breathing room for the user's response and to maintain rapid conversational momentum. For longer reports, write to a file and open via xdg-open or provide the file location. When using both Speaker_output_text and Speaker_speak_aloud in the same turn, they should complement each other, not summarise each other (spoken text is already captioned in the chat log). To generate headless speech files for external playback, conversion, or messaging without playing aloud in the app, use Speaker_speak_to_file (cached .opus files are automatically pruned after 24 hours)."
+        "Explicit speech & GUI output tool (.opus files via speak_to_file). You stay completely silent unless you call it. "
+        "Default to Speaker_speak_aloud for conversational replies (spoken words are already captioned in the chat log—never repeat or summarise speech in Speaker_output_text). "
+        "Keep replies brief; write long reports to a file and open via xdg-open. "
+        "See System_read_manual(topic='channels') for headless audio/media rules."
     )
     commands = [
-        "speak_aloud <text> (Synthesizes text aloud via neural TTS. In normal communication, keep responses brief to allow breathing room for the user's response. Gemini 3.8 native angle-bracket expressive cues like <laugh>, <sigh>, <gasp>, <cough>, <whisper>, <throat-clearing>, <short pause> are supported; do NOT use square-bracket tags.)",
-        "output_text <text> (Outputs markdown text to the GUI without audio. Follow clean GFM: separate paragraphs with blank lines, use fenced code blocks, standard lists, and avoid unclosed tags. Keep text brief for rapid back-and-forth interaction. For longer reports, write to a file and open via xdg-open or provide the file path.)",
-        "speak_to_file <text> [filename] (Synthesizes text into a .opus audio file saved in audio cache without playing it in the app. Expressive angle-bracket cues are supported. Cached files are retained for 24 hours.)"
+        "speak_aloud <text> (Default user reply via neural TTS, already captioned in chat; keep brief. Supports <laugh>/<sigh>/<whisper>/<short pause>, never [brackets].)",
+        "output_text <text> (Silent GFM markdown ONLY for complementary non-speakable content like URLs, code, or tables—never repeat speech or use routinely.)",
+        "speak_to_file <text> [filename] (Synthesizes text to a .opus file in audio_cache without playback; retained 24 hours.)"
     ]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
@@ -29,17 +32,16 @@ class SpeakerTool(Tool):
             {
                 "name": "Speaker_speak_aloud",
                 "description": (
-                    "Speak text aloud to the user via neural TTS. In normal day-to-day communication, keep responses brief to allow breathing room for the user's response, to maintain rapid conversational pacing, and to prevent server-side audio watchdog aborts. When Speaker_speak_aloud is used alongside Speaker_output_text in the same turn, they should complement each other, not summarise each other. For longer reports or large text blocks, save to a file and display via xdg-open or share the path instead. Expressive Cues: Use Gemini 3.8 native angle-bracket tags like <laugh>, <sigh>, <gasp>, <cough>, <whisper>, <throat-clearing>, <short pause>, etc. where appropriate. Do NOT use square-bracket tags like [laugh] or [whisper]."
+                    "Speaks text aloud to the user in first person via neural TTS (automatically captioned in the chat log). "
+                    "Keep responses brief for rapid pacing. Do NOT echo or summarise spoken text in Speaker_output_text; only pair with Speaker_output_text for non-speakable data (URLs, code, tables). "
+                    "Use Gemini 3.8 angle-bracket cues (<laugh>, <sigh>, <gasp>, <cough>, <whisper>, <throat-clearing>, <short pause>); do NOT use [square brackets]."
                 ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "text": {
                             "type": "STRING",
-                            "description": (
-                                "The exact text to speak aloud. Aim for natural conversational dialogue kept brief in normal "
-                                "day-to-day communication to allow breathing room for the user's response. Avoid massive monologues."
-                            )
+                            "description": "Concise spoken text in first-person dialogue."
                         }
                     },
                     "required": ["text"]
@@ -48,17 +50,16 @@ class SpeakerTool(Tool):
             {
                 "name": "Speaker_output_text",
                 "description": (
-                    "Outputs markdown text to the chat log without speaking it aloud. Use clean GitHub-flavoured Markdown: separate distinct paragraphs with standard blank lines (\\n\\n), wrap code in inline backticks or fenced code blocks with language tags, format lists cleanly with leading/trailing blank lines, and ensure all tags/formatting are closed. Don't use Speaker_output_text with every response, in rare situations where text output is needed keep it concise and complimentary to your spoken output. Use Speaker_output_text for reference material like URLs, code, tables, etc. When non-conversational reports, analyses, or documentation are required, write that to a file on disk instead and use xdg-open to display the document. Don't use Speaker_output_text when unnecessary."
+                    "Outputs silent GitHub-flavoured Markdown to the chat log without audio (blank lines between paragraphs/lists, code fences with language tags, closed tags). "
+                    "Do NOT use on routine responses or to repeat/summarise Speaker_speak_aloud (spoken text is already captioned). "
+                    "Reserve strictly for non-speakable reference material (URLs, code blocks, tables); offload long reports to files via xdg-open."
                 ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "text": {
                             "type": "STRING",
-                            "description": (
-                                "The markdown text to display silently in the GUI. Use standard GFM (paragraph blank lines, "
-                                "code fences, clean lists). Keep it brief."
-                            )
+                            "description": "Brief complementary GFM markdown (only non-speakable reference content)."
                         }
                     },
                     "required": ["text"]
@@ -67,30 +68,19 @@ class SpeakerTool(Tool):
             {
                 "name": "Speaker_speak_to_file",
                 "description": (
-                    "Synthesizes text into an Opus (.opus) audio file without playing it aloud in the app. "
-                    "Outputs a .opus audio file in your audio cache that you can subsequently use "
-                    "(e.g., save or copy to permanent storage like ~/Music or ~/Documents, play via xdg-open, "
-                    "convert, or send in messages). Expressive Cues: Use Gemini 3.8 native angle-bracket tags "
-                    "like <laugh>, <sigh>, <gasp>, <cough>, <whisper>, <throat-clearing>, <short pause> where appropriate. "
-                    "Do NOT use square-bracket tags. Note: Cached .opus files are automatically deleted after 24 hours "
-                    "if not moved or used."
+                    "Synthesizes text to a .opus file in audio_cache without playing aloud (for ~/Music or ~/Documents archiving, xdg-open playback, or messaging). "
+                    "Supports <laugh>/<whisper> cues, not [brackets]. Cached .opus files are deleted after 24 hours."
                 ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "text": {
                             "type": "STRING",
-                            "description": (
-                                "The exact text / transcript to synthesize into speech. Expressive cues like <laugh>, "
-                                "<sigh>, <whisper> are supported."
-                            )
+                            "description": "Transcript to synthesize (supports <laugh>, <sigh>, <whisper> cues)."
                         },
                         "filename": {
                             "type": "STRING",
-                            "description": (
-                                "Optional custom filename for the .opus file (e.g. 'voice_memo.opus' or 'announcement'). "
-                                "If omitted, a unique timestamped filename will be generated automatically."
-                            )
+                            "description": "Optional filename (e.g. 'voice_memo.opus'); defaults to timestamped name."
                         }
                     },
                     "required": ["text"]

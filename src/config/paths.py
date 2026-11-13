@@ -103,6 +103,16 @@ def get_chatroom_db_path() -> str:
     return os.path.join(get_chatroom_dir(), "chatroom.db")
 
 
+def get_chat_history_db_path(agent_id: str) -> str:
+    """Returns the persistent path to the agent's one-on-one chat history SQLite database"""
+    return os.path.join(get_base_dir_for(agent_id), "chat_history.db")
+
+
+def get_session_cache_file(agent_id: str) -> str:
+    """Returns the path to the active session cache JSON file for a specific agent"""
+    return os.path.join(get_base_dir_for(agent_id), "session_cache.json")
+
+
 def get_backup_targets_file(agent_id: str) -> str:
     """Returns the path to the backup targets JSON file for a specific agent"""
     return os.path.join(get_base_dir_for(agent_id), "backup_targets.json")
@@ -113,9 +123,18 @@ def get_browser_data_dir(agent_id: str) -> str:
     return os.path.join(get_base_dir_for(agent_id), "browser_data")
 
 
-def get_browser_cache_dir(agent_id: str) -> str:
-    """Returns the browser cache directory for a specific agent"""
-    return os.path.join(get_browser_data_dir(agent_id), "cache")
+def get_browser_cache_dir(agent_id: str = None) -> str:
+    """Returns the browser cache directory for a specific agent (or shared if None)"""
+    if agent_id:
+        return os.path.join(get_browser_data_dir(agent_id), "cache")
+    return os.path.join(get_app_data_dir(), "browser_cache")
+
+
+def get_browser_screenshot_dir(agent_id: str = None) -> str:
+    """Returns the browser screenshot cache directory for a specific agent (or shared if None)"""
+    if agent_id:
+        return os.path.join(get_base_dir_for(agent_id), "media")
+    return os.path.join(get_app_data_dir(), "media")
 
 
 def get_browser_download_dir(agent_name: str) -> str:
@@ -198,3 +217,6 @@ def ensure_openrouter_image_models_cache() -> str:
     return cache_file
 
 
+def get_provider_models_cache_file(provider_id: str) -> str:
+    """Returns the persistent writable path for cached models of a given provider"""
+    return os.path.join(get_app_data_dir(), f"{provider_id}_models.json")

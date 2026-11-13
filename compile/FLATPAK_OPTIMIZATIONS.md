@@ -42,7 +42,7 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 - **Location**: `src/core/whatsapp_daemon.py`
 - **Behavior**:
   - `WhatsAppDaemon.start()` checks `/app/share/puppeteer`, `$XDG_CACHE_HOME/puppeteer`, and `~/.cache/puppeteer`.
-  - If missing, it downloads `chrome-linux64.zip` (pinned version 153.0.8010.36, SHA-256 verified) asynchronously on a background thread into `paths.get_app_cache_dir() / "puppeteer"` so the GUI never freezes.
+  - If missing, it downloads `chrome-linux64.zip` (pinned version 157.0.8103.38, SHA-256 verified) asynchronously on a background thread into `paths.get_app_cache_dir() / "puppeteer"` so the GUI never freezes.
   - Immediately deletes `WidevineCdm/` and all `locales/*.pak` except `en-US.pak`.
   - Emits `[System: Downloading browser engine for WhatsApp bridge (one-time setup)...]` and `[System: WhatsApp bridge ready.]` to the conversation log.
   - If an agent invokes a `WhatsApp_*` command while the download is active, it receives an informative status notice asking it to wait a moment.

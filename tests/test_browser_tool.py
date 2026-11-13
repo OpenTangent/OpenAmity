@@ -87,6 +87,9 @@ def test_browser_paths():
     cache_dir = paths.get_browser_cache_dir(agent_id)
     assert cache_dir.endswith(os.path.join(agent_id, "browser_data", "cache"))
 
+    shot_dir = paths.get_browser_screenshot_dir(agent_id)
+    assert shot_dir.endswith(os.path.join(agent_id, "media"))
+
     dl_dir = paths.get_browser_download_dir(agent_name)
     assert dl_dir.endswith(os.path.join("Downloads", agent_name))
 
@@ -221,6 +224,7 @@ def test_browser_screenshot_downscale_and_som():
         res = tool.execute("screenshot", high_res=False, show_overlay_cues=True)
         assert isinstance(res, dict)
         assert "media" in res
+        assert "24 hours" in res["result"]
         shot_path = res["media"][0]
         assert os.path.exists(shot_path)
 

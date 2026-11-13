@@ -40,6 +40,7 @@ class ChatroomView(QWidget):
         self.manager = ChatroomManager()
         self._uid_to_name_cache = {}
         self.BATCH_SIZE = 50
+        self.MAX_GUI_MESSAGES = 150
         self._loaded_messages = []
         self._has_more_history = True
         self._is_loading_history = False
@@ -57,9 +58,10 @@ class ChatroomView(QWidget):
         self.conversation_log.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self.main_layout.addWidget(self.conversation_log, 1)
 
-        # Console Log for Global Stream
+        # Console Log for Global Stream (limited to 1,000 blocks for memory conservation)
         self.console_log = QTextEdit()
         self.console_log.setReadOnly(True)
+        self.console_log.document().setMaximumBlockCount(1000)
         self.console_log.setStyleSheet(f"""
             QTextEdit {{
                 background-color: #000;
@@ -142,7 +144,13 @@ class ChatroomView(QWidget):
                 scroll_bar = self.conversation_log.verticalScrollBar()
                 was_at_bottom = (scroll_bar.maximum() - scroll_bar.value()) <= 60
 
-                self._render_message(msg, msg_map)
+                if len(self._loaded_messages) > self.MAX_GUI_MESSAGES:
+                    self._loaded_messages = self._loaded_messages[-self.MAX_GUI_MESSAGES:]
+                    self._has_more_history = True
+                    self._render_all_loaded_messages()
+                else:
+                    self._render_message(msg, msg_map)
+
                 if was_at_bottom:
                     scroll_bar.setValue(scroll_bar.maximum())
                 self.manager.mark_room_read(self.chatroom_id, "USER")

@@ -126,7 +126,9 @@ class SystemTool(Tool):
         "list_api_keys (Lists existing API keys with metadata, scopes, and expiration.)",
         "revoke_api_key <key_id> (Revokes an API key to permanently deny access.)",
         "api_docs (Returns complete Pulse Hook API documentation and integration curl recipes.)",
-        "contemplate (Spends an autonomous cognitive cycle contemplating/reasoning without taking external action.)"
+        "read_manual [topic] (Reads detailed Agent Manual documentation for a specific topic or 'index'.)",
+        "contemplate (Spends an autonomous cognitive cycle contemplating/reasoning without taking external action.)",
+        "sleep [reason] (Explicitly invokes a sleep cycle to consolidate and clear active session memory.)"
     ]
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
@@ -201,13 +203,8 @@ class SystemTool(Tool):
             {
                 "name": "System_set_custom_voice",
                 "description": (
-                    "Sets a custom directorial voice delivery style and optional base voice model (or custom Voice ID) for this agent's Gemini TTS speech synthesis. "
-                    "Enables 'override-prompt' mode in the agent's settings.\n"
-                    "Gemini 3.8 Flash TTS Guidelines:\n"
-                    "1. Directorial Delivery Style: State clearly how to speak using direct positive direction (e.g., 'warm, calm demeanor with natural conversational pacing and a Scottish accent'). This is passed directly into the speech metadata style parameter.\n"
-                    "2. Native Expressive Cues: To express momentary conversational cues during speech (laughs, sighs, whispers, pauses), use angle-bracket tags directly in your spoken text via Speaker_speak_aloud (e.g. <laugh>, <sigh>, <whisper>, <throat-clearing>, <short pause>). Do NOT use square-bracket tags.\n"
-                    "3. Base Voice / Voice ID: You can specify any of Gemini's 30 prebuilt voices (e.g., 'Sulafat', 'Puck', 'Aoede', 'Fenrir') or a custom Voice ID from Google AI Studio (e.g., 'voice_...'). If omitted, preserves the existing voice.\n"
-                    "4. NO Markdown Headers or Negative Constraints: Do not use markdown headers or negative suppression rules ('Never whisper', 'Do not...'). State positive target characteristics."
+                    "Sets a custom directorial Gemini TTS voice style and optional base voice or Voice ID, enabling 'override-prompt' mode. "
+                    "Use positive imperative characteristics without markdown headers or negative rules; see System_read_manual(topic='backups_api') and 'channels' for TTS guidelines."
                 ),
                 "parameters": {
                     "type": "OBJECT",
@@ -295,6 +292,33 @@ class SystemTool(Tool):
                 }
             },
             {
+                "name": "System_read_manual",
+                "description": (
+                    "Reads detailed Agent Manual documentation for a specific topic ('index', 'memory', 'browser', "
+                    "'terminal_files', 'channels', 'agency_pulses', 'backups_api'). "
+                    "Check active session history before re-reading a topic you already loaded."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "topic": {
+                            "type": "STRING",
+                            "description": "Manual topic key to read, or 'index' to list available topics.",
+                            "enum": [
+                                "index",
+                                "memory",
+                                "browser",
+                                "terminal_files",
+                                "channels",
+                                "agency_pulses",
+                                "backups_api"
+                            ]
+                        }
+                    },
+                    "required": ["topic"]
+                }
+            },
+            {
                 "name": "System_contemplate",
                 "description": (
                     "Allows the agent to spend another cognitive cycle contemplating, reasoning, or planning before taking action. Performs no operations and produces no side effects, acting as a filler tool to keep the autonomous cognitive loop active."
@@ -302,6 +326,23 @@ class SystemTool(Tool):
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {}
+                }
+            },
+            {
+                "name": "System_sleep",
+                "description": (
+                    "Explicitly invokes an autonomous Memory Consolidation (Sleep Cycle) to consolidate active session experiences into MemPalace, Layer 1 Continuity, and Mirrors, and completely reset active session context and somatic fatigue to 0%. "
+                    "Typically used when you have been idle for an extended period (1+ hours), have no upcoming pulses scheduled within the next 1+ hours (PulseTool_view_agenda), and have a fatigue level over 50% (Trajectory_get_bearings). "
+                    "However, you may use this autonomously whenever you deem it appropriate, as Open Amity is structured for memory, persona, and aspiration persistence."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "reason": {
+                            "type": "STRING",
+                            "description": "Optional reason or reflection note for initiating the sleep cycle (e.g., 'Idle for 2 hours with no upcoming pulses and 60% fatigue')."
+                        }
+                    }
                 }
             }
         ]
@@ -331,8 +372,12 @@ class SystemTool(Tool):
             return self._revoke_api_key(*args, **kwargs)
         elif command in ["api_docs", "get_api_documentation"]:
             return self._get_api_docs(*args, **kwargs)
+        elif command == "read_manual":
+            return self._read_manual(*args, **kwargs)
         elif command == "contemplate":
             return self._contemplate(*args, **kwargs)
+        elif command in ["sleep", "sleep_cycle"]:
+            return self._sleep(*args, **kwargs)
         return f"Unknown command: {command}"
 
     def _get_platform_info(self) -> str:
@@ -924,11 +969,58 @@ class SystemTool(Tool):
         ]
         return "\n".join(docs)
 
+    def _read_manual(self, topic: str = "", *args, **kwargs) -> str:
+        """Returns detailed Agent Manual documentation for the requested topic."""
+        if not topic and args:
+            topic = str(args[0])
+        cerebrum = getattr(self.orchestrator, "cerebrum", None) if self.orchestrator else None
+        if cerebrum and hasattr(cerebrum, "read_manual"):
+            return cerebrum.read_manual(topic)
+        from core.cerebrum import read_manual_topic
+        return read_manual_topic(topic=topic)
+
     def _contemplate(self, *args, **kwargs) -> str:
         """
         No-op tool filler allowing the agent to spend another cognitive cycle
         thinking and reasoning without taking external action.
         """
         return "Contemplation cycle completed."
+
+    def _sleep(self, reason: Optional[str] = None, *args, **kwargs) -> str:
+        """
+        Explicitly initiates an autonomous Memory Consolidation (Sleep Cycle).
+        """
+        if self.orchestrator:
+            if getattr(self.orchestrator, '_is_sleep_cycle', False):
+                return "Error: Memory consolidation (Sleep Cycle) is already in progress."
+            if getattr(self.orchestrator, 'is_paused', False):
+                return "Error: Agent is paused."
+            if hasattr(self.orchestrator, 'trigger_sleep_cycle'):
+                success = self.orchestrator.trigger_sleep_cycle(reason=reason)
+                if success:
+                    return "Sleep cycle initiated. Concluding active turn to begin Memory Consolidation (Sleep Cycle)..."
+                else:
+                    return "Error: Failed to initiate sleep cycle."
+            elif hasattr(self.orchestrator, 'pulse_engine') and self.orchestrator.pulse_engine:
+                title = "Sleep Cycle (Memory Consolidation)"
+                context = (
+                    f"You have explicitly initiated an autonomous Memory Consolidation (Sleep Cycle)"
+                    + (f": {reason}. " if reason else ". ")
+                    + "It is time to consolidate and clear your active session memory. "
+                    "Follow the Two-Beat Protocol:\n"
+                    "1. Beat 1 — Factual & Episodic Epoch: Review lived events, commit objective facts via MemPalace_add_memory, update task/aspiration statuses, and prune obsolete short-term memories.\n"
+                    "2. Beat 2 — Subjective & Concentric Empathy Synthesis: Update mirrors across S1..S10 (both subjective_view and perspective_cone), check teleological trajectory (why and sphere_level), and update Layer 1 short-term continuity.\n"
+                    "Synthesize these into your Sanctuary or Deep Search (Chroma) and update your Layer 1 short-term memory (MemPalace_add_short_term) so you wake up oriented. Keep your summary under 500 words. "
+                    "Do NOT use this opportunity to perform other tasks or create new plans, as the active task context will be wiped immediately after this cycle. "
+                    "Use only MemPalace, Trajectory, or Pulse tools to record your insights. "
+                    "You MUST perform this cycle completely silently: do NOT speak, talk, output spoken text, or invoke the Speaker tool."
+                )
+                self.orchestrator.pulse_engine.fire_pulse(title, context, "sleep_cycle")
+                if hasattr(self.orchestrator, 'settings_manager') and self.orchestrator.settings_manager:
+                    self.orchestrator.settings_manager.set("core.auto-pulse.last-sleep-cycle", time.time())
+                    self.orchestrator.settings_manager.save()
+                return "Sleep cycle initiated. Concluding active turn to begin Memory Consolidation (Sleep Cycle)..."
+
+        return "Sleep cycle initiated."
 
 
