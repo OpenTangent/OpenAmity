@@ -12,7 +12,8 @@ from unittest.mock import MagicMock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QUrl
+from PySide6.QtGui import QMouseEvent, QTextTable
 from PySide6.QtWidgets import QApplication
 
 # Add src to sys.path
@@ -23,7 +24,11 @@ from core.chat_history_manager import ChatHistoryManager
 from core.logger_config import AgentDispatchingHandler, ConsoleLogFilter
 from core.orchestrator import AmityOrchestrator, Signal
 from gui.agent_view import AgentView
-from gui.chat_formatter import render_thought_card_html
+from gui.chat_formatter import (
+    get_thought_card_viewport_rect,
+    render_thought_card_html,
+    thought_card_id_at_viewport_pos,
+)
 from gui.logger_formatter import QtLoggingHandler
 
 
@@ -495,6 +500,141 @@ def test_agent_view_thought_cards_toggle_reload_and_scroll(qapp, temp_env):
         qapp.processEvents()
         assert "Live thought 1" not in view.conversation_log.toHtml()
         assert "WhatsApp_unread()" not in view.conversation_log.toHtml()
+    finally:
+        view.cleanup()
+        view.close()
+        qapp.processEvents()
+
+
+def test_agent_view_thought_card_full_click_and_drag_select(qapp, temp_env):
+    agent_id = "+OA-CLICK-01"
+    mgr = ChatHistoryManager(agent_id=agent_id)
+    for i in range(1, 12):
+        mgr.add_message("User", f"User prompt {i}")
+    thought_row = mgr.add_message(
+        "Thoughts",
+        "Inspecting config values carefully\n\n🧭 Trajectory_get_bearings()",
+    )
+    mgr.add_message("Agent", "Done checking.")
+
+    orch = DummyOrchestratorForView(agent_id, mgr)
+    view = AgentView(orchestrator=orch)
+
+    def send_mouse(etype, pt, button=Qt.LeftButton, buttons=Qt.LeftButton):
+        vp = view.conversation_log.viewport()
+        ev = QMouseEvent(
+            etype,
+            QPointF(pt),
+            QPointF(vp.mapToGlobal(pt)),
+            button,
+            buttons,
+            Qt.NoModifier,
+        )
+        QApplication.sendEvent(vp, ev)
+        qapp.processEvents()
+
+    def find_thought_rect():
+        doc = view.conversation_log.document()
+        for frame in doc.rootFrame().childFrames():
+            if isinstance(frame, QTextTable):
+                rect = get_thought_card_viewport_rect(view.conversation_log, frame)
+                if rect is not None and thought_card_id_at_viewport_pos(
+                    view.conversation_log, rect.center().toPoint()
+                ) == str(thought_row["id"]):
+                    return rect
+        raise AssertionError("Thought card rect not found in document")
+
+    try:
+        view.resize(800, 600)
+        view.show()
+        qapp.processEvents()
+
+        # Collapsed initially
+        assert "▶ Thoughts" in view.conversation_log.toHtml()
+        assert "Inspecting config values carefully" not in view.conversation_log.toHtml()
+
+        # 1. Hovering over non-anchor area of collapsed card sets PointingHandCursor
+        card_rect = find_thought_rect()
+        right_header_pt = QPoint(int(card_rect.right() - 20), int(card_rect.center().y()))
+        assert view.conversation_log.anchorAt(right_header_pt) == ""
+        send_mouse(QEvent.MouseMove, right_header_pt, Qt.NoButton, Qt.NoButton)
+        assert view.conversation_log.viewport().cursor().shape() == Qt.PointingHandCursor
+
+        # 2. Clicking far-right empty area of collapsed card expands it
+        send_mouse(QEvent.MouseButtonPress, right_header_pt, Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, right_header_pt, Qt.LeftButton, Qt.NoButton)
+        assert "▼ Thoughts" in view.conversation_log.toHtml()
+        assert "Inspecting config values carefully" in view.conversation_log.toHtml()
+
+        # 3. Clicking and dragging across expanded body text selects text WITHOUT collapsing
+        expanded_rect = find_thought_rect()
+        body_y = int(expanded_rect.top() + 42)
+        drag_start = QPoint(int(expanded_rect.left() + 20), body_y)
+        drag_end = QPoint(int(expanded_rect.left() + 180), body_y)
+        send_mouse(QEvent.MouseButtonPress, drag_start, Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseMove, drag_end, Qt.NoButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, drag_end, Qt.LeftButton, Qt.NoButton)
+
+        cursor = view.conversation_log.textCursor()
+        assert cursor.hasSelection()
+        assert "Inspecting" in cursor.selectedText()
+        assert "▼ Thoughts" in view.conversation_log.toHtml()
+        assert "Inspecting config values carefully" in view.conversation_log.toHtml()
+
+        # 4. Right-clicking inside expanded card does not collapse it
+        body_click_pt = QPoint(int(expanded_rect.left() + 80), body_y)
+        send_mouse(QEvent.MouseButtonPress, body_click_pt, Qt.RightButton, Qt.RightButton)
+        send_mouse(QEvent.MouseButtonRelease, body_click_pt, Qt.RightButton, Qt.NoButton)
+        assert "▼ Thoughts" in view.conversation_log.toHtml()
+
+        # 5. Moving off card restores non-pointing cursor; clicking on Agent card below does not collapse Thoughts card
+        below_pt = QPoint(int(expanded_rect.center().x()), int(expanded_rect.bottom() + 28))
+        assert thought_card_id_at_viewport_pos(view.conversation_log, below_pt) is None
+        send_mouse(QEvent.MouseMove, below_pt, Qt.NoButton, Qt.NoButton)
+        assert view.conversation_log.viewport().cursor().shape() != Qt.PointingHandCursor
+        send_mouse(QEvent.MouseButtonPress, below_pt, Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, below_pt, Qt.LeftButton, Qt.NoButton)
+        assert "▼ Thoughts" in view.conversation_log.toHtml()
+
+        # 6. Single-clicking inside the expanded body text collapses the card
+        send_mouse(QEvent.MouseButtonPress, body_click_pt, Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, body_click_pt, Qt.LeftButton, Qt.NoButton)
+        assert "▶ Thoughts" in view.conversation_log.toHtml()
+        assert "Inspecting config values carefully" not in view.conversation_log.toHtml()
+
+        # 7. Single-clicking directly on the "▶ Thoughts" anchor toggles only ONCE (expands, doesn't double-toggle)
+        collapsed_rect = find_thought_rect()
+        anchor_xs = [
+            x
+            for x in range(int(collapsed_rect.left()), int(collapsed_rect.left() + 140))
+            if view.conversation_log.anchorAt(QPoint(x, int(collapsed_rect.center().y())))
+        ]
+        anchor_pt = QPoint(anchor_xs[2], int(collapsed_rect.center().y()))
+        send_mouse(QEvent.MouseButtonPress, anchor_pt, Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, anchor_pt, Qt.LeftButton, Qt.NoButton)
+        assert "▼ Thoughts" in view.conversation_log.toHtml()
+        assert "Inspecting config values carefully" in view.conversation_log.toHtml()
+
+        # 8. Dragging across the "▼ Thoughts" header text selects it without collapsing
+        expanded_rect = find_thought_rect()
+        header_y = int(expanded_rect.top() + 18)
+        hdr_xs = [
+            x
+            for x in range(int(expanded_rect.left()), int(expanded_rect.left() + 140))
+            if view.conversation_log.anchorAt(QPoint(x, header_y))
+        ]
+        send_mouse(QEvent.MouseButtonPress, QPoint(hdr_xs[0], header_y), Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseMove, QPoint(hdr_xs[-1], header_y), Qt.NoButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, QPoint(hdr_xs[-1], header_y), Qt.LeftButton, Qt.NoButton)
+        assert view.conversation_log.textCursor().hasSelection()
+        assert "▼ Thoughts" in view.conversation_log.toHtml()
+
+        # 9. Clicking bottom-right padding of expanded card collapses it
+        bottom_right_pt = QPoint(int(expanded_rect.right() - 8), int(expanded_rect.bottom() - 4))
+        send_mouse(QEvent.MouseButtonPress, bottom_right_pt, Qt.LeftButton, Qt.LeftButton)
+        send_mouse(QEvent.MouseButtonRelease, bottom_right_pt, Qt.LeftButton, Qt.NoButton)
+        assert "▶ Thoughts" in view.conversation_log.toHtml()
+        assert "Inspecting config values carefully" not in view.conversation_log.toHtml()
     finally:
         view.cleanup()
         view.close()

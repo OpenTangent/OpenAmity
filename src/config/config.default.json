@@ -7,5 +7,11 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 7965
+  },
+  "ui": {
+    "sidebar-collapsed": false,
+    "agents-collapsed": false,
+    "chatrooms-collapsed": false,
+    "sidebar-width": 200
   }
 }

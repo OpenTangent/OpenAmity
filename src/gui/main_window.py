@@ -1,180 +1,23 @@
 import sys
-import math
 import logging
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QTextEdit, QMenu, QStackedLayout,
+                               QTextEdit, QMenu, QStackedLayout,
                                QStackedWidget, QMessageBox)
-from PySide6.QtCore import Qt, Signal, QTimer, QSize
-from PySide6.QtGui import QKeyEvent, QAction, QPainter, QColor, QPen, QBrush
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeyEvent, QAction, QShortcut, QKeySequence
 
 from gui.spellcheck import SpellCheckHighlighter
 from gui.logger_formatter import QtLoggingHandler, StreamLogger
 from gui.agent_view import AgentView
 from gui.chatroom_view import ChatroomView
-from gui.chatroom_sidebar import ChatroomSidebar
+from gui.chatroom_sidebar import ChatroomSidebar, SidebarAgentButton as AgentTabButton
 from gui.chatroom_editor_panel import ChatroomEditorPanel
 from core.chatroom_manager import ChatroomManager
 
 try:
-    from gui.theme import PRIMARY_ACCENT_COLOR, SECONDARY_ACCENT_COLOR, MODERN_SCROLLBAR_STYLE
+    from gui.theme import MODERN_SCROLLBAR_STYLE
 except ImportError:
-    PRIMARY_ACCENT_COLOR = "#a12924"
-    SECONDARY_ACCENT_COLOR = "#f7e3a5"
     MODERN_SCROLLBAR_STYLE = ""
-
-
-class AgentTabButton(QPushButton):
-    def __init__(self, agent_id: str, agent_name: str, parent=None):
-        super().__init__(agent_name, parent)
-        self.agent_id = agent_id
-        self.setFixedHeight(30)
-        self.setCursor(Qt.PointingHandCursor)
-        self.is_selected = False
-        self.is_paused = False
-        self.activity_state = "idle"  # "idle", "thinking", "speaking"
-        self._is_hovered = False
-
-        font = self.font()
-        font.setPointSize(10)
-        self.setFont(font)
-
-        # Pulse animation
-        self.pulse_phase = 0.0
-        self.pulse_timer = QTimer(self)
-        self.pulse_timer.setInterval(30)  # ~33 FPS
-        self.pulse_timer.timeout.connect(self._on_pulse_tick)
-
-        # Base and dark/light color limits for accents
-        self.primary_base = QColor(PRIMARY_ACCENT_COLOR)
-        self.primary_dark = QColor("#4e1412")
-        self.primary_light = QColor("#cf3832")
-
-        self.secondary_base = QColor(SECONDARY_ACCENT_COLOR)
-        self.secondary_dark = QColor("#705e2c")
-        self.secondary_light = QColor("#faecc2")
-
-    def _on_pulse_tick(self):
-        # A slow pulse: full cycle in ~2.0 seconds (frequency = 0.5 Hz)
-        self.pulse_phase += 0.0943
-        if self.pulse_phase >= 2 * math.pi:
-            self.pulse_phase -= 2 * math.pi
-        self.update()
-
-    def set_paused(self, paused: bool):
-        if self.is_paused != paused:
-            self.is_paused = paused
-            if paused:
-                self.pulse_timer.stop()
-                self.pulse_phase = 0.0
-                self.activity_state = "idle"
-            self.update()
-
-    def set_activity_state(self, state: str):
-        if self.is_paused:
-            state = "idle"
-        if self.activity_state == state:
-            return
-        self.activity_state = state
-        if state in ("thinking", "speaking"):
-            if not self.pulse_timer.isActive():
-                self.pulse_phase = 0.0
-                self.pulse_timer.start()
-        else:
-            self.pulse_timer.stop()
-            self.pulse_phase = 0.0
-            self.update()
-
-    def set_selected(self, selected: bool):
-        if self.is_selected != selected:
-            self.is_selected = selected
-            self.update()
-
-    def enterEvent(self, event):
-        self._is_hovered = True
-        if self.activity_state == "idle":
-            self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._is_hovered = False
-        if self.activity_state == "idle":
-            self.update()
-        super().leaveEvent(event)
-
-    @staticmethod
-    def _interpolate_color(c1: QColor, c2: QColor, factor: float) -> QColor:
-        factor = max(0.0, min(1.0, factor))
-        r = int(c1.red() + (c2.red() - c1.red()) * factor)
-        g = int(c1.green() + (c2.green() - c1.green()) * factor)
-        b = int(c1.blue() + (c2.blue() - c1.blue()) * factor)
-        return QColor(r, g, b)
-
-    def sizeHint(self):
-        fm = self.fontMetrics()
-        display_text = f"{self.text()} ⏸" if self.is_paused else self.text()
-        text_width = fm.horizontalAdvance(display_text)
-        return QSize(max(80, text_width + 30), 30)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-
-        rect = self.rect()
-        draw_rect = rect.adjusted(0, 0, -1, -1)
-
-        if self.is_paused:
-            if self.is_selected:
-                bg_color = QColor("#2b2513")
-                border_color = QColor("#8a6d1c")
-                text_color = QColor("#e0c068")
-            elif self._is_hovered:
-                bg_color = QColor("#241e0f")
-                border_color = QColor("#665114")
-                text_color = QColor("#c2a659")
-            else:
-                bg_color = QColor("#1c180d")
-                border_color = QColor("#47380d")
-                text_color = QColor("#857342")
-        elif self.activity_state == "speaking":
-            factor = (math.sin(self.pulse_phase) + 1.0) / 2.0
-            bg_color = self._interpolate_color(self.secondary_dark, self.secondary_light, factor)
-            border_color = self._interpolate_color(self.secondary_base, self.secondary_light, factor)
-            text_color = QColor("#1a1a1a")
-        elif self.activity_state == "thinking":
-            factor = (math.sin(self.pulse_phase) + 1.0) / 2.0
-            bg_color = self._interpolate_color(self.primary_dark, self.primary_light, factor)
-            border_color = self._interpolate_color(self.primary_base, self.primary_light, factor)
-            text_color = QColor("#FFFFFF")
-        else:
-            # Idle
-            if self.is_selected:
-                bg_color = QColor("#444444")
-                border_color = QColor("#555555")
-                text_color = QColor("#FFFFFF")
-            elif self._is_hovered:
-                bg_color = QColor("#333333")
-                border_color = QColor("#444444")
-                text_color = QColor("#FFFFFF")
-            else:
-                bg_color = QColor("#222222")
-                border_color = QColor("#222222")
-                text_color = QColor("#AAAAAA")
-
-        painter.setPen(QPen(border_color, 1))
-        painter.setBrush(QBrush(bg_color))
-        painter.drawRoundedRect(draw_rect, 4, 4)
-
-        font = self.font()
-        font.setPointSize(10)
-        painter.setFont(font)
-        painter.setPen(text_color)
-
-        text_rect = rect.adjusted(15, 0, -15, 0)
-        display_text = f"{self.text()} ⏸" if self.is_paused else self.text()
-        elided_text = painter.fontMetrics().elidedText(
-            display_text, Qt.TextElideMode.ElideRight, text_rect.width())
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, elided_text)
 
 
 class PromptTextEdit(QTextEdit):
@@ -237,7 +80,6 @@ class MainWindow(QMainWindow):
         self.agent_manager = agent_manager
         self.chatroom_manager = ChatroomManager()
         self.agent_views = {}  # dict of agent_id -> AgentView
-        self.tab_buttons = {}  # dict of agent_id -> AgentTabButton
         self.current_agent_id = None
         self.current_chatroom_id = None
         self.last_dm_agent_id = None
@@ -276,11 +118,13 @@ class MainWindow(QMainWindow):
         self.main_hlayout.setContentsMargins(0, 0, 0, 0)
         self.main_hlayout.setSpacing(0)
 
-        # Chatroom Tabs Sidebar (runs full height down the left side)
-        self.chatroom_sidebar = ChatroomSidebar(self)
-        self.chatroom_sidebar.all_agents_selected.connect(self._on_sidebar_all_agents_selected)
+        # Unified Navigation Sidebar (runs full height down the left side)
+        self.chatroom_sidebar = ChatroomSidebar(self.agent_manager, self)
+        self.chatroom_sidebar.agent_selected.connect(self.on_agent_tab_clicked)
+        self.chatroom_sidebar.new_agent_requested.connect(self.add_new_agent)
         self.chatroom_sidebar.chatroom_selected.connect(self._on_sidebar_chatroom_selected)
         self.chatroom_sidebar.new_chatroom_requested.connect(self.open_new_chatroom)
+        self.chatroom_sidebar.edit_chatroom_requested.connect(self.open_edit_chatroom)
         self.main_hlayout.addWidget(self.chatroom_sidebar)
 
         self.left_container = QWidget()
@@ -293,33 +137,7 @@ class MainWindow(QMainWindow):
         self.consoles_stack.hide()
         self.main_hlayout.addWidget(self.consoles_stack, 1)
 
-        # Header Bar (Agent Tabs to the right of the Chatroom Sidebar)
-        self.header_widget = QWidget()
-        self.header_widget.setStyleSheet("background-color: #1a1a1a;")
-        self.header_layout = QHBoxLayout(self.header_widget)
-        self.header_layout.setContentsMargins(10, 5, 10, 5)
-        self.header_layout.setSpacing(5)
-
-        self.tabs_layout = QHBoxLayout()
-        self.tabs_layout.setSpacing(2)
-        self.header_layout.addLayout(self.tabs_layout)
-
-        # Contextual top [+] button (Add Agent when in All Agents, Edit Chatroom when in Chatroom)
-        self.btn_add_agent = QPushButton("+")
-        self.btn_add_agent.setFixedSize(30, 30)
-        self.btn_add_agent.setToolTip("Add Agent")
-        self.btn_add_agent.setStyleSheet(
-            "QPushButton { background-color: #333; color: #FFF; border: none; font-size: 18px; border-radius: 4px; } QPushButton:hover { background-color: #444; }")
-        self.btn_add_agent.clicked.connect(self._on_top_plus_clicked)
-        self.header_layout.addWidget(self.btn_add_agent)
-
-        self.header_layout.addStretch()
-
-        self.hamburger_btn = QPushButton("☰")
-        self.hamburger_btn.setFixedSize(30, 30)
-        self.hamburger_btn.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #FFF; border: none; font-size: 20px; } QPushButton::menu-indicator { image: none; }")
-
+        # Contextual Hamburger Menu (docked into sidebar bottom settings bar)
         self.hamburger_menu = QMenu(self)
         self.hamburger_menu.setStyleSheet(
             "QMenu { background-color: #222; color: #FFF; border: 1px solid #444; } QMenu::item:selected { background-color: #333; }")
@@ -368,10 +186,12 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         self.hamburger_menu.addAction(exit_action)
 
-        self.hamburger_btn.setMenu(self.hamburger_menu)
-        self.header_layout.addWidget(self.hamburger_btn)
+        self.chatroom_sidebar.set_hamburger_menu(self.hamburger_menu)
+        self.hamburger_btn = self.chatroom_sidebar.hamburger_btn
+        self.btn_add_agent = self.chatroom_sidebar.btn_add_agent
 
-        self.main_vlayout.addWidget(self.header_widget)
+        self.sidebar_toggle_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        self.sidebar_toggle_shortcut.activated.connect(self.chatroom_sidebar.toggle_collapsed)
 
         # Content Area (Stacked: Views vs Settings vs Chatroom Editor)
         self.content_container = QWidget()
@@ -436,46 +256,15 @@ class MainWindow(QMainWindow):
         self.check_first_launch()
 
     @property
-    def btn_chatroom(self):
-        """Backward-compatibility property returning the sidebar All Agents tab button."""
-        return self.chatroom_sidebar.btn_all_agents
+    def tab_buttons(self):
+        """Returns mapping of agent_id -> SidebarAgentButton managed by the sidebar."""
+        return self.chatroom_sidebar.agent_buttons
 
     def update_chatroom_tab_visibility(self):
-        """Refreshes sidebar rooms and agent tab list."""
+        """Refreshes sidebar agents and rooms."""
         if hasattr(self, 'chatroom_sidebar'):
+            self.chatroom_sidebar.refresh_agents()
             self.chatroom_sidebar.refresh_rooms()
-        self._rebuild_agent_tabs()
-
-    def _rebuild_agent_tabs(self):
-        """Rebuilds the top tab bar ordered by agent age, filtered by current context (All Agents vs Chatroom members)."""
-        agents_by_age = self.agent_manager.get_agents_by_age()
-        curr_type, room_id = self.current_context
-
-        if curr_type == "room" and room_id is not None:
-            members = self.chatroom_manager.get_members(room_id)
-            member_uids = {m["agent_uid"] for m in members}
-            visible_agent_ids = [aid for aid in agents_by_age if self.agent_manager.get_agent_uid(aid) in member_uids]
-        else:
-            visible_agent_ids = agents_by_age
-
-        while self.tabs_layout.count():
-            self.tabs_layout.takeAt(0)
-
-        for aid in agents_by_age:
-            if aid in self.tab_buttons:
-                btn = self.tab_buttons[aid]
-                if aid in visible_agent_ids:
-                    btn.show()
-                    self.tabs_layout.addWidget(btn)
-                    if curr_type == "all":
-                        btn.set_selected(aid == self.current_agent_id)
-                    else:
-                        btn.set_selected(False)
-                else:
-                    btn.hide()
-
-    def _on_sidebar_all_agents_selected(self):
-        self.switch_to_all_agents(target_agent_id=self.last_dm_agent_id)
 
     def _on_sidebar_chatroom_selected(self, room_id: int):
         self.switch_to_chatroom(room_id)
@@ -509,11 +298,6 @@ class MainWindow(QMainWindow):
         self.agents_stack.setCurrentWidget(self.agent_views[target_agent_id])
         self.consoles_stack.setCurrentWidget(
             self.agent_views[target_agent_id].console_log)
-        self.hamburger_btn.show()
-
-        # Configure top [+] button for Add Agent
-        self.btn_add_agent.setText("+")
-        self.btn_add_agent.setToolTip("Add Agent")
 
         # Configure hamburger menu for agent
         for action in self.agent_menu_actions:
@@ -523,11 +307,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'menu_separator') and self.menu_separator:
             self.menu_separator.setVisible(True)
 
-        # Update sidebar selection
-        self.chatroom_sidebar.set_selected_context("all", None)
-
-        # Rebuild agent tabs (shows all agents, selects target_agent_id)
-        self._rebuild_agent_tabs()
+        # Update sidebar selection (deselects chatrooms, collapses room member lists, selects agent)
+        self.chatroom_sidebar.set_selected_agent(target_agent_id)
 
         # Update tool pip active states across agent views
         for aid, v in self.agent_views.items():
@@ -561,11 +342,6 @@ class MainWindow(QMainWindow):
         self.chatroom_view.set_chatroom(chatroom_id)
         self.agents_stack.setCurrentWidget(self.chatroom_view)
         self.consoles_stack.setCurrentWidget(self.chatroom_view.console_log)
-        self.hamburger_btn.show()
-
-        # Configure top [+] button for Edit Chatroom
-        self.btn_add_agent.setText("+")
-        self.btn_add_agent.setToolTip("Edit Chatroom")
 
         # Configure hamburger menu for chatroom
         for action in self.agent_menu_actions:
@@ -575,11 +351,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'menu_separator') and self.menu_separator:
             self.menu_separator.setVisible(True)
 
-        # Update sidebar selection
-        self.chatroom_sidebar.set_selected_context("room", chatroom_id)
-
-        # Rebuild agent tabs for this room
-        self._rebuild_agent_tabs()
+        # Update sidebar selection (selects room and expands only its member agents)
+        self.chatroom_sidebar.set_selected_chatroom(chatroom_id)
 
         # Deactivate tool pips on all agent views while viewing chatroom
         for aid, view in self.agent_views.items():
@@ -588,12 +361,6 @@ class MainWindow(QMainWindow):
 
         if not getattr(self.settings_panel, 'wizard_mode', False):
             self.hide_settings()
-
-    def _on_top_plus_clicked(self):
-        if self.current_context[0] == "room" and self.current_chatroom_id is not None:
-            self.open_edit_chatroom(self.current_chatroom_id)
-        else:
-            self.add_new_agent()
 
     def _on_menu_edit_chatroom(self):
         if self.current_context[0] == "room" and self.current_chatroom_id is not None:
@@ -613,7 +380,7 @@ class MainWindow(QMainWindow):
 
     def hide_chatroom_editor(self):
         self.stacked_layout.setCurrentIndex(0)
-        self._rebuild_agent_tabs()
+        self.chatroom_sidebar.refresh_selected_room_members()
 
     def on_chatroom_saved(self, chatroom_id: int):
         self.chatroom_sidebar.refresh_rooms()
@@ -642,21 +409,11 @@ class MainWindow(QMainWindow):
             self.chatroom_sidebar.refresh_rooms()
 
     def _on_agent_busy_state_changed(self, agent_id: str, busy: bool, speaking: bool):
-        if agent_id not in self.tab_buttons:
-            return
-        btn = self.tab_buttons[agent_id]
-        if speaking:
-            btn.set_activity_state("speaking")
-        elif busy:
-            btn.set_activity_state("thinking")
-        else:
-            btn.set_activity_state("idle")
+        state = "speaking" if speaking else ("thinking" if busy else "idle")
+        self.chatroom_sidebar.set_agent_activity_state(agent_id, state)
 
     def _on_agent_paused_state_changed(self, agent_id: str, paused: bool):
-        if agent_id not in self.tab_buttons:
-            return
-        btn = self.tab_buttons[agent_id]
-        btn.set_paused(paused)
+        self.chatroom_sidebar.set_agent_paused(agent_id, paused)
         if not paused:
             orch = self.agent_manager.get_orchestrator(agent_id)
             if orch and hasattr(orch, 'pulse_engine') and hasattr(orch.pulse_engine, 'notify_unpaused'):
@@ -666,10 +423,12 @@ class MainWindow(QMainWindow):
         if not target:
             return
         if target in self.agent_views:
+            self.chatroom_sidebar.set_agents_collapsed(False)
             self.switch_to_all_agents(target_agent_id=target)
             return
         aid = self.agent_manager.get_agent_id_by_uid(target)
         if aid and aid in self.agent_views:
+            self.chatroom_sidebar.set_agents_collapsed(False)
             self.switch_to_all_agents(target_agent_id=aid)
 
     def add_agent_tab(self, agent_id):
@@ -684,13 +443,6 @@ class MainWindow(QMainWindow):
         self.agents_stack.addWidget(view)
         self.consoles_stack.addWidget(view.console_log)
 
-        agent_name = self.agent_manager.get_agent_name(agent_id)
-        btn = AgentTabButton(agent_id, agent_name, self)
-        btn.set_paused(orchestrator.is_paused)
-        btn.clicked.connect(lambda checked=False,
-                            a=agent_id: self.on_agent_tab_clicked(a))
-        self.tab_buttons[agent_id] = btn
-
         orchestrator.on_shutdown_complete.connect(self.check_all_shutdown)
         orchestrator.on_busy_state_changed.connect(
             lambda busy, speaking, aid=agent_id: self.ui_agent_busy_state_changed.emit(aid, busy, speaking)
@@ -698,7 +450,8 @@ class MainWindow(QMainWindow):
         orchestrator.on_paused_state_changed.connect(
             lambda paused, aid=agent_id: self.ui_agent_paused_state_changed.emit(aid, paused)
         )
-        self._rebuild_agent_tabs()
+        self.chatroom_sidebar.refresh_agents()
+        self.chatroom_sidebar.set_agent_paused(agent_id, orchestrator.is_paused)
 
     def add_new_agent(self):
         new_id = self.agent_manager.create_new_agent()
@@ -742,14 +495,10 @@ class MainWindow(QMainWindow):
             view.cleanup()
             view.deleteLater()
 
-            btn = self.tab_buttons.pop(aid)
-            btn.set_activity_state("idle")
-            self.tabs_layout.removeWidget(btn)
-            btn.deleteLater()
-
             # Delete data
             self.agent_manager.delete_agent(aid)
-            self._rebuild_agent_tabs()
+            self.chatroom_sidebar.remove_agent(aid)
+            self.chatroom_sidebar.refresh_agents()
             self.chatroom_sidebar.refresh_rooms()
 
     def append_to_agent_console(self, agent_id, text):
@@ -788,8 +537,7 @@ class MainWindow(QMainWindow):
         self.update_tab_names()
 
     def update_tab_names(self):
-        for aid, btn in self.tab_buttons.items():
-            btn.setText(self.agent_manager.get_agent_name(aid))
+        self.chatroom_sidebar.update_agent_names()
 
     def on_wizard_finished(self):
         self.hide_settings()
@@ -829,9 +577,7 @@ class MainWindow(QMainWindow):
                 if hasattr(new_orch, 'pulse_engine') and hasattr(new_orch.pulse_engine, 'notify_unpaused'):
                     new_orch.pulse_engine.notify_unpaused()
 
-            if agent_id in self.tab_buttons:
-                self.tab_buttons[agent_id].set_paused(getattr(new_orch, 'is_paused', False))
-
+            self.chatroom_sidebar.set_agent_paused(agent_id, getattr(new_orch, 'is_paused', False))
             self.update_tab_names()
             self.switch_to_agent(agent_id)
         else:
@@ -842,6 +588,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self._shutting_down:
+            if hasattr(self, 'chatroom_sidebar') and self.chatroom_sidebar:
+                self.chatroom_sidebar.close()
             event.accept()
             return
 
@@ -870,6 +618,8 @@ class MainWindow(QMainWindow):
         if self.agents_pending_shutdown <= 0:
             if hasattr(self.agent_manager, 'stop_hook_server'):
                 self.agent_manager.stop_hook_server()
+            if hasattr(self.agent_manager, 'stop_chatroom_notifier'):
+                self.agent_manager.stop_chatroom_notifier()
             self.ui_shutdown_complete.emit()
 
     def keyPressEvent(self, event: QKeyEvent):

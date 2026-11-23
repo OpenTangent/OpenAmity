@@ -11,6 +11,7 @@ const port = parseInt(process.env.WHATSAPP_PORT || process.env.PORT, 10) || 3000
 app.use(express.json({ limit: '50mb' }));
 
 const dataDir = process.env.WHATSAPP_DATA_DIR || __dirname;
+const configuredAgentName = (process.env.WHATSAPP_AGENT_NAME || '').trim();
 const sessionDir = path.join(dataDir, '.wpp_session');
 const uploadDir = path.join(dataDir, 'uploads');
 const customWaJsPath = path.join(dataDir, 'wppconnect-wa.js');
@@ -212,10 +213,825 @@ function findChromeExecutable() {
     return null;
 }
 
+const browserMentionHelper = `
+function normalizeJidInBrowser(raw) {
+    if (!raw) return '';
+    let s = '';
+    if (typeof raw === 'string') {
+        s = raw;
+    } else if (typeof raw === 'object') {
+        if (typeof raw._serialized === 'string' && raw._serialized) {
+            s = raw._serialized;
+        } else if (raw.user && raw.server) {
+            s = String(raw.user) + '@' + String(raw.server);
+        } else if (typeof raw.id === 'string' && raw.id) {
+            s = raw.id.includes('@') ? raw.id : (raw.server ? (raw.id + '@' + String(raw.server)) : raw.id);
+        } else if (typeof raw.toString === 'function') {
+            const str = raw.toString();
+            if (str && str !== '[object Object]') {
+                s = str;
+            }
+        }
+    }
+    s = String(s || '').trim().toLowerCase();
+    if (!s || s === '[object object]') return '';
+
+    const atIdx = s.indexOf('@');
+    if (atIdx !== -1) {
+        let userPart = s.slice(0, atIdx).split(':')[0].replace(/^\\+/, '').trim();
+        let serverPart = s.slice(atIdx + 1).trim();
+        if (!userPart || !serverPart) return '';
+        if (serverPart === 's.whatsapp.net') {
+            serverPart = 'c.us';
+        }
+        return userPart + '@' + serverPart;
+    }
+    return s.split(':')[0].replace(/^\\+/, '').trim();
+}
+
+function extractJidUserInBrowser(raw) {
+    const norm = normalizeJidInBrowser(raw);
+    if (!norm) return '';
+    const atIdx = norm.indexOf('@');
+    return atIdx !== -1 ? norm.slice(0, atIdx) : norm;
+}
+
+function extractIterableInBrowser(val) {
+    if (!val) return [];
+    if (Array.isArray(val)) return val;
+    try {
+        if (typeof val.toArray === 'function') {
+            const arr = val.toArray();
+            if (Array.isArray(arr)) return arr;
+        }
+        if (Array.isArray(val.models)) return val.models;
+        if (typeof val[Symbol.iterator] === 'function' && typeof val !== 'string') {
+            return Array.from(val);
+        }
+    } catch (e) {}
+    return [];
+}
+
+function escapeRegExpInBrowser(str) {
+    return String(str).replace(/[.*+?^{}$()|[\\]\\\\]/g, '\\\\$&');
+}
+
+async function collectMyIdentifiersInBrowser(agentName) {
+    const jids = new Set();
+    const users = new Set();
+    const handles = new Set();
+    const rawWids = [];
+
+    const addId = (raw) => {
+        if (!raw) return;
+        if (typeof raw === 'object') {
+            rawWids.push(raw);
+        }
+        const norm = normalizeJidInBrowser(raw);
+        if (!norm) return;
+        jids.add(norm);
+        const u = extractJidUserInBrowser(norm);
+        if (u) users.add(u);
+    };
+
+    const addHandle = (raw) => {
+        if (typeof raw !== 'string') return;
+        const clean = raw.trim().replace(/^@+/, '').trim();
+        if (clean.length >= 2) {
+            handles.add(clean.toLowerCase());
+        }
+    };
+
+    addHandle(agentName);
+
+    const wpp = (typeof window !== 'undefined' && window.WPP) ? window.WPP : null;
+    if (wpp && wpp.conn) {
+        const connFns = ['getMyUserId', 'getMyUserWid', 'getMyUserLid', 'getMyDeviceId'];
+        for (const fn of connFns) {
+            try {
+                if (typeof wpp.conn[fn] === 'function') {
+                    addId(wpp.conn[fn]());
+                }
+            } catch (e) {}
+        }
+    }
+
+    const userPrefs = wpp && wpp.whatsapp && wpp.whatsapp.UserPrefs;
+    if (userPrefs) {
+        const prefFns = [
+            'getMaybeMeUser',
+            'getMeUser',
+            'getMaybeMePnUser',
+            'getMePnUserOrThrow',
+            'getMaybeMeLidUser',
+            'getMeLidUserOrThrow',
+            'getMeLidUser',
+            'getMaybeMeLid',
+            'getMe'
+        ];
+        for (const fn of prefFns) {
+            try {
+                if (typeof userPrefs[fn] === 'function') {
+                    addId(userPrefs[fn]());
+                }
+            } catch (e) {}
+        }
+    }
+
+    const connObj = wpp && wpp.whatsapp && wpp.whatsapp.Conn;
+    if (connObj) {
+        try { addId(connObj.wid); } catch (e) {}
+        try { addId(connObj.me); } catch (e) {}
+        try { addId(connObj.lid); } catch (e) {}
+        try { addId(connObj.meLid); } catch (e) {}
+        try { addHandle(connObj.pushname); } catch (e) {}
+    }
+
+    // Cross-resolve PN <-> LID so we always know both our @c.us and @lid even if a UserPrefs getter breaks
+    const initialJids = Array.from(jids);
+    const lidPnCache = wpp && wpp.whatsapp && wpp.whatsapp.lidPnCache;
+    if (lidPnCache) {
+        for (const wid of rawWids.slice()) {
+            try {
+                if (typeof lidPnCache.getCurrentLid === 'function') {
+                    addId(lidPnCache.getCurrentLid(wid));
+                }
+            } catch (e) {}
+            try {
+                if (typeof lidPnCache.getPhoneNumber === 'function') {
+                    addId(lidPnCache.getPhoneNumber(wid));
+                }
+            } catch (e) {}
+        }
+        for (const jid of initialJids) {
+            try {
+                if (jid.endsWith('@c.us') && typeof lidPnCache.getCurrentLid === 'function') {
+                    addId(lidPnCache.getCurrentLid(jid));
+                } else if (jid.endsWith('@lid') && typeof lidPnCache.getPhoneNumber === 'function') {
+                    addId(lidPnCache.getPhoneNumber(jid));
+                }
+            } catch (e) {}
+        }
+    }
+
+    if (wpp && wpp.contact && typeof wpp.contact.getPnLidEntry === 'function') {
+        for (const jid of initialJids) {
+            if (!jid.endsWith('@c.us') && !jid.endsWith('@lid')) continue;
+            try {
+                const entry = await wpp.contact.getPnLidEntry(jid);
+                if (entry) {
+                    addId(entry.lid);
+                    addId(entry.phoneNumber);
+                    if (entry.contact) {
+                        addId(entry.contact.id);
+                        addId(entry.contact.lid);
+                        addId(entry.contact.phoneNumber);
+                        addHandle(entry.contact.pushname);
+                        addHandle(entry.contact.username);
+                        addHandle(entry.contact.verifiedName);
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
+    if (wpp && wpp.profile && typeof wpp.profile.getMyProfileName === 'function') {
+        try {
+            const pName = await wpp.profile.getMyProfileName();
+            addHandle(pName);
+        } catch (e) {}
+    }
+
+    if (wpp && wpp.contact && typeof wpp.contact.get === 'function') {
+        for (const jid of Array.from(jids)) {
+            try {
+                const c = await wpp.contact.get(jid);
+                if (c) {
+                    addHandle(c.pushname);
+                    addHandle(c.username);
+                    addHandle(c.verifiedName);
+                    break;
+                }
+            } catch (e) {}
+        }
+    }
+
+    return { jids, users, handles, rawWids };
+}
+
+async function jidMatchesMeInBrowser(rawJid, myInfo) {
+    if (!rawJid || !myInfo) return false;
+    const norm = normalizeJidInBrowser(rawJid);
+    if (!norm) return false;
+    if (myInfo.jids.has(norm)) return true;
+
+    const userPart = extractJidUserInBrowser(norm);
+    const isUserDomain = !norm.includes('@') || norm.endsWith('@c.us') || norm.endsWith('@lid');
+    if (userPart && isUserDomain && myInfo.users.has(userPart)) {
+        return true;
+    }
+
+    const wpp = (typeof window !== 'undefined' && window.WPP) ? window.WPP : null;
+    if (norm.endsWith('@lid') || norm.endsWith('@c.us')) {
+        const lidPnCache = wpp && wpp.whatsapp && wpp.whatsapp.lidPnCache;
+        if (lidPnCache) {
+            try {
+                const alt = norm.endsWith('@lid')
+                    ? (typeof lidPnCache.getPhoneNumber === 'function' ? lidPnCache.getPhoneNumber(rawJid) || lidPnCache.getPhoneNumber(norm) : null)
+                    : (typeof lidPnCache.getCurrentLid === 'function' ? lidPnCache.getCurrentLid(rawJid) || lidPnCache.getCurrentLid(norm) : null);
+                const altNorm = normalizeJidInBrowser(alt);
+                if (altNorm && (myInfo.jids.has(altNorm) || myInfo.users.has(extractJidUserInBrowser(altNorm)))) {
+                    return true;
+                }
+            } catch (e) {}
+        }
+
+        if (wpp && wpp.contact && typeof wpp.contact.getPnLidEntry === 'function') {
+            try {
+                const entry = await wpp.contact.getPnLidEntry(norm);
+                if (entry) {
+                    const resolvedCandidates = [
+                        entry.phoneNumber,
+                        entry.lid,
+                        entry.contact && entry.contact.id,
+                        entry.contact && entry.contact.lid,
+                        entry.contact && entry.contact.phoneNumber
+                    ];
+                    for (const rc of resolvedCandidates) {
+                        const rcNorm = normalizeJidInBrowser(rc);
+                        if (rcNorm && (myInfo.jids.has(rcNorm) || myInfo.users.has(extractJidUserInBrowser(rcNorm)))) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
+    return false;
+}
+
+async function detectMessageMentionInBrowser(msg, agentName) {
+    if (!msg) return { mentioned: false, reason: '' };
+    const myInfo = await collectMyIdentifiersInBrowser(agentName);
+
+    // 1. Check all JID mention lists on the message
+    const mentionCandidates = [];
+    const listSources = [
+        msg.mentionedJidList,
+        msg.mentionedList,
+        msg._data && msg._data.mentionedJidList,
+        msg.attributes && msg.attributes.mentionedJidList
+    ];
+    try {
+        if (typeof msg.get === 'function') {
+            listSources.push(msg.get('mentionedJidList'));
+        }
+    } catch (e) {}
+    for (const src of listSources) {
+        for (const item of extractIterableInBrowser(src)) {
+            if (item) mentionCandidates.push(item);
+        }
+    }
+    try {
+        if (typeof msg.mentionMap === 'function') {
+            const mMap = msg.mentionMap();
+            if (mMap && typeof mMap === 'object') {
+                for (const k of Object.keys(mMap)) {
+                    mentionCandidates.push(k);
+                    if (mMap[k]) mentionCandidates.push(mMap[k]);
+                }
+            }
+        }
+    } catch (e) {}
+
+    const seenMentionKeys = new Set();
+    for (const cand of mentionCandidates) {
+        const key = normalizeJidInBrowser(cand);
+        if (!key || seenMentionKeys.has(key)) continue;
+        seenMentionKeys.add(key);
+        if (await jidMatchesMeInBrowser(cand, myInfo)) {
+            return { mentioned: true, reason: 'jid' };
+        }
+    }
+
+    // 2. Native MsgModel.isMentioned(wid) check
+    if (typeof msg.isMentioned === 'function' && myInfo.rawWids.length > 0) {
+        for (const wid of myInfo.rawWids) {
+            try {
+                if (msg.isMentioned(wid) === true) {
+                    return { mentioned: true, reason: 'native_is_mentioned' };
+                }
+            } catch (e) {}
+        }
+    }
+
+    // 3. Protocol group-wide mention (@everyone / @all)
+    const nonJidMentions = (typeof msg.nonJidMentions === 'number')
+        ? msg.nonJidMentions
+        : ((msg._data && typeof msg._data.nonJidMentions === 'number')
+            ? msg._data.nonJidMentions
+            : (msg.attributes && typeof msg.attributes.nonJidMentions === 'number' ? msg.attributes.nonJidMentions : 0));
+    if (typeof nonJidMentions === 'number' && (nonJidMentions & 1) !== 0) {
+        return { mentioned: true, reason: 'mention_all' };
+    }
+
+    // 4. Quoted reply to one of our own messages (handles LID/PN mismatch and DM replies without quotedParticipant)
+    const quotedObjs = [msg.quotedMsg, msg._quotedMsgObj].filter(Boolean);
+    for (const qObj of quotedObjs) {
+        if (qObj.fromMe || qObj.isSentByMe || (qObj.id && qObj.id.fromMe)) {
+            return { mentioned: true, reason: 'quoted_from_me' };
+        }
+    }
+    if ((msg.quotedMsgId && msg.quotedMsgId.fromMe) || (msg.quotedMsgKey && msg.quotedMsgKey.fromMe)) {
+        return { mentioned: true, reason: 'quoted_from_me' };
+    }
+
+    const quotedJids = [
+        msg.quotedParticipant,
+        msg._data && msg._data.quotedParticipant,
+        msg.attributes && msg.attributes.quotedParticipant,
+        msg.quotedMsgId && msg.quotedMsgId.participant,
+        msg.quotedMsgKey && msg.quotedMsgKey.participant
+    ];
+    for (const qObj of quotedObjs) {
+        quotedJids.push(qObj.author, qObj.from);
+    }
+    const seenQuotedKeys = new Set();
+    for (const qj of quotedJids) {
+        const key = normalizeJidInBrowser(qj);
+        if (!key || seenQuotedKeys.has(key)) continue;
+        seenQuotedKeys.add(key);
+        if (await jidMatchesMeInBrowser(qj, myInfo)) {
+            return { mentioned: true, reason: 'quoted_participant' };
+        }
+    }
+
+    // Fallback: look up quotedStanzaID in chat/MsgStore when WA-JS failed to hydrate _quotedMsgObj (e.g. LID reply)
+    const quotedStanzaId = msg.quotedStanzaID || (msg._data && msg._data.quotedStanzaID) || (msg.attributes && msg.attributes.quotedStanzaID) || '';
+    if (quotedStanzaId) {
+        const msgChatNorm = normalizeJidInBrowser(msg.chatId || msg.from || (msg.id && msg.id.remote));
+        const checkMsgModels = (models) => {
+            for (const qm of models) {
+                if (!qm || !qm.id) continue;
+                const qStanza = (typeof qm.id === 'object' && qm.id.id) ? String(qm.id.id) : '';
+                if (qStanza !== String(quotedStanzaId)) continue;
+                const qRemoteNorm = normalizeJidInBrowser(qm.chatId || (qm.id && qm.id.remote) || qm.from);
+                if (msgChatNorm && qRemoteNorm && qRemoteNorm !== msgChatNorm) continue;
+                if (qm.fromMe || qm.isSentByMe || (qm.id && qm.id.fromMe)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        try {
+            const chatMsgs = msg.chat && msg.chat.msgs;
+            const chatModels = chatMsgs && (typeof chatMsgs.getModelsArray === 'function' ? chatMsgs.getModelsArray() : extractIterableInBrowser(chatMsgs));
+            if (Array.isArray(chatModels) && checkMsgModels(chatModels)) {
+                return { mentioned: true, reason: 'quoted_stanza' };
+            }
+        } catch (e) {}
+        try {
+            const wpp = (typeof window !== 'undefined' && window.WPP) ? window.WPP : null;
+            const msgStore = wpp && wpp.whatsapp && wpp.whatsapp.MsgStore;
+            const storeModels = msgStore && (typeof msgStore.getModelsArray === 'function' ? msgStore.getModelsArray() : extractIterableInBrowser(msgStore));
+            if (Array.isArray(storeModels) && checkMsgModels(storeModels)) {
+                return { mentioned: true, reason: 'quoted_stanza' };
+            }
+        } catch (e) {}
+    }
+
+    // 5. Fallback text/caption scan for @<myPhone>, @<myLid>, or @<pushname/username/agentName>
+    const rawType = typeof msg.type === 'string' ? msg.type.trim().toLowerCase() : '';
+    const isMediaMsg = Boolean(msg.isMedia || msg.hasMedia) || ['image', 'video', 'document', 'sticker', 'ptt', 'audio'].includes(rawType);
+    const textParts = [];
+    if (!isMediaMsg && typeof msg.body === 'string' && msg.body.trim()) {
+        textParts.push(msg.body);
+    }
+    if (typeof msg.caption === 'string' && msg.caption.trim()) {
+        textParts.push(msg.caption);
+    }
+    if (typeof msg.comment === 'string' && msg.comment.trim()) {
+        textParts.push(msg.comment);
+    }
+    const combinedText = textParts.join('\\n');
+
+    if (combinedText) {
+        const numRegex = new RegExp('(?:^|[^A-Za-z0-9._%+/-])@(\\\\d{6,20})(?=$|[^\\\\d])', 'g');
+        let match;
+        const checkedNums = new Set();
+        while ((match = numRegex.exec(combinedText)) !== null) {
+            const digits = match[1];
+            if (!digits || checkedNums.has(digits)) continue;
+            checkedNums.add(digits);
+            if (myInfo.users.has(digits)) {
+                return { mentioned: true, reason: 'text_id' };
+            }
+            if (await jidMatchesMeInBrowser(digits + '@lid', myInfo) || await jidMatchesMeInBrowser(digits + '@c.us', myInfo)) {
+                return { mentioned: true, reason: 'text_id_resolved' };
+            }
+        }
+
+        for (const handle of myInfo.handles) {
+            const escaped = escapeRegExpInBrowser(handle);
+            const handleRegex = new RegExp('(?:^|[^A-Za-z0-9._%+/-])@' + escaped + '(?=$|[^A-Za-z0-9_])', 'i');
+            if (handleRegex.test(combinedText)) {
+                return { mentioned: true, reason: 'text_handle' };
+            }
+        }
+    }
+
+    return { mentioned: false, reason: '' };
+}
+`;
+
+const browserMessageVisibilityHelper = `
+var NON_MESSAGE_TYPES = new Set([
+    'gp2',
+    'group_notification',
+    'notification',
+    'notification_template',
+    'broadcast_notification',
+    'e2e_notification',
+    'protocol',
+    'revoked',
+    'call_log',
+    'ciphertext',
+    'reaction',
+    'reaction_enc',
+    'poll_update',
+    'pinned_message',
+    'pin_message',
+    'keep_in_chat',
+    'enc_comment',
+    'event_response',
+    'newsletter_notification',
+    'newsletter_admin_invite',
+    'biz_content_placeholder',
+    'request_phone_number',
+    'oversized',
+    'unknown',
+    'futureproof'
+]);
+
+var REVOKE_SUBTYPES = new Set(['revoke', 'sender_revoke', 'admin_revoke']);
+
+function extractStanzaIdInBrowser(rawId) {
+    if (!rawId) return '';
+    if (typeof rawId === 'object' && rawId.id) {
+        return String(rawId.id);
+    }
+    const serialized = typeof rawId === 'string' ? rawId : (rawId._serialized || '');
+    if (serialized) {
+        const parts = serialized.split('_');
+        if (parts.length >= 3 && (parts[0] === 'true' || parts[0] === 'false')) {
+            return parts[2];
+        }
+    }
+    return '';
+}
+
+function isVisibleUserMessageInBrowser(msg, options) {
+    if (!msg) return false;
+    const allowFromMe = Boolean(options && options.allowFromMe);
+    if (!allowFromMe && (msg.fromMe || msg.isSentByMe || (msg.id && msg.id.fromMe))) {
+        return false;
+    }
+
+    const chatIdStr =
+        (msg.chatId && (msg.chatId._serialized || msg.chatId)) ||
+        (msg.from && (msg.from._serialized || msg.from)) ||
+        (msg.id && msg.id.remote && (msg.id.remote._serialized || msg.id.remote)) ||
+        '';
+    if (
+        msg.isStatusV3 ||
+        msg.isBroadcast ||
+        String(chatIdStr).includes('@broadcast') ||
+        String(chatIdStr).endsWith('@newsletter')
+    ) {
+        return false;
+    }
+
+    if (
+        msg.isNotification ||
+        msg.isBizNotification ||
+        msg.isPSA ||
+        msg.invis ||
+        msg.isMdHistoryMsg ||
+        msg.asRevoked ||
+        msg.isRevoked
+    ) {
+        return false;
+    }
+
+    const rawType = typeof msg.type === 'string' ? msg.type.trim().toLowerCase() : '';
+    if (!rawType || NON_MESSAGE_TYPES.has(rawType)) {
+        return false;
+    }
+
+    try {
+        const sysTypes = window.WPP && window.WPP.whatsapp && window.WPP.whatsapp.enums && window.WPP.whatsapp.enums.SYSTEM_MESSAGE_TYPES;
+        if (Array.isArray(sysTypes) && sysTypes.includes(rawType)) {
+            return false;
+        }
+    } catch (e) {}
+
+    const rawSubtype = typeof msg.subtype === 'string' ? msg.subtype.trim().toLowerCase() : '';
+    if (rawSubtype && REVOKE_SUBTYPES.has(rawSubtype)) {
+        return false;
+    }
+
+    if (msg.isUnreadType === false) {
+        return false;
+    }
+
+    if (rawType === 'chat') {
+        const hasText = [msg.body, msg.caption, msg.matchedText, msg.title].some(
+            v => typeof v === 'string' && v.trim().length > 0
+        );
+        const hasPayload = Boolean(
+            msg.hasMedia ||
+            msg.isMedia ||
+            (typeof msg.lat === 'number' && typeof msg.lng === 'number') ||
+            (msg.pollName && Array.isArray(msg.pollOptions) && msg.pollOptions.length > 0) ||
+            (Array.isArray(msg.vcardList) && msg.vcardList.length > 0) ||
+            msg.vcardFormattedName
+        );
+        if (!hasText && !hasPayload) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function _getTrackedUnreadStoreInBrowser() {
+    if (typeof window === 'undefined' || !window) return null;
+    if (!window.__openAmityUnreadSeen || typeof window.__openAmityUnreadSeen !== 'object') {
+        window.__openAmityUnreadSeen = {};
+    }
+    return window.__openAmityUnreadSeen;
+}
+
+function recordTrackedVisibleUnreadInBrowser(chatIds, msgId, stanzaId) {
+    const store = _getTrackedUnreadStoreInBrowser();
+    if (!store) return;
+    const keys = [msgId, stanzaId].filter(Boolean).map(String);
+    if (keys.length === 0) return;
+    const cids = (Array.isArray(chatIds) ? chatIds : [chatIds]).filter(Boolean).map(String);
+    for (const cid of cids) {
+        if (!(store[cid] instanceof Set)) {
+            store[cid] = new Set();
+        }
+        const set = store[cid];
+        for (const k of keys) {
+            set.add(k);
+        }
+        while (set.size > 200) {
+            const oldest = set.values().next().value;
+            set.delete(oldest);
+        }
+    }
+}
+
+function removeTrackedVisibleUnreadInBrowser(msgId, stanzaId) {
+    const store = _getTrackedUnreadStoreInBrowser();
+    if (!store) return;
+    const keys = [msgId, stanzaId].filter(Boolean).map(String);
+    if (keys.length === 0) return;
+    for (const cid of Object.keys(store)) {
+        const set = store[cid];
+        if (!(set instanceof Set)) continue;
+        for (const k of keys) {
+            set.delete(k);
+        }
+        if (set.size === 0) {
+            delete store[cid];
+        }
+    }
+}
+
+function clearTrackedVisibleUnreadForChatInBrowser(chatId) {
+    const store = _getTrackedUnreadStoreInBrowser();
+    if (!store || !chatId) return;
+    delete store[String(chatId)];
+}
+
+async function getVisibleUnreadMessagesInBrowser(trackedOverride) {
+    const unreadChats = await window.WPP.chat.list({ onlyWithUnreadMessage: true });
+    const safeUnreadChats = Array.isArray(unreadChats) ? unreadChats : [];
+    const activeUnreadChatIds = new Set();
+    for (const chat of safeUnreadChats) {
+        if (!chat || !chat.id) continue;
+        if (typeof chat.unreadCount === 'number' && chat.unreadCount === 0) continue;
+        const cid = String(chat.id._serialized || chat.id || '');
+        if (cid) activeUnreadChatIds.add(cid);
+    }
+
+    const store = _getTrackedUnreadStoreInBrowser();
+    if (store) {
+        for (const cid of Object.keys(store)) {
+            if (!activeUnreadChatIds.has(cid)) {
+                delete store[cid];
+            }
+        }
+    }
+
+    const overrideSet = trackedOverride instanceof Set
+        ? trackedOverride
+        : (Array.isArray(trackedOverride) ? new Set(trackedOverride.filter(Boolean).map(String)) : null);
+
+    const visibleItems = [];
+    for (const chat of safeUnreadChats) {
+        if (!chat || !chat.id) continue;
+        const chatIdStr = String(chat.id._serialized || chat.id || '');
+        if (chatIdStr.includes('@broadcast') || chatIdStr.endsWith('@newsletter')) {
+            continue;
+        }
+        if (typeof chat.unreadCount === 'number' && chat.unreadCount === 0) {
+            continue;
+        }
+        const count = (typeof chat.unreadCount === 'number' && chat.unreadCount > 0) ? chat.unreadCount : (chat.unreadCount < 0 ? 2 : 1);
+        let msgs = [];
+        try {
+            msgs = await window.WPP.chat.getMessages(chat.id, { count: count, onlyUnread: true });
+        } catch (e) {
+            msgs = [];
+        }
+        if (!Array.isArray(msgs)) continue;
+
+        const chatVisible = [];
+        const seenKeys = new Set();
+        for (const msg of msgs) {
+            if (isVisibleUserMessageInBrowser(msg)) {
+                const mId = (msg.id && (msg.id._serialized || (typeof msg.id === 'string' ? msg.id : ''))) || '';
+                const mStanza = extractStanzaIdInBrowser(msg.id);
+                const k = mStanza || mId;
+                if (k) seenKeys.add(k);
+                chatVisible.push({ msg, chat });
+            }
+        }
+
+        // Parity with countVisibleUnreadInBrowser: when a subsequent revoked/system event
+        // displaces a tracked live unread message out of getMessages({ onlyUnread: true }),
+        // recover tracked visible unread messages from the recent tail without returning old read messages.
+        if (chatVisible.length < count && msgs.length > chatVisible.length) {
+            const trackedSet = overrideSet || (store && store[chatIdStr] instanceof Set ? store[chatIdStr] : null);
+            if (trackedSet && trackedSet.size > 0) {
+                const tailCount = Math.min(Math.max(count + 20, 30), 200);
+                let tailMsgs = [];
+                try {
+                    tailMsgs = await window.WPP.chat.getMessages(chat.id, { count: tailCount });
+                } catch (e) {
+                    tailMsgs = [];
+                }
+                if (Array.isArray(tailMsgs) && tailMsgs.length > 0) {
+                    const recovered = [];
+                    let visibleIncomingSeen = 0;
+                    for (let i = tailMsgs.length - 1; i >= 0; i--) {
+                        const m = tailMsgs[i];
+                        if (!isVisibleUserMessageInBrowser(m)) continue;
+                        if (visibleIncomingSeen >= count) break;
+                        visibleIncomingSeen++;
+                        const mId = (m.id && (m.id._serialized || (typeof m.id === 'string' ? m.id : ''))) || '';
+                        const mStanza = extractStanzaIdInBrowser(m.id);
+                        const k = mStanza || mId;
+                        if (k && seenKeys.has(k)) continue;
+                        if ((mId && trackedSet.has(mId)) || (mStanza && trackedSet.has(mStanza))) {
+                            if (k) seenKeys.add(k);
+                            recovered.push({ msg: m, chat });
+                        }
+                    }
+                    recovered.reverse();
+                    chatVisible.unshift(...recovered);
+                }
+            }
+        }
+
+        for (const item of chatVisible) {
+            visibleItems.push(item);
+        }
+    }
+    return visibleItems;
+}
+
+async function countVisibleUnreadInBrowser(filters) {
+    const safeFilters = (filters && typeof filters === 'object') ? filters : {};
+    const unreadChats = await window.WPP.chat.list({ onlyWithUnreadMessage: true });
+    const filteredUnreadChats = [];
+    const visibleItems = [];
+
+    for (const chat of (Array.isArray(unreadChats) ? unreadChats : [])) {
+        if (!chat || !chat.id) continue;
+        const chatIdStr = String(chat.id._serialized || chat.id || '');
+        if (chatIdStr.includes('@broadcast') || chatIdStr.endsWith('@newsletter')) {
+            continue;
+        }
+        if (typeof chat.unreadCount === 'number' && chat.unreadCount === 0) {
+            continue;
+        }
+        filteredUnreadChats.push(chat);
+        const count = (typeof chat.unreadCount === 'number' && chat.unreadCount > 0) ? chat.unreadCount : (chat.unreadCount < 0 ? 2 : 1);
+        let msgs = [];
+        try {
+            msgs = await window.WPP.chat.getMessages(chat.id, { count: count, onlyUnread: true });
+        } catch (e) {
+            msgs = [];
+        }
+        if (!Array.isArray(msgs)) continue;
+        for (const msg of msgs) {
+            if (isVisibleUserMessageInBrowser(msg)) {
+                visibleItems.push({ msg, chat });
+            }
+        }
+    }
+
+    const totalVisibleCount = visibleItems.length;
+    const chatIdSet = new Set(Array.isArray(safeFilters.chatIds) ? safeFilters.chatIds.filter(Boolean).map(String) : []);
+    const msgIdSet = new Set(Array.isArray(safeFilters.msgIds) ? safeFilters.msgIds.filter(Boolean).map(String) : []);
+    const stanzaIdSet = new Set(Array.isArray(safeFilters.stanzaIds) ? safeFilters.stanzaIds.filter(Boolean).map(String) : []);
+    const hasUntrackedFlag = Boolean(safeFilters.hasUntracked);
+
+    const matchedMsgKeys = new Set();
+    let matchedChatCount = 0;
+
+    for (const item of visibleItems) {
+        const msg = item.msg;
+        const chat = item.chat;
+        const msgId = (msg.id && (msg.id._serialized || (typeof msg.id === 'string' ? msg.id : ''))) || '';
+        const stanzaId = extractStanzaIdInBrowser(msg.id);
+        const chatIdCandidates = [
+            chat && chat.id && (chat.id._serialized || chat.id),
+            msg && msg.chatId && (msg.chatId._serialized || msg.chatId),
+            msg && msg.from && (msg.from._serialized || msg.from)
+        ].filter(Boolean).map(String);
+
+        if ((msgId && msgIdSet.has(msgId)) || (stanzaId && stanzaIdSet.has(stanzaId))) {
+            matchedMsgKeys.add(stanzaId || msgId);
+        }
+        if (chatIdCandidates.some(cid => chatIdSet.has(cid))) {
+            matchedChatCount++;
+        }
+    }
+
+    // Fallback tail scan on confirmed-unread chats when tracked message IDs were pushed out
+    // of getMessages({ onlyUnread: true }) by a subsequent revoked/system/protocol event.
+    if (!hasUntrackedFlag && (msgIdSet.size > 0 || stanzaIdSet.size > 0) && matchedMsgKeys.size === 0) {
+        for (const chat of filteredUnreadChats) {
+            const unreadTarget = (typeof chat.unreadCount === 'number' && chat.unreadCount > 0)
+                ? chat.unreadCount
+                : (chat.unreadCount < 0 ? 2 : 1);
+            const tailCount = Math.min(Math.max(unreadTarget + 20, 30), 200);
+            let tailMsgs = [];
+            try {
+                tailMsgs = await window.WPP.chat.getMessages(chat.id, { count: tailCount });
+            } catch (e) {
+                tailMsgs = [];
+            }
+            if (!Array.isArray(tailMsgs) || tailMsgs.length === 0) continue;
+
+            let visibleIncomingSeen = 0;
+            for (let i = tailMsgs.length - 1; i >= 0; i--) {
+                const m = tailMsgs[i];
+                if (!isVisibleUserMessageInBrowser(m)) {
+                    continue;
+                }
+                if (visibleIncomingSeen >= unreadTarget) {
+                    break;
+                }
+                const mId = (m.id && (m.id._serialized || (typeof m.id === 'string' ? m.id : ''))) || '';
+                const mStanza = extractStanzaIdInBrowser(m.id);
+                if ((mId && msgIdSet.has(mId)) || (mStanza && stanzaIdSet.has(mStanza))) {
+                    matchedMsgKeys.add(mStanza || mId);
+                }
+                visibleIncomingSeen++;
+            }
+        }
+    }
+
+    const matchedMsgCount = matchedMsgKeys.size;
+    let visibleCount = totalVisibleCount;
+    if (!hasUntrackedFlag && (msgIdSet.size > 0 || stanzaIdSet.size > 0)) {
+        visibleCount = matchedMsgCount;
+    } else if (chatIdSet.size > 0) {
+        visibleCount = matchedChatCount;
+    }
+
+    return {
+        visibleCount,
+        totalVisibleCount,
+        matchedMsgCount,
+        matchedChatCount
+    };
+}
+`;
+
 async function ensureListenersAttached() {
     if (!page) return false;
     try {
-        return await page.evaluate(async () => {
+        return await page.evaluate(async (visibilityHelper, mentionHelper, agentName) => {
+            eval(visibilityHelper);
+            eval(mentionHelper);
             if (typeof window.WPP === 'undefined' || !window.WPP.isReady) {
                 return false;
             }
@@ -244,22 +1060,25 @@ async function ensureListenersAttached() {
 
                 window.WPP.on('chat.new_message', async (msg) => {
                     try {
-                        if (!msg) return;
-
-                        // 1. Filter out outgoing / sent messages
-                        if (msg.fromMe || msg.isSentByMe || (msg.id && msg.id.fromMe)) {
+                        if (!isVisibleUserMessageInBrowser(msg)) {
                             return;
                         }
 
-                        // 2. Filter out status updates / broadcasts
-                        if (msg.isStatusV3 || msg.isBroadcast || (msg.chatId && (msg.chatId._serialized || msg.chatId).includes('@broadcast'))) {
-                            return;
-                        }
-
-                        // 3. Determine chat identifiers
-                        const rawFrom = (msg.from && (msg.from._serialized || msg.from)) || '';
-                        const rawChatId = (msg.chatId && (msg.chatId._serialized || msg.chatId)) || rawFrom;
-                        const rawAuthor = (msg.author && (msg.author._serialized || msg.author)) || rawFrom;
+                        // Determine chat identifiers
+                        const widStr = (w) => {
+                            if (!w) return '';
+                            if (typeof w === 'string') return w;
+                            if (typeof w._serialized === 'string' && w._serialized) return w._serialized;
+                            if (w.user && w.server) return `${w.user}@${w.server}`;
+                            if (typeof w.toString === 'function') {
+                                const s = w.toString();
+                                if (s && s !== '[object Object]') return s;
+                            }
+                            return '';
+                        };
+                        const rawFrom = widStr(msg.from);
+                        const rawChatId = widStr(msg.chatId) || rawFrom;
+                        const rawAuthor = widStr(msg.author) || rawFrom;
                         const isGroup = Boolean(msg.isGroupMsg || rawChatId.endsWith('@g.us'));
 
                         const targetId = isGroup ? rawAuthor : rawFrom;
@@ -341,30 +1160,105 @@ async function ensureListenersAttached() {
 
                         // Mention / reply-to-me detection
                         let mentioned = false;
+                        let mentionReason = '';
                         try {
-                            const ser = (w) => (w && (w._serialized || w)) || '';
-                            const myIds = new Set();
-                            try { myIds.add(ser(window.WPP.conn.getMyUserId())); } catch (e) {}
-                            try { if (window.WPP.conn.getMyUserLid) myIds.add(ser(window.WPP.conn.getMyUserLid())); } catch (e) {}
-                            myIds.delete('');
-                            const mentions = (msg.mentionedJidList || []).map(ser);
-                            const quoted = ser(msg.quotedParticipant);
-                            mentioned = mentions.some(j => myIds.has(j)) || (quoted !== '' && myIds.has(quoted));
+                            const mentionRes = await detectMessageMentionInBrowser(msg, agentName);
+                            if (mentionRes) {
+                                mentioned = Boolean(mentionRes.mentioned);
+                                mentionReason = String(mentionRes.reason || '');
+                            }
                         } catch (e) {}
 
                         const finalChatId = isGroup ? rawChatId : resolvedSenderId;
+                        const msgId = (msg.id && (msg.id._serialized || (typeof msg.id === 'string' ? msg.id : ''))) || '';
+                        const msgStanzaId = extractStanzaIdInBrowser(msg.id);
+                        const msgType = typeof msg.type === 'string' ? msg.type.trim().toLowerCase() : 'chat';
+                        const subtype = typeof msg.subtype === 'string' ? msg.subtype.trim().toLowerCase() : '';
+                        recordTrackedVisibleUnreadInBrowser([rawChatId, finalChatId], msgId, msgStanzaId);
                         const payload = JSON.stringify({
                             chatId: finalChatId,
+                            rawChatId: rawChatId || '',
                             senderName: senderName || '',
                             isGroup: Boolean(isGroup),
                             groupName: groupName || '',
-                            mentioned: Boolean(mentioned)
+                            mentioned: Boolean(mentioned),
+                            mentionReason: mentionReason,
+                            msgId: msgId,
+                            msgStanzaId: msgStanzaId,
+                            msgType: msgType,
+                            subtype: subtype
                         });
                         window.nodeOnMsgReceived(payload);
                     } catch (e) {
                         console.error('Error handling incoming message event:', e);
                     }
                 });
+
+                const emitRevokedMsg = (msgId, msgStanzaId, chatId, revokeType) => {
+                    if (!msgId && !msgStanzaId) return;
+                    removeTrackedVisibleUnreadInBrowser(msgId, msgStanzaId);
+                    try {
+                        if (typeof window.nodeOnMsgRevoked === 'function') {
+                            window.nodeOnMsgRevoked(JSON.stringify({
+                                msgId: msgId || '',
+                                msgStanzaId: msgStanzaId || '',
+                                chatId: chatId || '',
+                                revokeType: revokeType || 'revoke'
+                            }));
+                        }
+                    } catch (e) {}
+                };
+
+                window.WPP.on('chat.msg_revoke', (evt) => {
+                    try {
+                        if (!evt) return;
+                        const refIdObj = evt.refId;
+                        const refId = (refIdObj && (refIdObj._serialized || (typeof refIdObj === 'string' ? refIdObj : ''))) || '';
+                        const refStanzaId = extractStanzaIdInBrowser(refIdObj);
+                        const chatId =
+                            (refIdObj && refIdObj.remote && (refIdObj.remote._serialized || refIdObj.remote)) ||
+                            (evt.from && (evt.from._serialized || evt.from)) ||
+                            (evt.to && (evt.to._serialized || evt.to)) ||
+                            '';
+                        emitRevokedMsg(refId, refStanzaId, chatId, evt.type || 'revoke');
+                    } catch (e) {
+                        console.error('Error handling message revoke event:', e);
+                    }
+                });
+
+                try {
+                    const msgStore = window.WPP.whatsapp && window.WPP.whatsapp.MsgStore;
+                    if (msgStore && typeof msgStore.on === 'function') {
+                        msgStore.on('change:type', (msg) => {
+                            try {
+                                if (!msg || msg.fromMe || msg.isSentByMe || (msg.id && msg.id.fromMe)) return;
+                                if (msg.type === 'revoked' || msg.asRevoked || msg.isRevoked) {
+                                    const msgId = (msg.id && (msg.id._serialized || (typeof msg.id === 'string' ? msg.id : ''))) || '';
+                                    const msgStanzaId = extractStanzaIdInBrowser(msg.id);
+                                    const chatId =
+                                        (msg.chatId && (msg.chatId._serialized || msg.chatId)) ||
+                                        (msg.from && (msg.from._serialized || msg.from)) ||
+                                        (msg.id && msg.id.remote && (msg.id.remote._serialized || msg.id.remote)) ||
+                                        '';
+                                    emitRevokedMsg(msgId, msgStanzaId, chatId, 'revoked');
+                                }
+                            } catch (e) {}
+                        });
+                        msgStore.on('remove', (msg) => {
+                            try {
+                                if (!msg || msg.fromMe || msg.isSentByMe || (msg.id && msg.id.fromMe)) return;
+                                const msgId = (msg.id && (msg.id._serialized || (typeof msg.id === 'string' ? msg.id : ''))) || '';
+                                const msgStanzaId = extractStanzaIdInBrowser(msg.id);
+                                const chatId =
+                                    (msg.chatId && (msg.chatId._serialized || msg.chatId)) ||
+                                    (msg.from && (msg.from._serialized || msg.from)) ||
+                                    (msg.id && msg.id.remote && (msg.id.remote._serialized || msg.id.remote)) ||
+                                    '';
+                                emitRevokedMsg(msgId, msgStanzaId, chatId, 'remove');
+                            } catch (e) {}
+                        });
+                    }
+                } catch (e) {}
             }
 
             const isAuthed = await window.WPP.conn.isAuthenticated();
@@ -384,7 +1278,7 @@ async function ensureListenersAttached() {
             }
 
             return true;
-        });
+        }, browserMessageVisibilityHelper, browserMentionHelper, configuredAgentName);
     } catch (e) {
         return false;
     }
@@ -521,6 +1415,10 @@ async function startClient() {
 
         await page.exposeFunction('nodeOnMsgReceived', (payload) => {
             console.log(`[MSG_RECEIVED_JSON] ${payload}`);
+        });
+
+        await page.exposeFunction('nodeOnMsgRevoked', (payload) => {
+            console.log(`[MSG_REVOKED_JSON] ${payload}`);
         });
 
         // Pre-evaluate WA-JS on every page reload
@@ -1243,22 +2141,19 @@ app.get('/unread', async (req, res) => {
     if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     try {
         console.log('[DEBUG] /unread endpoint called via WA-JS');
-        const unreadData = await page.evaluate(async (resolveHelper, serializeHelper) => {
+        const unreadData = await page.evaluate(async (resolveHelper, serializeHelper, visibilityHelper) => {
             eval(resolveHelper);
             eval(serializeHelper);
+            eval(visibilityHelper);
 
-            const unreadChats = await window.WPP.chat.list({ onlyWithUnreadMessage: true });
+            const visibleItems = await getVisibleUnreadMessagesInBrowser();
             let unreadList = [];
 
-            for (const chat of unreadChats) {
-                const count = chat.unreadCount || 1;
-                const msgs = await window.WPP.chat.getMessages(chat.id, { count: count, onlyUnread: true });
-                for (const msg of msgs) {
-                    unreadList.push(await serializeMsgInBrowser(msg, chat));
-                }
+            for (const item of visibleItems) {
+                unreadList.push(await serializeMsgInBrowser(item.msg, item.chat));
             }
             return unreadList;
-        }, browserResolveTarget, browserSerializeMessage);
+        }, browserResolveTarget, browserSerializeMessage, browserMessageVisibilityHelper);
 
         for (const msg of unreadData) {
             if (msg.hasMedia) {
@@ -1273,12 +2168,39 @@ app.get('/unread', async (req, res) => {
     }
 });
 
+async function handleVisibleUnreadCount(req, res) {
+    if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
+    const body = (req && req.body && typeof req.body === 'object') ? req.body : {};
+    const chatIds = Array.isArray(body.chatIds) ? body.chatIds : [];
+    const msgIds = Array.isArray(body.msgIds) ? body.msgIds : [];
+    const stanzaIds = Array.isArray(body.stanzaIds) ? body.stanzaIds : [];
+    const hasUntracked = Boolean(body.hasUntracked);
+
+    try {
+        const counts = await page.evaluate(async (visibilityHelper, filters) => {
+            eval(visibilityHelper);
+            return await countVisibleUnreadInBrowser(filters);
+        }, browserMessageVisibilityHelper, { chatIds, msgIds, stanzaIds, hasUntracked });
+
+        res.json(counts);
+    } catch (e) {
+        console.error('Visible unread count check failed via WA-JS:', e);
+        res.status(500).json({ error: 'Protocol mismatch: Waiting for WA-JS update.', details: e.message });
+    }
+}
+
+app.post('/unread/visible_count', handleVisibleUnreadCount);
+app.get('/unread/visible_count', handleVisibleUnreadCount);
+
 app.post('/mark_read', async (req, res) => {
     if (!isReady || !page) return res.status(503).json({ error: 'Client not ready' });
     const { chatId } = req.body;
     try {
         await page.evaluate(async (cid) => {
             await window.WPP.chat.markIsRead(cid);
+            if (window.__openAmityUnreadSeen && typeof window.__openAmityUnreadSeen === 'object' && cid) {
+                delete window.__openAmityUnreadSeen[String(cid)];
+            }
         }, chatId);
         res.json({ success: true });
     } catch (e) {

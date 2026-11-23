@@ -1,16 +1,22 @@
 import logging
+import re
 import threading
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from .events import Signal
 
 try:
     from core.gemini_worker import GeminiWorker
-    from core.agy_worker import AgyWorker
     from core.audio_input import AudioService
-    from core.audio_output import TTSWorker
+    from core.audio_output import (
+        TTSWorker,
+        SpeechPlaybackController,
+        build_speech_cache_key,
+        get_speech_cache_path,
+        get_valid_cached_speech_path,
+    )
     from core.mempalace_manager import MemPalaceManager
     from core.cerebrum import Cerebrum
     from core.pulse_engine import PulseEngine
@@ -20,9 +26,14 @@ try:
     from core.config_manager import ConfigManager
 except ImportError:
     from .gemini_worker import GeminiWorker
-    from .agy_worker import AgyWorker
     from .audio_input import AudioService
-    from .audio_output import TTSWorker
+    from .audio_output import (
+        TTSWorker,
+        SpeechPlaybackController,
+        build_speech_cache_key,
+        get_speech_cache_path,
+        get_valid_cached_speech_path,
+    )
     from .mempalace_manager import MemPalaceManager
     from .cerebrum import Cerebrum
     from .pulse_engine import PulseEngine
@@ -48,6 +59,7 @@ class AmityOrchestrator:
         agent_id_var.set(self.agent_id)
 
         self.on_message_appended = Signal()  # sender, text
+        self.on_message_record_appended = Signal()  # full persisted message dict
         self.on_thought_card_updated = Signal()  # card_id, content, is_collapsed
         self.on_busy_state_changed = Signal()  # is_busy, is_speaking
         self.on_amplitude_emitted = Signal()  # float
@@ -76,6 +88,7 @@ class AmityOrchestrator:
         self._is_sleep_cycle = False
         self._sleep_cycle_error = False
         self._in_flight_prompt = None
+        self._last_prospective_context = None
 
         from core.session_cache import load_session_cache, save_session_cache, clear_session_cache
         self._session_cache_data = load_session_cache(self.agent_id) if not self.is_paused else None
@@ -124,6 +137,7 @@ class AmityOrchestrator:
         self._is_user_interaction = False
         self._speaker_invoked_in_cycle = False
         self._user_turn_nudged = False
+        self._fake_tool_turn_nudged = False
 
         self._last_notified_weight_threshold = 0  # Compatibility
         self.current_loop_count = 0
@@ -161,9 +175,8 @@ class AmityOrchestrator:
             if isinstance(pulse_state, dict) and "last_interaction_time" in pulse_state:
                 self.pulse_engine.last_interaction_time = float(pulse_state["last_interaction_time"])
 
-        wa_skill = self.cerebrum.tools.get("WhatsApp")
-        if wa_skill:
-            wa_skill.message_received_callback = self.pulse_engine.handle_whatsapp_message
+        self._wire_whatsapp_pulse_callbacks()
+        self._wire_email_pulse_callbacks()
 
         self.gemini_worker = None
         self.audio_service = None
@@ -181,16 +194,46 @@ class AmityOrchestrator:
         self.audio_service.error_occurred.connect(self.on_audio_error)
 
         self.tts_worker = None
+        self._speech_lock = threading.RLock()
+        self._active_speech_card_key = None
+        self._active_speech_is_replay = False
+        SpeechPlaybackController.instance().register_orchestrator(self)
         self.audio_service.start_initialization()
+
+    def _wire_whatsapp_pulse_callbacks(self):
+        if not hasattr(self, "pulse_engine") or not self.pulse_engine:
+            return
+        wa_skill = self.cerebrum.tools.get("WhatsApp")
+        if wa_skill:
+            wa_skill.message_received_callback = self.pulse_engine.handle_whatsapp_message
+            wa_skill.message_revoked_callback = self.pulse_engine.handle_whatsapp_message_revoked
+            self.pulse_engine.whatsapp_visible_unread_checker = wa_skill.get_visible_unread_count
+        else:
+            self.pulse_engine.whatsapp_visible_unread_checker = None
+
+    def _wire_email_pulse_callbacks(self):
+        if not hasattr(self, "pulse_engine") or not self.pulse_engine:
+            return
+        email_tool = self.cerebrum.tools.get("Email")
+        if email_tool:
+            email_tool.email_received_callback = self.pulse_engine.handle_email_message
+            self.pulse_engine.email_unread_checker = email_tool.has_unread_pending_emails
+            if hasattr(email_tool, "sync_monitor_state"):
+                try:
+                    email_tool.sync_monitor_state()
+                except Exception as e:
+                    logging.warning(f"Failed to sync EmailMonitor state: {e}")
+        else:
+            self.pulse_engine.email_unread_checker = None
+            if hasattr(self.pulse_engine, "cancel_pending_email_pulse"):
+                self.pulse_engine.cancel_pending_email_pulse()
 
     def init_worker(self):
         if self.gemini_worker is not None:
             return
 
         provider = self.settings_manager.get("core.api-provider", "gemini")
-        if self.settings_manager.get("core.antigravity.agy-mode", False):
-            self.gemini_worker = AgyWorker(agent_id=self.agent_id)
-        elif provider == "claude":
+        if provider == "claude":
             from .claude_worker import ClaudeWorker
             self.gemini_worker = ClaudeWorker(agent_id=self.agent_id)
         elif provider in ["chatgpt", "openai"]:
@@ -240,6 +283,11 @@ class AmityOrchestrator:
         if not hasattr(self, '_thought_card_lock') or self._thought_card_lock is None:
             self._thought_card_lock = threading.RLock()
         return self._thought_card_lock
+
+    def _get_speech_lock(self):
+        if not hasattr(self, '_speech_lock') or self._speech_lock is None:
+            self._speech_lock = threading.RLock()
+        return self._speech_lock
 
     def _append_to_thought_card(self, entry_text: str):
         """Appends a thought or tool execution line to the active thoughts card."""
@@ -317,7 +365,7 @@ class AmityOrchestrator:
         if action == "trigger_output_text":
             self._speaker_invoked_in_cycle = True
             self._collapse_active_thought_card()
-            self.append_to_conversation("Agent", payload.get("text", ""))
+            self.append_to_conversation("Agent", payload.get("text", ""), message_type="text")
             return "Text output to GUI."
         return None
 
@@ -342,6 +390,22 @@ class AmityOrchestrator:
             self.settings_manager.set("core.agent.uid", uid)
             self.settings_manager.save()
         return uid
+
+    def _extract_prospective_block(self, prompt: str) -> Optional[str]:
+        from core.prompt_context import MEMORY_BEGIN, MEMORY_END
+        text = prompt or ""
+        m_begin = text.find(MEMORY_BEGIN)
+        if m_begin < 0:
+            return None
+        m_end = text.find(MEMORY_END, m_begin)
+        if m_end < 0:
+            return None
+        dynamic_slice = text[m_begin + len(MEMORY_BEGIN):m_end]
+        prosp_idx = dynamic_slice.find("--- Morphological Memory (Prospective Attractors")
+        if prosp_idx < 0:
+            return None
+        extracted = dynamic_slice[prosp_idx:].strip()
+        return extracted or None
 
     def build_system_prompt(self):
         from core.prompt_context import MEMORY_BEGIN, fit_system_prompt, format_prompt_footprint
@@ -381,10 +445,19 @@ class AmityOrchestrator:
         self.system_prompt = "\n\n".join(parts)
         tools = self.cerebrum.get_all_tool_declarations()
         self.system_prompt = fit_system_prompt(self.system_prompt, self.settings_manager, tools)
+        self._last_prospective_context = self._extract_prospective_block(self.system_prompt)
         logging.info(f"Built system prompt: {format_prompt_footprint(self.system_prompt, tools)}")
 
     def deliver_memory_refresh(self, context):
         """Replace worker system memory before continuing a refresh tool round trip."""
+        norm_ctx = (context or "").strip()
+        cur_prompt = getattr(self, "system_prompt", "") or ""
+        if (
+            norm_ctx
+            and norm_ctx == getattr(self, "_last_prospective_context", None)
+            and norm_ctx in cur_prompt
+        ):
+            return
         from core.prompt_context import replace_memory_context, fit_system_prompt
         # Rebuild other dynamic sections, then put the freshly delivered block
         # in the authoritative system position (old history remains historical).
@@ -396,6 +469,7 @@ class AmityOrchestrator:
         if worker is not None:
             worker.update_system_instruction(prompt)
         self.system_prompt = prompt
+        self._last_prospective_context = norm_ctx or self._extract_prospective_block(prompt)
 
     def _teardown_worker(self):
         if self.gemini_worker:
@@ -448,47 +522,45 @@ class AmityOrchestrator:
         self.mempalace_manager.reload_settings()
         self.build_system_prompt()
         self.cerebrum.reload_skills()
-        wa_skill = self.cerebrum.tools.get("WhatsApp")
-        if wa_skill:
-            wa_skill.message_received_callback = self.pulse_engine.handle_whatsapp_message
+        self._wire_whatsapp_pulse_callbacks()
+        self._wire_email_pulse_callbacks()
         if hasattr(self, 'pulse_engine') and self.pulse_engine and hasattr(self.pulse_engine, 'reset_whatsapp_slowdown'):
             self.pulse_engine.reset_whatsapp_slowdown()
+        if hasattr(self, 'pulse_engine') and self.pulse_engine and hasattr(self.pulse_engine, 'reset_email_slowdown'):
+            self.pulse_engine.reset_email_slowdown(cancel_if_disabled=True)
 
         provider = self.settings_manager.get("core.api-provider", "gemini")
-        agy_mode = self.settings_manager.get("core.antigravity.agy-mode", False)
 
         worker_mismatch = False
         if self.gemini_worker is None:
             worker_mismatch = True
-        elif agy_mode and type(self.gemini_worker).__name__ != "AgyWorker":
+        elif provider == "claude" and type(self.gemini_worker).__name__ != "ClaudeWorker":
             worker_mismatch = True
-        elif not agy_mode and provider == "claude" and type(self.gemini_worker).__name__ != "ClaudeWorker":
+        elif provider in ["chatgpt", "openai"] and type(self.gemini_worker).__name__ != "ChatGptWorker":
             worker_mismatch = True
-        elif not agy_mode and provider in ["chatgpt", "openai"] and type(self.gemini_worker).__name__ != "ChatGptWorker":
+        elif provider == "deepseek" and type(self.gemini_worker).__name__ != "DeepSeekWorker":
             worker_mismatch = True
-        elif not agy_mode and provider == "deepseek" and type(self.gemini_worker).__name__ != "DeepSeekWorker":
+        elif provider == "openrouter" and type(self.gemini_worker).__name__ != "OpenRouterWorker":
             worker_mismatch = True
-        elif not agy_mode and provider == "openrouter" and type(self.gemini_worker).__name__ != "OpenRouterWorker":
+        elif provider not in ["claude", "chatgpt", "openai", "deepseek", "openrouter"] and type(self.gemini_worker).__name__ != "GeminiWorker":
             worker_mismatch = True
-        elif not agy_mode and provider not in ["claude", "chatgpt", "openai", "deepseek", "openrouter"] and type(self.gemini_worker).__name__ != "GeminiWorker":
-            worker_mismatch = True
-        elif not agy_mode and provider == "claude":
+        elif provider == "claude":
             current_key = self.settings_manager.get_env("CLAUDE_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
-        elif not agy_mode and provider in ["chatgpt", "openai"]:
+        elif provider in ["chatgpt", "openai"]:
             current_key = self.settings_manager.get_env("OPENAI_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
-        elif not agy_mode and provider == "deepseek":
+        elif provider == "deepseek":
             current_key = self.settings_manager.get_env("DEEPSEEK_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
-        elif not agy_mode and provider == "openrouter":
+        elif provider == "openrouter":
             current_key = self.settings_manager.get_env("OPENROUTER_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
-        elif not agy_mode and provider not in ["claude", "chatgpt", "openai", "deepseek", "openrouter"]:
+        elif provider not in ["claude", "chatgpt", "openai", "deepseek", "openrouter"]:
             current_key = self.settings_manager.get_env("GEMINI_API_KEY")
             if getattr(self.gemini_worker, 'api_key', None) != current_key or not getattr(self.gemini_worker, 'available', False):
                 worker_mismatch = True
@@ -627,10 +699,7 @@ class AmityOrchestrator:
             return
 
         # If TTS is speaking, interrupt immediately
-        if hasattr(self, 'tts_worker') and self.tts_worker:
-            self.tts_worker.stop()
-        if hasattr(self, 'speech_queue') and self.speech_queue is not None:
-            self.speech_queue.clear()
+        self.stop_speech(update_busy_state=False, notify_controller=True)
 
         # If agent is busy thinking or executing tools, mark audio interjection in progress
         if getattr(self, 'is_busy', False):
@@ -646,14 +715,12 @@ class AmityOrchestrator:
             self.audio_service.stop_listening()
         if self.gemini_worker and hasattr(self.gemini_worker, 'is_processing') and self.gemini_worker.is_processing:
             self.gemini_worker.abort()
-        if self.tts_worker:
-            self.tts_worker.stop()
+        self.stop_speech(update_busy_state=False, notify_controller=True)
 
         self._audio_interjection_in_progress = False
         with self._get_interjection_lock():
             self._get_pending_interjections().clear()
 
-        self.speech_queue.clear()
         self.event_queue.clear()
         self.is_thinking = False
         self._collapse_active_thought_card()
@@ -735,6 +802,7 @@ class AmityOrchestrator:
 
         self.session_fatigue_tokens = 0
         self.clear_session_state()
+        self._wire_email_pulse_callbacks()
         self.set_busy_state(False)
         self.on_paused_state_changed.emit(True)
         self.append_to_conversation(
@@ -753,6 +821,7 @@ class AmityOrchestrator:
 
         if self.pulse_engine:
             self.pulse_engine.last_interaction_time = time.time()
+        self._wire_email_pulse_callbacks()
 
         now = datetime.now().astimezone()
         tz_str = f" ({now.tzname()})" if now.tzname() else ""
@@ -835,9 +904,7 @@ class AmityOrchestrator:
 
         if worker_busy or tool_busy:
             # Immediate TTS Interruption
-            if self.tts_worker:
-                self.tts_worker.stop()
-            self.speech_queue.clear()
+            self.stop_speech(update_busy_state=False, notify_controller=True)
 
             # Immediate UI log display with "User (Interjection)"
             self.append_to_conversation("User (Interjection)", text)
@@ -848,9 +915,7 @@ class AmityOrchestrator:
 
             logging.info(f"Queued User Interjection during active cycle: '{text}' (audio: {bool(audio_path)})")
         else:
-            if self.tts_worker:
-                self.tts_worker.stop()
-            self.speech_queue.clear()
+            self.stop_speech(update_busy_state=False, notify_controller=True)
             self.process_input(text, audio_path=audio_path)
 
     @with_agent_context
@@ -885,6 +950,9 @@ class AmityOrchestrator:
     def check_cycle_completion(self):
         is_speaking = (self.tts_worker and self.tts_worker.is_alive()) or len(
             self.speech_queue) > 0
+        if getattr(self, 'is_paused', False):
+            self.set_busy_state(False, speaking=bool(is_speaking))
+            return
         logging.debug(
             f"check_cycle_completion evaluated is_speaking: {is_speaking}, is_thinking: {self.is_thinking}")
         if not self.is_thinking and not is_speaking:
@@ -919,6 +987,26 @@ class AmityOrchestrator:
                         CacheManager.clear_all_agent_expired_caches(self.agent_id, max_age_days=1.0)
                     except Exception:
                         pass
+                    if (
+                        hasattr(self, "mempalace_manager")
+                        and self.mempalace_manager
+                        and hasattr(self.mempalace_manager, "compact_short_term_for_sleep")
+                    ):
+                        try:
+                            self.mempalace_manager.compact_short_term_for_sleep(max_active=5)
+                        except Exception as e:
+                            logging.warning(f"Post-sleep STM compaction warning: {e}")
+                    if hasattr(self, "mempalace_manager") and self.mempalace_manager:
+                        if hasattr(self.mempalace_manager, "step_temporal_decay"):
+                            try:
+                                self.mempalace_manager.step_temporal_decay()
+                            except Exception as e:
+                                logging.warning(f"Post-sleep temporal decay warning: {e}")
+                        if hasattr(self.mempalace_manager, "consolidate_semantic_bridges"):
+                            try:
+                                self.mempalace_manager.consolidate_semantic_bridges()
+                            except Exception as e:
+                                logging.warning(f"Post-sleep semantic bridge consolidation warning: {e}")
                     self.build_system_prompt()
 
                     now = datetime.now().astimezone()
@@ -967,9 +1055,15 @@ class AmityOrchestrator:
                 elif next_event["type"] == "pulse":
                     self.process_pulse(next_event["text"], purpose=next_event.get("purpose"))
         else:
+            is_replay_only = (
+                getattr(self, '_active_speech_is_replay', False)
+                and not self.is_thinking
+                and not getattr(self, '_is_executing_tools', False)
+            )
+            busy_flag = False if is_replay_only else True
             logging.debug(
-                "check_cycle_completion calling set_busy_state(True)")
-            self.set_busy_state(True, speaking=is_speaking)
+                f"check_cycle_completion calling set_busy_state({busy_flag}, speaking={is_speaking})")
+            self.set_busy_state(busy_flag, speaking=is_speaking)
 
     def prune_expired_caches(self, max_age_days: float = 1.0) -> None:
         """Prunes all temporary cache files (audio, media, browser screenshots/cache) older than max_age_days."""
@@ -988,10 +1082,7 @@ class AmityOrchestrator:
         provider = self.settings_manager.get("core.api-provider", "gemini")
         needs_reload = False
 
-        if self.settings_manager.get("core.antigravity.agy-mode", False):
-            if type(self.gemini_worker).__name__ != "AgyWorker":
-                needs_reload = True
-        elif provider == "claude":
+        if provider == "claude":
             if type(self.gemini_worker).__name__ != "ClaudeWorker":
                 needs_reload = True
             else:
@@ -1062,6 +1153,7 @@ class AmityOrchestrator:
         self._is_user_interaction = True
         self._speaker_invoked_in_cycle = False
         self._user_turn_nudged = False
+        self._fake_tool_turn_nudged = False
 
         with self.budget_lock:
             self.current_task_weight = self.session_fatigue_tokens
@@ -1091,6 +1183,8 @@ class AmityOrchestrator:
                 prompt += f"[System Feedback from previous turn]: {self.last_action_result}\n\n"
                 self.last_action_result = None
 
+            matched = []
+            recalled_drawer_ids = set()
             if hasattr(self, 'mempalace_manager') and self.mempalace_manager and text:
                 try:
                     mirrors = self.mempalace_manager._load_mirrors()
@@ -1100,8 +1194,61 @@ class AmityOrchestrator:
                         ctx = self.mempalace_manager.get_entity_context(matched[:2])
                         if ctx:
                             prompt += f"[Proactive Memory Recall for {', '.join(matched[:2])}]:\n{ctx}\n\n"
+                            recalled_drawer_ids = set(re.findall(r"\[Drawer #([^\]]+)\]", ctx))
                 except Exception as e:
                     logging.debug(f"Proactive entity recall check error: {e}")
+
+            if (
+                hasattr(self, "mempalace_manager")
+                and self.mempalace_manager
+                and getattr(self.mempalace_manager, "_morpho_enabled", False) is True
+                and hasattr(self.mempalace_manager, "_get_prospective_memory_context")
+            ):
+                try:
+                    active_perspectives = list(dict.fromkeys([p for p in ([user_name] + matched[:2]) if p]))
+                    prosp_ctx = self.mempalace_manager._get_prospective_memory_context(
+                        active_perspectives=active_perspectives
+                    )
+                    if isinstance(prosp_ctx, str) and prosp_ctx.strip():
+                        norm_prosp = prosp_ctx.strip()
+                        if norm_prosp != getattr(self, "_last_prospective_context", None):
+                            if hasattr(self, "deliver_memory_refresh"):
+                                self.deliver_memory_refresh(prosp_ctx)
+                            self._last_prospective_context = norm_prosp
+                except Exception as e:
+                    logging.debug(f"Interlocutor prospective memory refresh error: {e}")
+
+            if (
+                hasattr(self, "mempalace_manager")
+                and self.mempalace_manager
+                and text
+                and hasattr(self.mempalace_manager, "prime_for_input")
+            ):
+                try:
+                    if recalled_drawer_ids:
+                        try:
+                            priming_hint = self.mempalace_manager.prime_for_input(
+                                text, exclude_drawer_ids=recalled_drawer_ids
+                            )
+                        except TypeError:
+                            priming_hint = self.mempalace_manager.prime_for_input(text)
+                            if isinstance(priming_hint, str) and priming_hint.strip():
+                                kept_lines = []
+                                bullet_count = 0
+                                for ln in priming_hint.splitlines():
+                                    m_did = re.search(r"- \[Drawer #([^\]]+)\]", ln)
+                                    if m_did:
+                                        if m_did.group(1) in recalled_drawer_ids:
+                                            continue
+                                        bullet_count += 1
+                                    kept_lines.append(ln)
+                                priming_hint = "\n".join(kept_lines) if bullet_count > 0 else ""
+                    else:
+                        priming_hint = self.mempalace_manager.prime_for_input(text)
+                    if isinstance(priming_hint, str) and priming_hint.strip():
+                        prompt += f"{priming_hint.strip()}\n\n"
+                except Exception as e:
+                    logging.debug(f"Perturbation prospective priming skipped: {e}")
 
             prompt += f"[{user_name} (User)]: {self.current_user_prompt}"
             self._in_flight_prompt = prompt
@@ -1140,8 +1287,8 @@ class AmityOrchestrator:
             self.event_queue.clear()
 
         if self.is_busy:
-            if purpose == "WhatsApp message received" and self.has_queued_pulse("WhatsApp message received"):
-                logging.debug("WhatsApp pulse already queued while busy; coalescing.")
+            if purpose in ("WhatsApp message received", "Email received") and self.has_queued_pulse(purpose):
+                logging.debug(f"{purpose} pulse already queued while busy; coalescing.")
                 return
             self.event_queue.append({"type": "pulse", "text": text, "purpose": purpose})
             return
@@ -1164,6 +1311,7 @@ class AmityOrchestrator:
             "Terminal command completed",
             "Terminal command in progress",
             "WhatsApp message received",
+            "Email received",
             "Subagent task completed",
             "Subagent task error",
             "Memory consolidation cycle",
@@ -1183,6 +1331,8 @@ class AmityOrchestrator:
                 category = "Memory consolidation cycle"
             elif "whatsapp" in cat_lower or "whatsapp" in text.lower():
                 category = "WhatsApp message received"
+            elif "email" in cat_lower or "[AGENT_PULSE] Event: New emails" in text:
+                category = "Email received"
             elif "external" in cat_lower or "hook" in cat_lower:
                 category = "External pulse received"
             elif "still running" in text or "in progress" in cat_lower:
@@ -1203,6 +1353,25 @@ class AmityOrchestrator:
         self._is_sleep_cycle = ("Sleep Cycle" in text or category == "Memory consolidation cycle")
         if self._is_sleep_cycle:
             self._sleep_cycle_error = False
+        if (
+            not self._is_sleep_cycle
+            and category == "Scheduled routine"
+            and hasattr(self, "mempalace_manager")
+            and self.mempalace_manager
+            and hasattr(self.mempalace_manager, "get_top_open_curiosity")
+        ):
+            try:
+                fatigue = self.get_fatigue() if hasattr(self, "get_fatigue") else 0.0
+                if isinstance(fatigue, (int, float)) and not isinstance(fatigue, bool) and fatigue < 0.50:
+                    cur = self.mempalace_manager.get_top_open_curiosity()
+                    if isinstance(cur, dict) and cur.get("perspective") and cur.get("open_curiosity"):
+                        text += (
+                            f"\n[Relational Curiosity Anchor ({cur['perspective']} [S{cur['sphere_level']}]): "
+                            f"{cur['open_curiosity']} — hold in mind if a natural opening arises; "
+                            "remain silent on routine checks if unneeded.]"
+                        )
+            except Exception as e:
+                logging.debug(f"Relational curiosity anchor skipped: {e}")
         if "You are shutting down." not in text:
             self.append_to_conversation("System", f"[Autonomy Pulse: {category}]")
         self.is_thinking = True
@@ -1211,6 +1380,7 @@ class AmityOrchestrator:
         self._is_user_interaction = False
         self._speaker_invoked_in_cycle = False
         self._user_turn_nudged = False
+        self._fake_tool_turn_nudged = False
 
         with self.budget_lock:
             self.current_task_weight = getattr(self, 'session_fatigue_tokens', 0)
@@ -1239,19 +1409,35 @@ class AmityOrchestrator:
             self.finish_thinking()
             self.set_busy_state(False)
 
-    def append_to_conversation(self, sender, text):
+    def append_to_conversation(self, sender, text, message_type: str = "") -> dict:
         self._collapse_active_thought_card()
+        msg_type = str(message_type or "").strip()
+        record = None
         if hasattr(self, 'chat_history_manager') and self.chat_history_manager:
             try:
-                self.chat_history_manager.add_message(sender=sender, content=text)
+                record = self.chat_history_manager.add_message(
+                    sender=sender, content=text, message_type=msg_type
+                )
             except Exception as e:
                 logging.error(f"Failed to persist chat message: {e}", exc_info=True)
+        if not isinstance(record, dict):
+            record = {
+                "id": None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "sender": sender,
+                "content": text,
+                "message_type": msg_type,
+            }
         self.recent_history.append((sender, text))
         max_history = 6 if self.settings_manager.get(
             "core.low-token-mode", False) else 10
         while len(self.recent_history) > max_history:
             self.recent_history.pop(0)
         self.on_message_appended.emit(sender, text)
+        rec_sig = getattr(self, 'on_message_record_appended', None)
+        if rec_sig is not None:
+            rec_sig.emit(record)
+        return record
 
     def on_audio_initialized(self):
         logging.info("System: Ready.")
@@ -1306,9 +1492,7 @@ class AmityOrchestrator:
             logging.debug(
                 "handle_gemini_thought logging agent thought to info")
             provider = self.settings_manager.get("core.api-provider", "gemini")
-            if self.settings_manager.get("core.antigravity.agy-mode", False):
-                worker_type = "agyworker"
-            elif provider == "claude":
+            if provider == "claude":
                 worker_type = "claudeworker"
             elif provider in ["chatgpt", "openai"]:
                 worker_type = "chatgptworker"
@@ -1362,6 +1546,39 @@ class AmityOrchestrator:
                 return
 
         if not function_calls:
+            from core.session_cache import has_fake_tool_invocation_text
+
+            if (
+                has_fake_tool_invocation_text(clean_text)
+                and not getattr(self, '_fake_tool_turn_nudged', False)
+                and not getattr(self, 'is_paused', False)
+                and not getattr(self, '_shutdown_flag', False)
+                and self.gemini_worker
+                and getattr(self.gemini_worker, 'running', False)
+            ):
+                self._fake_tool_turn_nudged = True
+                needs_speaker = (
+                    getattr(self, '_is_user_interaction', False)
+                    and not getattr(self, '_speaker_invoked_in_cycle', False)
+                )
+                if needs_speaker:
+                    self._user_turn_nudged = True
+                speaker_clause = (
+                    " (including Speaker_speak_aloud or Speaker_output_text to respond to the user)"
+                    if needs_speaker else ""
+                )
+                nudge_text = (
+                    "[System Error: ZERO native tool calls were received by the API because you wrote "
+                    "'[Tool invocation: ...]' or tool names as literal plain text inside your monologue instead of "
+                    "using the provider's native structured function-calling API. Plain-text tool strings are never executed. "
+                    f"Re-invoke your intended tool(s){speaker_clause} now as native structured tool calls.]"
+                )
+                logging.warning(
+                    f"Agent {self.agent_id} emitted plain-text tool imitation with 0 native function calls. Triggering corrective auto-nudge."
+                )
+                self.gemini_worker.send_prompt(nudge_text)
+                return
+
             if (
                 getattr(self, '_is_user_interaction', False)
                 and not getattr(self, '_speaker_invoked_in_cycle', False)
@@ -1383,6 +1600,7 @@ class AmityOrchestrator:
             self.finish_thinking()
             return
 
+        self._fake_tool_turn_nudged = False
         logging.debug(
             "handle_gemini_thought starting _async_tool_execution thread")
         threading.Thread(target=self._async_tool_execution, args=(
@@ -1682,9 +1900,10 @@ class AmityOrchestrator:
     @with_agent_context
     def handle_gemini_speech(self, text: str):
         clean_text = text.strip()
-        self.append_to_conversation("Agent", clean_text)
+        record = self.append_to_conversation("Agent", clean_text, message_type="speech")
         if clean_text:
-            self.speak(clean_text)
+            msg_id = record.get("id") if isinstance(record, dict) else None
+            self.speak(clean_text, message_id=msg_id)
 
     @with_agent_context
     def handle_gemini_error(self, text):
@@ -1697,47 +1916,212 @@ class AmityOrchestrator:
         if not self._is_truly_busy():
             self.set_busy_state(False)
 
-    def speak(self, text):
-        self.speech_queue.append(text)
+    def speak(
+        self,
+        text,
+        message_id=None,
+        card_key: Optional[str] = None,
+        bypass_mute: bool = False,
+        is_replay: bool = False,
+    ):
+        resolved_key = card_key or build_speech_cache_key(message_id=message_id, text=text)
+        with self._get_speech_lock():
+            if self.speech_queue is None:
+                self.speech_queue = []
+            self.speech_queue.append(
+                {
+                    "text": text,
+                    "message_id": message_id,
+                    "card_key": resolved_key,
+                    "bypass_mute": bool(bypass_mute),
+                    "is_replay": bool(is_replay),
+                }
+            )
         self.process_speech_queue()
 
-    def process_speech_queue(self):
-        if self.tts_worker and self.tts_worker.is_alive():
-            return
+    @with_agent_context
+    def replay_transcript(
+        self,
+        text: str,
+        message_id=None,
+        card_key: Optional[str] = None,
+    ) -> bool:
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return False
+        if SpeechPlaybackController.instance().is_any_speech_active():
+            return False
+        resolved_key = card_key or build_speech_cache_key(message_id=message_id, text=clean_text)
+        self.speak(
+            clean_text,
+            message_id=message_id,
+            card_key=resolved_key,
+            bypass_mute=True,
+            is_replay=True,
+        )
+        return True
 
-        if not self.speech_queue:
+    def stop_speech(self, update_busy_state: bool = True, notify_controller: bool = True):
+        with self._get_speech_lock():
+            if getattr(self, 'speech_queue', None) is not None:
+                self.speech_queue.clear()
+            worker = getattr(self, 'tts_worker', None)
+            self.tts_worker = None
+            self._active_speech_card_key = None
+            self._active_speech_is_replay = False
+
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+
+        if notify_controller:
+            SpeechPlaybackController.instance().mark_idle(worker=worker)
+
+        if update_busy_state and hasattr(self, 'set_busy_state'):
+            if getattr(self, 'is_paused', False):
+                self.set_busy_state(False, speaking=False)
+            elif getattr(self, 'is_thinking', False) or getattr(self, '_is_executing_tools', False):
+                self.set_busy_state(True, speaking=False)
+            elif hasattr(self, 'check_cycle_completion'):
+                self.check_cycle_completion()
+            else:
+                self.set_busy_state(False, speaking=False)
+
+    def process_speech_queue(self, finished_worker=None):
+        worker_to_start = None
+        cached_file = None
+        card_key = None
+        queued_count = 0
+        no_more_items = False
+
+        with self._get_speech_lock():
+            if self.tts_worker and self.tts_worker.is_alive():
+                return
+
+            if getattr(self, 'speech_queue', None) is None:
+                self.speech_queue = []
+
+            selected_item = None
+            is_muted = bool(self.settings_manager.get("core.mute", False)) if getattr(self, 'settings_manager', None) else False
+            while self.speech_queue:
+                raw_item = self.speech_queue.pop(0)
+                if isinstance(raw_item, dict):
+                    item_text = str(raw_item.get("text") or "")
+                    item_msg_id = raw_item.get("message_id")
+                    item_card_key = raw_item.get("card_key") or build_speech_cache_key(item_msg_id, item_text)
+                    bypass_mute = bool(raw_item.get("bypass_mute", False))
+                    is_replay = bool(raw_item.get("is_replay", False))
+                else:
+                    item_text = str(raw_item or "")
+                    item_msg_id = None
+                    item_card_key = build_speech_cache_key(None, item_text)
+                    bypass_mute = False
+                    is_replay = False
+
+                if not item_text.strip():
+                    continue
+                if is_muted and not bypass_mute:
+                    continue
+
+                selected_item = (item_text, item_msg_id, item_card_key, is_replay)
+                break
+
+            if selected_item is None:
+                self._active_speech_card_key = None
+                self._active_speech_is_replay = False
+                no_more_items = True
+            else:
+                next_text, msg_id, card_key, is_replay = selected_item
+                cache_key = build_speech_cache_key(message_id=msg_id, text=next_text)
+                cache_path = get_speech_cache_path(self.agent_id, cache_key)
+                cached_file = get_valid_cached_speech_path(self.agent_id, cache_key) if is_replay else None
+
+                worker_to_start = TTSWorker(
+                    next_text,
+                    agent_id=self.agent_id,
+                    cache_path=cache_path,
+                    use_cached_file=cached_file,
+                    card_key=card_key,
+                )
+                self.tts_worker = worker_to_start
+                self._active_speech_card_key = card_key
+                self._active_speech_is_replay = bool(is_replay)
+                queued_count = len(self.speech_queue)
+
+                worker_to_start.started_playback.connect(
+                    lambda w=worker_to_start, ck=card_key: self._on_started_playback(w, ck)
+                )
+                worker_to_start.amplitude_emitted.connect(self.on_amplitude_emitted.emit)
+                if hasattr(worker_to_start, "waveform_emitted") and hasattr(self, "on_waveform_emitted"):
+                    worker_to_start.waveform_emitted.connect(self.on_waveform_emitted.emit)
+                worker_to_start.status_emitted.connect(
+                    lambda msg: self.append_to_conversation("System", msg)
+                )
+                worker_to_start.error_occurred.connect(
+                    lambda msg, w=worker_to_start: self._on_tts_error(msg, w)
+                )
+                worker_to_start.on_finished.connect(
+                    lambda w=worker_to_start: self.on_tts_finished(w)
+                )
+
+        if no_more_items:
+            SpeechPlaybackController.instance().mark_idle(worker=finished_worker)
             self.check_cycle_completion()
             return
 
-        next_text = self.speech_queue.pop(0)
+        controller = SpeechPlaybackController.instance()
+        if cached_file:
+            controller.mark_playing(
+                self.agent_id,
+                card_key,
+                worker=worker_to_start,
+                queued_count=queued_count,
+            )
+        else:
+            controller.mark_generating(
+                self.agent_id,
+                card_key,
+                worker=worker_to_start,
+                queued_count=queued_count,
+            )
+        worker_to_start.start()
 
-        if self.settings_manager.get("core.mute", False):
-            self.process_speech_queue()
+    def _on_tts_error(self, message: str, worker=None):
+        if worker is not None and (getattr(worker, "_is_stopped", False) or getattr(self, "tts_worker", None) is not worker):
             return
-
-        self.tts_worker = TTSWorker(next_text, agent_id=self.agent_id)
-        self.tts_worker.started_playback.connect(self._on_started_playback)
-        self.tts_worker.amplitude_emitted.connect(
-            self.on_amplitude_emitted.emit)
-        if hasattr(self.tts_worker, "waveform_emitted") and hasattr(self, "on_waveform_emitted"):
-            self.tts_worker.waveform_emitted.connect(
-                self.on_waveform_emitted.emit)
-        self.tts_worker.status_emitted.connect(
-            lambda msg: self.append_to_conversation("System", msg))
-        self.tts_worker.error_occurred.connect(self._on_tts_error)
-        self.tts_worker.on_finished.connect(self.on_tts_finished)
-        self.tts_worker.start()
-
-    def _on_tts_error(self, message: str):
         self.append_to_conversation("System", message)
-        self.on_tts_finished()
+        self.on_tts_finished(worker=worker)
 
-    def on_tts_finished(self):
-        self.tts_worker = None
-        self.process_speech_queue()
+    def on_tts_finished(self, worker=None):
+        with self._get_speech_lock():
+            if worker is not None and getattr(self, "tts_worker", None) is not worker:
+                return
+            self.tts_worker = None
+            self._active_speech_card_key = None
+            self._active_speech_is_replay = False
+        self.process_speech_queue(finished_worker=worker)
 
-    def _on_started_playback(self):
-        self.set_busy_state(self.is_busy, speaking=True)
+    def _on_started_playback(self, worker=None, card_key: Optional[str] = None):
+        with self._get_speech_lock():
+            if worker is not None and (getattr(worker, "_is_stopped", False) or getattr(self, "tts_worker", None) is not worker):
+                return
+            active_key = card_key or getattr(self, "_active_speech_card_key", None)
+            queued_count = len(getattr(self, "speech_queue", None) or [])
+            is_replay_only = (
+                getattr(self, "_active_speech_is_replay", False)
+                and not getattr(self, "is_thinking", False)
+                and not getattr(self, "_is_executing_tools", False)
+            )
+        SpeechPlaybackController.instance().mark_playing(
+            getattr(self, "agent_id", None),
+            active_key,
+            worker=worker,
+            queued_count=queued_count,
+        )
+        busy_flag = False if is_replay_only else bool(getattr(self, "is_busy", False))
+        self.set_busy_state(busy_flag, speaking=True)
 
     def shutdown(self, force_sleep=False):
         self._finalize_shutdown()
@@ -1755,6 +2139,7 @@ class AmityOrchestrator:
         if self.pulse_engine:
             self.pulse_engine.stop()
         self.stop_all_processing()
+        SpeechPlaybackController.instance().unregister_orchestrator(self)
         if self.gemini_worker and hasattr(self.gemini_worker, 'stop_session'):
             self.gemini_worker.stop_session()
         if self.cerebrum:

@@ -311,3 +311,120 @@ def test_other_agent_settings_panel_without_whatsapp(qapp):
 
     panel.deleteLater()
 
+
+def test_email_advanced_settings_accordion_toggle(qapp):
+    panel = SettingsPanelWidget()
+    email_card = panel.social_cards["email"]
+
+    assert hasattr(panel, "ui_email_pulse_adv_toggle_btn")
+    assert hasattr(panel, "ui_email_pulse_adv_container")
+    assert hasattr(panel, "ui_email_check_interval")
+    assert hasattr(panel, "ui_email_buffer")
+    assert hasattr(panel, "ui_email_pulse_all")
+    assert hasattr(panel, "ui_email_whitelist_container")
+    assert hasattr(panel, "ui_email_whitelist")
+
+    # Header and container live inside the Email card body
+    assert panel.ui_email_pulse_adv_toggle_btn.parent() == email_card.body_widget
+    assert panel.ui_email_pulse_adv_container.parent() == email_card.body_widget
+
+    # Controls are inside the advanced email container
+    assert panel.ui_email_check_interval.parent() == panel.ui_email_pulse_adv_container
+    assert panel.ui_email_buffer.parent() == panel.ui_email_pulse_adv_container
+    assert panel.ui_email_pulse_all.parent() == panel.ui_email_pulse_adv_container
+    assert panel.ui_email_whitelist_container.parent() == panel.ui_email_pulse_adv_container
+    assert panel.ui_email_whitelist.parent() == panel.ui_email_whitelist_container
+
+    # Defaults
+    assert panel.ui_email_check_interval.value() == 60
+    assert panel.ui_email_buffer.value() == 30
+    assert not panel.ui_email_pulse_all.isChecked()
+
+    # Dynamic visibility when "Pulse on all emails" is toggled
+    assert not panel.ui_email_whitelist_container.isHidden()
+    panel.ui_email_pulse_all.setChecked(True)
+    assert panel.ui_email_whitelist_container.isHidden()
+    panel.ui_email_pulse_all.setChecked(False)
+    assert not panel.ui_email_whitelist_container.isHidden()
+
+    # Collapsed by default with clean flat styling matching Advanced Whatsapp Settings
+    assert panel.ui_email_pulse_adv_container.isHidden()
+    assert panel.ui_email_pulse_adv_toggle_btn.text() == "▶ Advanced Email Settings"
+    assert panel.ui_email_pulse_adv_container.objectName() == "settingsSubContainer"
+    btn_style = panel.ui_email_pulse_adv_toggle_btn.styleSheet()
+    assert "background-color: transparent" in btn_style
+    assert "border: none" in btn_style
+
+    # Click to expand
+    panel.ui_email_pulse_adv_toggle_btn.click()
+    assert not panel.ui_email_pulse_adv_container.isHidden()
+    assert panel.ui_email_pulse_adv_toggle_btn.text() == "▼ Advanced Email Settings"
+
+    # Click to collapse
+    panel.ui_email_pulse_adv_toggle_btn.click()
+    assert panel.ui_email_pulse_adv_container.isHidden()
+    assert panel.ui_email_pulse_adv_toggle_btn.text() == "▶ Advanced Email Settings"
+
+    # Existing Advanced Server Settings accordion remains independent and intact
+    assert panel.ui_email_adv_container.isHidden()
+    assert "Advanced Server Settings" in panel.ui_email_adv_toggle_btn.text()
+
+    panel.deleteLater()
+
+
+def test_email_pulse_settings_load_and_save_in_social_accounts(qapp, tmp_path, monkeypatch):
+    agent_dir = tmp_path / "test_email_pulse_settings_agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    config_file = str(tmp_path / "config.json")
+    monkeypatch.setattr("config.paths.get_base_dir_for", lambda aid: str(agent_dir))
+
+    cm = ConfigManager(config_file=config_file)
+    sm = SettingsManager(agent_id="test_email_pulse_settings_agent")
+    sm.set("core.tools.email", True)
+    sm.set("core.auto-pulse.email.pulse-all-emails", False)
+    sm.set("core.auto-pulse.email.whitelist", ["alice@example.com", "@company.com"])
+    sm.set("core.auto-pulse.email.check-interval-seconds", 90)
+    sm.set("core.auto-pulse.email.buffer-seconds", 45)
+    sm.save()
+
+    panel = SettingsPanelWidget()
+    panel.config = cm
+    panel.load_settings(settings_manager=sm)
+
+    # Verify loaded values
+    assert panel.ui_email_check_interval.value() == 90
+    assert panel.ui_email_buffer.value() == 45
+    assert panel.ui_email_pulse_all.isChecked() is False
+    assert panel.ui_email_whitelist_container.isHidden() is False
+    items = [panel.ui_email_whitelist.item(i).text() for i in range(panel.ui_email_whitelist.count())]
+    assert items == ["alice@example.com", "@company.com"]
+
+    # Modify and save
+    panel.ui_email_check_interval.setValue(120)
+    panel.ui_email_buffer.setValue(15)
+    panel.ui_email_whitelist.addItem("boss@partner.org")
+    panel.ui_email_pulse_all.setChecked(True)
+    assert panel.ui_email_whitelist_container.isHidden() is True
+    panel.save_settings()
+
+    # Verify persisted values
+    assert sm.get("core.auto-pulse.email.check-interval-seconds") == 120
+    assert sm.get("core.auto-pulse.email.buffer-seconds") == 15
+    assert sm.get("core.auto-pulse.email.pulse-all-emails") is True
+    assert sm.get("core.auto-pulse.email.whitelist") == [
+        "alice@example.com",
+        "@company.com",
+        "boss@partner.org",
+    ]
+
+    # Reload into a fresh panel and confirm whitelist container starts hidden when pulse-all is True
+    panel2 = SettingsPanelWidget()
+    panel2.config = cm
+    panel2.load_settings(settings_manager=sm)
+    assert panel2.ui_email_pulse_all.isChecked() is True
+    assert panel2.ui_email_whitelist_container.isHidden() is True
+
+    panel.deleteLater()
+    panel2.deleteLater()
+
+

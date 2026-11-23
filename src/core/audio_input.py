@@ -157,9 +157,8 @@ class AudioService:
                 wf.writeframes(audio_data_int16.tobytes())
 
             is_low_token = self.settings.get("core.low-token-mode", False)
-            is_agy_mode = self.settings.get("core.antigravity.agy-mode", False)
 
-            if is_low_token or is_agy_mode:
+            if is_low_token:
                 from .local_stt import LocalSTT
                 text = LocalSTT().transcribe(temp_wav)
                 if not text or text.startswith("Failed"):

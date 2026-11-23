@@ -72,6 +72,41 @@ def test_deduplication(temp_archive):
     assert emails[0]["is_read"] == 1
 
 
+def test_deduplication_preserves_existing_read_status_when_requested(temp_archive):
+    msg = EmailMessage()
+    msg["Subject"] = "Keep Unread"
+    msg["From"] = "sender@example.com"
+    msg["To"] = "agent@example.com"
+    msg["Message-ID"] = "<keep-unread-203@example.com>"
+    msg.set_content("Needs explicit agent handling.")
+
+    id1 = temp_archive.save_email(folder="INBOX", msg_obj=msg, server_uid=None, is_read=False)
+    # Subsequent IMAP re-sync with preserve_existing_read_status=True must not flip unread -> read
+    id2 = temp_archive.save_email(
+        folder="INBOX",
+        msg_obj=msg,
+        server_uid="77",
+        is_read=True,
+        preserve_existing_read_status=True,
+    )
+
+    assert id1 == id2
+    em = temp_archive.get_email(str(id1))
+    assert em["is_read"] == 0
+    assert em["server_uid"] == "77"
+
+    # Once explicitly marked read locally, re-sync with is_read=False also keeps it read
+    assert temp_archive.mark_as_read(str(id1), is_read=True) is True
+    temp_archive.save_email(
+        folder="INBOX",
+        msg_obj=msg,
+        server_uid="77",
+        is_read=False,
+        preserve_existing_read_status=True,
+    )
+    assert temp_archive.get_email(str(id1))["is_read"] == 1
+
+
 def test_multipart_email_with_attachments(temp_archive):
     msg = EmailMessage()
     msg["Subject"] = "Monthly Report with PDF"

@@ -167,3 +167,60 @@ def test_chatroom_view_limits(qapp, temp_gui_env):
     assert view._loaded_messages[-1]["content"] == "Chatroom msg 200"
 
     view.close()
+
+
+def test_agent_and_chatroom_views_no_horizontal_overflow(qapp, temp_gui_env):
+    """Both AgentView and ChatroomView wrap long code blocks, blockquotes, and tables without horizontal scrolling."""
+    long_markdown = (
+        "```python\n"
+        + "def long_signature(" + ", ".join([f"param_{i}=123" for i in range(18)]) + "):\n"
+        + "    return '" + "x" * 140 + "'\n"
+        + "```\n\n"
+        + "> > > > > Deeply nested blockquote " + "word " * 25 + "\n\n"
+        + "| " + " | ".join([f"C{i}" for i in range(10)]) + " |\n"
+        + "| " + " | ".join(["---"] * 10) + " |\n"
+        + "| " + " | ".join(["v"] * 10) + " |"
+    )
+
+    mock_orchestrator = create_mock_orchestrator("+OA-TEST-WRAP")
+    agent_view = AgentView(mock_orchestrator)
+    agent_view.resize(480, 400)
+    agent_view.show()
+    agent_view.append_to_conversation("Agent", long_markdown)
+    qapp.processEvents()
+
+    agent_log = agent_view.conversation_log
+    assert agent_log.document().size().width() <= agent_log.viewport().width()
+    assert agent_log.horizontalScrollBar().maximum() == 0
+    assert not agent_log.horizontalScrollBar().isVisible()
+    agent_view.cleanup()
+    agent_view.close()
+
+    mock_agent_manager = MagicMock()
+    mock_agent_manager.get_agent_id_by_uid.return_value = None
+    cm = ChatroomManager()
+    cm.create_chatroom("Wrap Test Room")
+    chatroom_view = ChatroomView(mock_agent_manager, chatroom_id=1)
+    chatroom_view.resize(480, 400)
+    chatroom_view.show()
+    chatroom_view.on_chatroom_event({
+        "event": "new_message",
+        "chatroom_id": 1,
+        "message": {
+            "id": 1,
+            "chatroom_id": 1,
+            "sender_id": "+OA-MEMBER-0001",
+            "sender_name": "MemberWithAVeryLongDisplayName",
+            "sender_type": "agent",
+            "content": long_markdown,
+            "timestamp": "2026-11-19T09:00:00Z",
+            "reactions": [{"reaction": f"👍{i}"} for i in range(12)],
+        },
+    })
+    qapp.processEvents()
+
+    room_log = chatroom_view.conversation_log
+    assert room_log.document().size().width() <= room_log.viewport().width()
+    assert room_log.horizontalScrollBar().maximum() == 0
+    assert not room_log.horizontalScrollBar().isVisible()
+    chatroom_view.close()

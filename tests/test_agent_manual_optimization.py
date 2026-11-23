@@ -44,8 +44,18 @@ def test_agent_manual_index_compact_and_topics_complete():
     with open(MANUAL_INDEX_PATH, "r", encoding="utf-8") as f:
         index_text = f.read()
 
-    assert len(index_text) < 6200, f"Core index grew too large: {len(index_text)} chars"
+    assert len(index_text) < 8200, f"Core index grew too large: {len(index_text)} chars"
     assert "Use your tools natively" in index_text
+    assert "## 2. Tool Use & Invocation Rules" in index_text
+    assert "Same-Turn Execution" in index_text
+    assert "EXACT SAME TURN" in index_text
+    assert "Zero tool calls will cause your cognitive cycle to halt" in index_text
+    assert "System_contemplate" in index_text
+    assert "Batch Independent Operations" in index_text
+    assert "independent, idempotent" in index_text
+    assert "Always use quotes around string arguments in tool calls" in index_text
+    assert "[Tool invocation:" in index_text
+    assert "Fatigue & Token Budget" in index_text
     assert "Speaker_speak_aloud" in index_text
     assert "Speaker_output_text" in index_text
     assert "already automatically captioned" in index_text

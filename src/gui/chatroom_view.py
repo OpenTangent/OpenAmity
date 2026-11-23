@@ -309,7 +309,7 @@ class ChatroomView(QWidget):
                 chip_items.append(
                     f"<span style='background-color: #2b2b2b; border: 1px solid #444; border-radius: 10px; padding: 2px 7px; font-size: 12px; margin-right: 4px; color: #FFF;'>{emoji} {count}</span>"
                 )
-            reactions_html = f"<div style='margin-top: 5px;'>{''.join(chip_items)}</div>"
+            reactions_html = f"<div style='margin-top: 5px;'>{' '.join(chip_items)}</div>"
 
         anchor_tag = f"<a name='msg_{msg_id}' id='msg_{msg_id}'></a>"
 

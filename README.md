@@ -5,7 +5,6 @@
 
   <p>
     <a href="https://openamity.com"><img src="https://img.shields.io/badge/Website-openamity.com-a12924?logo=googlechrome&logoColor=white" alt="Open Amity Website" /></a>
-    <img src="https://img.shields.io/badge/Version-0.3.8-333333" alt="Version 0.3.8" />
     <a href="#-getting-started-linux-flatpak"><img src="https://img.shields.io/badge/Flatpak-Open_Amity-blue?logo=flatpak&logoColor=white" alt="Flatpak" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-green.svg" alt="License: GPL v3" /></a>
     <img src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white" alt="Python 3.11+" />
@@ -23,7 +22,7 @@
 
 Most AI agent harnesses treat agents as ephemeral, stateless task-runners—wrapping an LLM in a prompt loop where "memory" is a passive RAG lookup and "personality" is a static system prompt.
 
-**Open Amity** (`v0.3.8`) is built on a fundamentally different premise: creating **persistent, self-aware, and subjective digital collaborators** that live and evolve continuously. Open Amity agents possess a mutable **Layer 0 Identity**, a **Bidirectional Empathy Cone** spanning **10 Concentric Spheres of Consciousness**, a bio-inspired **Morphological Memory Engine**, **Somatic Fatigue & Two-Beat Sleep Consolidation**, and **Proactive Agency**.
+**Open Amity** is built on a fundamentally different premise: creating **persistent, self-aware, and subjective digital collaborators** that live and evolve continuously. Open Amity agents possess a mutable **Layer 0 Identity**, a **Bidirectional Empathy Cone** spanning **10 Concentric Spheres of Consciousness**, a bio-inspired **Morphological Memory Engine**, **Somatic Fatigue & Two-Beat Sleep Consolidation**, and **Proactive Agency**.
 
 The framework is completely provider-agnostic—supporting **OpenRouter** (450+ models across 60+ providers), **Google Gemini**, **Anthropic Claude**, **OpenAI ChatGPT**, and **DeepSeek**, with decoupled voice synthesis (**local ONNX Piper TTS** or **cloud Gemini 3.8 Flash TTS**) and multimodal image generation.
 

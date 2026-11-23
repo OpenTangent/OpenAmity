@@ -287,5 +287,8 @@ class AgentManager:
             except Exception as e:
                 logging.debug(f"AgentManager: Error stopping HookServer: {e}")
             self.hook_server = None
+
+    def stop_chatroom_notifier(self):
+        """Stops the ChatroomWatchNotifier and cancels pending watch timers."""
         if hasattr(self, 'chatroom_notifier') and self.chatroom_notifier:
             self.chatroom_notifier.stop()

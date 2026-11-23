@@ -57,9 +57,9 @@ class CacheManager:
         try:
             from config import paths
 
-            # 1. Audio cache (Speaker_speak_to_file opus files)
+            # 1. Audio cache (Speaker_speak_to_file and speech transcript replay .opus files)
             CacheManager.clear_expired(
-                paths.get_audio_cache_dir(agent_id), max_age_days=max_age_days)
+                paths.get_audio_cache_dir(agent_id), max_age_days=max_age_days, recursive=True)
 
             # 2. Generated media (Media_generate images)
             CacheManager.clear_expired(

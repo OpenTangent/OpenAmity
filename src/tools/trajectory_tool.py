@@ -6,12 +6,15 @@ from typing import List, Dict, Any
 from core.cerebrum import Tool
 from core.file_utils import atomic_json_write
 
+MAX_TASK_DESCRIPTION_CHARS = 280
+
 
 class TrajectoryTool(Tool):
     name = "Trajectory"
     icon = "🧭"
     color = "#1ABC9C"
     async_commands = []
+    MAX_TASK_DESCRIPTION_CHARS = MAX_TASK_DESCRIPTION_CHARS
     description = "Manage the agent's self-reflection, hierarchical aspirations (using short-term goals as milestones for long-term ones), and tasks."
     commands = ["get_bearings", "reflect_and_update_state",
                 "manage_aspirations", "manage_tasks"]
@@ -108,13 +111,17 @@ class TrajectoryTool(Tool):
         base = self._get_base_structure()
         merged = self._deep_merge(base, user_data)
 
-        # Normalize aspirations and pull any SQLite-only rows if trajectory.json had no aspirations
+        # Normalize aspirations and tasks
         for tier in ["short_term", "medium_term", "long_term"]:
             tier_list = merged["aspirations"].get(tier, [])
             if isinstance(tier_list, list):
                 merged["aspirations"][tier] = [
                     tm._normalize_aspiration(a) for a in tier_list if isinstance(a, dict)
                 ]
+        if isinstance(merged.get("tasks"), list):
+            merged["tasks"] = [
+                tm._normalize_task(t) for t in merged["tasks"] if isinstance(t, dict)
+            ]
 
         if merged != user_data:
             try:
@@ -137,6 +144,10 @@ class TrajectoryTool(Tool):
                 data["aspirations"][tier] = [
                     tm._normalize_aspiration(a) for a in data["aspirations"][tier] if isinstance(a, dict)
                 ]
+        if isinstance(data.get("tasks"), list):
+            data["tasks"] = [
+                tm._normalize_task(t) for t in data["tasks"] if isinstance(t, dict)
+            ]
         atomic_json_write(traj_file, data)
         try:
             tm._sync_to_db(data)
@@ -391,8 +402,21 @@ class TrajectoryTool(Tool):
 
                         deferral_count = task.get("deferral_count", 0)
                         deferral_warning = " (WARNING: Repeatedly deferred. Consider breaking this down or removing it.)" if deferral_count >= 3 else ""
+                        raw_desc = str(task.get("description", "") or "")
+                        display_desc = (
+                            raw_desc[:MAX_TASK_DESCRIPTION_CHARS - 3]
+                            + "... [legacy verbose task; condense & move notes to artifact_path]"
+                            if len(raw_desc) > MAX_TASK_DESCRIPTION_CHARS
+                            else raw_desc
+                        )
                         lines.append(
-                            f"    -> Task {task['id']} | Status: {status_display} | Created: {task_created}{deferral_warning} | {task['description']}")
+                            f"    -> Task {task['id']} | Status: {status_display} | Created: {task_created}{deferral_warning} | {display_desc}")
+                        task_why = str(task.get("why", "") or "").strip()
+                        if task_why:
+                            lines.append(f"      WHY: {task_why}")
+                        task_artifact = str(task.get("artifact_path", "") or "").strip()
+                        if task_artifact:
+                            lines.append(f"      Artifact: {task_artifact}")
 
         all_asp_ids = {a['id'] for tier in ["short_term", "medium_term",
                                             "long_term"] for a in data["aspirations"].get(tier, [])}
@@ -408,8 +432,21 @@ class TrajectoryTool(Tool):
                 status_display = task['status']
                 if blocked_by:
                     status_display += f" (BLOCKED BY: {', '.join(blocked_by)})"
+                raw_desc = str(task.get("description", "") or "")
+                display_desc = (
+                    raw_desc[:MAX_TASK_DESCRIPTION_CHARS - 3]
+                    + "... [legacy verbose task; condense & move notes to artifact_path]"
+                    if len(raw_desc) > MAX_TASK_DESCRIPTION_CHARS
+                    else raw_desc
+                )
                 lines.append(
-                    f"  Task {task['id']} (for unknown Aspiration: {task.get('aspiration_id')}) | Status: {status_display} | Created: {task_created} | {task['description']}")
+                    f"  Task {task['id']} (for unknown Aspiration: {task.get('aspiration_id')}) | Status: {status_display} | Created: {task_created} | {display_desc}")
+                task_why = str(task.get("why", "") or "").strip()
+                if task_why:
+                    lines.append(f"    WHY: {task_why}")
+                task_artifact = str(task.get("artifact_path", "") or "").strip()
+                if task_artifact:
+                    lines.append(f"    Artifact: {task_artifact}")
 
         lines.append("\n=== OPERATIONAL HINTS ===")
         lines.append(
@@ -566,21 +603,45 @@ class TrajectoryTool(Tool):
 
         return f"Error: Unknown action '{action}' for aspirations."
 
-    def _manage_tasks(self, action: str, aspiration_id: str = None, task_id: str = None, description: str = None, status: str = None, depends_on: List[str] = None) -> str:
+    def _manage_tasks(
+        self,
+        action: str,
+        aspiration_id: str = None,
+        task_id: str = None,
+        description: str = None,
+        status: str = None,
+        depends_on: List[str] = None,
+        why: str = None,
+        artifact_path: str = None,
+    ) -> str:
+        if action in ("add", "update") and description is not None:
+            desc_clean = str(description).strip()
+            if len(desc_clean) > MAX_TASK_DESCRIPTION_CHARS:
+                return (
+                    f"Error: Task description exceeds {MAX_TASK_DESCRIPTION_CHARS} characters "
+                    f"({len(desc_clean)} chars). Keep task descriptions concise and forward-looking "
+                    f"(<= {MAX_TASK_DESCRIPTION_CHARS} chars), put teleological purpose in 'why', "
+                    "and offload detailed audit logs, hashes, or notes to a Markdown file referenced via 'artifact_path'."
+                )
+        else:
+            desc_clean = None
+
         data = self._load_data()
         tasks = data.get("tasks", [])
 
         if action == "add":
-            if not aspiration_id or not description:
+            if not aspiration_id or not desc_clean:
                 return "Error: aspiration_id and description are required to add a task."
             new_id = f"tsk_{uuid.uuid4().hex[:6]}"
             new_task = {
                 "id": new_id,
                 "aspiration_id": aspiration_id,
-                "description": description,
+                "description": desc_clean,
                 "status": "pending",
                 "created_at": datetime.now().isoformat(),
-                "depends_on": depends_on or []
+                "depends_on": depends_on or [],
+                "why": str(why).strip() if why is not None else "",
+                "artifact_path": str(artifact_path).strip() if artifact_path is not None else "",
             }
             tasks.append(new_task)
             data["tasks"] = tasks
@@ -594,10 +655,14 @@ class TrajectoryTool(Tool):
             if not target:
                 return f"Error: Task {task_id} not found."
 
-            if description:
-                target["description"] = description
+            if desc_clean:
+                target["description"] = desc_clean
             if depends_on is not None:
                 target["depends_on"] = depends_on
+            if why is not None:
+                target["why"] = str(why).strip()
+            if artifact_path is not None:
+                target["artifact_path"] = str(artifact_path).strip()
             if status:
                 target["status"] = status
                 if status == "completed":
@@ -711,7 +776,7 @@ class TrajectoryTool(Tool):
                         },
                         "description": {
                             "type": "STRING",
-                            "description": "The description of the task (required for 'add')."
+                            "description": "Concise forward-looking task description (<= 280 chars, required for 'add'). Offload detailed notes/audit logs to 'artifact_path'."
                         },
                         "status": {
                             "type": "STRING",
@@ -723,6 +788,14 @@ class TrajectoryTool(Tool):
                                 "type": "STRING"
                             },
                             "description": "Optional list of Task IDs that this task depends on (blocked by)."
+                        },
+                        "why": {
+                            "type": "STRING",
+                            "description": "Optional teleological purpose explaining why or for whom this task matters."
+                        },
+                        "artifact_path": {
+                            "type": "STRING",
+                            "description": "Optional path to a Markdown report, audit log, or artifact file holding verbose details."
                         }
                     },
                     "required": ["action"]

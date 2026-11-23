@@ -143,6 +143,8 @@ class MemPalaceTool(Tool):
                 if isinstance(res, dict):
                     mem_id = res.get("id", "N/A")
                     msg = f"Successfully added to short-term memory (ID: {mem_id})."
+                    if res.get("warning"):
+                        msg += f" [Warning: {res['warning']}]"
                     if res.get("overflow"):
                         msg += f" [Warning: Capacity limit exceeded ({res.get('unresolved_count', 0)} unresolved items preserved; working memory in overflow).]"
                     if res.get("archived_count"):
@@ -183,6 +185,7 @@ class MemPalaceTool(Tool):
             epistemic_boundary = kwargs.get("epistemic_boundary")
             ripple_notes = kwargs.get("ripple_notes")
             prediction_error_note = kwargs.get("prediction_error_note")
+            open_curiosity = kwargs.get("open_curiosity")
 
             if not perspective or not str(perspective).strip():
                 return "Error: perspective is required."
@@ -202,6 +205,7 @@ class MemPalaceTool(Tool):
                     epistemic_boundary=epistemic_boundary,
                     ripple_notes=ripple_notes,
                     prediction_error_note=prediction_error_note,
+                    open_curiosity=open_curiosity,
                 )
                 if isinstance(res, dict) and not res.get("success"):
                     return f"Error updating mirror: {res.get('error', 'Failed to update mirror')}"
@@ -405,6 +409,7 @@ class MemPalaceTool(Tool):
                         "epistemic_boundary": {"type": "STRING", "description": "Observed/stated vs inferred vs unknown about their inner state."},
                         "ripple_notes": {"type": "STRING", "description": "Downstream impact on this sphere from inner-sphere actions."},
                         "prediction_error_note": {"type": "STRING", "description": "Prior expectation contradicted by reality and lesson learned."},
+                        "open_curiosity": {"type": "STRING", "description": "Optional genuine question or perspective gap you want to explore next about their lived world."},
                         "confidence": {"type": "NUMBER", "description": "Epistemic confidence [0.0..1.0] (default: 1.0)."},
                         "provenance": {"type": "STRING", "description": "'stated', 'observed', or 'inferred' (default: 'inferred')."},
                         "evidence_refs": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Supporting drawer IDs or session references."},

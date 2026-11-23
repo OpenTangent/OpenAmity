@@ -16,6 +16,139 @@ except ImportError:
     from .settings_manager import SettingsManager
 
 
+WHATSAPP_NON_MESSAGE_TYPES = frozenset({
+    "gp2",
+    "group_notification",
+    "notification",
+    "notification_template",
+    "broadcast_notification",
+    "e2e_notification",
+    "protocol",
+    "revoked",
+    "call_log",
+    "ciphertext",
+    "reaction",
+    "reaction_enc",
+    "poll_update",
+    "pinned_message",
+    "pin_message",
+    "keep_in_chat",
+    "enc_comment",
+    "event_response",
+    "newsletter_notification",
+    "newsletter_admin_invite",
+    "biz_content_placeholder",
+    "request_phone_number",
+    "oversized",
+    "unknown",
+    "futureproof",
+})
+
+WHATSAPP_REVOKE_SUBTYPES = frozenset({
+    "revoke",
+    "sender_revoke",
+    "admin_revoke",
+})
+
+
+def extract_whatsapp_stanza_id(raw_id) -> str:
+    """Extracts the stable stanza ID from a WA-JS MsgKey dict or serialized message ID."""
+    if not raw_id:
+        return ""
+    if isinstance(raw_id, dict):
+        if raw_id.get("id"):
+            return str(raw_id.get("id"))
+        serialized = str(raw_id.get("_serialized") or "")
+    else:
+        serialized = str(raw_id or "")
+    if serialized:
+        parts = serialized.split("_")
+        if len(parts) >= 3 and parts[0] in ("true", "false"):
+            return parts[2]
+    return ""
+
+
+def is_visible_whatsapp_message(msg: dict, *, allow_from_me: bool = False) -> bool:
+    """Returns True only for visible user-facing WhatsApp messages (excluding system/protocol/revoked/empty events)."""
+    if not isinstance(msg, dict):
+        return False
+
+    raw_id = msg.get("id")
+    id_from_me = (
+        bool(raw_id.get("fromMe"))
+        if isinstance(raw_id, dict)
+        else str(raw_id or "").startswith("true_")
+    )
+    if not allow_from_me and (msg.get("fromMe") or msg.get("isSentByMe") or id_from_me):
+        return False
+
+    raw_chat = msg.get("chatId") or msg.get("from") or ""
+    if isinstance(raw_chat, dict):
+        raw_chat = raw_chat.get("_serialized") or raw_chat.get("id") or ""
+    chat_id_str = str(raw_chat or "")
+    if (
+        msg.get("isStatusV3")
+        or msg.get("isBroadcast")
+        or "@broadcast" in chat_id_str
+        or chat_id_str.endswith("@newsletter")
+    ):
+        return False
+
+    if (
+        msg.get("isNotification")
+        or msg.get("isBizNotification")
+        or msg.get("isPSA")
+        or msg.get("invis")
+        or msg.get("isMdHistoryMsg")
+        or msg.get("asRevoked")
+        or msg.get("isRevoked")
+    ):
+        return False
+
+    raw_type_val = msg["type"] if "type" in msg else "chat"
+    raw_type = str(raw_type_val or "").strip().lower()
+    if not raw_type or raw_type in WHATSAPP_NON_MESSAGE_TYPES:
+        return False
+
+    raw_subtype = str(msg.get("subtype") or "").strip().lower()
+    if raw_subtype and raw_subtype in WHATSAPP_REVOKE_SUBTYPES:
+        return False
+
+    if msg.get("isUnreadType") is False:
+        return False
+
+    if raw_type == "chat":
+        has_text = any(
+            isinstance(msg.get(k), str) and msg.get(k).strip()
+            for k in ("content", "body", "caption", "matchedText", "title")
+        )
+        has_payload = bool(
+            msg.get("hasMedia")
+            or msg.get("isMedia")
+            or msg.get("mediaPath")
+            or (
+                isinstance(msg.get("lat"), (int, float))
+                and not isinstance(msg.get("lat"), bool)
+                and isinstance(msg.get("lng"), (int, float))
+                and not isinstance(msg.get("lng"), bool)
+            )
+            or (isinstance(msg.get("location"), dict) and msg.get("location"))
+            or (isinstance(msg.get("contacts"), list) and len(msg.get("contacts")) > 0)
+            or (isinstance(msg.get("poll"), dict) and msg.get("poll"))
+            or (
+                msg.get("pollName")
+                and isinstance(msg.get("pollOptions"), list)
+                and len(msg.get("pollOptions")) > 0
+            )
+            or (isinstance(msg.get("vcardList"), list) and len(msg.get("vcardList")) > 0)
+            or msg.get("vcardFormattedName")
+        )
+        if not has_text and not has_payload:
+            return False
+
+    return True
+
+
 class WhatsAppDaemon:
     _chrome_download_lock = threading.Lock()
     _port_lock = threading.Lock()
@@ -31,6 +164,7 @@ class WhatsAppDaemon:
         self.port_file = os.path.join(self.bridge_dir, "daemon.port")
         self.node_process = None
         self.message_callback = None
+        self.message_revoked_callback = None
         self.status_callback = None
         self._is_downloading_chrome = False
         self._stopping = False
@@ -518,6 +652,12 @@ class WhatsAppDaemon:
         env["PORT"] = str(self.port)
         env["WHATSAPP_PORT"] = str(self.port)
         env["WHATSAPP_DATA_DIR"] = self.data_dir
+        try:
+            agent_name = SettingsManager(agent_id=self.agent_id).get("core.agent.name", "")
+            if isinstance(agent_name, str) and agent_name.strip():
+                env["WHATSAPP_AGENT_NAME"] = agent_name.strip()
+        except Exception:
+            pass
 
         chrome_exe = self._find_chrome_executable()
         if chrome_exe:
@@ -551,6 +691,11 @@ class WhatsAppDaemon:
             f.write(str(self.node_process.pid))
 
         def read_output(pipe, label):
+            try:
+                from core.logger_config import agent_id_var
+                agent_id_var.set(self.agent_id)
+            except Exception:
+                pass
             for line in iter(pipe.readline, ''):
                 if line:
                     line_str = line.strip()
@@ -588,29 +733,60 @@ class WhatsAppDaemon:
             time.sleep(1)
 
     def _parse_message_line(self, line_str: str):
-        """Parses [MSG_RECEIVED_JSON] or legacy [MSG_RECEIVED] output and invokes callback."""
-        if not self.message_callback:
-            return
-
+        """Parses [MSG_RECEIVED_JSON], [MSG_REVOKED_JSON], or legacy [MSG_RECEIVED] output and invokes callbacks."""
         if line_str.startswith("[MSG_RECEIVED_JSON]"):
+            if not self.message_callback:
+                return
             json_part = line_str[len("[MSG_RECEIVED_JSON]"):].strip()
             try:
                 data = json.loads(json_part)
-                sender_id = data.get("chatId", "")
+                raw_chat_id = data.get("rawChatId", "")
+                sender_id = data.get("chatId", "") or raw_chat_id
                 sender_name = data.get("senderName", "")
                 is_group = bool(data.get("isGroup", False))
                 group_name = data.get("groupName", "")
                 mentioned = bool(data.get("mentioned", False))
+                mention_reason = str(data.get("mentionReason", "") or "")
+                msg_id = data.get("msgId", "")
+                msg_stanza_id = data.get("msgStanzaId", "") or extract_whatsapp_stanza_id(msg_id)
+                msg_type = data.get("msgType", "")
+                subtype = data.get("subtype", "")
                 self.message_callback(
                     sender_id,
                     sender_name,
                     is_group=is_group,
                     group_name=group_name,
                     mentioned=mentioned,
+                    mention_reason=mention_reason,
+                    raw_chat_id=raw_chat_id,
+                    msg_id=msg_id,
+                    msg_stanza_id=msg_stanza_id,
+                    msg_type=msg_type,
+                    subtype=subtype,
                 )
             except Exception as e:
                 logging.debug(f"WhatsAppDaemon: Error parsing JSON message event: {e}")
+        elif line_str.startswith("[MSG_REVOKED_JSON]"):
+            if not self.message_revoked_callback:
+                return
+            json_part = line_str[len("[MSG_REVOKED_JSON]"):].strip()
+            try:
+                data = json.loads(json_part)
+                msg_id = data.get("msgId", "")
+                msg_stanza_id = data.get("msgStanzaId", "") or extract_whatsapp_stanza_id(msg_id)
+                chat_id = data.get("chatId", "")
+                revoke_type = data.get("revokeType", "revoke")
+                self.message_revoked_callback(
+                    msg_id=msg_id,
+                    msg_stanza_id=msg_stanza_id,
+                    chat_id=chat_id,
+                    revoke_type=revoke_type,
+                )
+            except Exception as e:
+                logging.debug(f"WhatsAppDaemon: Error parsing JSON revoke event: {e}")
         elif line_str.startswith("[MSG_RECEIVED]"):
+            if not self.message_callback:
+                return
             parts = line_str.split(" ", 2)
             if len(parts) >= 2:
                 sender_id = parts[1]

@@ -1,13 +1,238 @@
 import os
+import re
 import json
 import time
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from config import paths
 from core.file_utils import atomic_json_write
 
 logger = logging.getLogger("core.session_cache")
+
+_TOOL_INVOCATION_START_RE = re.compile(r"\[Tool invocation:\s*([A-Za-z0-9_]+)\s*\(")
+_FAKE_CALLED_LINE_RE = re.compile(r"🔧\s*Called\b")
+_FAKE_CALLED_STRIP_LINE_RE = re.compile(r"(?m)^[ \t]*🔧\s*Called\b[^\n]*\n?")
+_FAKE_CALLED_INLINE_RE = re.compile(r"🔧\s*Called\b[^\n]*")
+_TOOL_RESULT_ARROW_RE = re.compile(r"([A-Za-z0-9_]+)\s*->\s*")
+_EMPTY_ASSISTANT_FALLBACK = "[Attempted plain-text tool imitation; no native tool call emitted]"
+
+
+def has_fake_tool_invocation_text(text: str) -> bool:
+    """Return True if assistant text contains plain-text tool-call imitations."""
+    if not text or not isinstance(text, str):
+        return False
+    return "[Tool invocation:" in text or bool(_FAKE_CALLED_LINE_RE.search(text))
+
+
+def _scan_balanced_paren_end(text: str, open_paren_idx: int) -> Optional[int]:
+    """Return index of matching ')' for '(' at open_paren_idx, or None if unbalanced."""
+    n = len(text)
+    depth = 1
+    i = open_paren_idx + 1
+    while i < n and text[i].isspace():
+        i += 1
+    json_style = i < n and text[i] in ("{", "[", '"')
+    quote_char: Optional[str] = None
+    escape = False
+
+    i = open_paren_idx + 1
+    while i < n:
+        ch = text[i]
+        if quote_char is not None:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote_char:
+                quote_char = None
+        else:
+            if ch == '"' or (not json_style and ch == "'"):
+                quote_char = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return None
+
+
+def _parse_tool_args(raw_args: str) -> Dict[str, Any]:
+    """Parse captured argument text into a dictionary suitable for native tool schemas."""
+    stripped = (raw_args or "").strip()
+    if not stripped:
+        return {}
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    except Exception:
+        return {"_raw": stripped}
+
+
+def extract_tool_invocations_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Strip `[Tool invocation: ...]` and `🔧Called ...` blocks from text and return parsed invocations."""
+    if not text or not isinstance(text, str):
+        return "", []
+
+    invocations: List[Dict[str, Any]] = []
+    kept_parts: List[str] = []
+    n = len(text)
+    pos = 0
+
+    while pos < n:
+        match = _TOOL_INVOCATION_START_RE.search(text, pos)
+        if not match:
+            kept_parts.append(text[pos:])
+            break
+
+        kept_parts.append(text[pos:match.start()])
+        tool_name = match.group(1)
+        open_paren_idx = match.end() - 1
+        close_paren_idx = _scan_balanced_paren_end(text, open_paren_idx)
+
+        if close_paren_idx is None:
+            # Truncated/unclosed block: drop only up to end of line to avoid swallowing prose.
+            nl_idx = text.find("\n", match.start())
+            pos = nl_idx + 1 if nl_idx != -1 else n
+            continue
+
+        raw_args = text[open_paren_idx + 1:close_paren_idx]
+        args_dict = _parse_tool_args(raw_args)
+        invocations.append({
+            "name": tool_name,
+            "args": args_dict,
+            "arguments": json.dumps(args_dict, ensure_ascii=False),
+        })
+
+        end_pos = close_paren_idx + 1
+        rest = text[end_pos:]
+        ws_len = len(rest) - len(rest.lstrip(" \t"))
+        if end_pos + ws_len < n and text[end_pos + ws_len] == "]":
+            end_pos = end_pos + ws_len + 1
+        if end_pos < n and text[end_pos] == "\n":
+            end_pos += 1
+        pos = end_pos
+
+    cleaned = "".join(kept_parts)
+    cleaned = _FAKE_CALLED_STRIP_LINE_RE.sub("", cleaned)
+    cleaned = _FAKE_CALLED_INLINE_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, invocations
+
+
+def strip_fake_tool_invocation_text(text: str) -> str:
+    """Remove plain-text tool-call imitations from assistant text."""
+    cleaned, _ = extract_tool_invocations_from_text(text)
+    return cleaned
+
+
+def sanitize_fake_tool_assistant_text(text: str, fallback: str = _EMPTY_ASSISTANT_FALLBACK) -> str:
+    """Strip fake plain-text tool invocations if present, returning fallback when empty."""
+    if not has_fake_tool_invocation_text(text):
+        return text
+    cleaned = strip_fake_tool_invocation_text(text)
+    return cleaned or fallback
+
+
+def _normalize_tool_result_payload(parsed_obj: Any) -> str:
+    """Normalize a parsed tool result payload into a JSON object string."""
+    if isinstance(parsed_obj, dict):
+        return json.dumps(parsed_obj, ensure_ascii=False)
+    if isinstance(parsed_obj, str):
+        try:
+            nested = json.loads(parsed_obj)
+            if isinstance(nested, dict):
+                return json.dumps(nested, ensure_ascii=False)
+        except Exception:
+            pass
+        return json.dumps({"result": parsed_obj}, ensure_ascii=False)
+    return json.dumps({"result": parsed_obj}, ensure_ascii=False)
+
+
+def extract_tool_results_from_user_text(text: str) -> Tuple[List[str], str]:
+    """Extract leading `[Tool Result: ...]` blocks from a user turn and return remaining text."""
+    if not text or not isinstance(text, str):
+        return [], ""
+
+    results: List[str] = []
+    decoder = json.JSONDecoder()
+    n = len(text)
+    pos = 0
+
+    while pos < n:
+        while pos < n and text[pos].isspace():
+            pos += 1
+        if not text.startswith("[Tool Result:", pos):
+            break
+
+        inner_pos = pos + len("[Tool Result:")
+        while inner_pos < n and text[inner_pos].isspace():
+            inner_pos += 1
+
+        arrow_match = _TOOL_RESULT_ARROW_RE.match(text, inner_pos)
+        if arrow_match:
+            inner_pos = arrow_match.end()
+
+        parsed_block = False
+        if inner_pos < n and text[inner_pos] in ("{", "[", '"'):
+            try:
+                parsed_obj, end_idx = decoder.raw_decode(text, inner_pos)
+                after = text[end_idx:]
+                ws_len = len(after) - len(after.lstrip())
+                if end_idx + ws_len < n and text[end_idx + ws_len] == "]":
+                    results.append(_normalize_tool_result_payload(parsed_obj))
+                    pos = end_idx + ws_len + 1
+                    parsed_block = True
+            except Exception:
+                pass
+
+        if parsed_block:
+            continue
+
+        # Fallback balanced-bracket scan for legacy or plain-text tool results.
+        depth = 1
+        quote_char: Optional[str] = None
+        escape = False
+        scan = inner_pos
+        close_idx: Optional[int] = None
+        while scan < n:
+            ch = text[scan]
+            if quote_char is not None:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote_char:
+                    quote_char = None
+            else:
+                if ch == '"':
+                    quote_char = ch
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = scan
+                        break
+            scan += 1
+
+        if close_idx is None:
+            break
+
+        raw_result = text[inner_pos:close_idx].strip()
+        try:
+            parsed_raw = json.loads(raw_result)
+            results.append(_normalize_tool_result_payload(parsed_raw))
+        except Exception:
+            results.append(json.dumps({"result": raw_result}, ensure_ascii=False))
+        pos = close_idx + 1
+
+    remaining = text[pos:].strip() if results else text.strip()
+    return results, remaining
 
 
 def normalize_session_messages(
@@ -23,6 +248,7 @@ def normalize_session_messages(
     - Replaces inline base64 media blocks with concise text placeholders.
     - Appends any in-flight prompt if not already present.
     - Merges consecutive messages with the same role to respect alternation.
+    - Strips unpaired/failed plain-text tool imitations from assistant turns.
     - If close_trailing_user=True and the final turn is 'user', appends an assistant closure
       so models with strict alternating role constraints do not reject the history.
     """
@@ -124,6 +350,25 @@ def normalize_session_messages(
         else:
             merged_turns.append(dict(turn))
 
+    # Sanitize unpaired/failed plain-text tool imitations in assistant turns so they never poison future turns
+    for idx, turn in enumerate(merged_turns):
+        if turn["role"] != "assistant" or not has_fake_tool_invocation_text(turn["content"]):
+            continue
+        clean_body, _ = extract_tool_invocations_from_text(turn["content"])
+        next_has_results = (
+            idx + 1 < len(merged_turns)
+            and merged_turns[idx + 1]["role"] == "user"
+            and bool(extract_tool_results_from_user_text(merged_turns[idx + 1]["content"])[0])
+        )
+        if next_has_results:
+            # Strip any stray 🔧Called lines while preserving paired [Tool invocation: ...] for reconstruction
+            cleaned_called = _FAKE_CALLED_STRIP_LINE_RE.sub("", turn["content"])
+            cleaned_called = _FAKE_CALLED_INLINE_RE.sub("", cleaned_called).strip()
+            if cleaned_called != turn["content"]:
+                turn["content"] = cleaned_called
+        else:
+            turn["content"] = clean_body or "[Turn completed without native tool calls]"
+
     # Close trailing user turn if requested for restoration
     if close_trailing_user and merged_turns and merged_turns[-1]["role"] == "user":
         merged_turns.append({
@@ -132,6 +377,128 @@ def normalize_session_messages(
         })
 
     return merged_turns
+
+
+def reconstruct_structured_session_turns(
+    messages: List[Dict[str, Any]],
+    in_flight_prompt: Optional[str] = None,
+    close_trailing_user: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Reconstructs normalized session messages into structured native tool-call / tool-result turns
+    so restored sessions render real API tool structures instead of plain-text `[Tool invocation: ...]`
+    strings inside assistant turns.
+    """
+    norm_messages = normalize_session_messages(
+        messages,
+        in_flight_prompt=in_flight_prompt,
+        close_trailing_user=False,
+    )
+    structured: List[Dict[str, Any]] = []
+    i = 0
+    n = len(norm_messages)
+
+    while i < n:
+        curr = norm_messages[i]
+        if curr["role"] == "assistant":
+            clean_text, invocations = extract_tool_invocations_from_text(curr["content"])
+            results: List[str] = []
+            remaining_user = ""
+            if invocations and i + 1 < n and norm_messages[i + 1]["role"] == "user":
+                results, remaining_user = extract_tool_results_from_user_text(norm_messages[i + 1]["content"])
+
+            if invocations and results:
+                paired_calls = []
+                for j, inv in enumerate(invocations):
+                    res_str = results[j] if j < len(results) else json.dumps({"result": "[Completed]"})
+                    paired_calls.append({
+                        "id": f"call_restored_{i}_{j}",
+                        "name": inv["name"],
+                        "args": inv["args"],
+                        "arguments": inv["arguments"],
+                        "result": res_str,
+                    })
+                structured.append({
+                    "role": "assistant",
+                    "content": clean_text,
+                    "tool_calls": paired_calls,
+                })
+                structured.append({
+                    "role": "tool_results",
+                    "tool_calls": paired_calls,
+                })
+                if remaining_user:
+                    structured.append({
+                        "role": "assistant",
+                        "content": "[Completed tool execution]",
+                    })
+                    structured.append({
+                        "role": "user",
+                        "content": remaining_user,
+                    })
+                i += 2
+                continue
+
+            final_text = clean_text if invocations else curr["content"]
+            structured.append({
+                "role": "assistant",
+                "content": final_text or "[Turn completed without native tool calls]",
+            })
+            i += 1
+        else:
+            structured.append({"role": "user", "content": curr["content"]})
+            i += 1
+
+    if close_trailing_user and structured and structured[-1]["role"] in ("user", "tool_results"):
+        structured.append({
+            "role": "assistant",
+            "content": "[Turn interrupted by application shutdown or restart]",
+        })
+
+    return structured
+
+
+def restore_openai_session_history(
+    messages: List[Dict[str, Any]],
+    close_trailing_user: bool = True,
+) -> Tuple[List[Dict[str, Any]], set]:
+    """Build OpenAI-style chat history with native `tool_calls` and `tool` messages from cache."""
+    structured = reconstruct_structured_session_turns(messages, close_trailing_user=close_trailing_user)
+    history: List[Dict[str, Any]] = []
+    consumed_ids = set()
+
+    for msg in structured:
+        role = msg.get("role", "user")
+        if role == "assistant" and msg.get("tool_calls"):
+            history.append({
+                "role": "assistant",
+                "content": msg.get("content") or "",
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                    for tc in msg["tool_calls"]
+                ],
+            })
+        elif role == "tool_results":
+            for tc in msg.get("tool_calls", []):
+                consumed_ids.add(tc["id"])
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tc["result"],
+                })
+        else:
+            content = msg.get("content", "")
+            if content:
+                history.append({"role": role, "content": content})
+
+    return history, consumed_ids
 
 
 def save_session_cache(agent_id: str, data: Dict[str, Any]) -> bool:

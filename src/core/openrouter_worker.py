@@ -409,6 +409,8 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         self.primary_model = "MiMo-V2.6-Pro"
         self.light_model = "gpt-6-luna"
         self.multimodal_failed = False
+        self.last_assistant_text = ""
+        self.last_reasoning_text = ""
 
         # Audio STT setup
         from .local_stt import LocalSTT
@@ -440,6 +442,8 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
             self.history = []
             self.consumed_tool_call_ids = set()
             self.multimodal_failed = False
+            self.last_assistant_text = ""
+            self.last_reasoning_text = ""
 
         # Determine model
         is_low_token = self.settings.get("core.low-token-mode", False)
@@ -503,16 +507,11 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
         return messages
 
     def set_session_history(self, messages: list):
-        """Restores chat history from normalized turns."""
-        from core.session_cache import normalize_session_messages
-        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
-        self.history = []
-        self.consumed_tool_call_ids = set()
-        for msg in norm_messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if content:
-                self.history.append({"role": role, "content": content})
+        """Restores chat history with native tool calls from cached turns."""
+        from core.session_cache import restore_openai_session_history
+        self.history, self.consumed_tool_call_ids = restore_openai_session_history(
+            messages, close_trailing_user=True
+        )
 
     def stop_session(self):
         self.running = False
@@ -1071,7 +1070,8 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                     assistant_msg["tool_calls"] = final_tool_calls
                     assistant_msg["content"] = full_text if full_text else None
                 else:
-                    assistant_msg["content"] = full_text or ""
+                    from core.session_cache import sanitize_fake_tool_assistant_text
+                    assistant_msg["content"] = sanitize_fake_tool_assistant_text(full_text or "")
 
                 if full_reasoning:
                     assistant_msg["reasoning"] = full_reasoning
@@ -1101,6 +1101,11 @@ class OpenRouterWorker(MemoryContextWorkerMixin):
                     emitted_thought = f"{full_reasoning}\n\n{full_text}"
                 elif full_reasoning and not full_text:
                     emitted_thought = full_reasoning
+
+                # Expose clean assistant text and reasoning separately for headless callers
+                # while keeping emitted_thought intact for the GUI thought panel.
+                self.last_assistant_text = full_text
+                self.last_reasoning_text = full_reasoning
 
                 logging.debug(
                     f"About to emit thought_received. Text length: {len(emitted_thought)}, Tools: {len(function_calls)}")

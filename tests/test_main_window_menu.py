@@ -85,6 +85,8 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
 
     # Test Agent View State
     window.switch_to_agent(aid1)
+    assert window.hamburger_btn.parentWidget() is window.chatroom_sidebar.settings_bar
+    assert not window.chatroom_sidebar.settings_bar.isHidden()
     assert not window.hamburger_btn.isHidden()
     for action in window.agent_menu_actions:
         assert action.isVisible()
@@ -122,6 +124,12 @@ def test_hamburger_menu_partitioning_and_chatroom_visibility(qapp, temp_environm
     visible_in_chatroom = [a.text() for a in actions if not a.isSeparator() and a.isVisible()]
     assert visible_in_chatroom == ["Edit Chatroom", "Delete Chatroom", "System Settings", "Exit"]
 
+    # Collapsing sidebar hides settings bar and hamburger button completely
+    window.chatroom_sidebar.set_collapsed(True)
+    assert window.chatroom_sidebar.settings_bar.isHidden()
+    window.chatroom_sidebar.set_collapsed(False)
+    assert not window.chatroom_sidebar.settings_bar.isHidden()
+
     # Test switching back to Agent View
     window.switch_to_agent(aid2)
     assert not window.hamburger_btn.isHidden()
@@ -142,7 +150,6 @@ def test_dynamic_agent_tabs_and_context_switching(qapp, temp_environment):
     aid1 = agent_manager.create_new_agent()
     aid2 = agent_manager.create_new_agent()
     uid1 = agent_manager.get_agent_uid(aid1)
-    uid2 = agent_manager.get_agent_uid(aid2)
 
     cm = ChatroomManager()
     # Create room with only aid1 access
@@ -151,33 +158,42 @@ def test_dynamic_agent_tabs_and_context_switching(qapp, temp_environment):
     with patch("gui.main_window.SpellCheckHighlighter"):
         window = MainWindow(agent_manager)
 
-    # Initially in "All Agents"
+    # Top agent tab bar has been removed
+    assert not hasattr(window, "header_widget")
+    assert not hasattr(window, "tabs_layout")
+
+    # Initially in Agent DM view with all agents in sidebar and + New Agent last
     assert window.current_context == ("all", None)
-    assert window.btn_add_agent.toolTip() == "Add Agent"
-    # Both tabs visible in age order
-    visible_tab_ids = [window.tabs_layout.itemAt(i).widget().agent_id for i in range(window.tabs_layout.count())]
-    assert aid1 in visible_tab_ids
-    assert aid2 in visible_tab_ids
+    sidebar = window.chatroom_sidebar
+    agents_layout = sidebar.agents_layout
+    sidebar_agent_ids = [
+        agents_layout.itemAt(i).widget().agent_id
+        for i in range(agents_layout.count() - 1)
+    ]
+    assert aid1 in sidebar_agent_ids
+    assert aid2 in sidebar_agent_ids
+    assert agents_layout.itemAt(agents_layout.count() - 1).widget() is sidebar.btn_add_agent
 
     # Switch to room
     window.switch_to_chatroom(room_id)
     assert window.current_context == ("room", room_id)
-    assert window.btn_add_agent.toolTip() == "Edit Chatroom"
+    assert list(sidebar.room_member_buttons.keys()) == [aid1]
+    assert room_id in sidebar.room_edit_buttons
 
-    # Only aid1 is visible in tabs bar
-    visible_tab_ids = [window.tabs_layout.itemAt(i).widget().agent_id for i in range(window.tabs_layout.count())]
-    assert visible_tab_ids == [aid1]
+    # Clicking + Edit Room opens ChatroomEditorPanel
+    sidebar.room_edit_buttons[room_id].click()
+    assert window.stacked_layout.currentIndex() == 2
+    window.hide_chatroom_editor()
+    assert window.stacked_layout.currentIndex() == 0
 
-    # Clicking agent tab in chatroom switches to All Agents and opens DM
-    window.on_agent_tab_clicked(aid1)
+    # Collapse Agents header, then click sub-listed agent -> opens DM and auto-expands Agents
+    sidebar.set_agents_collapsed(True)
+    assert sidebar.agents_container.isHidden()
+    sidebar.room_member_buttons[aid1].click()
     assert window.current_context == ("all", None)
     assert window.current_agent_id == aid1
-    assert window.btn_add_agent.toolTip() == "Add Agent"
-
-    # Now all tabs visible again
-    visible_tab_ids = [window.tabs_layout.itemAt(i).widget().agent_id for i in range(window.tabs_layout.count())]
-    assert aid1 in visible_tab_ids
-    assert aid2 in visible_tab_ids
+    assert not sidebar.agents_container.isHidden()
+    assert len(sidebar.room_member_buttons) == 0
 
     window.close()
 
@@ -219,23 +235,30 @@ def test_tab_change_hides_settings_panel_except_wizard(qapp, temp_environment):
 
 
 def test_tab_widths_remain_constant_on_selection(qapp, temp_environment):
+    from core.chatroom_manager import ChatroomManager
+
     agent_manager = AgentManager()
     aid1 = agent_manager.create_new_agent()
     aid2 = agent_manager.create_new_agent()
+    uid1 = agent_manager.get_agent_uid(aid1)
+
+    cm = ChatroomManager()
+    rid = cm.create_chatroom("Width Room", members=[{"agent_uid": uid1, "watch": False}])
 
     with patch("gui.main_window.SpellCheckHighlighter"):
         window = MainWindow(agent_manager)
 
-    # 1. Check Chatroom Tab sizeHint when unselected vs selected
+    # 1. Check Chatroom SidebarTabButton sizeHint when unselected vs selected
+    room_btn = window.chatroom_sidebar.room_buttons[rid]
     window.switch_to_agent(aid1)
-    chatroom_unselected_size = window.btn_chatroom.sizeHint()
+    chatroom_unselected_size = room_btn.sizeHint()
 
-    window.switch_to_chatroom()
-    chatroom_selected_size = window.btn_chatroom.sizeHint()
+    window.switch_to_chatroom(rid)
+    chatroom_selected_size = room_btn.sizeHint()
 
     assert chatroom_unselected_size.width() == chatroom_selected_size.width()
 
-    # 2. Check Agent Tab sizeHint when unselected vs selected vs different states
+    # 2. Check SidebarAgentButton sizeHint when unselected vs selected vs different states
     agent_btn = window.tab_buttons[aid1]
 
     agent_btn.set_selected(False)
@@ -246,7 +269,7 @@ def test_tab_widths_remain_constant_on_selection(qapp, temp_environment):
 
     assert agent_unselected_width == agent_selected_width
 
-    # 3. Check Agent Tab sizeHint across activity states (thinking, speaking, idle)
+    # 3. Check SidebarAgentButton sizeHint across activity states (thinking, speaking, idle)
     agent_btn.set_activity_state("thinking")
     assert agent_btn.sizeHint().width() == agent_unselected_width
 
@@ -320,6 +343,43 @@ def test_delete_current_chatroom(qapp, temp_environment):
         assert cm.get_chatroom(rid)["deleted_at"] is not None
         assert window.current_context == ("all", None)
         assert rid not in [r["id"] for r in cm.list_chatrooms()]
+
+    window.close()
+
+
+def test_background_speaking_agent_and_shortcut_collapse_and_menu_popup(qapp, temp_environment):
+    agent_manager = AgentManager()
+    aid1 = agent_manager.create_new_agent()
+    aid2 = agent_manager.create_new_agent()
+
+    with patch("gui.main_window.SpellCheckHighlighter"):
+        window = MainWindow(agent_manager)
+
+    window.switch_to_agent(aid1)
+
+    # Upward hamburger menu popup opens cleanly when expanded
+    window.chatroom_sidebar._show_hamburger_menu()
+    qapp.processEvents()
+    window.hamburger_menu.close()
+
+    # Toggle collapse via Ctrl+B shortcut signal
+    assert window.chatroom_sidebar.is_collapsed() is False
+    window.sidebar_toggle_shortcut.activated.emit()
+    assert window.chatroom_sidebar.is_collapsed() is True
+
+    # Background agent aid2 starts speaking while selected agent aid1 is thinking
+    window.ui_agent_busy_state_changed.emit(aid1, True, False)
+    window.ui_agent_busy_state_changed.emit(aid2, True, True)
+    qapp.processEvents()
+
+    # Selected agent's visualizer stays hidden; background agent view is not shown; collapsed rail prioritizes speaking
+    assert window.agent_views[aid1].visualizer.isHidden() is True
+    assert window.agent_views[aid2].isVisible() is False
+    assert window.chatroom_sidebar.collapsed_strip.activity_state == "speaking"
+
+    # Toggle back via shortcut
+    window.sidebar_toggle_shortcut.activated.emit()
+    assert window.chatroom_sidebar.is_collapsed() is False
 
     window.close()
 

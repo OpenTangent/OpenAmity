@@ -6,6 +6,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 from PySide6.QtWidgets import QApplication, QTextBrowser
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase, QTextOption
 from gui.chat_formatter import (
     HtmlTagBalancer,
@@ -140,10 +141,58 @@ def test_setup_chat_browser(qapp):
     assert browser.isReadOnly() is True
     assert browser.lineWrapMode() == QTextBrowser.LineWrapMode.WidgetWidth
     assert browser.wordWrapMode() == QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+    assert browser.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert browser.document().indentWidth() == 24
     assert browser.document().defaultStyleSheet() == CHAT_DOCUMENT_CSS
     assert CHAT_FONT_FAMILY in browser.styleSheet()
     assert "font-size: 18px;" in browser.styleSheet()
     assert CHAT_FONT_FAMILY == "EB Garamond"
+
+
+def test_chat_browser_never_overflows_horizontally(qapp):
+    """Code blocks, blockquotes, nested lists, wide tables, and raw HTML must wrap within viewport width."""
+    browser = QTextBrowser()
+    browser.resize(450, 400)
+    browser.show()
+    setup_chat_browser(browser)
+
+    markdown_cases = [
+        "```python\n" + " ".join(["long_code_token"] * 30) + "\n```",
+        "```python\n" + "a" * 160 + "\n```",
+        "    " + "indented_code_" * 15,
+        "Inline `" + "x" * 160 + "` and `" + " ".join(["cmd"] * 30) + "`.",
+        "https://example.com/" + "/".join(["very_long_segment"] * 18),
+        "\n".join([">" * i + f" Nested quote {i} " + "word " * 10 for i in range(1, 11)]),
+        "\n".join(["  " * i + f"- Item {i} " + "word " * 8 for i in range(10)]),
+        "\n".join(["   " * i + f"1. Step {i} " + "word " * 8 for i in range(10)]),
+        "| " + " | ".join([f"H{i}" for i in range(12)]) + " |\n"
+        + "| " + " | ".join(["---"] * 12) + " |\n"
+        + "| " + " | ".join(["val"] * 12) + " |",
+        '<pre style="white-space: pre">' + "word " * 30 + "</pre>",
+        '<p style="white-space: nowrap">' + "word " * 30 + "</p>",
+        '<table><tr><td width="2000">left</td><td width="2000">right</td></tr></table>',
+        '<table width="2000"><tr><td>wide</td></tr></table>',
+    ]
+
+    for md in markdown_cases:
+        html = wrap_in_isolated_container(f"<div style='font-size: 18px;'>{render_markdown_to_html(md)}</div>")
+        insert_message_into_log(browser, html)
+        qapp.processEvents()
+        assert browser.document().size().width() <= browser.viewport().width()
+        assert browser.horizontalScrollBar().maximum() == 0
+        assert not browser.horizontalScrollBar().isVisible()
+
+    # Preserves leading indentation inside code blocks while wrapping
+    assert "indented_code_" in browser.toPlainText()
+
+    # Also remains wrapped after narrowing and widening the viewport
+    for width in (360, 750, 450):
+        browser.resize(width, 400)
+        qapp.processEvents()
+        assert browser.document().size().width() <= browser.viewport().width()
+        assert browser.horizontalScrollBar().maximum() == 0
+
+    browser.close()
 
 
 def test_eb_garamond_font_registered(qapp):

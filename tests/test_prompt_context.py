@@ -37,7 +37,7 @@ def test_replace_preserves_other_memory_and_removes_old_prospective():
 
 @pytest.mark.parametrize("module,class_name",[("openrouter_worker","OpenRouterWorker"),
     ("chatgpt_worker","ChatGptWorker"),("claude_worker","ClaudeWorker"),
-    ("deepseek_worker","DeepSeekWorker"),("agy_worker","AgyWorker")])
+    ("deepseek_worker","DeepSeekWorker")])
 def test_actual_worker_adapter_keeps_history(module,class_name):
     import importlib
     cls=getattr(importlib.import_module("core."+module),class_name)

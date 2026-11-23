@@ -65,7 +65,12 @@ def _create_mock_orchestrator(tmp_path, token_limit=400000, low_token=False):
     orch.build_system_prompt = MagicMock()
 
     appended_messages = []
-    orch.append_to_conversation = lambda sender, text: appended_messages.append((sender, text))
+
+    def _append_to_conversation(sender, text, message_type=""):
+        appended_messages.append((sender, text))
+        return {"id": None, "sender": sender, "content": text, "message_type": message_type}
+
+    orch.append_to_conversation = _append_to_conversation
     orch._appended_messages = appended_messages
 
     return orch

@@ -40,7 +40,8 @@ try:
                            BG_DARK, BG_CARD, BG_CARD_DISABLED, BG_INPUT, BG_INPUT_FOCUS,
                            BG_BUTTON, BG_BUTTON_HOVER, BG_BUTTON_PRESSED,
                            BORDER_COLOR, BORDER_COLOR_DISABLED, BORDER_INPUT, BORDER_BUTTON,
-                           TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, TEXT_DISABLED, MODERN_SCROLLBAR_STYLE)
+                           TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, TEXT_DISABLED,
+                           MODERN_SCROLLBAR_STYLE, get_icon_css)
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
@@ -61,6 +62,16 @@ except ImportError:
     TEXT_MUTED = "#aaaaaa"
     TEXT_DISABLED = "#777777"
     MODERN_SCROLLBAR_STYLE = ""
+
+    def get_icon_css(icon_filename: str) -> str:
+        icon_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "assets", "icons", icon_filename,
+        )
+        if os.path.exists(icon_path):
+            normalized = icon_path.replace("\\", "/")
+            return f'image: url("{normalized}");'
+        return ""
 
 
 THINKING_LEVELS = ["low", "medium", "high", "max"]
@@ -165,21 +176,6 @@ PROVIDER_MODELS = {
         ],
         "default_model": "MiMo-V2.6-Pro",
         "default_light_model": "gpt-6-luna"
-    },
-    "antigravity": {
-        "models": [
-            "Gemini 3.8 Flash (High)",
-            "Gemini 3.5 Flash (High)",
-            "Gemini 3.1 Pro (High)",
-            "Custom..."
-        ],
-        "light_models": [
-            "Gemini 3.5 Flash (High)",
-            "Gemini 3.8 Flash (High)",
-            "Custom..."
-        ],
-        "default_model": "Gemini 3.8 Flash (High)",
-        "default_light_model": "Gemini 3.5 Flash (High)"
     }
 }
 
@@ -433,18 +429,7 @@ class AgentBackupSelectionDialog(QDialog):
         self.checkboxes = {}
         self.worker_thread = None
 
-        checkmark_path = ""
-        try:
-            from config.paths import get_assets_dir
-            assets_dir = get_assets_dir()
-        except Exception:
-            assets_dir = str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
-        cand_chk = os.path.join(assets_dir, "icons", "checkmark.svg")
-        if not os.path.exists(cand_chk):
-            cand_chk = os.path.join(assets_dir, "checkmark.svg")
-        if os.path.exists(cand_chk):
-            checkmark_path = cand_chk.replace("\\", "/")
-        chk_img_css = f'image: url("{checkmark_path}");' if checkmark_path else ""
+        chk_img_css = get_icon_css("checkmark.svg")
 
         self.setStyleSheet(f"""
             QDialog {{ background-color: {BG_CARD}; color: {TEXT_PRIMARY}; }}
@@ -1123,28 +1108,8 @@ class SettingsPanelWidget(QWidget):
     check_whatsapp_status = poll_whatsapp_status
 
     def init_ui(self):
-        checkmark_path = ""
-        radio_dot_path = ""
-        try:
-            from config.paths import get_assets_dir
-            assets_dir = get_assets_dir()
-        except Exception:
-            assets_dir = str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
-
-        cand_chk = os.path.join(assets_dir, "icons", "checkmark.svg")
-        if not os.path.exists(cand_chk):
-            cand_chk = os.path.join(assets_dir, "checkmark.svg")
-        if os.path.exists(cand_chk):
-            checkmark_path = cand_chk.replace("\\", "/")
-
-        cand_radio = os.path.join(assets_dir, "icons", "radio_dot.svg")
-        if not os.path.exists(cand_radio):
-            cand_radio = os.path.join(assets_dir, "radio_dot.svg")
-        if os.path.exists(cand_radio):
-            radio_dot_path = cand_radio.replace("\\", "/")
-
-        chk_img_css = f'image: url("{checkmark_path}");' if checkmark_path else ""
-        radio_img_css = f'image: url("{radio_dot_path}");' if radio_dot_path else ""
+        chk_img_css = get_icon_css("checkmark.svg")
+        radio_img_css = get_icon_css("radio_dot.svg")
 
         self.setStyleSheet(f"""
             QWidget {{
@@ -1716,7 +1681,7 @@ class SettingsPanelWidget(QWidget):
             "Powered by <b>Gemini 3.8 Flash TTS</b> (High Fidelity). "
             "Get an API key from <a href='https://aistudio.google.com/'>Google AI Studio</a>.<br>"
             "<i>Note: This Gemini API key is dedicated to speech synthesis. Any cognitive worker "
-            "(Claude, ChatGPT, DeepSeek, Antigravity, or Gemini) can vocalize using high-quality Gemini TTS when configured here.</i>")
+            "(OpenRouter, Gemini, Claude, ChatGPT, or DeepSeek) can vocalize using high-quality Gemini TTS when configured here.</i>")
         guide_gemini.setTextFormat(Qt.RichText)
         guide_gemini.setTextInteractionFlags(Qt.TextBrowserInteraction)
         guide_gemini.setOpenExternalLinks(True)
@@ -2058,14 +2023,12 @@ class SettingsPanelWidget(QWidget):
         self.ui_use_chatgpt_api = QRadioButton("Use ChatGPT API", self)
         self.ui_use_deepseek_api = QRadioButton("Use DeepSeek API", self)
         self.ui_use_openrouter_api = QRadioButton("Use OpenRouter API", self)
-        self.ui_agy_mode = QRadioButton("Use Antigravity", self)
 
         self.ui_use_gemini_api.setVisible(False)
         self.ui_use_claude_api.setVisible(False)
         self.ui_use_chatgpt_api.setVisible(False)
         self.ui_use_deepseek_api.setVisible(False)
         self.ui_use_openrouter_api.setVisible(False)
-        self.ui_agy_mode.setVisible(False)
 
         self.provider_button_group = QButtonGroup(self)
         self.provider_button_group.addButton(self.ui_use_gemini_api)
@@ -2073,7 +2036,6 @@ class SettingsPanelWidget(QWidget):
         self.provider_button_group.addButton(self.ui_use_chatgpt_api)
         self.provider_button_group.addButton(self.ui_use_deepseek_api)
         self.provider_button_group.addButton(self.ui_use_openrouter_api)
-        self.provider_button_group.addButton(self.ui_agy_mode)
 
         self.ui_use_gemini_api.toggled.connect(
             lambda checked: self._on_provider_radio_toggled("gemini", checked))
@@ -2085,8 +2047,6 @@ class SettingsPanelWidget(QWidget):
             lambda checked: self._on_provider_radio_toggled("deepseek", checked))
         self.ui_use_openrouter_api.toggled.connect(
             lambda checked: self._on_provider_radio_toggled("openrouter", checked))
-        self.ui_agy_mode.toggled.connect(
-            lambda checked: self._on_provider_radio_toggled("antigravity", checked))
 
         self.provider_cards = {}
 
@@ -2611,6 +2571,90 @@ class SettingsPanelWidget(QWidget):
         test_row.addWidget(self.ui_email_test_status, 1)
         layout_email.addLayout(test_row)
 
+        layout_email.addSpacing(10)
+
+        # Advanced Email Settings Accordion (Auto-Pulse controls, matching Advanced Whatsapp Settings)
+        self.ui_email_pulse_adv_toggle_btn = QPushButton("▶ Advanced Email Settings")
+        self.ui_email_pulse_adv_toggle_btn.setObjectName("emailAdvToggleBtn")
+        self.ui_email_pulse_adv_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.ui_email_pulse_adv_toggle_btn.setStyleSheet("""
+            QPushButton#emailAdvToggleBtn {
+                background-color: transparent;
+                color: #CCCCCC;
+                text-align: left;
+                padding: 6px 0px;
+                border: none;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton#emailAdvToggleBtn:hover {
+                color: #FFFFFF;
+                background-color: transparent;
+            }
+            QPushButton#emailAdvToggleBtn:focus {
+                outline: none;
+            }
+        """)
+        self.ui_email_pulse_adv_toggle_btn.clicked.connect(self._toggle_advanced_email_pulse_settings)
+        layout_email.addWidget(self.ui_email_pulse_adv_toggle_btn)
+
+        self.ui_email_pulse_adv_container = QWidget()
+        self.ui_email_pulse_adv_container.setObjectName("settingsSubContainer")
+        email_pulse_layout = QVBoxLayout(self.ui_email_pulse_adv_container)
+        email_pulse_layout.setContentsMargins(0, 4, 0, 0)
+        email_pulse_layout.setSpacing(8)
+
+        email_pulse_layout.addWidget(QLabel("Email Check Interval (seconds):"))
+        self.ui_email_check_interval = QSpinBox()
+        self.ui_email_check_interval.setFocusPolicy(Qt.StrongFocus)
+        self.ui_email_check_interval.wheelEvent = lambda event: event.ignore()
+        self.ui_email_check_interval.setRange(15, 3600)
+        self.ui_email_check_interval.setValue(60)
+        email_pulse_layout.addWidget(self.ui_email_check_interval)
+        email_pulse_layout.addWidget(self.create_tip(
+            "How frequently to check the IMAP server for new emails when email auto-pulsing is enabled (minimum 15 seconds). No background checks run unless 'Pulse on all emails' is enabled or at least one address is whitelisted."))
+
+        email_pulse_layout.addWidget(QLabel("Email Auto-response Buffer (seconds):"))
+        self.ui_email_buffer = QSpinBox()
+        self.ui_email_buffer.setFocusPolicy(Qt.StrongFocus)
+        self.ui_email_buffer.wheelEvent = lambda event: event.ignore()
+        self.ui_email_buffer.setRange(0, 3600)
+        self.ui_email_buffer.setValue(30)
+        email_pulse_layout.addWidget(self.ui_email_buffer)
+        email_pulse_layout.addWidget(self.create_tip(
+            "The time to wait after detecting a qualifying email before the agent is notified. Each notification adds 10s to the next wait, resetting after 30 minutes of silence."))
+
+        self.ui_email_pulse_all = QCheckBox("Pulse on all emails")
+        self.ui_email_pulse_all.setCursor(Qt.PointingHandCursor)
+        self.ui_email_pulse_all.setChecked(False)
+        email_pulse_layout.addWidget(self.ui_email_pulse_all)
+        email_pulse_layout.addWidget(self.create_tip(
+            "When enabled, any newly received email generates a notification pulse after the buffer timeout."))
+
+        self.ui_email_whitelist_container = QWidget()
+        self.ui_email_whitelist_container.setStyleSheet("background-color: transparent;")
+        email_wl_layout = QVBoxLayout(self.ui_email_whitelist_container)
+        email_wl_layout.setContentsMargins(0, 0, 0, 0)
+        email_wl_layout.setSpacing(6)
+
+        email_wl_layout.addWidget(QLabel("Email Address Whitelist:"))
+        self.ui_email_whitelist = QListWidget()
+        self.ui_email_whitelist.setFixedHeight(100)
+        email_wl_layout.addWidget(self.ui_email_whitelist)
+        email_wl_layout.addLayout(self.create_list_controls(
+            self.ui_email_whitelist, "Add Email",
+            dialog_title="Add Email Address",
+            dialog_prompt="Enter email address or domain (e.g. alice@example.com or @company.com):"))
+        email_wl_layout.addWidget(self.create_tip(
+            "Emails received from these addresses or domains will trigger an automatic pulse. Use full addresses (alice@example.com) or domain entries (@company.com)."))
+        email_pulse_layout.addWidget(self.ui_email_whitelist_container)
+
+        self.ui_email_pulse_all.toggled.connect(
+            lambda checked: self.ui_email_whitelist_container.setHidden(checked))
+
+        self.ui_email_pulse_adv_container.setVisible(False)
+        layout_email.addWidget(self.ui_email_pulse_adv_container)
+
         main_layout.addWidget(card_email)
         main_layout.addSpacing(6)
 
@@ -3100,6 +3144,12 @@ class SettingsPanelWidget(QWidget):
         self.ui_email_adv_container.setVisible(is_visible)
         self._update_advanced_summary()
 
+    def _toggle_advanced_email_pulse_settings(self):
+        is_visible = self.ui_email_pulse_adv_container.isHidden()
+        self.ui_email_pulse_adv_container.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.ui_email_pulse_adv_toggle_btn.setText(f"{arrow} Advanced Email Settings")
+
     def _toggle_advanced_whatsapp_settings(self):
         is_visible = self.ui_whatsapp_adv_container.isHidden()
         self.ui_whatsapp_adv_container.setVisible(is_visible)
@@ -3370,7 +3420,6 @@ class SettingsPanelWidget(QWidget):
             "chatgpt": getattr(self, "ui_use_chatgpt_api", None),
             "deepseek": getattr(self, "ui_use_deepseek_api", None),
             "openrouter": getattr(self, "ui_use_openrouter_api", None),
-            "antigravity": getattr(self, "ui_agy_mode", None),
         }
         return radio_map.get(provider_id)
 
@@ -4492,7 +4541,7 @@ class SettingsPanelWidget(QWidget):
         # 1. Primary Model
         model_val = self.settings.get(f"core.{provider_id}.model", "")
         if not model_val:
-            legacy_key = "core.antigravity.agy-models" if provider_id == "antigravity" else f"core.{provider_id}.{provider_id}-models"
+            legacy_key = f"core.{provider_id}.{provider_id}-models"
             legacy = self.settings.get(legacy_key, [])
             if isinstance(legacy, list) and legacy:
                 model_val = legacy[0]
@@ -4589,11 +4638,8 @@ class SettingsPanelWidget(QWidget):
         self.settings.set(f"core.{provider_id}.light-model", light_model)
 
         # Legacy lists synchronization for backwards compatibility
-        if provider_id == "antigravity":
-            self.settings.set("core.antigravity.agy-models", [primary_model, light_model])
-        else:
-            self.settings.set(f"core.{provider_id}.{provider_id}-models", [primary_model, light_model])
-            self.settings.set(f"core.{provider_id}.light-models", [light_model])
+        self.settings.set(f"core.{provider_id}.{provider_id}-models", [primary_model, light_model])
+        self.settings.set(f"core.{provider_id}.light-models", [light_model])
 
     def load_system_config(self):
         if self.config is None:
@@ -4826,12 +4872,8 @@ class SettingsPanelWidget(QWidget):
             self.ui_gemini_tts_api_key.setText(gemini_tts_key)
             self._last_synced_gemini_voice_key = self.settings.get_env("GEMINI_API_KEY", "")
 
-            agy_mode = self.settings.get("core.antigravity.agy-mode", False)
             provider = self.settings.get("core.api-provider", "gemini")
-            if agy_mode:
-                self.ui_agy_mode.setChecked(True)
-                sel_p = "antigravity"
-            elif provider == "claude":
+            if provider == "claude":
                 self.ui_use_claude_api.setChecked(True)
                 sel_p = "claude"
             elif provider in ["chatgpt", "openai"]:
@@ -4969,6 +5011,33 @@ class SettingsPanelWidget(QWidget):
                         is_cloud = preset in ["Gmail / Google Workspace", "Outlook / Microsoft 365"]
                         self.ui_email_delete_from_server.setChecked(not is_cloud)
                 self._update_advanced_summary()
+
+            email_pulse_all = bool(self.settings.get("core.auto-pulse.email.pulse-all-emails", False))
+            if hasattr(self, 'ui_email_pulse_all'):
+                self.ui_email_pulse_all.setChecked(email_pulse_all)
+                if hasattr(self, 'ui_email_whitelist_container'):
+                    self.ui_email_whitelist_container.setHidden(email_pulse_all)
+
+            email_whitelist = self.settings.get("core.auto-pulse.email.whitelist", []) or []
+            if hasattr(self, 'ui_email_whitelist'):
+                self.ui_email_whitelist.clear()
+                self.ui_email_whitelist.addItems(email_whitelist)
+
+            if hasattr(self, 'ui_email_check_interval'):
+                raw_interval = self.settings.get("core.auto-pulse.email.check-interval-seconds", 60)
+                try:
+                    interval_val = int(60 if raw_interval is None else raw_interval)
+                except (TypeError, ValueError):
+                    interval_val = 60
+                self.ui_email_check_interval.setValue(interval_val)
+
+            if hasattr(self, 'ui_email_buffer'):
+                raw_email_buf = self.settings.get("core.auto-pulse.email.buffer-seconds", 30)
+                try:
+                    email_buf_val = int(30 if raw_email_buf is None else raw_email_buf)
+                except (TypeError, ValueError):
+                    email_buf_val = 30
+                self.ui_email_buffer.setValue(email_buf_val)
 
             limit = self.settings.get("core.somatic.token-usage-limit")
             if limit is None:
@@ -5131,9 +5200,7 @@ class SettingsPanelWidget(QWidget):
             use_chatgpt = self.ui_use_chatgpt_api.isChecked()
             use_deepseek = self.ui_use_deepseek_api.isChecked()
             use_openrouter = getattr(self, 'ui_use_openrouter_api', None) and self.ui_use_openrouter_api.isChecked()
-            agy_mode = self.ui_agy_mode.isChecked()
 
-            self.settings.set("core.antigravity.agy-mode", agy_mode)
             if use_claude:
                 self.settings.set("core.api-provider", "claude")
             elif use_chatgpt:
@@ -5227,6 +5294,20 @@ class SettingsPanelWidget(QWidget):
                     is_del = self.ui_email_delete_from_server.isChecked()
                     self.settings.set_env("EMAIL_DELETE_FROM_SERVER", "true" if is_del else "false")
                     self.settings.set("core.tools.email_delete_from_server", is_del)
+
+            if hasattr(self, 'ui_email_pulse_all'):
+                self.settings.set("core.auto-pulse.email.pulse-all-emails", self.ui_email_pulse_all.isChecked())
+            if hasattr(self, 'ui_email_whitelist'):
+                email_whitelist = [
+                    self.ui_email_whitelist.item(i).text().strip()
+                    for i in range(self.ui_email_whitelist.count())
+                    if self.ui_email_whitelist.item(i).text().strip()
+                ]
+                self.settings.set("core.auto-pulse.email.whitelist", email_whitelist)
+            if hasattr(self, 'ui_email_check_interval'):
+                self.settings.set("core.auto-pulse.email.check-interval-seconds", self.ui_email_check_interval.value())
+            if hasattr(self, 'ui_email_buffer'):
+                self.settings.set("core.auto-pulse.email.buffer-seconds", self.ui_email_buffer.value())
 
             limit_val = self.ui_agency_limit.value()
             self.settings.set("core.somatic.token-usage-limit", limit_val)

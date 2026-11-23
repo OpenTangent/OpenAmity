@@ -4,9 +4,9 @@ This document defines the Flatpak optimization architecture for Open Amity (`com
 
 ---
 
-## 1. Summary of Optimizations (~3.55 GB → ~880 MB Installed)
+## 1. Summary of Optimizations (~3.44 GB → ~880 MB Installed)
 
-The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Through the Tier 1 (zero-sacrifice) and Tier 2 (on-demand + runtime decoding) optimizations below, the installed footprint is reduced to **~880 MB** (a **~75.2% reduction**, saving **~2.67 GB**).
+The unoptimized baseline Flatpak weighed **~3,435 MB (~3.44 GB)** installed. Through the Tier 1 (zero-sacrifice) and Tier 2 (on-demand + runtime decoding) optimizations below, the installed footprint is reduced to **~880 MB** (a **~74.2% reduction**, saving **~2.55 GB**).
 
 | Component / Subsystem | Unoptimized | Optimized | Saved | Mechanism & Reason |
 | :--- | :---: | :---: | :---: | :--- |
@@ -14,11 +14,11 @@ The unoptimized baseline Flatpak weighed **~3,550 MB (~3.55 GB)** installed. Thr
 | **`io.qt.PySide.BaseApp` Runtime Cleanup** | 522 MB | 0 MB | **522 MB** | BaseApp bundled unneeded `QtWebEngine` (200 MB), `translations` (44 MB), `PyOpenGL` (31 MB), `libexec/webenginedriver` (23 MB), and unused Qt 3D/Charts/Graphs/Quick bindings and `.pyi` stubs. Pruned via `BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh` and explicit cleanup commands. |
 | **Puppeteer Chromium** | 350 MB | 0 MB (in Flatpak)<br>~285 MB (in user cache) | **350 MB in Flatpak**<br>*(+ 66 MB in user cache)* | Full Chrome for Testing was bundled statically for WhatsApp. Since WhatsApp is disabled by default, Chrome is now downloaded on demand asynchronously into `~/.cache/puppeteer` only when WhatsApp is enabled, and stripped of `WidevineCdm/` (18 MB) and 55+ unused locales (48 MB). |
 | **Playwright Node.js Deduplication** | 168 MB | 0 MB | **168 MB** | The `playwright` Python wheel bundled its own duplicate 118 MB `node` binary at `site-packages/playwright/driver/node`. We use Flathub's `org.freedesktop.Sdk.Extension.node24` (`/usr/lib/sdk/node24/install.sh`) which builds a stripped `node` binary linked against runtime OpenSSL/zlib/ICU, omits `npm` and C++ headers from `/app`, and symlinks `playwright/driver/node` to `/app/bin/node`. |
-| **Unused `google-antigravity` & `kubernetes`** | 197 MB | 0 MB | **197 MB** | `google-antigravity` (115 MB) was never imported by `src/` (AgyWorker calls the host `agy` CLI). `kubernetes` (82 MB) was an optional distributed cluster dependency in ChromaDB never used by local `PersistentClient`. Both removed. |
+| **Unused `kubernetes` Dependency** | 82 MB | 0 MB | **82 MB** | `kubernetes` (82 MB) was an optional distributed cluster dependency in ChromaDB never used by local `PersistentClient`. Removed in `post-install`. |
 | **`PyAV` (`av` + `av.libs`) Audio Decoding** | 104 MB | 0 MB | **104 MB** | `faster-whisper` pulled in `PyAV` (104 MB) including video encoders (`libx265`, `libx264`, `libvpx`, `libSvtAv1Enc`). We replaced PyAV with `/usr/bin/ffmpeg` (already in the KDE Platform runtime) to decode audio directly into a NumPy float32 array, stubbed `sys.modules["av"]` in `LocalSTT` so `faster_whisper.audio` imports cleanly, and removed `av` and `av.libs`. |
 | **ChromaDB ONNX Model Bundle** | 80 MB | 0 MB | **80 MB in Flatpak**<br>*(+ 80 MB duplicate copy)* | Static `onnx.tar.gz` removed from Flatpak. `InitWorker` downloads, verifies (SHA-256), and extracts `all-MiniLM-L6-v2` into persistent XDG cache (`~/.cache/chroma` symlinked to `$XDG_CACHE_HOME`) on first launch with live splash screen progress. |
-| **Non-Latin Piper Models & App Assets** | 44 MB | 0 MB | **44 MB** | Pruned `piper/hebrew/*.onnx` (21 MB) and `piper/tashkeel/*.onnx` (4.6 MB) while retaining their Python `__init__.py` modules so `piper.voice` imports cleanly, plus `piper/train` (0.4 MB), `/app/src/assets/screenshots` (3.4 MB), unused `Inter-*.ttf` fonts (1.6 MB), and `whatsapp_node/node_modules` typing/map files (~13 MB). |
-| **Total Reduction** | **~3,550 MB** | **~880 MB** | **~2,665 MB (~2.67 GB saved)** | |
+| **Non-Latin Piper Models & App Assets** | 44 MB | 0 MB | **44 MB** | Pruned `piper/hebrew/*.onnx` (21 MB) and `piper/tashkeel/*.onnx` (4.6 MB) while retaining their Python `__init__.py` modules so `piper.voice` imports cleanly, plus `piper/train` (0.4 MB), `/app/src/assets/screenshots` (3.4 MB), and `whatsapp_node/node_modules` typing/map files (~13 MB); unused `Inter-*.ttf` fonts (1.6 MB) were removed directly from the repository. |
+| **Total Reduction** | **~3,435 MB** | **~880 MB** | **~2,550 MB (~2.55 GB saved)** | |
 
 ---
 
@@ -92,7 +92,6 @@ du -sh "$FLATPAK_FILES"/lib/python*/site-packages/* | sort -hr | head -n 25
 ```
 **Red Flags to Watch For**:
 - `kubernetes`: Should be **0 MB**. If present, ensure `rm -rf .../site-packages/kubernetes*` is in `cleanup-commands`.
-- `google/antigravity`: Should be **0 MB**. Filtered out in `sync_requirements.py`.
 - `av` / `av.libs`: Should be **0 MB**.
 - `OpenGL`: Should be **0 MB**.
 - `playwright/driver/node`: Verify it is a **symlink** to `/app/bin/node`, not an actual 118 MB binary.

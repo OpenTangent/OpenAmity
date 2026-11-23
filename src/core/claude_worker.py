@@ -196,17 +196,41 @@ class ClaudeWorker(MemoryContextWorkerMixin):
             return messages
 
     def set_session_history(self, messages: list):
-        """Restores chat history from normalized turns."""
-        from core.session_cache import normalize_session_messages
-        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
+        """Restores chat history with native tool_use/tool_result blocks from cached turns."""
+        from core.session_cache import reconstruct_structured_session_turns
+        structured = reconstruct_structured_session_turns(messages, close_trailing_user=True)
         with self._history_lock:
             self.history = []
             self.consumed_tool_use_ids = set()
-            for msg in norm_messages:
+            for msg in structured:
                 role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if content:
-                    self.history.append({"role": role, "content": content})
+                if role == "assistant" and msg.get("tool_calls"):
+                    blocks = []
+                    if msg.get("content"):
+                        blocks.append({"type": "text", "text": msg["content"]})
+                    for tc in msg["tool_calls"]:
+                        blocks.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc["args"],
+                        })
+                        self.consumed_tool_use_ids.add(tc["id"])
+                    self.history.append({"role": "assistant", "content": blocks})
+                elif role == "tool_results":
+                    blocks = [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tc["id"],
+                            "content": tc["result"],
+                        }
+                        for tc in msg.get("tool_calls", [])
+                    ]
+                    self.history.append({"role": "user", "content": blocks})
+                else:
+                    content = msg.get("content", "")
+                    if content:
+                        self.history.append({"role": role, "content": content})
 
     def stop_session(self):
         self.running = False
@@ -638,6 +662,20 @@ class ClaudeWorker(MemoryContextWorkerMixin):
                             th_text = getattr(block, "thinking", None) or (block.get("thinking") if isinstance(block, dict) else "")
                             if th_text:
                                 full_thinking += th_text
+
+                if not function_calls and full_text:
+                    from core.session_cache import has_fake_tool_invocation_text, sanitize_fake_tool_assistant_text
+                    if has_fake_tool_invocation_text(full_text):
+                        sanitized = sanitize_fake_tool_assistant_text(full_text)
+                        clean_blocks = []
+                        for block in message.content:
+                            b_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                            if b_type != "text":
+                                clean_blocks.append(block)
+                        clean_blocks.append({"type": "text", "text": sanitized})
+                        with self._history_lock:
+                            if self.history and self.history[-1].get("role") == "assistant":
+                                self.history[-1]["content"] = clean_blocks
 
                 self.current_model = model_name
 

@@ -65,11 +65,11 @@
                 "BASEAPP_REMOVE_WEBENGINE=1 /app/cleanup-BaseApp.sh || true",
                 "rm -rf /app/lib/python3.*/site-packages/OpenGL*",
                 "rm -rf /app/lib/python3.*/site-packages/PySide6/QtQuick* /app/lib/python3.*/site-packages/PySide6/QtQml* /app/lib/python3.*/site-packages/PySide6/Qt3D* /app/lib/python3.*/site-packages/PySide6/QtPdf* /app/lib/python3.*/site-packages/PySide6/QtSensors* /app/lib/python3.*/site-packages/PySide6/QtPositioning*",
-                "rm -rf /app/lib/python3.*/site-packages/kubernetes* /app/lib/python3.*/site-packages/google_antigravity*",
+                "rm -rf /app/lib/python3.*/site-packages/kubernetes*",
                 "rm -rf /app/lib/python3.*/site-packages/av* /app/lib/python3.*/site-packages/av.libs",
                 "rm -rf /app/lib/python3.*/site-packages/piper/train /app/lib/python3.*/site-packages/piper/hebrew/*.onnx /app/lib/python3.*/site-packages/piper/tashkeel/*.onnx",
                 "ln -sf /app/bin/node /app/lib/python3.*/site-packages/playwright/driver/node 2>/dev/null || true",
-                "rm -rf /app/src/assets/screenshots /app/src/assets/fonts/Inter-*.ttf",
+                "rm -rf /app/src/assets/screenshots",
                 "find /app/src/tools/whatsapp_node/node_modules -type f \\( -name \"*.d.ts\" -o -name \"*.map\" \\) -delete"
             ],
             "sources": [

@@ -88,7 +88,7 @@ def test_orchestrator_restart_worker_refreshes_prompt_and_identity(temp_agent_en
 
 
 def test_worker_swapping_on_provider_change(temp_agent_environment):
-    """Verifies that changing api-provider or agy-mode swaps the worker appropriately."""
+    """Verifies that changing api-provider swaps the worker appropriately."""
     agent_id = "test-agent-003"
 
     with patch("core.audio_input.AudioService.start_initialization"):
@@ -98,15 +98,7 @@ def test_worker_swapping_on_provider_change(temp_agent_environment):
             orch.init_worker()
             assert type(orch.gemini_worker).__name__ == "GeminiWorker"
 
-            # Switch to AGY mode
-            orch.settings_manager.set("core.antigravity.agy-mode", True)
-            orch.settings_manager.save()
-
-            orch.reload_settings()
-            assert type(orch.gemini_worker).__name__ == "AgyWorker"
-
             # Switch to Claude
-            orch.settings_manager.set("core.antigravity.agy-mode", False)
             orch.settings_manager.set("core.api-provider", "claude")
             orch.settings_manager.save()
 
@@ -119,6 +111,27 @@ def test_worker_swapping_on_provider_change(temp_agent_environment):
 
             orch.reload_settings()
             assert type(orch.gemini_worker).__name__ == "ChatGptWorker"
+
+            # Switch to DeepSeek
+            orch.settings_manager.set("core.api-provider", "deepseek")
+            orch.settings_manager.save()
+
+            orch.reload_settings()
+            assert type(orch.gemini_worker).__name__ == "DeepSeekWorker"
+
+            # Switch to OpenRouter
+            orch.settings_manager.set("core.api-provider", "openrouter")
+            orch.settings_manager.save()
+
+            orch.reload_settings()
+            assert type(orch.gemini_worker).__name__ == "OpenRouterWorker"
+
+            # Switch back to Gemini
+            orch.settings_manager.set("core.api-provider", "gemini")
+            orch.settings_manager.save()
+
+            orch.reload_settings()
+            assert type(orch.gemini_worker).__name__ == "GeminiWorker"
         finally:
             orch.pulse_engine.stop()
             orch._shutdown_flag = True

@@ -15,7 +15,6 @@ from core.claude_worker import ClaudeWorker
 from core.chatgpt_worker import ChatGptWorker
 from core.deepseek_worker import DeepSeekWorker
 from core.openrouter_worker import OpenRouterWorker
-from core.agy_worker import AgyWorker
 from core.gemini_worker import GeminiWorker
 
 

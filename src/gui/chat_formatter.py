@@ -1,10 +1,21 @@
+import math
 import re
 import html
 from html.parser import HTMLParser
 from typing import Dict, Optional
 import markdown
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
 from PySide6.QtWidgets import QTextBrowser
-from PySide6.QtGui import QTextCursor, QTextBlockFormat, QTextCharFormat, QTextOption
+from PySide6.QtGui import (
+    QTextCursor,
+    QTextBlockFormat,
+    QTextBlockUserData,
+    QTextCharFormat,
+    QTextLength,
+    QTextOption,
+    QTextTable,
+    QTextTableCell,
+)
 
 try:
     from gui.theme import (
@@ -17,7 +28,7 @@ try:
 except ImportError:
     PRIMARY_ACCENT_COLOR = "#a12924"
     SECONDARY_ACCENT_COLOR = "#f7e3a5"
-    CHAT_FONT_FAMILY = "Inter"
+    CHAT_FONT_FAMILY = "EB Garamond"
     CHAT_DOCUMENT_CSS = ""
     MODERN_SCROLLBAR_STYLE = ""
 
@@ -162,6 +173,86 @@ def _format_thought_card_body(content: str, tool_colors: Optional[Dict[str, str]
     return "<br>".join(_format_thought_card_line(line, tool_colors=tool_colors) for line in lines)
 
 
+_THOUGHT_TOGGLE_PREFIX = "thought:toggle:"
+
+
+def _extract_thought_card_id(cell: QTextTableCell) -> Optional[str]:
+    """Extracts the Thoughts card ID from the toggle anchor inside a table cell."""
+    block = cell.firstCursorPosition().block()
+    last_pos = cell.lastPosition()
+    while block.isValid() and block.position() <= last_pos:
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid():
+                href = frag.charFormat().anchorHref()
+                if href.startswith(_THOUGHT_TOGGLE_PREFIX):
+                    return href[len(_THOUGHT_TOGGLE_PREFIX):]
+            it += 1
+        block = block.next()
+    return None
+
+
+class SpeechCardBlockData(QTextBlockUserData):
+    """Metadata attached to a rendered speech transcript card's first QTextBlock."""
+
+    def __init__(self, card_key: str, message_id=None, transcript_text: str = ""):
+        super().__init__()
+        self.card_key = str(card_key)
+        self.message_id = message_id
+        self.transcript_text = transcript_text
+
+
+def get_card_viewport_rect(browser: QTextBrowser, table: QTextTable) -> Optional[QRectF]:
+    """Computes an isolated card table's visual bounding rect in viewport coordinates."""
+    if table.rows() < 1 or table.columns() < 1:
+        return None
+    cell = table.cellAt(0, 0)
+    first_block = cell.firstCursorPosition().block()
+    if not first_block.isValid():
+        return None
+
+    layout = browser.document().documentLayout()
+    fbr = layout.blockBoundingRect(first_block)
+    tfr = layout.frameBoundingRect(table)
+    cf = cell.format().toTableCellFormat()
+    ff = table.frameFormat()
+
+    h_scroll = browser.horizontalScrollBar().value() if browser.horizontalScrollBar() else 0
+    v_scroll = browser.verticalScrollBar().value() if browser.verticalScrollBar() else 0
+
+    left = math.floor(fbr.left() - cf.leftPadding() - ff.border() - h_scroll)
+    top = math.floor(fbr.top() - cf.topPadding() - ff.border() - v_scroll)
+    right = math.ceil(fbr.right() + cf.rightPadding() + ff.border() - h_scroll)
+    height = tfr.height() - ff.topMargin() - ff.bottomMargin() - 2.0 * ff.border()
+    bottom = math.ceil(top + max(0.0, height))
+    return QRectF(left, top, max(0.0, right - left), max(0.0, bottom - top))
+
+
+get_thought_card_viewport_rect = get_card_viewport_rect
+
+
+def thought_card_id_at_viewport_pos(browser: QTextBrowser, pos: QPoint) -> Optional[str]:
+    """Returns the Thoughts card ID if viewport coordinate `pos` lies inside a Thoughts card."""
+    if not browser.viewport().rect().contains(pos):
+        return None
+    doc = browser.document()
+    if doc is None:
+        return None
+
+    pt = QPointF(pos)
+    for frame in doc.rootFrame().childFrames():
+        if not isinstance(frame, QTextTable) or frame.rows() < 1 or frame.columns() < 1:
+            continue
+        card_id = _extract_thought_card_id(frame.cellAt(0, 0))
+        if card_id is None:
+            continue
+        rect = get_thought_card_viewport_rect(browser, frame)
+        if rect is not None and rect.contains(pt):
+            return card_id
+    return None
+
+
 def render_thought_card_html(
     card_id,
     content: str,
@@ -230,19 +321,82 @@ def wrap_in_isolated_container(
     )
 
 
+def _constrain_inserted_tables(root_table: QTextTable):
+    """Removes fixed pixel table/column widths and compacts wide multi-column tables."""
+    stack = [root_table]
+    while stack:
+        table = stack.pop()
+        for child in table.childFrames():
+            if isinstance(child, QTextTable):
+                stack.append(child)
+
+        tf = table.format().toTableFormat()
+        tf_changed = False
+        if tf.width().type() == QTextLength.Type.FixedLength:
+            tf.setWidth(QTextLength(QTextLength.Type.VariableLength, 0))
+            tf_changed = True
+
+        constraints = tf.columnWidthConstraints()
+        if any(c.type() == QTextLength.Type.FixedLength for c in constraints):
+            tf.setColumnWidthConstraints([
+                QTextLength(QTextLength.Type.VariableLength, 0)
+                if c.type() == QTextLength.Type.FixedLength
+                else c
+                for c in constraints
+            ])
+            tf_changed = True
+
+        if tf_changed:
+            table.setFormat(tf)
+
+        if table.columns() >= 8:
+            for row in range(table.rows()):
+                for col in range(table.columns()):
+                    cell = table.cellAt(row, col)
+                    cf = cell.format().toTableCellFormat()
+                    cf.setLeftPadding(min(cf.leftPadding(), 3.0))
+                    cf.setRightPadding(min(cf.rightPadding(), 3.0))
+                    cf.setTopPadding(min(cf.topPadding(), 4.0))
+                    cf.setBottomPadding(min(cf.bottomPadding(), 4.0))
+                    cell.setFormat(cf)
+
+
+def _normalize_inserted_message_wrapping(doc, start_pos: int, end_pos: int):
+    """Ensures newly inserted blocks wrap at widget width and tables do not force fixed widths."""
+    block = doc.findBlock(start_pos)
+    while block.isValid() and block.position() <= end_pos:
+        bf = block.blockFormat()
+        if bf.nonBreakableLines():
+            bf.setNonBreakableLines(False)
+            fix_cursor = QTextCursor(block)
+            fix_cursor.setBlockFormat(bf)
+        block = block.next()
+
+    for frame in reversed(doc.rootFrame().childFrames()):
+        if frame.firstPosition() < start_pos:
+            break
+        if isinstance(frame, QTextTable):
+            _constrain_inserted_tables(frame)
+
+
 def insert_message_into_log(browser: QTextBrowser, message_html: str):
     """Safely appends a message into the conversation log browser.
     Resets character format, block format, and cursor positioning to prevent format bleeding.
     """
+    doc = browser.document()
     cursor = browser.textCursor()
     cursor.movePosition(QTextCursor.End)
 
-    if not browser.document().isEmpty():
+    if not doc.isEmpty():
         cursor.setCharFormat(QTextCharFormat())
         cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
 
+    insert_start_pos = cursor.position()
     browser.setTextCursor(cursor)
     cursor.insertHtml(message_html)
+    insert_end_pos = cursor.position()
+
+    _normalize_inserted_message_wrapping(doc, insert_start_pos, insert_end_pos)
 
     # Auto scroll to bottom
     scroll_bar = browser.verticalScrollBar()
@@ -255,6 +409,8 @@ def setup_chat_browser(browser: QTextBrowser):
     browser.setReadOnly(True)
     browser.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
     browser.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    browser.document().setIndentWidth(24)
 
     if CHAT_DOCUMENT_CSS:
         browser.document().setDefaultStyleSheet(CHAT_DOCUMENT_CSS)

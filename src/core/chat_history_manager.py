@@ -69,9 +69,14 @@ class ChatHistoryManager:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         timestamp TEXT NOT NULL,
                         sender TEXT NOT NULL,
-                        content TEXT NOT NULL
+                        content TEXT NOT NULL,
+                        message_type TEXT NOT NULL DEFAULT ''
                     )
                 """)
+                cursor.execute("PRAGMA table_info(messages)")
+                existing_cols = {row["name"] for row in cursor.fetchall()}
+                if "message_type" not in existing_cols:
+                    cursor.execute("ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT ''")
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp
                     ON messages(timestamp);
@@ -82,26 +87,34 @@ class ChatHistoryManager:
                 """)
                 conn.commit()
 
-    def add_message(self, sender: str, content: str, timestamp: Optional[str] = None) -> Dict[str, Any]:
+    def add_message(
+        self,
+        sender: str,
+        content: str,
+        timestamp: Optional[str] = None,
+        message_type: str = "",
+    ) -> Dict[str, Any]:
         """Persists a new message into the agent's chat history.
 
         Args:
             sender: The sender display name or role (e.g. 'User', 'Agent', 'System')
             content: The message text / markdown content
             timestamp: Optional ISO 8601 timestamp; defaults to current UTC time
+            message_type: Optional semantic type (e.g. 'speech', 'text', or '')
 
         Returns:
             Dictionary representing the stored message record.
         """
         if not timestamp:
             timestamp = datetime.now(timezone.utc).isoformat()
+        msg_type = str(message_type or "").strip()
 
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "INSERT INTO messages (timestamp, sender, content) VALUES (?, ?, ?)",
-                    (timestamp, sender, content)
+                    "INSERT INTO messages (timestamp, sender, content, message_type) VALUES (?, ?, ?, ?)",
+                    (timestamp, sender, content, msg_type)
                 )
                 msg_id = cursor.lastrowid
                 conn.commit()
@@ -109,7 +122,8 @@ class ChatHistoryManager:
                     "id": msg_id,
                     "timestamp": timestamp,
                     "sender": sender,
-                    "content": content
+                    "content": content,
+                    "message_type": msg_type,
                 }
 
     def update_message(self, message_id: int, content: str, timestamp: Optional[str] = None) -> bool:
@@ -146,7 +160,7 @@ class ChatHistoryManager:
                 cursor = conn.cursor()
                 if before_id is not None:
                     cursor.execute("""
-                        SELECT id, timestamp, sender, content
+                        SELECT id, timestamp, sender, content, message_type
                         FROM messages
                         WHERE id < ?
                         ORDER BY id DESC
@@ -154,7 +168,7 @@ class ChatHistoryManager:
                     """, (before_id, limit))
                 else:
                     cursor.execute("""
-                        SELECT id, timestamp, sender, content
+                        SELECT id, timestamp, sender, content, message_type
                         FROM messages
                         ORDER BY id DESC
                         LIMIT ?
@@ -170,7 +184,8 @@ class ChatHistoryManager:
                         "id": r["id"],
                         "timestamp": r["timestamp"],
                         "sender": r["sender"],
-                        "content": r["content"]
+                        "content": r["content"],
+                        "message_type": r["message_type"] or "",
                     }
                     for r in rows
                 ]

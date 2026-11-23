@@ -294,22 +294,47 @@ class GeminiWorker(MemoryContextWorkerMixin):
             return messages
 
     def set_session_history(self, messages: list):
-        """Restores chat history from normalized turns into Gemini types.Content objects."""
+        """Restores chat history into Gemini types.Content objects with native function calls."""
         if not getattr(self, 'available', False) or not self.client:
             return
         from google.genai import types
-        from core.session_cache import normalize_session_messages
-        norm_messages = normalize_session_messages(messages, close_trailing_user=True)
+        from core.session_cache import reconstruct_structured_session_turns
+        structured = reconstruct_structured_session_turns(messages, close_trailing_user=True)
         with self._chat_lock:
             sdk_history = []
-            for msg in norm_messages:
-                role = "user" if msg.get("role") == "user" else "model"
-                content_text = msg.get("content", "")
-                if content_text:
-                    sdk_history.append(types.Content(
-                        role=role,
-                        parts=[types.Part.from_text(text=content_text)]
-                    ))
+            for msg in structured:
+                role = msg.get("role", "user")
+                if role == "assistant" and msg.get("tool_calls"):
+                    parts = []
+                    if msg.get("content"):
+                        parts.append(types.Part.from_text(text=msg["content"]))
+                    for tc in msg["tool_calls"]:
+                        fc_part = types.Part.from_function_call(name=tc["name"], args=tc["args"])
+                        try:
+                            fc_part.thought_signature = b"skip_thought_signature_validator"
+                        except Exception:
+                            pass
+                        parts.append(fc_part)
+                    sdk_history.append(types.Content(role="model", parts=parts))
+                elif role == "tool_results":
+                    parts = []
+                    for tc in msg.get("tool_calls", []):
+                        try:
+                            resp_obj = json.loads(tc["result"])
+                            if not isinstance(resp_obj, dict):
+                                resp_obj = {"result": resp_obj}
+                        except Exception:
+                            resp_obj = {"result": str(tc.get("result", ""))}
+                        parts.append(types.Part.from_function_response(name=tc["name"], response=resp_obj))
+                    sdk_history.append(types.Content(role="user", parts=parts))
+                else:
+                    content_text = msg.get("content", "")
+                    if content_text:
+                        sdk_role = "user" if role == "user" else "model"
+                        sdk_history.append(types.Content(
+                            role=sdk_role,
+                            parts=[types.Part.from_text(text=content_text)]
+                        ))
             if sdk_history:
                 try:
                     self.thinker_chat = self.client.chats.create(
@@ -577,6 +602,25 @@ class GeminiWorker(MemoryContextWorkerMixin):
 
                 if tokens > 0 and hasattr(self, 'tokens_consumed'):
                     self.tokens_consumed.emit(tokens)
+
+                if not function_calls and full_text:
+                    from core.session_cache import has_fake_tool_invocation_text, sanitize_fake_tool_assistant_text
+                    if has_fake_tool_invocation_text(full_text):
+                        with self._chat_lock:
+                            for hist_list in (
+                                self._get_chat_history(),
+                                getattr(self.thinker_chat, "_comprehensive_history", None) if self.thinker_chat else None,
+                            ):
+                                if isinstance(hist_list, list) and hist_list:
+                                    last_turn = hist_list[-1]
+                                    if getattr(last_turn, "role", None) == "model" and getattr(last_turn, "parts", None):
+                                        for part in last_turn.parts:
+                                            p_text = getattr(part, "text", None)
+                                            if p_text and has_fake_tool_invocation_text(p_text):
+                                                try:
+                                                    part.text = sanitize_fake_tool_assistant_text(p_text)
+                                                except Exception:
+                                                    pass
 
                 logging.debug(
                     f"About to emit thought_received. Callback count: {len(self.thought_received._callbacks)}")

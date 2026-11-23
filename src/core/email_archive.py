@@ -120,11 +120,14 @@ class EmailArchive:
         raw_bytes: bytes = b"",
         server_uid: Optional[str] = None,
         is_read: bool = False,
-        msg_obj: Optional[EmailMessage] = None
+        msg_obj: Optional[EmailMessage] = None,
+        preserve_existing_read_status: bool = False,
     ) -> int:
         """
         Parses and archives an email into the local SQLite database.
         Deduplicates by folder and Message-ID (or header fingerprint).
+        When preserve_existing_read_status is True, re-archiving an existing row
+        keeps its local is_read flag intact instead of letting server flags override it.
         Returns the unique local archive integer ID.
         """
         if msg_obj is None and raw_bytes:
@@ -219,8 +222,11 @@ class EmailArchive:
 
                 if existing_row:
                     existing_id = existing_row["id"]
-                    # Update read status and server_uid if updated
-                    new_read = 1 if (is_read or existing_row["is_read"]) else 0
+                    # Update read status and server_uid if updated (unless preserving local state)
+                    if preserve_existing_read_status:
+                        new_read = existing_row["is_read"]
+                    else:
+                        new_read = 1 if (is_read or existing_row["is_read"]) else 0
                     cursor.execute(
                         "UPDATE archived_emails SET is_read = ?, server_uid = COALESCE(?, server_uid) WHERE id = ?",
                         (new_read, server_uid, existing_id)
@@ -316,6 +322,62 @@ class EmailArchive:
                 row = cursor.fetchone()
                 if row:
                     return dict(row)
+
+                return None
+
+    def find_email_read_status(
+        self,
+        folder: str = "INBOX",
+        message_id: str = "",
+        server_uid: str = "",
+    ) -> Optional[bool]:
+        """
+        Lightweight indexed lookup checking whether an email exists in the local archive
+        and returning its read status without loading raw RFC822 blobs or bodies.
+
+        Returns:
+            None  -> email is not in the local archive
+            True  -> email is archived and marked read (is_read == 1)
+            False -> email is archived and still unread (is_read == 0)
+        """
+        clean_msg_id = str(message_id or "").strip()
+        clean_uid = str(server_uid or "").strip()
+        if not clean_msg_id and not clean_uid:
+            return None
+
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                if clean_msg_id:
+                    if folder:
+                        cursor.execute(
+                            "SELECT is_read FROM archived_emails WHERE folder = ? AND message_id = ? LIMIT 1",
+                            (folder, clean_msg_id),
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT is_read FROM archived_emails WHERE message_id = ? LIMIT 1",
+                            (clean_msg_id,),
+                        )
+                    row = cursor.fetchone()
+                    if row is not None:
+                        return bool(row["is_read"])
+
+                if clean_uid:
+                    if folder:
+                        cursor.execute(
+                            "SELECT is_read FROM archived_emails WHERE folder = ? AND server_uid = ? LIMIT 1",
+                            (folder, clean_uid),
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT is_read FROM archived_emails WHERE server_uid = ? LIMIT 1",
+                            (clean_uid,),
+                        )
+                    row = cursor.fetchone()
+                    if row is not None:
+                        return bool(row["is_read"])
 
                 return None
 

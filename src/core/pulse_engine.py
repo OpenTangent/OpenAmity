@@ -5,14 +5,25 @@ import sqlite3
 import os
 import re
 import calendar
+import email.utils
 from datetime import datetime, timedelta
 from .events import Signal
 try:
     from core.settings_manager import SettingsManager
     from core.address_book import AddressBookManager
+    from core.whatsapp_daemon import (
+        WHATSAPP_NON_MESSAGE_TYPES,
+        WHATSAPP_REVOKE_SUBTYPES,
+        extract_whatsapp_stanza_id,
+    )
 except ImportError:
     from .settings_manager import SettingsManager
     from .address_book import AddressBookManager
+    from .whatsapp_daemon import (
+        WHATSAPP_NON_MESSAGE_TYPES,
+        WHATSAPP_REVOKE_SUBTYPES,
+        extract_whatsapp_stanza_id,
+    )
 
 from config import paths
 
@@ -37,7 +48,7 @@ class PulseEngine:
         if hasattr(self.orchestrator, 'on_paused_state_changed'):
             try:
                 self.orchestrator.on_paused_state_changed.connect(
-                    lambda is_paused: self.notify_unpaused() if not is_paused else None)
+                    lambda is_paused: self.notify_paused() if is_paused else self.notify_unpaused())
             except Exception:
                 pass
 
@@ -49,6 +60,19 @@ class PulseEngine:
         self._wa_last_pulse_time = 0.0
         self.whatsapp_timer = None
         self.pending_whatsapp_senders = set()
+        self._pending_whatsapp_messages = []
+        self._pending_whatsapp_chats = set()
+        self._wa_has_untracked_pending = False
+        self.whatsapp_visible_unread_checker = None
+
+        # Email auto-pulse state
+        self._email_lock = threading.Lock()
+        self._email_extra_delay = 0.0
+        self._email_last_pulse_time = 0.0
+        self.email_timer = None
+        self._pending_email_messages = []
+        self._email_has_untracked_pending = False
+        self.email_unread_checker = None
 
         # Wakeup event for instant trigger
         self._wakeup_event = threading.Event()
@@ -58,6 +82,10 @@ class PulseEngine:
         self.schedule_thread = threading.Thread(
             target=self._schedule_loop, daemon=True)
         self.schedule_thread.start()
+
+    def notify_paused(self):
+        self.cancel_pending_whatsapp_pulse()
+        self.cancel_pending_email_pulse()
 
     def notify_unpaused(self):
         self._last_unpause_time = time.time()
@@ -95,6 +123,52 @@ class PulseEngine:
             self._wa_last_pulse_time = 0.0
             logging.debug("PulseEngine: WhatsApp cumulative slow-down reset to 0.")
 
+    def _clear_pending_whatsapp_batch_locked(self):
+        self._pending_whatsapp_messages.clear()
+        self._pending_whatsapp_chats.clear()
+        self._wa_has_untracked_pending = False
+
+    def cancel_pending_whatsapp_pulse(self):
+        """Cancels any pending WhatsApp pulse debounce timer and clears queued WhatsApp items."""
+        with self._wa_lock:
+            if self.whatsapp_timer:
+                self.whatsapp_timer.cancel()
+                self.whatsapp_timer = None
+            self._clear_pending_whatsapp_batch_locked()
+
+    def _clear_pending_email_batch_locked(self):
+        self._pending_email_messages.clear()
+        self._email_has_untracked_pending = False
+
+    def cancel_pending_email_pulse(self):
+        """Cancels any pending email pulse debounce timer and clears queued email items."""
+        with self._email_lock:
+            if self.email_timer:
+                self.email_timer.cancel()
+                self.email_timer = None
+            self._clear_pending_email_batch_locked()
+
+    def reset_email_slowdown(self, cancel_if_disabled: bool = False):
+        """Resets the cumulative Email buffer delay back to 0.0 (and optionally cancels pending timer if disabled)."""
+        with self._email_lock:
+            self._email_extra_delay = 0.0
+            self._email_last_pulse_time = 0.0
+            if cancel_if_disabled:
+                email_cfg = self.settings_manager.get("core.auto-pulse.email", {}) or {}
+                pulse_all = bool(email_cfg.get("pulse-all-emails", False))
+                whitelist = [
+                    str(w).strip()
+                    for w in (email_cfg.get("whitelist") or [])
+                    if str(w or "").strip()
+                ]
+                email_enabled = bool(self.settings_manager.get("core.tools.email", False))
+                if not email_enabled or (not pulse_all and not whitelist):
+                    if self.email_timer:
+                        self.email_timer.cancel()
+                        self.email_timer = None
+                    self._clear_pending_email_batch_locked()
+            logging.debug("PulseEngine: Email cumulative slow-down reset to 0.")
+
     def stop(self):
         self.is_running = False
         self._wakeup_event.set()
@@ -102,6 +176,12 @@ class PulseEngine:
             if self.whatsapp_timer:
                 self.whatsapp_timer.cancel()
                 self.whatsapp_timer = None
+            self._clear_pending_whatsapp_batch_locked()
+        with self._email_lock:
+            if self.email_timer:
+                self.email_timer.cancel()
+                self.email_timer = None
+            self._clear_pending_email_batch_locked()
 
     def _schedule_loop(self):
         from core.logger_config import agent_id_var
@@ -351,7 +431,7 @@ class PulseEngine:
                         continue
                     else:
                         # Within 15-minute leniency period: fire it
-                        active_type = p_type if p_type in ["external_hook", "sleep_cycle", "whatsapp"] else "scheduled_task"
+                        active_type = p_type if p_type in ["external_hook", "sleep_cycle", "whatsapp", "email"] else "scheduled_task"
                         self.fire_pulse(title, context, pulse_type=active_type)
                         c.execute(
                             'UPDATE pulses SET has_run=1, status="completed" WHERE id=?', (p_id,))
@@ -385,6 +465,8 @@ class PulseEngine:
             purpose = "Memory consolidation cycle"
         elif pulse_type == "whatsapp" or "WhatsApp Message" in (title or ""):
             purpose = "WhatsApp message received"
+        elif pulse_type == "email" or "New emails" in (title or ""):
+            purpose = "Email received"
         elif pulse_type == "external_hook" or "External Pulse" in (title or "") or "External pulse" in (title or ""):
             purpose = "External pulse received"
         elif pulse_type == "scheduled_task":
@@ -474,39 +556,84 @@ class PulseEngine:
                 return True
         return False
 
-    def handle_whatsapp_message(self, sender_id, sender_name="", is_group=None, group_name="", mentioned=False, **kwargs):
+    def handle_whatsapp_message(
+        self,
+        sender_id,
+        sender_name="",
+        is_group=None,
+        group_name="",
+        mentioned=False,
+        msg_id="",
+        msg_stanza_id="",
+        msg_type="",
+        raw_chat_id="",
+        subtype="",
+        is_notification=False,
+        is_revoked=False,
+        is_visible=True,
+        **kwargs,
+    ):
         if getattr(self.orchestrator, 'is_paused', False):
             return
         if not sender_id:
             return
-        if sender_id.endswith("@broadcast") or sender_id == "status@broadcast":
+        clean_raw_chat_id = str(raw_chat_id or "").strip()
+        if (
+            "@broadcast" in sender_id
+            or sender_id.endswith("@newsletter")
+            or "@broadcast" in clean_raw_chat_id
+            or clean_raw_chat_id.endswith("@newsletter")
+        ):
+            return
+
+        normalized_type = str(msg_type or "").strip().lower()
+        normalized_subtype = str(subtype or "").strip().lower()
+        if (
+            is_visible is False
+            or is_notification
+            or is_revoked
+            or kwargs.get("is_unread_type") is False
+            or (normalized_type and normalized_type in WHATSAPP_NON_MESSAGE_TYPES)
+            or (normalized_subtype and normalized_subtype in WHATSAPP_REVOKE_SUBTYPES)
+        ):
+            logging.debug(
+                f"PulseEngine: Ignoring non-message/invisible WhatsApp event "
+                f"(sender_id='{sender_id}', msg_type='{normalized_type}', subtype='{normalized_subtype}', "
+                f"is_notification={bool(is_notification)}, is_revoked={bool(is_revoked)}, is_visible={is_visible})."
+            )
             return
 
         if is_group is None:
             is_group = sender_id.endswith("@g.us")
 
         sys_settings = self.settings_manager.get("core.auto-pulse", {})
-        pulse_on_mentions = sys_settings.get("pulse-on-mentions", False)
-        pulse_all_dms = sys_settings.get("pulse-all-dms", False)
-        pulse_all_groups = sys_settings.get("pulse-all-groups", False)
+        pulse_on_mentions = bool(sys_settings.get("pulse-on-mentions", False))
+        pulse_all_dms = bool(sys_settings.get("pulse-all-dms", False))
+        pulse_all_groups = bool(sys_settings.get("pulse-all-groups", False))
 
         qualifies = False
+        trigger_source = ""
 
         # 1. Pulse on Mentions check (applies to both DMs and groups)
         if pulse_on_mentions and mentioned:
             qualifies = True
+            mention_reason = str(kwargs.get("mention_reason", "") or "").strip()
+            trigger_source = f"mention:{mention_reason}" if mention_reason else "mention"
         elif is_group:
             # 2. Group message check
             if pulse_all_groups:
                 qualifies = True
+                trigger_source = "all_groups"
             else:
                 group_whitelist = sys_settings.get("group-whitelist", [])
                 if self._matches_group_whitelist(group_name, group_whitelist):
                     qualifies = True
+                    trigger_source = "group_whitelist"
         else:
             # 3. Direct Message check
             if pulse_all_dms:
                 qualifies = True
+                trigger_source = "all_dms"
             else:
                 clean_sender = sender_id.replace(
                     "@c.us", "").replace("@g.us", "").replace("@lid", "").replace("+", "").strip()
@@ -518,16 +645,46 @@ class PulseEngine:
                 whitelist = sys_settings.get("whitelist", [])
                 if self._matches_phone_whitelist(clean_sender, resolved_name, contact, whitelist):
                     qualifies = True
+                    trigger_source = "dm_whitelist"
 
         if not qualifies:
             logging.debug(
                 f"PulseEngine: WhatsApp message ignored (sender_id='{sender_id}', name='{sender_name}', group='{group_name}', is_group={is_group}, mentioned={mentioned}).")
             return
 
-        self._schedule_whatsapp_pulse()
+        clean_msg_id = str(msg_id or "").strip()
+        clean_stanza = str(msg_stanza_id or "").strip() or extract_whatsapp_stanza_id(clean_msg_id)
+        self._schedule_whatsapp_pulse(
+            chat_id=str(sender_id).strip(),
+            raw_chat_id=clean_raw_chat_id,
+            msg_id=clean_msg_id,
+            stanza_id=clean_stanza,
+            trigger_source=trigger_source,
+        )
 
-    def _schedule_whatsapp_pulse(self):
+    def _schedule_whatsapp_pulse(self, chat_id="", raw_chat_id="", msg_id="", stanza_id="", trigger_source=""):
         with self._wa_lock:
+            if chat_id:
+                self._pending_whatsapp_chats.add(chat_id)
+            if raw_chat_id:
+                self._pending_whatsapp_chats.add(raw_chat_id)
+
+            if msg_id or stanza_id:
+                already_tracked = any(
+                    (msg_id and entry["msg_id"] == msg_id)
+                    or (stanza_id and entry["stanza_id"] == stanza_id)
+                    for entry in self._pending_whatsapp_messages
+                )
+                if not already_tracked:
+                    self._pending_whatsapp_messages.append({
+                        "msg_id": msg_id,
+                        "stanza_id": stanza_id,
+                        "chat_id": chat_id,
+                        "raw_chat_id": raw_chat_id,
+                    })
+            else:
+                self._wa_has_untracked_pending = True
+
             if self.whatsapp_timer is not None:
                 logging.debug("PulseEngine: WhatsApp pulse timer already running; message joined pending batch.")
                 return
@@ -538,20 +695,69 @@ class PulseEngine:
                 logging.debug("PulseEngine: WhatsApp buffer extra delay reset to 0 after 30 minutes of silence.")
 
             sys_settings = self.settings_manager.get("core.auto-pulse", {})
-            buffer_seconds = float(sys_settings.get("buffer-seconds", 30))
+            raw_buffer = sys_settings.get("buffer-seconds", 30)
+            try:
+                buffer_seconds = float(30 if raw_buffer is None else raw_buffer)
+            except (TypeError, ValueError):
+                buffer_seconds = 30.0
             delay = max(0.0, buffer_seconds + self._wa_extra_delay)
 
             self.whatsapp_timer = threading.Timer(delay, self.execute_whatsapp_pulse)
             self.whatsapp_timer.daemon = True
             self.whatsapp_timer.start()
-            logging.debug(f"PulseEngine: WhatsApp pulse scheduled in {delay}s (base={buffer_seconds}s, extra={self._wa_extra_delay}s).")
+            source_note = f", trigger={trigger_source}" if trigger_source else ""
+            logging.debug(f"PulseEngine: WhatsApp pulse scheduled in {delay}s (base={buffer_seconds}s, extra={self._wa_extra_delay}s{source_note}).")
+
+    def handle_whatsapp_message_revoked(self, msg_id="", msg_stanza_id="", chat_id="", revoke_type="revoke", **kwargs):
+        clean_msg_id = str(msg_id or "").strip()
+        clean_stanza = str(msg_stanza_id or "").strip() or extract_whatsapp_stanza_id(clean_msg_id)
+        if not clean_msg_id and not clean_stanza:
+            return
+
+        with self._wa_lock:
+            if not self._pending_whatsapp_messages:
+                return
+
+            remaining = [
+                entry for entry in self._pending_whatsapp_messages
+                if not (
+                    (clean_msg_id and entry["msg_id"] == clean_msg_id)
+                    or (clean_stanza and entry["stanza_id"] == clean_stanza)
+                )
+            ]
+            if len(remaining) == len(self._pending_whatsapp_messages):
+                return
+
+            self._pending_whatsapp_messages = remaining
+            if not self._wa_has_untracked_pending:
+                rebuilt_chats = set()
+                for entry in remaining:
+                    if entry["chat_id"]:
+                        rebuilt_chats.add(entry["chat_id"])
+                    if entry["raw_chat_id"]:
+                        rebuilt_chats.add(entry["raw_chat_id"])
+                self._pending_whatsapp_chats = rebuilt_chats
+
+                if not remaining and self.whatsapp_timer is not None:
+                    self.whatsapp_timer.cancel()
+                    self.whatsapp_timer = None
+                    self._clear_pending_whatsapp_batch_locked()
+                    logging.info(
+                        f"PulseEngine: Cancelled pending WhatsApp pulse countdown because all triggering messages were deleted/revoked ({revoke_type})."
+                    )
 
     def execute_whatsapp_pulse(self, *args, **kwargs):
         from core.logger_config import agent_id_var
         agent_id_var.set(self.agent_id)
 
         with self._wa_lock:
+            if self.whatsapp_timer is not None and threading.current_thread() is not self.whatsapp_timer:
+                self.whatsapp_timer.cancel()
             self.whatsapp_timer = None
+            pending_messages = list(self._pending_whatsapp_messages)
+            pending_chats = sorted(self._pending_whatsapp_chats)
+            has_untracked = self._wa_has_untracked_pending
+            self._clear_pending_whatsapp_batch_locked()
 
         if getattr(self.orchestrator, 'is_paused', False):
             return
@@ -559,6 +765,30 @@ class PulseEngine:
         if hasattr(self.orchestrator, "has_queued_pulse") and self.orchestrator.has_queued_pulse("WhatsApp message received") is True:
             logging.info("PulseEngine: WhatsApp pulse already queued in orchestrator; coalescing.")
             return
+
+        checker = getattr(self, "whatsapp_visible_unread_checker", None)
+        if callable(checker):
+            msg_ids = [m["msg_id"] for m in pending_messages if m.get("msg_id")]
+            stanza_ids = [m["stanza_id"] for m in pending_messages if m.get("stanza_id")]
+            try:
+                try:
+                    visible_count = checker(
+                        chat_ids=pending_chats,
+                        msg_ids=msg_ids,
+                        stanza_ids=stanza_ids,
+                        has_untracked=has_untracked,
+                    )
+                except TypeError:
+                    visible_count = checker()
+            except Exception as e:
+                logging.warning(f"PulseEngine: Failed to verify visible WhatsApp unread count; skipping pulse: {e}")
+                visible_count = 0
+
+            if not isinstance(visible_count, (int, float)) or isinstance(visible_count, bool) or visible_count <= 0:
+                logging.info(
+                    f"PulseEngine: Skipping WhatsApp pulse because visible unread message count is {visible_count!r} (<= 0)."
+                )
+                return
 
         title = "New WhatsApp messages"
         context = "You have new unread WhatsApp messages. Check your unread messages (WhatsApp_unread) and reply if appropriate."
@@ -568,3 +798,172 @@ class PulseEngine:
             self._wa_extra_delay += 10.0
             self._wa_last_pulse_time = time.time()
             logging.debug(f"PulseEngine: WhatsApp pulse generated; cumulative delay increased to +{self._wa_extra_delay}s.")
+
+    # --- Email Message Handling & Pulse Management ---
+    @staticmethod
+    def _normalize_email_address(raw_sender: str) -> str:
+        if not raw_sender:
+            return ""
+        _, addr = email.utils.parseaddr(str(raw_sender).strip())
+        return (addr or "").strip().lower()
+
+    def _matches_email_whitelist(self, sender_email: str, whitelist: list) -> bool:
+        clean_sender = self._normalize_email_address(sender_email)
+        if not clean_sender or "@" not in clean_sender:
+            return False
+        sender_domain = clean_sender.rsplit("@", 1)[1]
+
+        for item in (whitelist or []):
+            if not item:
+                continue
+            entry = str(item).strip().lower()
+            if not entry:
+                continue
+            if entry.startswith("*@"):
+                domain = entry[2:].strip()
+                if domain and sender_domain == domain:
+                    return True
+            elif entry.startswith("@"):
+                domain = entry[1:].strip()
+                if domain and sender_domain == domain:
+                    return True
+            else:
+                norm_entry = self._normalize_email_address(entry) or entry
+                if norm_entry == clean_sender:
+                    return True
+        return False
+
+    def handle_email_message(
+        self,
+        sender_email: str,
+        sender_name: str = "",
+        uid: str = "",
+        message_id: str = "",
+        folder: str = "INBOX",
+        **kwargs,
+    ):
+        if getattr(self.orchestrator, "is_paused", False):
+            return
+        clean_sender = self._normalize_email_address(sender_email)
+        if not clean_sender or "@" not in clean_sender:
+            return
+
+        email_settings = self.settings_manager.get("core.auto-pulse.email", {}) or {}
+        if not isinstance(email_settings, dict):
+            email_settings = {}
+        pulse_all = bool(email_settings.get("pulse-all-emails", False))
+
+        qualifies = False
+        trigger_source = ""
+        if pulse_all:
+            qualifies = True
+            trigger_source = "all_emails"
+        else:
+            whitelist = email_settings.get("whitelist", []) or []
+            if self._matches_email_whitelist(clean_sender, whitelist):
+                qualifies = True
+                trigger_source = "email_whitelist"
+
+        if not qualifies:
+            logging.debug(
+                f"PulseEngine: Email ignored (sender='{clean_sender}', folder='{folder}')."
+            )
+            return
+
+        self._schedule_email_pulse(
+            uid=str(uid or "").strip(),
+            message_id=str(message_id or "").strip(),
+            folder=str(folder or "INBOX").strip() or "INBOX",
+            trigger_source=trigger_source,
+        )
+
+    def _schedule_email_pulse(self, uid: str = "", message_id: str = "", folder: str = "INBOX", trigger_source: str = ""):
+        with self._email_lock:
+            if uid or message_id:
+                already_tracked = any(
+                    (uid and entry["uid"] == uid and entry["folder"] == folder)
+                    or (message_id and entry["message_id"] == message_id)
+                    for entry in self._pending_email_messages
+                )
+                if not already_tracked:
+                    self._pending_email_messages.append({
+                        "uid": uid,
+                        "message_id": message_id,
+                        "folder": folder,
+                    })
+            else:
+                self._email_has_untracked_pending = True
+
+            if self.email_timer is not None:
+                logging.debug("PulseEngine: Email pulse timer already running; email joined pending batch.")
+                return
+
+            now = time.time()
+            if self._email_last_pulse_time > 0 and (now - self._email_last_pulse_time) >= 1800.0:
+                self._email_extra_delay = 0.0
+                logging.debug("PulseEngine: Email buffer extra delay reset to 0 after 30 minutes of silence.")
+
+            email_settings = self.settings_manager.get("core.auto-pulse.email", {}) or {}
+            raw_buffer = email_settings.get("buffer-seconds", 30) if isinstance(email_settings, dict) else 30
+            try:
+                buffer_seconds = float(30 if raw_buffer is None else raw_buffer)
+            except (TypeError, ValueError):
+                buffer_seconds = 30.0
+            delay = max(0.0, buffer_seconds + self._email_extra_delay)
+
+            self.email_timer = threading.Timer(delay, self.execute_email_pulse)
+            self.email_timer.daemon = True
+            self.email_timer.start()
+            source_note = f", trigger={trigger_source}" if trigger_source else ""
+            logging.debug(
+                f"PulseEngine: Email pulse scheduled in {delay}s (base={buffer_seconds}s, extra={self._email_extra_delay}s{source_note})."
+            )
+
+    def execute_email_pulse(self, *args, **kwargs):
+        from core.logger_config import agent_id_var
+        agent_id_var.set(self.agent_id)
+
+        with self._email_lock:
+            if self.email_timer is not None and threading.current_thread() is not self.email_timer:
+                self.email_timer.cancel()
+            self.email_timer = None
+            pending_emails = list(self._pending_email_messages)
+            has_untracked = self._email_has_untracked_pending
+            self._clear_pending_email_batch_locked()
+
+        if getattr(self.orchestrator, "is_paused", False):
+            return
+
+        if hasattr(self.orchestrator, "has_queued_pulse") and self.orchestrator.has_queued_pulse("Email received") is True:
+            logging.info("PulseEngine: Email pulse already queued in orchestrator; coalescing.")
+            return
+
+        checker = getattr(self, "email_unread_checker", None)
+        if callable(checker):
+            try:
+                try:
+                    has_unread = checker(pending_emails=pending_emails, has_untracked=has_untracked)
+                except TypeError:
+                    has_unread = checker()
+            except Exception as e:
+                logging.warning(f"PulseEngine: Failed to verify pending unread email status; continuing with pulse: {e}")
+                has_unread = True
+
+            if has_unread is False:
+                logging.info(
+                    "PulseEngine: Skipping email pulse because all pending triggering emails have already been read."
+                )
+                return
+
+        title = "New emails received"
+        context = (
+            "You have new unread emails. Check your inbox "
+            "(Email_fetch_emails with unread_only=True), read relevant messages with Email_read_email, "
+            "reply if appropriate, and explicitly mark handled emails as read with Email_mark_as_read."
+        )
+        self.fire_pulse(title, context, pulse_type="email")
+
+        with self._email_lock:
+            self._email_extra_delay += 10.0
+            self._email_last_pulse_time = time.time()
+            logging.debug(f"PulseEngine: Email pulse generated; cumulative delay increased to +{self._email_extra_delay}s.")

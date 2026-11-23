@@ -91,7 +91,9 @@ class TrajectoryManager:
                     status TEXT NOT NULL DEFAULT 'pending',
                     priority TEXT NOT NULL DEFAULT 'medium',
                     created_at TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    why TEXT DEFAULT '',
+                    artifact_path TEXT DEFAULT ''
                 )
                 """)
                 # Idempotent column check for pre-existing aspirations table
@@ -109,6 +111,16 @@ class TrajectoryManager:
                     conn.execute("ALTER TABLE aspirations ADD COLUMN why TEXT DEFAULT ''")
                 if "sphere_level" not in cols:
                     conn.execute("ALTER TABLE aspirations ADD COLUMN sphere_level INTEGER DEFAULT 1")
+
+                # Idempotent column check for pre-existing tasks table
+                task_cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+                }
+                if "why" not in task_cols:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN why TEXT DEFAULT ''")
+                if "artifact_path" not in task_cols:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN artifact_path TEXT DEFAULT ''")
         except Exception as e:
             logger.warning(f"TrajectoryManager: Could not initialize/migrate trajectory.db: {e}")
 
@@ -140,6 +152,15 @@ class TrajectoryManager:
             out["sphere_level"] = 1
         return out
 
+    @staticmethod
+    def _normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(task)
+        why_val = out.get("why")
+        out["why"] = str(why_val).strip() if why_val is not None else ""
+        art_val = out.get("artifact_path")
+        out["artifact_path"] = str(art_val).strip() if art_val is not None else ""
+        return out
+
     def load_data(self) -> Dict[str, Any]:
         """
         Loads trajectory data from trajectory.json and merges/synchronizes with trajectory.db.
@@ -166,7 +187,7 @@ class TrajectoryManager:
                                     ]
                         raw_tasks = loaded.get("tasks", [])
                         if isinstance(raw_tasks, list):
-                            data["tasks"] = [dict(t) for t in raw_tasks if isinstance(t, dict)]
+                            data["tasks"] = [self._normalize_task(t) for t in raw_tasks if isinstance(t, dict)]
                 except Exception as e:
                     logger.error(f"TrajectoryManager: Failed to read {self.file_path}: {e}")
 
@@ -263,17 +284,20 @@ class TrajectoryManager:
                 conn.execute("DELETE FROM tasks")
                 for t in data.get("tasks", []):
                     if isinstance(t, dict) and t.get("id"):
+                        norm_t = self._normalize_task(t)
                         conn.execute("""
                         INSERT OR REPLACE INTO tasks
-                        (id, description, status, priority, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        (id, description, status, priority, created_at, updated_at, why, artifact_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            str(t["id"]),
-                            str(t.get("description", "")),
-                            str(t.get("status", "pending")),
-                            str(t.get("priority", "medium")),
-                            str(t.get("created_at", "")),
-                            str(t.get("updated_at", "")),
+                            str(norm_t["id"]),
+                            str(norm_t.get("description", "")),
+                            str(norm_t.get("status", "pending")),
+                            str(norm_t.get("priority", "medium")),
+                            str(norm_t.get("created_at", "")),
+                            str(norm_t.get("updated_at", "")),
+                            norm_t["why"],
+                            norm_t["artifact_path"],
                         ))
         except Exception as e:
             logger.warning(f"TrajectoryManager: Failed syncing to trajectory.db: {e}")
@@ -290,5 +314,11 @@ class TrajectoryManager:
                         for a in data["aspirations"][tier]
                         if isinstance(a, dict)
                     ]
+            if isinstance(data.get("tasks"), list):
+                data["tasks"] = [
+                    self._normalize_task(t)
+                    for t in data["tasks"]
+                    if isinstance(t, dict)
+                ]
             atomic_json_write(self.file_path, data)
             self._sync_to_db(data)

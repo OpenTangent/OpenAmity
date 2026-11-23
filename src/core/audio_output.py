@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 import logging
 import math
@@ -8,12 +9,351 @@ import re
 import os
 import requests
 from pathlib import Path
+from typing import Optional
 from .events import Signal
 from .settings_manager import SettingsManager
 from google import genai
 from google.genai import types
 
 TTS_PLAYBACK_LOCK = threading.Lock()
+SPEECH_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+def build_speech_cache_key(message_id=None, text: str = "") -> str:
+    """Builds a deterministic cache key for a speech transcript card."""
+    if message_id is not None and str(message_id).strip():
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(message_id).strip())
+        return f"msg_{safe_id}"
+    digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+    return f"txt_{digest}"
+
+
+def get_speech_cache_path(agent_id: Optional[str], cache_key: str) -> str:
+    """Returns the .opus file path for a speech transcript cache entry."""
+    from config import paths
+    cache_dir = paths.get_speech_transcript_cache_dir(agent_id)
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cache_key or "unknown"))
+    return os.path.join(cache_dir, f"{safe_key}.opus")
+
+
+def get_valid_cached_speech_path(
+    agent_id: Optional[str],
+    cache_key: str,
+    max_age_seconds: float = SPEECH_CACHE_TTL_SECONDS,
+) -> Optional[str]:
+    """Returns the cached .opus path if it exists, is non-empty, and is within the 24h TTL."""
+    path = get_speech_cache_path(agent_id, cache_key)
+    if not os.path.isfile(path):
+        return None
+    try:
+        st = os.stat(path)
+        if st.st_size <= 0 or (time.time() - st.st_mtime) > max_age_seconds:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None
+        return path
+    except Exception:
+        return None
+
+
+def encode_pcm_to_opus_atomic(pcm_bytes: bytes, sample_rate: int, output_path: str) -> bool:
+    """Encodes 16-bit signed LE mono PCM bytes into an Opus file atomically."""
+    if not pcm_bytes or not output_path:
+        return False
+
+    abs_path = os.path.abspath(output_path)
+    cache_dir = os.path.dirname(abs_path)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    try:
+        from .cache_manager import CacheManager
+        CacheManager.clear_expired(cache_dir, max_age_days=1.0)
+    except Exception:
+        pass
+
+    tmp_path = os.path.join(
+        cache_dir,
+        f".{os.path.basename(abs_path)}.{os.getpid()}.{threading.get_ident()}.tmp.opus",
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "s16le",
+        "-ar", str(max(8000, int(sample_rate or 24000))),
+        "-ac", "1",
+        "-i", "-",
+        "-c:a", "libopus",
+        tmp_path,
+    ]
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        proc.communicate(input=pcm_bytes, timeout=30)
+        if proc.returncode == 0 and os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
+            os.replace(tmp_path, abs_path)
+            return True
+        logging.getLogger("core.TTS").warning(
+            f"Failed to encode cached speech .opus (code {proc.returncode})"
+        )
+    except Exception as e:
+        logging.getLogger("core.TTS").warning(f"Failed to cache speech audio: {e}")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    if os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    return False
+
+
+class SpeechPlaybackController:
+    """Process-global coordinator for speech playback state and stop-all controls across agents."""
+
+    _instance = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._orchestrators = []
+        self._active_worker = None
+        self._state = {
+            "is_active": False,
+            "phase": "idle",
+            "agent_id": None,
+            "card_key": None,
+            "queued_count": 0,
+        }
+        self.playback_state_changed = Signal()
+
+    @classmethod
+    def instance(cls) -> "SpeechPlaybackController":
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    @classmethod
+    def reset_instance(cls):
+        """Resets singleton state (intended for test isolation)."""
+        with cls._instance_lock:
+            cls._instance = None
+
+    def register_orchestrator(self, orchestrator):
+        if orchestrator is None:
+            return
+        with self._lock:
+            if orchestrator not in self._orchestrators:
+                self._orchestrators.append(orchestrator)
+
+    def unregister_orchestrator(self, orchestrator):
+        if orchestrator is None:
+            return
+        snapshot = None
+        with self._lock:
+            self._orchestrators = [o for o in self._orchestrators if o is not orchestrator]
+            if self._state.get("agent_id") == getattr(orchestrator, "agent_id", None):
+                snapshot = self._reconcile_idle_locked()
+        if snapshot is not None:
+            self.playback_state_changed.emit(snapshot)
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    def _find_live_orchestrator_speech_locked(self, ignore_worker=None) -> Optional[dict]:
+        for orch in list(self._orchestrators):
+            worker = getattr(orch, "tts_worker", None)
+            if worker is not None and worker is not ignore_worker and not getattr(worker, "_is_stopped", False):
+                try:
+                    alive = worker.is_alive()
+                except Exception:
+                    alive = True
+                if alive:
+                    q = getattr(orch, "speech_queue", None)
+                    phase = "playing" if getattr(worker, "_playback_started_emitted", False) else "generating"
+                    card_key = getattr(worker, "card_key", None) or getattr(orch, "_active_speech_card_key", None)
+                    return {
+                        "worker": worker,
+                        "agent_id": getattr(orch, "agent_id", None),
+                        "card_key": card_key,
+                        "phase": phase,
+                        "queued_count": len(q) if q else 0,
+                    }
+            q = getattr(orch, "speech_queue", None)
+            if q and len(q) > 0:
+                sm = getattr(orch, "settings_manager", None)
+                is_muted = False
+                if sm is not None:
+                    try:
+                        is_muted = bool(sm.get("core.mute", False))
+                    except Exception:
+                        is_muted = False
+                eligible_items = (
+                    list(q)
+                    if not is_muted
+                    else [item for item in list(q) if isinstance(item, dict) and item.get("bypass_mute", False)]
+                )
+                if eligible_items:
+                    first = eligible_items[0]
+                    card_key = first.get("card_key") if isinstance(first, dict) else None
+                    return {
+                        "worker": None,
+                        "agent_id": getattr(orch, "agent_id", None),
+                        "card_key": card_key,
+                        "phase": "generating",
+                        "queued_count": len(eligible_items),
+                    }
+        return None
+
+    def _has_live_orchestrator_speech_locked(self, ignore_worker=None) -> bool:
+        return self._find_live_orchestrator_speech_locked(ignore_worker=ignore_worker) is not None
+
+    def is_any_speech_active(self) -> bool:
+        with self._lock:
+            if self._state.get("is_active"):
+                return True
+            return self._has_live_orchestrator_speech_locked()
+
+    def mark_generating(
+        self,
+        agent_id: Optional[str],
+        card_key: Optional[str],
+        worker=None,
+        queued_count: int = 0,
+    ):
+        with self._lock:
+            if worker is not None and getattr(worker, "_is_stopped", False):
+                return
+            if self._active_worker is not None and self._active_worker is not worker:
+                try:
+                    other_alive = self._active_worker.is_alive()
+                except Exception:
+                    other_alive = False
+                if other_alive and not getattr(self._active_worker, "_is_stopped", False):
+                    return
+            self._active_worker = worker
+            self._state = {
+                "is_active": True,
+                "phase": "generating",
+                "agent_id": agent_id,
+                "card_key": card_key,
+                "queued_count": int(queued_count or 0),
+            }
+            snapshot = dict(self._state)
+        self.playback_state_changed.emit(snapshot)
+
+    def mark_playing(
+        self,
+        agent_id: Optional[str],
+        card_key: Optional[str],
+        worker=None,
+        queued_count: int = 0,
+    ):
+        with self._lock:
+            if worker is not None and getattr(worker, "_is_stopped", False):
+                return
+            if worker is not None:
+                self._active_worker = worker
+            self._state = {
+                "is_active": True,
+                "phase": "playing",
+                "agent_id": agent_id,
+                "card_key": card_key,
+                "queued_count": int(queued_count or 0),
+            }
+            snapshot = dict(self._state)
+        self.playback_state_changed.emit(snapshot)
+
+    def _reconcile_idle_locked(self, worker=None) -> Optional[dict]:
+        if worker is not None and self._active_worker is not None and worker is not self._active_worker:
+            try:
+                active_alive = self._active_worker.is_alive()
+            except Exception:
+                active_alive = False
+            if active_alive and not getattr(self._active_worker, "_is_stopped", False):
+                return None
+
+        live = self._find_live_orchestrator_speech_locked(ignore_worker=worker)
+        if live is not None:
+            self._active_worker = live["worker"]
+            next_state = {
+                "is_active": True,
+                "phase": live["phase"],
+                "agent_id": live["agent_id"],
+                "card_key": live["card_key"],
+                "queued_count": int(live.get("queued_count", 0) or 0),
+            }
+            if next_state != self._state:
+                self._state = next_state
+                return dict(self._state)
+            return None
+
+        was_active = self._state.get("is_active", False)
+        self._active_worker = None
+        self._state = {
+            "is_active": False,
+            "phase": "idle",
+            "agent_id": None,
+            "card_key": None,
+            "queued_count": 0,
+        }
+        if was_active:
+            return dict(self._state)
+        return None
+
+    def mark_idle(self, worker=None):
+        with self._lock:
+            snapshot = self._reconcile_idle_locked(worker=worker)
+        if snapshot is not None:
+            self.playback_state_changed.emit(snapshot)
+
+    def stop_all_speech(self):
+        with self._lock:
+            orchestrators = list(self._orchestrators)
+            active_worker = self._active_worker
+            self._active_worker = None
+            self._state = {
+                "is_active": False,
+                "phase": "idle",
+                "agent_id": None,
+                "card_key": None,
+                "queued_count": 0,
+            }
+            snapshot = dict(self._state)
+
+        for orch in orchestrators:
+            try:
+                if hasattr(orch, "stop_speech"):
+                    orch.stop_speech(update_busy_state=True, notify_controller=False)
+                else:
+                    q = getattr(orch, "speech_queue", None)
+                    if q is not None:
+                        q.clear()
+                    w = getattr(orch, "tts_worker", None)
+                    if w is not None:
+                        w.stop()
+            except Exception as e:
+                logging.debug(f"Error stopping speech on orchestrator: {e}")
+
+        if active_worker is not None:
+            try:
+                active_worker.stop()
+            except Exception:
+                pass
+
+        self.playback_state_changed.emit(snapshot)
 
 GEMINI_VOICES = {
     # Female Voices
@@ -621,7 +961,16 @@ def extract_oscilloscope_frames(
 
 
 class TTSWorker(threading.Thread):
-    def __init__(self, text, voice=None, daemon=True, agent_id=None):
+    def __init__(
+        self,
+        text,
+        voice=None,
+        daemon=True,
+        agent_id=None,
+        cache_path: Optional[str] = None,
+        use_cached_file: Optional[str] = None,
+        card_key: Optional[str] = None,
+    ):
         super().__init__(daemon=daemon)
         self.started_playback = Signal()
         self.amplitude_emitted = Signal()
@@ -629,6 +978,9 @@ class TTSWorker(threading.Thread):
         self.error_occurred = Signal()
         self.status_emitted = Signal()
         self.agent_id = agent_id
+        self.cache_path = cache_path
+        self.use_cached_file = use_cached_file
+        self.card_key = card_key
 
         self.settings = SettingsManager(agent_id=self.agent_id)
         self.text = text
@@ -666,16 +1018,120 @@ class TTSWorker(threading.Thread):
         self.model = self.voice_models[0]
 
         self.process = None
+        self._decoder_process = None
         self._is_stopped = False
+        self._playback_started_emitted = False
         self.on_finished = Signal()
 
     def stop(self):
         self._is_stopped = True
-        if self.process:
+        for proc in (self._decoder_process, self.process):
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _emit_started_playback_once(self):
+        if not self._playback_started_emitted and not self._is_stopped:
+            self._playback_started_emitted = True
+            self.started_playback.emit()
+
+    def _emit_pcm_telemetry(
+        self,
+        data: bytes,
+        pcm_remainder: bytes,
+        sample_rate: int,
+        first_batch: bool,
+        flush: bool = False,
+    ) -> tuple[bytes, bool]:
+        if flush:
+            if pcm_remainder and not self._is_stopped:
+                frames, pcm_remainder = extract_oscilloscope_frames(
+                    pcm_remainder, sample_rate=sample_rate, flush=True
+                )
+                if frames:
+                    if first_batch:
+                        frames = ([[]] * 5) + frames
+                        first_batch = False
+                    self.waveform_emitted.emit(frames)
+            return pcm_remainder, first_batch
+
+        frames, pcm_remainder = extract_oscilloscope_frames(
+            pcm_remainder + data, sample_rate=sample_rate, flush=False
+        )
+        if frames:
+            if first_batch:
+                frames = ([[]] * 5) + frames
+                first_batch = False
+            self.waveform_emitted.emit(frames)
+
+        samples = len(data) // 2
+        if samples > 0:
+            sum_sq = 0
+            stride = max(1, samples // 100)
+            if stride > 0:
+                for i in range(0, samples * 2, stride * 2):
+                    val = int.from_bytes(data[i:i+2], byteorder='little', signed=True)
+                    sum_sq += val * val
+                rms = math.sqrt(sum_sq / (samples / stride))
+                amp = min(1.0, rms / 32768.0)
+                self.amplitude_emitted.emit(amp)
+
+        return pcm_remainder, first_batch
+
+    def _wait_for_ffplay(self, total_pcm_bytes: int, sample_rate: int):
+        if not self.process:
+            return
+        if self._is_stopped:
             try:
                 self.process.kill()
+                self.process.wait(timeout=2)
             except Exception:
                 pass
+            return
+
+        audio_duration = (total_pcm_bytes / max(1, sample_rate * 2)) if total_pcm_bytes > 0 else 0.0
+        deadline = time.monotonic() + max(15.0, audio_duration + 10.0)
+        while self.process:
+            if self._is_stopped:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+                except Exception:
+                    pass
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+                except Exception:
+                    pass
+                return
+            try:
+                self.process.wait(timeout=min(0.15, remaining))
+                return
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+                return
+
+    def _spawn_cache_writer(self, pcm_bytes: bytes, sample_rate: int) -> Optional[threading.Thread]:
+        if not self.cache_path or not pcm_bytes:
+            return None
+        target_path = self.cache_path
+        t = threading.Thread(
+            target=encode_pcm_to_opus_atomic,
+            args=(pcm_bytes, sample_rate, target_path),
+            daemon=True,
+        )
+        t.start()
+        return t
 
     def run(self):
         try:
@@ -690,6 +1146,20 @@ class TTSWorker(threading.Thread):
             self.on_finished.emit()
 
     def _stream_and_play(self):
+        if self.use_cached_file and os.path.isfile(self.use_cached_file):
+            played = self._play_cached_opus_file(self.use_cached_file)
+            if played or self._is_stopped:
+                return
+            # Corrupt cached file; delete and fall back to live synthesis
+            try:
+                os.remove(self.use_cached_file)
+            except Exception:
+                pass
+            self.use_cached_file = None
+
+        self._stream_and_play_live()
+
+    def _stream_and_play_live(self):
         if self.settings.get("core.low-token-mode", False):
             self._stream_and_play_piper()
             return
@@ -714,8 +1184,122 @@ class TTSWorker(threading.Thread):
         else:
             self._stream_and_play_piper()
 
+    def _play_cached_opus_file(self, filepath: str) -> bool:
+        total_pcm_bytes = 0
+        decoder_ok = False
+        try:
+            self._decoder_process = subprocess.Popen(
+                [
+                    "ffmpeg", "-v", "error", "-i", filepath,
+                    "-f", "s16le", "-ar", "24000", "-ac", "1", "-"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.process = subprocess.Popen(
+                [
+                    "ffplay", "-f", "s16le", "-ar", "24000",
+                    "-fflags", "nobuffer", "-flags", "low_delay",
+                    "-probesize", "32", "-analyzeduration", "0",
+                    "-nodisp", "-autoexit", "-i", "-"
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            pcm_remainder = b""
+            leftover_pcm = b""
+            first_batch = True
+            while not self._is_stopped:
+                raw = self._decoder_process.stdout.read(4096) if self._decoder_process.stdout else b""
+                if not raw:
+                    break
+                data = leftover_pcm + raw
+                if len(data) % 2 != 0:
+                    leftover_pcm = data[-1:]
+                    data = data[:-1]
+                else:
+                    leftover_pcm = b""
+                if not data:
+                    continue
+
+                self._emit_started_playback_once()
+                total_pcm_bytes += len(data)
+                if self.process and self.process.stdin:
+                    try:
+                        self.process.stdin.write(data)
+                        self.process.stdin.flush()
+                    except BrokenPipeError:
+                        if not self._is_stopped:
+                            logging.getLogger("core.TTS").warning("ffplay closed early during cached playback.")
+                        break
+
+                pcm_remainder, first_batch = self._emit_pcm_telemetry(
+                    data, pcm_remainder, sample_rate=24000, first_batch=first_batch, flush=False
+                )
+
+            if leftover_pcm and not self._is_stopped and self.process and self.process.stdin:
+                padded = leftover_pcm + b"\x00"
+                total_pcm_bytes += len(padded)
+                try:
+                    self.process.stdin.write(padded)
+                    self.process.stdin.flush()
+                except Exception:
+                    pass
+
+            pcm_remainder, first_batch = self._emit_pcm_telemetry(
+                b"", pcm_remainder, sample_rate=24000, first_batch=first_batch, flush=True
+            )
+
+            if self.process and self.process.stdin and not self._is_stopped:
+                try:
+                    self.process.stdin.write(b"\x00" * 7200)
+                    self.process.stdin.flush()
+                except Exception:
+                    pass
+            if self.process and self.process.stdin:
+                try:
+                    self.process.stdin.close()
+                except Exception:
+                    pass
+
+            if self._decoder_process:
+                try:
+                    if self._is_stopped:
+                        self._decoder_process.kill()
+                    self._decoder_process.wait(timeout=5)
+                    decoder_ok = (self._decoder_process.returncode == 0)
+                except Exception:
+                    try:
+                        self._decoder_process.kill()
+                    except Exception:
+                        pass
+
+            self._wait_for_ffplay(total_pcm_bytes, 24000)
+            return self._is_stopped or (decoder_ok and total_pcm_bytes > 0)
+        except Exception as e:
+            logging.getLogger("core.TTS").warning(f"Failed to play cached speech file '{filepath}': {e}")
+            return self._is_stopped
+        finally:
+            if self._decoder_process:
+                if self._decoder_process.poll() is None:
+                    try:
+                        self._decoder_process.kill()
+                        self._decoder_process.wait(timeout=2)
+                    except Exception:
+                        pass
+                self._decoder_process = None
+            if self.process:
+                if self._is_stopped and self.process.poll() is None:
+                    try:
+                        self.process.kill()
+                        self.process.wait(timeout=2)
+                    except Exception:
+                        pass
+                self.process = None
+
     def _stream_and_play_gemini(self, api_key=None):
-        self.started_playback.emit()
         if self._is_stopped:
             return
 
@@ -842,78 +1426,19 @@ class TTSWorker(threading.Thread):
 
         audio_queue = queue.Queue()
         abort_event = threading.Event()
-
-        def writer_thread():
-            pcm_remainder = b""
-            first_batch = True
-            try:
-                while not self._is_stopped:
-                    try:
-                        data = audio_queue.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
-                    if data is None:
-                        if pcm_remainder and not self._is_stopped:
-                            frames, pcm_remainder = extract_oscilloscope_frames(
-                                pcm_remainder, sample_rate=24000, flush=True
-                            )
-                            if frames:
-                                if first_batch:
-                                    frames = ([[]] * 5) + frames
-                                    first_batch = False
-                                self.waveform_emitted.emit(frames)
-                        break
-
-                    if self.process and self.process.stdin:
-                        self.process.stdin.write(data)
-                        self.process.stdin.flush()
-
-                        frames, pcm_remainder = extract_oscilloscope_frames(
-                            pcm_remainder + data, sample_rate=24000, flush=False
-                        )
-                        if frames:
-                            if first_batch:
-                                frames = ([[]] * 5) + frames
-                                first_batch = False
-                            self.waveform_emitted.emit(frames)
-
-                        samples = len(data) // 2
-                        if samples > 0:
-                            sum_sq = 0
-                            stride = max(1, samples // 100)
-                            if stride > 0:
-                                for i in range(0, samples * 2, stride * 2):
-                                    val = int.from_bytes(
-                                        data[i:i+2], byteorder='little', signed=True)
-                                    sum_sq += val * val
-                                rms = math.sqrt(
-                                    sum_sq / (samples / stride))
-                                amp = min(1.0, rms / 32768.0)
-                                self.amplitude_emitted.emit(amp)
-            except BrokenPipeError:
-                if not self._is_stopped and not abort_event.is_set():
-                    logging.getLogger("core.TTS.Gemini").warning("ffplay process closed unexpectedly (Broken pipe).")
-            except Exception as e:
-                logging.getLogger("core.TTS.Gemini").error(
-                    f"TTS writer thread error: {e}")
-            finally:
-                if self.process and self.process.stdin and not self._is_stopped:
-                    try:
-                        self.process.stdin.write(b'\x00' * 7200)
-                        self.process.stdin.flush()
-                    except Exception:
-                        pass
-                if self.process and self.process.stdin:
-                    try:
-                        self.process.stdin.close()
-                    except Exception:
-                        pass
-
-        writer = threading.Thread(target=writer_thread, daemon=True)
-        writer.start()
+        writer = self._start_pcm_writer_thread(
+            audio_queue,
+            sample_rate=24000,
+            tail_silence_bytes=7200,
+            log_name="core.TTS.Gemini",
+            abort_event=abort_event,
+        )
 
         stream_err = None
         leftover_pcm = b""
+        captured_pcm = bytearray() if self.cache_path else None
+        total_pcm_bytes = 0
+        cache_thread = None
         try:
             for chunk in response_stream:
                 if self._is_stopped:
@@ -950,18 +1475,35 @@ class TTSWorker(threading.Thread):
                             else:
                                 leftover_pcm = b""
                             if data:
+                                self._emit_started_playback_once()
+                                total_pcm_bytes += len(data)
+                                if captured_pcm is not None:
+                                    captured_pcm.extend(data)
                                 audio_queue.put(data)
                 except RuntimeError:
                     raise
                 except (IndexError, AttributeError, TypeError) as inner_err:
                     logging.getLogger("core.TTS.Gemini").warning(
                         f"Skipped an unexpected TTS chunk. Reason: {inner_err}")
+
+            if not self._is_stopped:
+                if leftover_pcm:
+                    pad = leftover_pcm + b"\x00"
+                    audio_queue.put(pad)
+                    total_pcm_bytes += len(pad)
+                    if captured_pcm is not None:
+                        captured_pcm.extend(pad)
+                    leftover_pcm = b""
+                if self.cache_path and captured_pcm:
+                    cache_thread = self._spawn_cache_writer(bytes(captured_pcm), 24000)
         except Exception as err:
             abort_event.set()
             stream_err = err
         finally:
             if leftover_pcm:
-                audio_queue.put(leftover_pcm + b"\x00")
+                pad = leftover_pcm + b"\x00"
+                audio_queue.put(pad)
+                total_pcm_bytes += len(pad)
                 leftover_pcm = b""
 
             if stream_err is not None or self._is_stopped:
@@ -981,21 +1523,70 @@ class TTSWorker(threading.Thread):
             else:
                 audio_queue.put(None)
                 writer.join()
-                if self.process:
-                    try:
-                        self.process.wait(timeout=15)
-                    except Exception:
-                        try:
-                            self.process.kill()
-                            self.process.wait(timeout=2)
-                        except Exception:
-                            pass
-                    self.process = None
+                self._wait_for_ffplay(total_pcm_bytes, 24000)
+                self.process = None
+
+            if cache_thread is not None:
+                cache_thread.join(timeout=30)
 
         if stream_err is not None:
             raise stream_err
 
+    def _start_pcm_writer_thread(
+        self,
+        audio_queue: queue.Queue,
+        sample_rate: int,
+        tail_silence_bytes: int,
+        log_name: str,
+        abort_event: Optional[threading.Event] = None,
+    ) -> threading.Thread:
+        def writer_thread():
+            pcm_remainder = b""
+            first_batch = True
+            try:
+                while not self._is_stopped:
+                    try:
+                        data = audio_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if data is None:
+                        pcm_remainder, first_batch = self._emit_pcm_telemetry(
+                            b"", pcm_remainder, sample_rate=sample_rate, first_batch=first_batch, flush=True
+                        )
+                        break
+
+                    if self.process and self.process.stdin:
+                        self.process.stdin.write(data)
+                        self.process.stdin.flush()
+                        pcm_remainder, first_batch = self._emit_pcm_telemetry(
+                            data, pcm_remainder, sample_rate=sample_rate, first_batch=first_batch, flush=False
+                        )
+            except BrokenPipeError:
+                if not self._is_stopped and (abort_event is None or not abort_event.is_set()):
+                    logging.getLogger(log_name).warning("ffplay process closed unexpectedly (Broken pipe).")
+            except Exception as e:
+                logging.getLogger(log_name).error(f"TTS writer thread error: {e}")
+            finally:
+                if self.process and self.process.stdin and not self._is_stopped:
+                    try:
+                        self.process.stdin.write(b"\x00" * tail_silence_bytes)
+                        self.process.stdin.flush()
+                    except Exception:
+                        pass
+                if self.process and self.process.stdin:
+                    try:
+                        self.process.stdin.close()
+                    except Exception:
+                        pass
+
+        writer = threading.Thread(target=writer_thread, daemon=True)
+        writer.start()
+        return writer
+
     def _stream_and_play_piper(self):
+        cache_thread = None
+        total_pcm_bytes = 0
+        piper_sample_rate = 22050
         try:
             voice = load_piper_voice(self.settings, status_callback=self.status_emitted.emit)
             if not voice:
@@ -1005,16 +1596,13 @@ class TTSWorker(threading.Thread):
             clean_text = re.sub(r'<.*?>', '', clean_text)
             clean_text = re.sub(r'\s+', ' ', clean_text).strip()
 
-            if not clean_text:
+            if not clean_text or self._is_stopped:
                 return
 
-            self.started_playback.emit()
-            if self._is_stopped:
-                return
-
+            piper_sample_rate = int(getattr(voice.config, "sample_rate", 22050) or 22050)
             self.process = subprocess.Popen(
                 [
-                    "ffplay", "-f", "s16le", "-ar", str(voice.config.sample_rate),
+                    "ffplay", "-f", "s16le", "-ar", str(piper_sample_rate),
                     "-fflags", "nobuffer", "-flags", "low_delay",
                     "-probesize", "32", "-analyzeduration", "0",
                     "-nodisp", "-autoexit", "-i", "-"
@@ -1025,83 +1613,26 @@ class TTSWorker(threading.Thread):
             )
 
             audio_queue = queue.Queue()
-            piper_sample_rate = int(getattr(voice.config, "sample_rate", 22050) or 22050)
+            writer = self._start_pcm_writer_thread(
+                audio_queue,
+                sample_rate=piper_sample_rate,
+                tail_silence_bytes=int(piper_sample_rate * 0.15) * 2,
+                log_name="core.TTS.Piper",
+            )
 
-            def writer_thread():
-                pcm_remainder = b""
-                first_batch = True
-                try:
-                    while not self._is_stopped:
-                        try:
-                            data = audio_queue.get(timeout=0.2)
-                        except queue.Empty:
-                            continue
-                        if data is None:
-                            if pcm_remainder and not self._is_stopped:
-                                frames, pcm_remainder = extract_oscilloscope_frames(
-                                    pcm_remainder, sample_rate=piper_sample_rate, flush=True
-                                )
-                                if frames:
-                                    if first_batch:
-                                        frames = ([[]] * 5) + frames
-                                        first_batch = False
-                                    self.waveform_emitted.emit(frames)
-                            break
-
-                        if self.process and self.process.stdin:
-                            self.process.stdin.write(data)
-                            self.process.stdin.flush()
-
-                            frames, pcm_remainder = extract_oscilloscope_frames(
-                                pcm_remainder + data, sample_rate=piper_sample_rate, flush=False
-                            )
-                            if frames:
-                                if first_batch:
-                                    frames = ([[]] * 5) + frames
-                                    first_batch = False
-                                self.waveform_emitted.emit(frames)
-
-                            samples = len(data) // 2
-                            if samples > 0:
-                                sum_sq = 0
-                                stride = max(1, samples // 100)
-                                if stride > 0:
-                                    for i in range(0, samples * 2, stride * 2):
-                                        val = int.from_bytes(
-                                            data[i:i+2], byteorder='little', signed=True)
-                                        sum_sq += val * val
-                                    rms = math.sqrt(
-                                        sum_sq / (samples / stride))
-                                    amp = min(1.0, rms / 32768.0)
-                                    self.amplitude_emitted.emit(amp)
-                except BrokenPipeError:
-                    if not self._is_stopped:
-                        logging.getLogger("core.TTS.Piper").warning("ffplay process closed unexpectedly (Broken pipe).")
-                except Exception as e:
-                    logging.getLogger("core.TTS.Piper").error(
-                        f"Piper writer thread error: {e}")
-                finally:
-                    if self.process and self.process.stdin and not self._is_stopped:
-                        try:
-                            self.process.stdin.write(
-                                b'\x00' * (int(piper_sample_rate * 0.15) * 2))
-                            self.process.stdin.flush()
-                        except Exception:
-                            pass
-                    if self.process and self.process.stdin:
-                        try:
-                            self.process.stdin.close()
-                        except Exception:
-                            pass
-
-            writer = threading.Thread(target=writer_thread, daemon=True)
-            writer.start()
-
+            captured_pcm = bytearray() if self.cache_path else None
             for chunk in voice.synthesize(clean_text):
                 if self._is_stopped:
                     break
                 if chunk and chunk.audio_int16_bytes:
+                    self._emit_started_playback_once()
+                    total_pcm_bytes += len(chunk.audio_int16_bytes)
+                    if captured_pcm is not None:
+                        captured_pcm.extend(chunk.audio_int16_bytes)
                     audio_queue.put(chunk.audio_int16_bytes)
+
+            if not self._is_stopped and self.cache_path and captured_pcm:
+                cache_thread = self._spawn_cache_writer(bytes(captured_pcm), piper_sample_rate)
 
         except Exception as e:
             logging.getLogger("core.TTS.Piper").error(
@@ -1120,14 +1651,16 @@ class TTSWorker(threading.Thread):
                 else:
                     writer.join()
             if self.process:
-                try:
-                    self.process.wait(timeout=15 if not self._is_stopped else 2)
-                except Exception:
+                if self._is_stopped:
                     try:
-                        self.process.kill()
+                        self.process.wait(timeout=2)
                     except Exception:
                         pass
+                else:
+                    self._wait_for_ffplay(total_pcm_bytes, piper_sample_rate)
                 self.process = None
+            if cache_thread is not None:
+                cache_thread.join(timeout=30)
 
 
 def synthesize_speech_to_file(text: str, output_path: str, agent_id: str = None, voice: str = None, settings=None, status_callback=None) -> str:

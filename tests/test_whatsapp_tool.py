@@ -18,7 +18,6 @@ def mock_whatsapp_tool():
     mock_settings.get.side_effect = lambda key, default=None: {
         "core.tts.provider": "piper",
         "core.tts.piper.model-name-piper": "en_GB-cori-high",
-        "core.antigravity.agy-mode": False,
     }.get(key, default)
     mock_orch.settings_manager = mock_settings
 
@@ -101,31 +100,6 @@ def test_whatsapp_send_voice_with_reply_to(mock_whatsapp_tool):
                 result = tool.execute("send_voice", target="Bob", message="Replying to your note", reply_to="msg_98765")
                 assert "successfully" in result
                 assert mock_post.call_args[1]["data"]["reply_to"] == "msg_98765"
-
-
-def test_whatsapp_send_voice_agy_mode_not_blocked(mock_whatsapp_tool):
-    tool, mock_orch = mock_whatsapp_tool
-    mock_orch.settings_manager.get.side_effect = lambda key, default=None: {
-        "core.tts.provider": "piper",
-        "core.antigravity.agy-mode": True,
-    }.get(key, default)
-
-    def fake_synth(text, output_path, agent_id=None, settings=None, voice=None):
-        with open(output_path, "wb") as f:
-            f.write(b"OggOpusDummyAudioData")
-        return output_path
-
-    mock_status_resp = MagicMock()
-    mock_status_resp.json.return_value = {"ready": True}
-    mock_post_resp = MagicMock()
-    mock_post_resp.json.return_value = {"success": True}
-
-    with patch("core.audio_output.synthesize_speech_to_file", side_effect=fake_synth):
-        with patch("requests.get", return_value=mock_status_resp):
-            with patch("requests.post", return_value=mock_post_resp):
-                result = tool.execute("send_voice", target="Charlie", message="Voice note in agy mode")
-                assert "successfully" in result
-                assert "unavailable when agy-mode is active" not in result
 
 
 def test_whatsapp_send_voice_synthesis_failure(mock_whatsapp_tool):
@@ -986,5 +960,148 @@ def test_whatsapp_vote_poll_missing_params_and_error(mock_whatsapp_tool):
         with patch("requests.post", return_value=mock_err_resp):
             res = tool.execute("vote_poll", msgId="poll_msg_123", options=["0", "1"])
             assert res == "Error: Poll only allows selecting up to 1 option(s), but 2 were provided."
+
+
+def test_get_visible_unread_count_success_and_zero(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+
+    resp_zero = MagicMock()
+    resp_zero.status_code = 200
+    resp_zero.json.return_value = {"visibleCount": 0}
+
+    with patch("requests.post", return_value=resp_zero) as mock_post:
+        count = tool.get_visible_unread_count(
+            chat_ids=["123@c.us"],
+            msg_ids=["false_123@c.us_M1"],
+            stanza_ids=["M1"],
+            has_untracked=False,
+        )
+        assert count == 0
+        mock_post.assert_called_once_with(
+            "http://127.0.0.1:3000/unread/visible_count",
+            json={
+                "chatIds": ["123@c.us"],
+                "msgIds": ["false_123@c.us_M1"],
+                "stanzaIds": ["M1"],
+                "hasUntracked": False,
+            },
+            timeout=10,
+        )
+
+    resp_two = MagicMock()
+    resp_two.status_code = 200
+    resp_two.json.return_value = {"visibleCount": 2}
+    with patch("requests.post", return_value=resp_two):
+        assert tool.get_visible_unread_count(chat_ids=["123@c.us"]) == 2
+
+
+def test_get_visible_unread_count_503_and_exception_fail_closed(mock_whatsapp_tool):
+    import requests as req_lib
+
+    tool, _ = mock_whatsapp_tool
+
+    resp_503 = MagicMock()
+    resp_503.status_code = 503
+    with patch("requests.post", return_value=resp_503):
+        assert tool.get_visible_unread_count(chat_ids=["123@c.us"]) == 0
+
+    with patch("requests.post", side_effect=req_lib.exceptions.ConnectionError("refused")):
+        assert tool.get_visible_unread_count(chat_ids=["123@c.us"]) == 0
+
+
+def test_get_visible_unread_count_404_fallback_filters_non_messages(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+
+    resp_404 = MagicMock()
+    resp_404.status_code = 404
+
+    resp_unread = MagicMock()
+    resp_unread.status_code = 200
+    resp_unread.json.return_value = {
+        "unread": [
+            {"id": "false_111@g.us_GP2", "chatId": "111@g.us", "type": "gp2", "content": ""},
+            {"id": "false_111@g.us_REV1", "chatId": "111@g.us", "type": "revoked", "content": ""},
+            {"id": "false_222@c.us_REAL1", "chatId": "222@c.us", "type": "chat", "content": "Hello"},
+        ]
+    }
+
+    with patch("requests.post", return_value=resp_404), patch("requests.get", return_value=resp_unread):
+        assert tool.get_visible_unread_count(msg_ids=["false_111@g.us_REV1"], stanza_ids=["REV1"]) == 0
+        assert tool.get_visible_unread_count(msg_ids=["false_222@c.us_REAL1"], stanza_ids=["REAL1"]) == 1
+        assert tool.get_visible_unread_count(chat_ids=["111@g.us"], has_untracked=True) == 0
+        assert tool.get_visible_unread_count(chat_ids=["222@c.us"], has_untracked=True) == 1
+
+
+def test_whatsapp_unread_filters_non_message_and_revoked_items(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    mock_status_resp = MagicMock()
+    mock_status_resp.json.return_value = {"ready": True}
+
+    mock_only_non_msgs = MagicMock()
+    mock_only_non_msgs.json.return_value = {
+        "unread": [
+            {"id": "false_111@g.us_GP2", "chatId": "111@g.us", "type": "gp2", "content": ""},
+            {"id": "false_222@c.us_E2E", "chatId": "222@c.us", "type": "e2e_notification", "content": ""},
+            {"id": "false_222@c.us_REV", "chatId": "222@c.us", "type": "revoked", "content": ""},
+            {"id": "false_222@c.us_EMPTY", "chatId": "222@c.us", "type": "chat", "content": "   "},
+        ]
+    }
+
+    def fake_get_empty(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        return mock_only_non_msgs
+
+    with patch("requests.get", side_effect=fake_get_empty):
+        assert tool.execute("unread") == "No unread messages."
+
+    mock_mixed = MagicMock()
+    mock_mixed.json.return_value = {
+        "unread": [
+            {"id": "false_111@g.us_GP2", "chatId": "111@g.us", "type": "gp2", "content": ""},
+            {
+                "id": "false_222@c.us_REAL1",
+                "chatId": "222@c.us",
+                "chatName": "Alice",
+                "senderName": "Alice",
+                "senderNumber": "222",
+                "content": "Actual message",
+                "type": "chat",
+                "hasMedia": False,
+            },
+        ]
+    }
+
+    def fake_get_mixed(url, *args, **kwargs):
+        if url.endswith("/status"):
+            return mock_status_resp
+        return mock_mixed
+
+    with patch("requests.get", side_effect=fake_get_mixed):
+        res = tool.execute("unread")
+        assert isinstance(res, str)
+        assert "Actual message" in res
+        assert "GP2" not in res
+
+
+def test_whatsapp_on_message_revoked_forwarding(mock_whatsapp_tool):
+    tool, _ = mock_whatsapp_tool
+    revoked_events = []
+    tool.message_revoked_callback = lambda **kw: revoked_events.append(kw)
+
+    tool._on_message_revoked(
+        msg_id="false_123@c.us_ABC",
+        msg_stanza_id="ABC",
+        chat_id="123@c.us",
+        revoke_type="sender_revoke",
+    )
+    assert revoked_events == [
+        {
+            "msg_id": "false_123@c.us_ABC",
+            "msg_stanza_id": "ABC",
+            "chat_id": "123@c.us",
+            "revoke_type": "sender_revoke",
+        }
+    ]
 
 

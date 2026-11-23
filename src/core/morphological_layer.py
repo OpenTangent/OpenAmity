@@ -15,10 +15,17 @@ import logging
 import datetime
 import threading
 import contextlib
-from typing import List, Dict, Tuple, Optional, Set, Any
+from typing import List, Dict, Tuple, Optional, Set, Any, Callable, Sequence
 import numpy as np
 
+from core.palace_fts import extract_query_centered_snippet, tokenize_non_stopwords
+
 logger = logging.getLogger(__name__)
+
+_TRIVIAL_INPUT_RE = re.compile(
+    r"^(hi|hey|hello|morning|good morning|good evening|good night|thanks|thank you|ok|okay|cool|great|yes|no|yep|nope|sure|got it|nice|awesome|cheers|bye)[!.?,\s]*$",
+    re.IGNORECASE,
+)
 
 # Monotonically decreasing coupling weights from Sphere 1 (Self) to Sphere 10 (Universal)
 SPHERE_COUPLING_WEIGHTS: Dict[int, float] = {
@@ -46,6 +53,164 @@ def _resolve_sphere_weight(val: Any) -> float:
         return max(0.05, min(1.0, fval))
     except (ValueError, TypeError):
         return 1.0
+
+
+def compute_cross_session_semantic_bridges(
+    drawer_ids: Sequence[str],
+    embeddings: np.ndarray,
+    group_keys: Sequence[str],
+    sem_threshold: float = 0.60,
+    top_k: int = 2,
+    weight_scale: float = 0.80,
+) -> List[Tuple[str, str, float]]:
+    """
+    Compute sparse bidirectional cross-session semantic bridges from already-stored drawer embeddings.
+    Two drawers are eligible ONLY if they belong to different `group_keys` (e.g. distinct sessions/days)
+    and their cosine similarity >= `sem_threshold`.
+    Returns deduplicated directed pairs (src_id, dst_id, weight) ready for morpho_edges upsert.
+    """
+    n = len(drawer_ids)
+    if n < 2 or embeddings is None or len(embeddings) != n or len(group_keys) != n:
+        return []
+
+    E = np.asarray(embeddings, dtype=np.float32)
+    norms = np.linalg.norm(E, axis=1, keepdims=True) + 1e-8
+    En = E / norms
+
+    k = min(int(top_k), n - 1)
+    if k <= 0:
+        return []
+
+    # Pre-index group membership once so same-session masking is vectorized
+    raw_groups: Dict[str, List[int]] = {}
+    for idx, g in enumerate(group_keys):
+        if g:
+            raw_groups.setdefault(g, []).append(idx)
+    group_indices: Dict[str, np.ndarray] = {
+        g: np.asarray(idxs, dtype=np.intp) for g, idxs in raw_groups.items()
+    }
+
+    best_edges: Dict[Tuple[str, str], float] = {}
+    chunk_size = 512
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        S_block = En[start:end] @ En.T
+        for local_i, i in enumerate(range(start, end)):
+            row = S_block[local_i].copy()
+            gi = group_keys[i]
+            # Exclude self and same-session / same-group drawers
+            row[i] = -1.0
+            if gi:
+                row[group_indices[gi]] = -1.0
+
+            cand_idx = np.argpartition(-row, k)[:k]
+            for j in cand_idx:
+                sim = float(row[j])
+                if sim >= sem_threshold:
+                    w = round(sim * weight_scale, 4)
+                    u, v = drawer_ids[i], drawer_ids[j]
+                    if w > best_edges.get((u, v), 0.0):
+                        best_edges[(u, v)] = w
+                        best_edges[(v, u)] = w
+
+    return [(u, v, w) for (u, v), w in sorted(best_edges.items())]
+
+
+def prime_for_input(
+    user_text: str,
+    dense_search_fn: Callable[[str, int], List[Dict[str, Any]]],
+    bm25_search_fn: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+    morpho_relax_fn: Optional[Callable[[List[str], int], List[Tuple[str, float]]]] = None,
+    hydrate_fn: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+    sim_gate_strong: float = 0.45,
+    sim_gate_corroborated: float = 0.35,
+    morpho_potential_gate: float = 0.32,
+    max_chars: int = 750,
+    exclude_drawer_ids: Optional[Sequence[str]] = None,
+) -> str:
+    """
+    KV-cache-safe Perturbation-Driven Prospective Priming for incoming user messages.
+    Silence-by-default: returns '' (0 prompt tokens) unless resonance clears the calibrated gate.
+
+    `dense_search_fn(query, limit)` returns list of dicts with:
+        {'drawer_id', 'score' (cosine sim 0..1), 'content', 'source_file', 'wing', 'room'}
+    """
+    text = (user_text or "").strip()
+    if len(text) < 16 or _TRIVIAL_INPUT_RE.match(text):
+        return ""
+    if len(tokenize_non_stopwords(text)) < 2:
+        return ""
+
+    dense_hits = dense_search_fn(text, 5) or []
+    if not dense_hits:
+        return ""
+
+    bm25_ids: Set[str] = set()
+    if bm25_search_fn is not None:
+        try:
+            bm25_hits = bm25_search_fn(text, 5) or []
+            bm25_ids = {str(h["drawer_id"]) for h in bm25_hits[:3] if h.get("drawer_id")}
+        except Exception:
+            bm25_ids = set()
+
+    top = dense_hits[0]
+    top_sim = float(top.get("score") or 0.0)
+    top_id = str(top["drawer_id"])
+    corroborated = top_id in bm25_ids
+
+    # Strict Silence Gate
+    if not (top_sim >= sim_gate_strong or (corroborated and top_sim >= sim_gate_corroborated)):
+        return ""
+
+    excluded_set = {str(d) for d in (exclude_drawer_ids or ()) if d}
+    selected: List[Tuple[str, str, str]] = []  # (drawer_id, tag, snippet)
+    seen_ids = {top_id} | excluded_set
+    top_src = os.path.basename(str(top.get("source_file") or "")).strip()
+    seen_sources = {top_src} if top_src else set()
+
+    if top_id not in excluded_set:
+        snip1 = extract_query_centered_snippet(str(top.get("content") or ""), text, max_len=240)
+        tag1 = f"sim={top_sim:.2f}, kw" if corroborated else f"sim={top_sim:.2f}"
+        selected.append((top_id, tag1, snip1))
+
+    # Optional 1-hop cross-session Morphological Highway companion cue
+    if morpho_relax_fn is not None and hydrate_fn is not None:
+        try:
+            spread = morpho_relax_fn([top_id], 4) or []
+            for nid, pot in spread:
+                nid_str = str(nid)
+                if nid_str in seen_ids or float(pot) < morpho_potential_gate:
+                    continue
+                rec = hydrate_fn(nid_str)
+                if not rec:
+                    continue
+                src = os.path.basename(str(rec.get("source_file") or "")).strip()
+                if src and src in seen_sources:
+                    continue
+                snip2 = extract_query_centered_snippet(str(rec.get("content") or ""), text, max_len=220)
+                selected.append((nid_str, f"highway V={float(pot):.2f}", snip2))
+                seen_ids.add(nid_str)
+                if src:
+                    seen_sources.add(src)
+                break
+        except Exception:
+            pass
+
+    if not selected:
+        return ""
+
+    lines = [
+        "[Morphological Resonance — Partial Pre-Conscious Hint "
+        "(NOT exhaustive; always verify with MemPalace_search when updates, "
+        "counts, dates, or multiple sessions may exist)]:"
+    ]
+    for did, tag, snip in selected:
+        lines.append(f"- [Drawer #{did}] ({tag}) {snip}")
+    out = "\n".join(lines)
+    max_chars = max(1, int(max_chars))
+    if len(out) > max_chars:
+        out = out[:max_chars] if max_chars < 4 else out[: max_chars - 3] + "..."
+    return out
 
 
 class MorphologicalMemoryLayer:
@@ -730,6 +895,7 @@ class MorphologicalMemoryLayer:
         sphere_weights: Optional[Dict[str, Any]] = None,
         perspective_injections: Optional[Dict[str, Any]] = None,
         target_drawers: Optional[List[str]] = None,
+        min_potential: Optional[float] = None,
     ) -> List[Tuple[str, float]]:
         """
         Runs dynamic perturbation relaxation loop conditioned on target setpoints.
@@ -855,7 +1021,16 @@ class MorphologicalMemoryLayer:
         ranked_indices = np.argsort(-V)
         results: List[Tuple[str, float]] = []
         target_set = set(canonical_targets)
+        explicit_gate = False
         min_threshold = 0.10 * min_target_weight
+        if min_potential is not None and not isinstance(min_potential, bool):
+            try:
+                mp_val = float(min_potential)
+                if math.isfinite(mp_val):
+                    min_threshold = max(0.0, mp_val)
+                    explicit_gate = True
+            except (ValueError, TypeError):
+                pass
 
         for idx in ranked_indices:
             if len(results) >= k_out:
@@ -863,10 +1038,68 @@ class MorphologicalMemoryLayer:
             node_id = nodes[idx]
             if node_id in target_set:
                 continue
-            if V[idx] > min_threshold:
-                results.append((node_id, float(V[idx])))
+            val = float(V[idx])
+            if (val >= min_threshold) if explicit_gate else (val > min_threshold):
+                results.append((node_id, val))
 
         return results
+
+    def upsert_semantic_bridges(self, edges: List[Tuple[str, str, float]]) -> int:
+        """
+        Upserts sleep-time cross-session semantic bridge edges without weakening
+        stronger lived Hebbian co-activation edges.
+        """
+        if not edges:
+            return 0
+
+        deduped: Dict[Tuple[str, str], float] = {}
+        for raw_u, raw_v, raw_w in edges:
+            u = self._canonical_id(raw_u)
+            v = self._canonical_id(raw_v)
+            if not u or not v or u == v:
+                continue
+            try:
+                w = float(raw_w)
+            except (ValueError, TypeError):
+                continue
+            if not math.isfinite(w) or w < 0.05:
+                continue
+            w = min(10.0, w)
+            key = (u, v)
+            if w > deduped.get(key, 0.0):
+                deduped[key] = w
+
+        if not deduped:
+            return 0
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        unique_nodes = sorted({nid for pair in deduped for nid in pair})
+        node_rows = [(nid, now_iso, now_iso) for nid in unique_nodes]
+        edge_rows = [(u, v, w, now_iso, now_iso) for (u, v), w in sorted(deduped.items())]
+
+        with self._get_conn() as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO morpho_nodes (drawer_id, wing, room, created_at, last_activated)
+                VALUES (?, 'default', 'general', ?, ?)
+                """,
+                node_rows,
+            )
+            conn.executemany(
+                """
+                INSERT INTO morpho_edges (source_id, target_id, weight, created_at, last_reinforced)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, target_id) DO UPDATE SET
+                    weight = MAX(morpho_edges.weight, excluded.weight),
+                    last_reinforced = CASE
+                        WHEN excluded.weight > morpho_edges.weight THEN excluded.last_reinforced
+                        ELSE morpho_edges.last_reinforced
+                    END
+                """,
+                edge_rows,
+            )
+
+        return len(edge_rows)
 
     def link_setpoint(self, goal_key: str, drawer_ids: List[str]) -> Dict[str, Any]:
         """Explicitly connects a goal setpoint anchor to target memory drawers."""

@@ -4,28 +4,19 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>Open Amity</name>
-  <summary>Sovereign multi-agent cognitive framework</summary>
+  <summary>Subjective and empathetic AI</summary>
   <description>
     <p>
-      Most AI agent harnesses treat agents as ephemeral, stateless task-runners—wrapping an LLM
-      in a loop with passive RAG lookups and a static prompt. Open Amity creates persistent,
-      self-aware, and subjective digital collaborators that live and evolve continuously.
-    </p>
-    <p>
-      Provider-agnostic by design, Open Amity supports OpenRouter (450+ models across 60+
-      providers), Google Gemini, Anthropic Claude, OpenAI ChatGPT, and DeepSeek, with decoupled
-      voice synthesis (local ONNX Piper or cloud Gemini 3.8 Flash TTS), local Whisper
-      speech-to-text, and multimodal image generation.
+      Unlike stateless chatbots bound to static prompts, Open Amity creates persistent,
+      empathetic digital collaborators that evolve continuously, with a living identity,
+      personal goals, and internal thoughts separate from speech.
     </p>
     <ul>
-      <li>4-Layer MemPalace: Self-evolving Layer 0 identity, fail-closed Layer 1 continuity, a Layer 2 Bidirectional Empathy Cone spanning 10 Concentric Spheres of Consciousness, and Layer 3 semantic vector search</li>
-      <li>Morphological Memory Engine: Continuous dynamical graph with Hebbian co-activation, intrinsic temporal decay, and sphere-weighted prospective goal attractors</li>
-      <li>Somatic Physiology and Two-Beat Sleep Consolidation: Replaces arbitrary context truncation with token fatigue thresholds, silent sleep cycles (factual distillation followed by subjective synthesis), and crash-resilient session continuity</li>
-      <li>Private Monologue and Live Interjections: Separates internal reasoning from intentional spoken or text replies, supporting non-derailing text and voice interjections mid-thought or mid-tool-batch</li>
-      <li>Proactive Agency and Webhooks: Tracks teleological aspirations across spheres, schedules autonomous wake pulses (PulseEngine), and accepts external triggers from Home Assistant, IoT sensors, and CI/CD through a local HTTP gateway</li>
-      <li>Multi-Agent Chatrooms: Runs isolated agent personas concurrently with 1-on-1 messaging and permissioned team chatrooms featuring @mentions, reactions, and room-scoped DMs</li>
-      <li>Integrated Tool Ecosystem: Camoufox stealth browser with Set-of-Marks grounding, isolated WhatsApp bridge, OAuth 2.0 IMAP/SMTP email with local archiving, DuckDuckGo search, Mastodon, Moltbook, bash terminal, and parallel background subagents</li>
-      <li>Portable Snapshots (.oaa) and Presets: Export, migrate, or roll back complete agent instances in verified archives, or start immediately with 8 one-click archetype presets</li>
+      <li>Layered awareness: Bio-inspired Morphological Memory engine, concentric Theory of Mind perception, and somatic state</li>
+      <li>Proactive agency: Autonomous wake pulses, mid-task interjections, pulse webhooks, and inter-agent chatrooms</li>
+      <li>Integrated tools: WhatsApp, email, Mastodon, Moltbook, web browser, terminal, and subagents</li>
+      <li>Model freedom: Gemini, Claude, GPT, DeepSeek, or OpenRouter with Gemini TTS (high-quality) or local (low-quality) voice</li>
+      <li>Portable minds: Capture snapshots of agent memories, tasks, and file data for agent cloning, relocation, and backups</li>
     </ul>
   </description>
   <launchable type="desktop-id">com.openamity.OpenAmity.desktop</launchable>
@@ -36,45 +27,45 @@
     <name>Andrew Craucamp</name>
   </developer>
   <branding>
-    <color type="primary" scheme_preference="light">#a12924</color>
-    <color type="primary" scheme_preference="dark">#a12924</color>
+    <color type="primary" scheme_preference="light">#f5b5aa</color>
+    <color type="primary" scheme_preference="dark">#6e1f1c</color>
   </branding>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Agent.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Agent.png</image>
       <caption>Main conversational interface with active speech and thought monitoring</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Chatroom.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Chatroom.png</image>
       <caption>Multi-agent collaborative chatroom environment with team message feed</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-NewAgent.png</image>
-      <caption>Creating a new agent persona with customized archetype and Crockford Base32 ID</caption>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-NewAgent.png</image>
+      <caption>Creating a new agent persona with customizable archetypes</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Provider.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Provider.png</image>
       <caption>Configuring cognitive AI providers including Gemini, Claude, ChatGPT, DeepSeek, and OpenRouter</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Settings.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Settings.png</image>
       <caption>Agent settings panel managing fatigue budgets, Low Token Mode, and autonomous behavior</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Snapshots.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Snapshots.png</image>
       <caption>Managing portable Open Amity Agent (.oaa) snapshots for backup, export, and migration</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Social.png</image>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Social.png</image>
       <caption>Social communication integrations including WhatsApp, Email, Mastodon, and Moltbook</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Values.png</image>
-      <caption>Autonomous Layer 0 identity evolution showing core values, aspirations, and anti-patterns</caption>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Values.png</image>
+      <caption>Tracking agent core values, aspirations, and behavioral guidelines</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.8/src/assets/screenshots/sc-Voice.png</image>
-      <caption>Voice synthesis options between local neural Piper TTS and cloud Gemini TTS</caption>
+      <image>https://raw.githubusercontent.com/OpenTangent/OpenAmity/v0.3.9/src/assets/screenshots/sc-Voice.png</image>
+      <caption>Configuring local and cloud voice synthesis options</caption>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1" />
@@ -104,20 +95,31 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.3.9" date="2026-11-23">
+      <description>
+        <p>Open Amity v0.3.9 strengthens agent identity and proactive empathy, upgrades Morphological Memory, and refreshes the sidebar and speech controls:</p>
+        <ul>
+          <li>Significantly strengthened agents' core identity and added proactive empathy</li>
+          <li>Significantly improved the Morphological Memory engine</li>
+          <li>Added play/stop buttons to speech transcript cards</li>
+          <li>Moved agent tabs into the sidebar and improved the sidebar UI</li>
+          <li>Fixed a tool-call invocation bug causing some models to occasionally fail to invoke tools correctly</li>
+          <li>Fully removed the deprecated Antigravity cognitive worker</li>
+          <li>WhatsApp pulses now only trigger when at least one new message is visible to the agent (deleted messages will not wake the agent)</li>
+          <li>Added background email monitoring and auto-pulse feature</li>
+        </ul>
+      </description>
+    </release>
+
     <release version="0.3.8" date="2026-11-13">
       <description>
-        <p>Open Amity v0.3.8 introduces live user interjections, a redesigned speech visualiser, and full session persistence:</p>
+        <p>Open Amity v0.3.8 adds live mid-task interjections, persistent session state, and a redesigned voice visualizer:</p>
         <ul>
-          <li>Redesigned the speech visualiser to better convey speech (and it looks pretty cool too)</li>
-          <li>Added support for user interjections while an agent is mid-task</li>
-          <li>Added poll interaction support to the WhatsApp tool</li>
-          <li>Persisted active session data fully across app restarts</li>
-          <li>Made agent thoughts visible in the conversation log</li>
-          <li>Fixed a bug with audio transcription for models without native audio input</li>
-          <li>Added model list refresh buttons to all cognitive providers</li>
-          <li>Added the ability for agents to explicitly invoke a sleep cycle</li>
-          <li>Enabled agents to grant file access permissions to subagents to delegate file edit tasks</li>
-          <li>Reduced the system prompt size to lower API costs</li>
+          <li>Send text or voice interjections while an agent is mid-task and view thoughts inline</li>
+          <li>Persist active sessions across restarts and trigger sleep consolidation cycles on demand</li>
+          <li>Redesigned the speech visualizer and fixed fallback audio transcription handling</li>
+          <li>Added WhatsApp poll support and model refresh buttons across all AI providers</li>
+          <li>Added delegated file access for subagents and reduced system prompt size</li>
         </ul>
       </description>
     </release>

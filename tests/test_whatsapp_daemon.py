@@ -78,6 +78,11 @@ def test_whatsapp_daemon_skips_occupied_port(temp_agent_environment):
 
 
 def test_whatsapp_daemon_start_passes_port_env(temp_agent_environment):
+    from core.settings_manager import SettingsManager
+    sm = SettingsManager(agent_id="agent-env-test")
+    sm.set("core.agent.name", "Amity")
+    sm.save()
+
     daemon = WhatsAppDaemon(agent_id="agent-env-test")
     os.makedirs(daemon.bridge_dir, exist_ok=True)
     # Create dummy server.js so start doesn't bail early
@@ -104,6 +109,7 @@ def test_whatsapp_daemon_start_passes_port_env(temp_agent_environment):
         env = call_args[1].get("env", {})
         assert env.get("WHATSAPP_PORT") == str(daemon.port)
         assert env.get("PORT") == str(daemon.port)
+        assert env.get("WHATSAPP_AGENT_NAME") == "Amity"
         assert os.path.exists(daemon.port_file)
         with open(daemon.port_file, "r") as pf:
             assert pf.read().strip() == str(daemon.port)
@@ -295,7 +301,7 @@ def test_whatsapp_daemon_parse_message_line():
     daemon.message_callback = lambda s_id, s_name, **kwargs: events.append((s_id, s_name, kwargs))
 
     # 1. Parse JSON message line with group and mention
-    line_json = '[MSG_RECEIVED_JSON] {"chatId": "12345@g.us", "senderName": "Alice", "isGroup": true, "groupName": "Project Amity", "mentioned": true}'
+    line_json = '[MSG_RECEIVED_JSON] {"chatId": "12345@g.us", "senderName": "Alice", "isGroup": true, "groupName": "Project Amity", "mentioned": true, "mentionReason": "jid"}'
     daemon._parse_message_line(line_json)
     assert len(events) == 1
     assert events[0][0] == "12345@g.us"
@@ -303,6 +309,7 @@ def test_whatsapp_daemon_parse_message_line():
     assert events[0][2]["is_group"] is True
     assert events[0][2]["group_name"] == "Project Amity"
     assert events[0][2]["mentioned"] is True
+    assert events[0][2]["mention_reason"] == "jid"
 
     # 2. Parse legacy line
     line_legacy = '[MSG_RECEIVED] 27836527975@c.us Bob'
@@ -409,5 +416,39 @@ def test_whatsapp_daemon_concurrent_chrome_download_deduplication(temp_agent_env
     assert chrome_bin is not None and os.access(chrome_bin, os.X_OK)
     assert not os.path.exists(os.path.join(cache_root, "puppeteer", "chrome-linux64", "locales", "fr.pak"))
     assert os.path.exists(os.path.join(cache_root, "puppeteer", "chrome-linux64", "locales", "en-US.pak"))
+
+
+def test_whatsapp_daemon_parse_message_and_revoke_lines():
+    daemon = WhatsAppDaemon(agent_id="test-daemon-revoke")
+    received = []
+    revoked = []
+    daemon.message_callback = lambda s_id, s_name, **kwargs: received.append((s_id, s_name, kwargs))
+    daemon.message_revoked_callback = lambda **kwargs: revoked.append(kwargs)
+
+    daemon._parse_message_line(
+        '[MSG_RECEIVED_JSON] {"chatId": "27831112222@c.us", "rawChatId": "999888@lid", '
+        '"senderName": "Alice", "isGroup": false, "groupName": "", "mentioned": false, '
+        '"msgId": "false_999888@lid_3EB0XYZ", "msgStanzaId": "3EB0XYZ", "msgType": "chat", "subtype": ""}'
+    )
+    assert len(received) == 1
+    assert received[0][0] == "27831112222@c.us"
+    assert received[0][1] == "Alice"
+    assert received[0][2]["raw_chat_id"] == "999888@lid"
+    assert received[0][2]["msg_id"] == "false_999888@lid_3EB0XYZ"
+    assert received[0][2]["msg_stanza_id"] == "3EB0XYZ"
+    assert received[0][2]["msg_type"] == "chat"
+
+    # Revoke event must still dispatch even when message_callback is None
+    daemon.message_callback = None
+    daemon._parse_message_line(
+        '[MSG_REVOKED_JSON] {"msgId": "false_999888@lid_3EB0XYZ", "chatId": "999888@lid", "revokeType": "sender_revoke"}'
+    )
+    assert len(revoked) == 1
+    assert revoked[0] == {
+        "msg_id": "false_999888@lid_3EB0XYZ",
+        "msg_stanza_id": "3EB0XYZ",
+        "chat_id": "999888@lid",
+        "revoke_type": "sender_revoke",
+    }
 
 

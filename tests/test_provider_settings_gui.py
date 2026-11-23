@@ -25,7 +25,8 @@ def qapp():
 
 def test_provider_models_structure():
     """Verify PROVIDER_MODELS structure, keys, and Custom... terminating entry."""
-    expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "openrouter", "antigravity"]
+    expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]
+    assert set(PROVIDER_MODELS.keys()) == set(expected_providers)
     for prov in expected_providers:
         assert prov in PROVIDER_MODELS, f"Provider {prov} missing in PROVIDER_MODELS"
         assert "models" in PROVIDER_MODELS[prov]
@@ -81,12 +82,6 @@ def test_provider_gui_controls_exist(qapp, monkeypatch, tmp_path):
 
         assert "The light model is used for low token mode" in light_tip.text()
         assert "automatic fallback" in light_tip.text()
-
-    # Antigravity is removed from GUI
-    assert getattr(widget, "ui_antigravity_model", None) is None
-    assert getattr(widget, "ui_antigravity_custom_model", None) is None
-    assert getattr(widget, "ui_antigravity_thinking_level", None) is None
-    assert getattr(widget, "ui_antigravity_light_model", None) is None
 
 
 def test_custom_model_visibility_toggle(qapp, monkeypatch, tmp_path):

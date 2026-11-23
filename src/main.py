@@ -206,6 +206,11 @@ def main():
     setup_logging(retention_days=retention_days, debug_logging=debug_logging)
     logger.info(f"Starting Open Amity Version: {amity_version}")
 
+    # Outside Flatpak on Linux, register a dedicated .Devel desktop entry so
+    # Wayland/GNOME Dash resolves the dev icon without shadowing the official Flatpak.
+    if "pytest" not in sys.modules:
+        paths.ensure_dev_desktop_entry()
+
     # Silence noisy multimedia and C-level FFmpeg decode logs
     try:
         from core.audio_output import silence_ffmpeg_logs
@@ -220,7 +225,7 @@ def main():
 
     QApplication.setApplicationName("Open Amity")
     # Desktop file name helps Wayland and Linux DEs match the app to its .desktop file
-    QApplication.setDesktopFileName("com.openamity.OpenAmity")
+    QApplication.setDesktopFileName(paths.get_desktop_app_id())
     app = QApplication(sys.argv)
 
     # Load custom fonts

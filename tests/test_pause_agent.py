@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
+from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import QApplication
 from core.settings_manager import SettingsManager
 from core.orchestrator import AmityOrchestrator
@@ -208,12 +209,31 @@ def test_gui_pause_button_and_layout(qapp, temp_agent_dir):
 
     # 2. Verify initial state (playing/active)
     assert view.btn_pause.text() == "❚❚"
+    idle_pause_css = view.btn_pause.styleSheet()
+    assert "font-size: 10px" in idle_pause_css
+    assert "padding-bottom" not in idle_pause_css
+    assert "padding-top: 4px" in view.btn_mic.styleSheet()
+    assert "padding-top: 5px" in view.btn_mute.styleSheet()
     assert view.text_input.isEnabled() is True
+
+    # Verify mute toggle keeps vertical centering padding
+    view.toggle_mute(True)
+    assert "padding-top: 5px" in view.btn_mute.styleSheet()
+    view.toggle_mute(False)
+    assert "padding-top: 5px" in view.btn_mute.styleSheet()
 
     # 3. Simulate pausing
     orch.is_paused = True
     orch.on_paused_state_changed.emit(True)
     assert view.btn_pause.text() == "▶"
+    pause_css = view.btn_pause.styleSheet()
+    assert "#1b3820" in pause_css
+    assert "#2e7d32" in pause_css
+    assert "#81c784" in pause_css
+    assert "padding-bottom: 4px" in pause_css
+    assert "#4a3b10" not in pause_css
+    assert "#FFD700" not in pause_css
+    assert "#AA8800" not in pause_css
     assert view.text_input.isEnabled() is False
     assert "Agent is paused" in view.text_input.placeholderText()
     assert view.btn_send.isEnabled() is False
@@ -223,6 +243,9 @@ def test_gui_pause_button_and_layout(qapp, temp_agent_dir):
     orch.is_paused = False
     orch.on_paused_state_changed.emit(False)
     assert view.btn_pause.text() == "❚❚"
+    unpaused_css = view.btn_pause.styleSheet()
+    assert "font-size: 10px" in unpaused_css
+    assert "padding-bottom" not in unpaused_css
     assert view.text_input.isEnabled() is True
     assert view.btn_send.isEnabled() is True
     assert view.btn_mic.isEnabled() is True
@@ -256,6 +279,76 @@ def test_agent_tab_button_paused_indicator(qapp):
 
     btn.set_paused(False)
     assert btn.is_paused is False
+
+
+def test_agent_tab_button_paused_layout_and_neutral_colors(qapp):
+    # 1. Main tab: idle unpaused vs paused
+    main_btn = AgentTabButton("agent_1", "Nova")
+    main_btn.setFixedWidth(180)
+    main_draw_rect = main_btn.rect().adjusted(4, 2, -4, -2)
+    main_fm = QFontMetrics(main_btn.font())
+
+    watch_center, pause_rect, text_rect = main_btn._compute_content_layout(main_draw_rect, main_fm)
+    assert watch_center is None
+    assert pause_rect is None
+
+    main_btn.set_paused(True)
+    watch_center, pause_rect, text_rect = main_btn._compute_content_layout(main_draw_rect, main_fm)
+    assert watch_center is None
+    assert pause_rect is not None
+    assert text_rect.right() < pause_rect.left()
+    assert pause_rect.right() <= main_draw_rect.right() - 5
+
+    # 2. Chatroom sub-item: watching unpaused vs watching + paused
+    sub_btn = AgentTabButton("agent_1", "Nova", is_sub_item=True, is_watching=True)
+    sub_btn.setFixedWidth(180)
+    sub_draw_rect = sub_btn.rect().adjusted(18, 1, -4, -1)
+    sub_fm = QFontMetrics(sub_btn.font())
+
+    watch_center, pause_rect, text_rect = sub_btn._compute_content_layout(sub_draw_rect, sub_fm)
+    assert watch_center is not None
+    assert pause_rect is None
+    assert text_rect.right() < watch_center.x() - 3
+
+    sub_btn.set_paused(True)
+    watch_center, pause_rect, text_rect = sub_btn._compute_content_layout(sub_draw_rect, sub_fm)
+    assert watch_center is not None
+    assert pause_rect is not None
+    assert text_rect.right() < pause_rect.left()
+    assert pause_rect.right() < watch_center.x() - 3
+
+    # 3. Rendered pixel colors match normal unpaused idle/selected tabs (no amber tint or border)
+    idle_main = AgentTabButton("agent_idle", "Nova")
+    idle_main.setFixedWidth(180)
+    paused_main = AgentTabButton("agent_paused", "Nova")
+    paused_main.setFixedWidth(180)
+    paused_main.set_paused(True)
+
+    idle_img = idle_main.grab().toImage()
+    paused_img = paused_main.grab().toImage()
+    assert paused_img.pixelColor(90, 5) == QColor("#292929")
+    assert paused_img.pixelColor(90, 5) == idle_img.pixelColor(90, 5)
+    assert paused_img.pixelColor(90, 2) == idle_img.pixelColor(90, 2)
+
+    idle_main.set_selected(True)
+    paused_main.set_selected(True)
+    idle_sel_img = idle_main.grab().toImage()
+    paused_sel_img = paused_main.grab().toImage()
+    assert paused_sel_img.pixelColor(90, 5) == QColor("#3a3a3a")
+    assert paused_sel_img.pixelColor(90, 5) == idle_sel_img.pixelColor(90, 5)
+    assert paused_sel_img.pixelColor(90, 2) == idle_sel_img.pixelColor(90, 2)
+
+    idle_sub = AgentTabButton("agent_sub_idle", "Nova", is_sub_item=True, is_watching=True)
+    idle_sub.setFixedWidth(180)
+    paused_sub = AgentTabButton("agent_sub_paused", "Nova", is_sub_item=True, is_watching=True)
+    paused_sub.setFixedWidth(180)
+    paused_sub.set_paused(True)
+
+    idle_sub_img = idle_sub.grab().toImage()
+    paused_sub_img = paused_sub.grab().toImage()
+    assert paused_sub_img.pixelColor(90, 5) == QColor("#262626")
+    assert paused_sub_img.pixelColor(90, 5) == idle_sub_img.pixelColor(90, 5)
+    assert paused_sub_img.pixelColor(90, 1) == idle_sub_img.pixelColor(90, 1)
 
 
 def test_pulse_engine_shares_orchestrator_settings_manager(temp_agent_dir):

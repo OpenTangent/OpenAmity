@@ -28,6 +28,54 @@ _html_to_plain_text = html_to_plain_text
 MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB max total attachment size (Gmail standard)
 
 
+def _parse_bool_param(value: Any, default: bool = False) -> bool:
+    """Safely parses boolean tool parameters (including stringified booleans)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in ("true", "1", "yes", "on"):
+            return True
+        if cleaned in ("false", "0", "no", "off", ""):
+            return False
+    return bool(value)
+
+
+def _parse_imap_fetch_data(msg_data: Any) -> Tuple[Optional[bytes], bool]:
+    """
+    Extracts raw payload bytes and whether the IMAP \\Seen flag is set from an
+    imaplib FETCH response, handling FLAGS placed either before or after literals
+    without scanning message body bytes.
+    """
+    raw_bytes: Optional[bytes] = None
+    meta_chunks: List[str] = []
+
+    for part in msg_data or []:
+        if isinstance(part, tuple):
+            if len(part) >= 1 and part[0]:
+                meta_chunks.append(
+                    part[0].decode("ascii", errors="ignore")
+                    if isinstance(part[0], bytes)
+                    else str(part[0])
+                )
+            if len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
+                payload = bytes(part[1])
+                if raw_bytes is None or len(payload) > len(raw_bytes):
+                    raw_bytes = payload
+        elif isinstance(part, bytes):
+            meta_chunks.append(part.decode("ascii", errors="ignore"))
+        elif isinstance(part, str):
+            meta_chunks.append(part)
+
+    flags_str = " ".join(meta_chunks)
+    flag_groups = re.findall(r"FLAGS\s*\(([^)]*)\)", flags_str, flags=re.IGNORECASE)
+    target_str = " ".join(flag_groups) if flag_groups else flags_str
+    is_seen = bool(re.search(r"\\seen(?![a-z0-9_-])", target_str, flags=re.IGNORECASE))
+    return raw_bytes, is_seen
+
+
 def _resolve_attachment_path(raw_path: str, agent_name: str = "Agent") -> Optional[str]:
     """Resolves an attachment path or filename across standard agent locations."""
     if not raw_path:
@@ -68,7 +116,9 @@ class EmailTool(Tool):
         "Manage the agent's dedicated email account: send emails, fetch recent messages, "
         "read full emails, search mailboxes, download attachments, and organize folders. "
         "Retrieved emails are moved to a local archive and cleared from the IMAP server to "
-        "prevent server mailbox quota exhaustion."
+        "prevent server mailbox quota exhaustion while preserving their unread status; "
+        "reading an email does not mark it as read, so call Email_mark_as_read explicitly "
+        "once you have read and handled it."
     )
     commands = [
         "send_email",
@@ -86,6 +136,110 @@ class EmailTool(Tool):
         super().__init__(orchestrator)
         self._token_manager = OAuth2TokenManager()
         self._archive = None
+        self.email_received_callback = None
+        self._monitor = None
+
+    @property
+    def monitor(self):
+        return self._monitor
+
+    def _on_email_received(
+        self,
+        sender_email: str,
+        sender_name: str = "",
+        uid: str = "",
+        message_id: str = "",
+        folder: str = "INBOX",
+        **kwargs,
+    ):
+        callback = getattr(self, "email_received_callback", None)
+        if callable(callback):
+            callback(
+                sender_email=sender_email,
+                sender_name=sender_name,
+                uid=uid,
+                message_id=message_id,
+                folder=folder,
+                **kwargs,
+            )
+
+    def sync_monitor_state(self) -> bool:
+        """
+        Starts, reconfigures, or stops the background IMAP EmailMonitor according to
+        live settings (`core.auto-pulse.email`), credentials, and orchestrator pause state.
+        """
+        if self._monitor is None:
+            from core.email_monitor import EmailMonitor
+            self._monitor = EmailMonitor(
+                email_tool=self,
+                orchestrator=self.orchestrator,
+                folder="INBOX",
+                email_received_callback=self._on_email_received,
+            )
+        else:
+            self._monitor.orchestrator = self.orchestrator
+            self._monitor.agent_id = getattr(self.orchestrator, "agent_id", None) if self.orchestrator else None
+            self._monitor.email_received_callback = self._on_email_received
+        return self._monitor.sync_state()
+
+    def has_unread_pending_emails(
+        self,
+        pending_emails: Optional[List[Dict[str, Any]]] = None,
+        has_untracked: bool = False,
+    ) -> bool:
+        """
+        Pre-dispatch check invoked by PulseEngine right before firing an email pulse.
+        Returns False only when local archiving is active, all triggering emails are tracked,
+        and every single tracked email has already been archived and marked read (`is_read == 1`).
+        """
+        if has_untracked or not pending_emails:
+            return True
+
+        try:
+            cfg = self._get_settings()
+        except Exception:
+            return True
+
+        if not cfg.get("archive_local", True):
+            return True
+
+        archive = self.archive
+        if archive is None or not hasattr(archive, "find_email_read_status"):
+            return True
+
+        checked_any = False
+        for item in pending_emails:
+            if not isinstance(item, dict):
+                return True
+            uid = str(item.get("uid") or "").strip()
+            msg_id = str(item.get("message_id") or "").strip()
+            folder = str(item.get("folder") or "INBOX").strip() or "INBOX"
+            if not uid and not msg_id:
+                return True
+            checked_any = True
+            try:
+                status = archive.find_email_read_status(
+                    folder=folder,
+                    message_id=msg_id,
+                    server_uid=uid,
+                )
+            except Exception as e:
+                logger.debug(f"has_unread_pending_emails archive check failed: {e}")
+                return True
+            # None -> still waiting on IMAP server; False -> archived and still unread
+            if status is None or status is False:
+                return True
+
+        return not checked_any
+
+    def shutdown(self):
+        """Stops the background IMAP email monitor cleanly."""
+        if self._monitor is not None:
+            try:
+                self._monitor.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping EmailMonitor during shutdown: {e}")
+            self._monitor = None
 
     @property
     def archive(self) -> EmailArchive:
@@ -403,18 +557,13 @@ class EmailTool(Tool):
             moved_count = 0
             for uid_bytes in uids:
                 uid_str = uid_bytes.decode("ascii", errors="replace")
-                res, msg_data = imap.uid("fetch", uid_bytes, "(RFC822 FLAGS)")
+                # CRITICAL: Use BODY.PEEK[] (never RFC822/BODY[]) so syncing on a
+                # read-write selected mailbox does NOT implicitly set \Seen on the server.
+                res, msg_data = imap.uid("fetch", uid_bytes, "(BODY.PEEK[] FLAGS)")
                 if res != "OK" or not msg_data:
                     continue
 
-                raw_bytes = None
-                is_read = False
-                for part in msg_data:
-                    if isinstance(part, tuple):
-                        raw_bytes = part[1]
-                        flags_str = part[0].decode("ascii", errors="ignore") if isinstance(part[0], bytes) else str(part[0])
-                        if "\\Seen" in flags_str:
-                            is_read = True
+                raw_bytes, is_read = _parse_imap_fetch_data(msg_data)
 
                 if raw_bytes:
                     try:
@@ -422,7 +571,8 @@ class EmailTool(Tool):
                             folder=folder,
                             raw_bytes=raw_bytes,
                             server_uid=uid_str,
-                            is_read=is_read
+                            is_read=is_read,
+                            preserve_existing_read_status=True,
                         )
                         if delete_from_server:
                             del_res, _ = imap.uid("store", uid_bytes, "+FLAGS", "\\Deleted")
@@ -627,7 +777,7 @@ class EmailTool(Tool):
     def _execute_fetch_emails(self, params: dict) -> str:
         folder = params.get("folder", "INBOX")
         limit = min(int(params.get("limit", 10)), 50)
-        unread_only = bool(params.get("unread_only", False))
+        unread_only = _parse_bool_param(params.get("unread_only"), default=False)
         cfg = self._get_settings()
 
         logger.debug(f"Fetching emails from folder '{folder}' (limit={limit}, unread_only={unread_only}, archive_local={cfg.get('archive_local', True)})")
@@ -696,18 +846,13 @@ class EmailTool(Tool):
                 if res != "OK" or not msg_data:
                     continue
 
-                headers_raw = b""
-                flags_str = ""
-                for part in msg_data:
-                    if isinstance(part, tuple):
-                        headers_raw = part[1]
-                        flags_str = str(part[0])
+                headers_raw, is_read = _parse_imap_fetch_data(msg_data)
+                headers_raw = headers_raw or b""
 
                 parsed_msg = email.message_from_bytes(headers_raw, policy=policy.default)
                 subject = _decode_mime_header(parsed_msg.get("Subject", "(No Subject)"))
                 from_sender = _decode_mime_header(parsed_msg.get("From", "Unknown Sender"))
                 date_str = parsed_msg.get("Date", "Unknown Date")
-                is_read = "\\Seen" in flags_str
 
                 results.append(
                     f"- [ID: {uid_str}] {'[READ]' if is_read else '[UNREAD]'} "
@@ -730,14 +875,13 @@ class EmailTool(Tool):
     def _execute_read_email(self, params: dict) -> str:
         email_id = str(params.get("email_id", "")).strip()
         folder = params.get("folder", "INBOX")
-        mark_as_read = bool(params.get("mark_as_read", True))
         cfg = self._get_settings()
 
         if not email_id:
             logger.error("read_email failed: 'email_id' is missing.")
             return "Error: 'email_id' is required to read an email."
 
-        logger.debug(f"Reading email UID '{email_id}' from folder '{folder}' (mark_as_read={mark_as_read}, archive_local={cfg.get('archive_local', True)})")
+        logger.debug(f"Reading email UID '{email_id}' from folder '{folder}' (read-only, archive_local={cfg.get('archive_local', True)})")
 
         if cfg.get("archive_local", True):
             em = self.archive.get_email(email_id, folder=folder)
@@ -749,8 +893,14 @@ class EmailTool(Tool):
                 em = self.archive.get_email(email_id, folder=folder)
 
             if em:
-                if mark_as_read:
-                    self.archive.mark_as_read(email_id, is_read=True, folder=folder)
+                # Intentionally NEVER auto-mark as read on open; the agent must call
+                # Email_mark_as_read explicitly once it has read and handled the email.
+                is_read = bool(em.get("is_read"))
+                status_line = (
+                    "READ"
+                    if is_read
+                    else "UNREAD (remains unread until you explicitly call Email_mark_as_read)"
+                )
 
                 subject = em.get("subject") or "(No Subject)"
                 from_sender = em.get("from_sender") or "Unknown"
@@ -765,9 +915,10 @@ class EmailTool(Tool):
                     att_names = []
                 att_section = "\nAttachments:\n" + "\n".join(f"- {a}" for a in att_names) if att_names else "\nAttachments: None"
 
-                logger.info(f"Successfully read email ID '{email_id}': '{subject}' from '{from_sender}' (local archive)")
+                logger.info(f"Successfully read email ID '{email_id}': '{subject}' from '{from_sender}' (local archive, is_read={is_read})")
                 return (
                     f"=== Email Details (ID: {email_id}) ===\n"
+                    f"Status: {status_line}\n"
                     f"Subject: {subject}\n"
                     f"From: {from_sender}\n"
                     f"To: {to_recipient}\n"
@@ -785,7 +936,7 @@ class EmailTool(Tool):
             logger.error(f"read_email failed: ID '{email_id}' not found in local archive or on server in folder '{folder}'.")
             return f"Error: Email with UID '{email_id}' not found in folder '{folder}'."
 
-        # Fallback to direct IMAP
+        # Fallback to direct IMAP (strictly read-only; never mutates \Seen)
         success, imap_or_err = self._get_imap_connection()
         if not success:
             logger.error(f"read_email IMAP connection failed: {imap_or_err}")
@@ -793,19 +944,19 @@ class EmailTool(Tool):
 
         imap = imap_or_err
         try:
-            status, _ = imap.select(f'"{folder}"', readonly=not mark_as_read)
+            status, _ = imap.select(f'"{folder}"', readonly=True)
             if status != "OK":
                 imap.logout()
                 logger.error(f"read_email failed: Folder '{folder}' could not be selected.")
                 return f"Error: Mailbox folder '{folder}' could not be selected."
 
-            status, data = imap.uid("fetch", email_id.encode("ascii"), "(RFC822)")
-            if status != "OK" or not data or not data[0] or not isinstance(data[0], tuple):
+            status, data = imap.uid("fetch", email_id.encode("ascii"), "(BODY.PEEK[] FLAGS)")
+            raw_bytes, is_read = _parse_imap_fetch_data(data) if status == "OK" else (None, False)
+            if status != "OK" or raw_bytes is None:
                 imap.logout()
                 logger.error(f"read_email failed: UID '{email_id}' not found in folder '{folder}'.")
                 return f"Error: Email with UID '{email_id}' not found in folder '{folder}'."
 
-            raw_bytes = data[0][1]
             msg = email.message_from_bytes(raw_bytes, policy=policy.default)
 
             subject = _decode_mime_header(msg.get("Subject", "(No Subject)"))
@@ -849,16 +1000,19 @@ class EmailTool(Tool):
             if not body_text.strip():
                 body_text = "(Email body is empty or in unsupported format)"
 
-            if mark_as_read:
-                imap.uid("store", email_id.encode("ascii"), "+FLAGS", "\\Seen")
-
             imap.logout()
-            logger.info(f"Successfully read email UID '{email_id}': '{subject}' from '{from_sender}' with {len(attachments)} attachment(s)")
+            logger.info(f"Successfully read email UID '{email_id}': '{subject}' from '{from_sender}' with {len(attachments)} attachment(s) (is_read={is_read})")
 
             att_section = "\nAttachments:\n" + "\n".join(f"- {a}" for a in attachments) if attachments else "\nAttachments: None"
+            status_line = (
+                "READ"
+                if is_read
+                else "UNREAD (remains unread until you explicitly call Email_mark_as_read)"
+            )
 
             return (
                 f"=== Email Details (ID: {email_id}) ===\n"
+                f"Status: {status_line}\n"
                 f"Subject: {subject}\n"
                 f"From: {from_sender}\n"
                 f"To: {to_recipient}\n"
@@ -1094,13 +1248,13 @@ class EmailTool(Tool):
                 logger.error(f"download_attachment failed: Folder '{folder}' could not be selected.")
                 return f"Error: Mailbox folder '{folder}' could not be selected."
 
-            status, data = imap.uid("fetch", email_id.encode("ascii"), "(RFC822)")
-            if status != "OK" or not data or not data[0] or not isinstance(data[0], tuple):
+            status, data = imap.uid("fetch", email_id.encode("ascii"), "(BODY.PEEK[])")
+            raw_bytes, _ = _parse_imap_fetch_data(data) if status == "OK" else (None, False)
+            if status != "OK" or raw_bytes is None:
                 imap.logout()
                 logger.error(f"download_attachment failed: Email UID '{email_id}' not found.")
                 return f"Error: Email with UID '{email_id}' not found."
 
-            raw_bytes = data[0][1]
             msg = email.message_from_bytes(raw_bytes, policy=policy.default)
             imap.logout()
 
@@ -1168,10 +1322,35 @@ class EmailTool(Tool):
                 self._safe_close_imap(imap)
             return f"Error downloading attachment: {type(e).__name__}: {str(e)}"
 
+    def _sync_imap_seen_flag_best_effort(self, server_uid: str, read: bool, folder: str = "INBOX") -> None:
+        """
+        Best-effort sync of \\Seen flag back to the IMAP server when server copies
+        are retained (delete_from_server=False, e.g. Gmail/Outlook). Never fails
+        local mark_as_read if the server is offline or the UID is no longer present.
+        """
+        if not server_uid:
+            return
+        imap = None
+        try:
+            success, imap_or_err = self._get_imap_connection()
+            if not success:
+                logger.debug(f"Skipping IMAP \\Seen sync for UID '{server_uid}': {imap_or_err}")
+                return
+            imap = imap_or_err
+            status, _ = imap.select(f'"{folder}"', readonly=False)
+            if status == "OK":
+                flag_cmd = "+FLAGS" if read else "-FLAGS"
+                imap.uid("store", str(server_uid).encode("ascii"), flag_cmd, "\\Seen")
+            imap.logout()
+        except Exception as e:
+            logger.debug(f"Best-effort IMAP \\Seen sync failed for UID '{server_uid}': {e}")
+            self._safe_close_imap(imap)
+
     def _execute_mark_as_read(self, params: dict) -> str:
         email_id = str(params.get("email_id", "")).strip()
-        read = bool(params.get("read", True))
-        folder = params.get("folder", "INBOX")
+        read = _parse_bool_param(params.get("read"), default=True)
+        explicit_folder = "folder" in params and bool(str(params.get("folder") or "").strip())
+        folder = str(params.get("folder") or "INBOX").strip() or "INBOX"
         cfg = self._get_settings()
 
         if not email_id:
@@ -1180,7 +1359,27 @@ class EmailTool(Tool):
         logger.debug(f"Marking email UID '{email_id}' as {'read' if read else 'unread'} in '{folder}' (archive_local={cfg.get('archive_local', True)})")
 
         if cfg.get("archive_local", True):
-            self.archive.mark_as_read(email_id, is_read=read, folder=folder)
+            em = self.archive.get_email(email_id, folder=folder)
+            if not em and not explicit_folder:
+                em = self.archive.get_email(email_id, folder=None)
+            if not em:
+                logger.warning(f"mark_as_read failed: Email '{email_id}' not found in local archive (folder='{folder}').")
+                return f"Error: Email '{email_id}' not found in folder '{folder}'."
+
+            target_folder = em.get("folder") or folder
+            updated = self.archive.mark_as_read(str(em["id"]), is_read=read, folder=target_folder)
+            if not updated:
+                logger.error(f"mark_as_read failed: Could not update local archive row for email '{email_id}'.")
+                return f"Failed to update read status for email '{email_id}'."
+
+            # When server copies are kept (e.g. Gmail/Outlook), mirror explicit read status to IMAP
+            if not cfg.get("delete_from_server", True) and em.get("server_uid"):
+                self._sync_imap_seen_flag_best_effort(
+                    server_uid=str(em["server_uid"]),
+                    read=read,
+                    folder=target_folder,
+                )
+
             logger.info(f"Updated read flag for email '{email_id}' to {read} in local archive")
             return f"Email '{email_id}' marked as {'read' if read else 'unread'}."
 
@@ -1192,7 +1391,11 @@ class EmailTool(Tool):
 
         imap = imap_or_err
         try:
-            imap.select(f'"{folder}"', readonly=False)
+            sel_status, _ = imap.select(f'"{folder}"', readonly=False)
+            if sel_status != "OK":
+                imap.logout()
+                logger.error(f"mark_as_read failed: Folder '{folder}' could not be selected.")
+                return f"Error: Mailbox folder '{folder}' could not be selected."
             flag_cmd = "+FLAGS" if read else "-FLAGS"
             status, _ = imap.uid("store", email_id.encode("ascii"), flag_cmd, "\\Seen")
             imap.logout()
@@ -1351,7 +1554,7 @@ class EmailTool(Tool):
             },
             {
                 "name": "Email_fetch_emails",
-                "description": "Fetch a list of recent emails from a mailbox folder (default INBOX).",
+                "description": "Fetch a list of recent emails from a mailbox folder (default INBOX). Syncs new mail from IMAP without marking it as read; emails remain unread until you explicitly call Email_mark_as_read.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -1372,21 +1575,17 @@ class EmailTool(Tool):
             },
             {
                 "name": "Email_read_email",
-                "description": "Read the full contents, headers, and attachment list of a specific email by its ID.",
+                "description": "Read the full contents, headers, and attachment list of a specific email by its ID. Opening an email does NOT mark it as read; you must explicitly call Email_mark_as_read after reading and handling it.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "email_id": {
                             "type": "STRING",
-                            "description": "The UID of the email to read (from fetch_emails or search_emails)."
+                            "description": "The ID of the email to read (from fetch_emails or search_emails)."
                         },
                         "folder": {
                             "type": "STRING",
                             "description": "Mailbox folder (default 'INBOX')."
-                        },
-                        "mark_as_read": {
-                            "type": "BOOLEAN",
-                            "description": "Whether to mark the email as read/seen on the server. Defaults to true."
                         }
                     },
                     "required": ["email_id"]
@@ -1457,13 +1656,13 @@ class EmailTool(Tool):
             },
             {
                 "name": "Email_mark_as_read",
-                "description": "Mark an email as read or unread on the server.",
+                "description": "Explicitly mark an email as read or unread. Opening an email with Email_read_email does NOT mark it as read—call this tool once you have read and handled an email (or pass read=False to keep/mark it unread for follow-up).",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "email_id": {
                             "type": "STRING",
-                            "description": "The UID of the email."
+                            "description": "The ID of the email (from fetch_emails or search_emails)."
                         },
                         "read": {
                             "type": "BOOLEAN",
@@ -1509,7 +1708,7 @@ class EmailTool(Tool):
             },
             {
                 "name": "Email_sync_emails",
-                "description": "Synchronize incoming emails from the IMAP server into the local archive and purge them from the server to free mailbox quota.",
+                "description": "Synchronize incoming emails from the IMAP server into the local archive (preserving unread status without marking them read) and purge them from the server to free mailbox quota.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {

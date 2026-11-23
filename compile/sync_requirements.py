@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
+import argparse
+import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 
@@ -14,11 +18,255 @@ FLATPAK_REQS_FILE = "requirements-flatpak.txt"
 GENERATOR_URL = "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/pip/flatpak-pip-generator.py"
 GENERATOR_SCRIPT = "flatpak-pip-generator.py"
 
+def _normalize_pkg_name(name: str) -> str:
+    """Canonicalize a Python distribution name according to PEP 503."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _strip_inline_comment(line: str) -> str:
+    """Strip full-line or whitespace-preceded inline comments from a requirements line."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    return re.sub(r"\s+#.*$", "", stripped).strip()
+
+
+def _parse_requirements_txt(requirements_path: str):
+    """Parse active non-PySide requirements from requirements.txt."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    desired = {}
+    unparseable = []
+    with open(requirements_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            cleaned = _strip_inline_comment(raw_line)
+            if not cleaned:
+                continue
+            if "pyside" in cleaned.lower():
+                continue
+            if cleaned.startswith("-") or cleaned.endswith("\\"):
+                unparseable.append(cleaned)
+                continue
+            try:
+                req = Requirement(cleaned)
+            except InvalidRequirement:
+                unparseable.append(cleaned)
+                continue
+            canon = _normalize_pkg_name(req.name)
+            if canon in desired:
+                unparseable.append(cleaned)
+                continue
+            desired[canon] = req
+    return desired, unparseable
+
+
+def _extract_module_requirement(module: dict):
+    """Extract the single Requirement installed by a flatpak-pip-generator module."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    if not isinstance(module, dict):
+        return None
+    build_cmds = module.get("build-commands")
+    if not isinstance(build_cmds, list) or len(build_cmds) != 1:
+        return None
+    cmd_str = build_cmds[0]
+    if not isinstance(cmd_str, str):
+        return None
+    try:
+        tokens = shlex.split(cmd_str)
+    except ValueError:
+        return None
+    if not tokens or "install" not in tokens:
+        return None
+    install_idx = tokens.index("install")
+    pip_bin = os.path.basename(tokens[0])
+    if not pip_bin.startswith("pip") and "pip" not in tokens[:install_idx]:
+        return None
+
+    positional = [tok for tok in tokens[install_idx + 1:] if not tok.startswith("-")]
+    if len(positional) != 1:
+        return None
+    try:
+        return Requirement(positional[0])
+    except InvalidRequirement:
+        return None
+
+
+def _query_flatpak_runtime_packages(flatpak_manifest_path: str | None) -> dict[str, str] | None:
+    """Query Python packages pre-installed inside the target Flatpak runtime."""
+    if not flatpak_manifest_path or not os.path.exists(flatpak_manifest_path):
+        return None
+    try:
+        with open(flatpak_manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        runtime = manifest.get("runtime")
+        runtime_version = manifest.get("runtime-version")
+        if not runtime or not runtime_version:
+            return None
+        runtime_ref = f"{runtime}//{runtime_version}"
+        code = (
+            "import importlib.metadata, json; "
+            "print(json.dumps({d.metadata['Name']: d.version "
+            "for d in importlib.metadata.distributions() if d.metadata.get('Name')}))"
+        )
+        res = subprocess.run(
+            ["flatpak", "run", "--command=python3", runtime_ref, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        raw_pkgs = json.loads(res.stdout)
+        return {_normalize_pkg_name(k): str(v) for k, v in raw_pkgs.items()}
+    except Exception:
+        return None
+
+
+def _requirements_equivalent(a, b) -> bool:
+    """Check semantic equivalence between two parsed Requirement objects."""
+    return (
+        _normalize_pkg_name(a.name) == _normalize_pkg_name(b.name)
+        and {e.lower() for e in a.extras} == {e.lower() for e in b.extras}
+        and a.specifier == b.specifier
+        and str(a.marker or "") == str(b.marker or "")
+        and (a.url or "") == (b.url or "")
+    )
+
+
+def reconcile_python_requirements(
+    requirements_path: str,
+    python_reqs_json_path: str,
+    flatpak_manifest_path: str | None = None,
+    runtime_packages: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    """Verify python3-requirements.json against requirements.txt and prune orphaned modules.
+
+    Returns ("up_to_date", []), ("pruned", pruned_module_names), or
+    ("needs_regen", reasons_or_changed_requirements).
+    """
+    if not os.path.exists(python_reqs_json_path):
+        return ("needs_regen", [f"{python_reqs_json_path} is missing"])
+    if not os.path.exists(requirements_path):
+        return ("needs_regen", [f"{requirements_path} is missing"])
+
+    try:
+        with open(python_reqs_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        return ("needs_regen", [f"invalid JSON in python3-requirements.json: {exc}"])
+
+    if not isinstance(data, dict) or not isinstance(data.get("modules"), list):
+        return ("needs_regen", ["python3-requirements.json missing 'modules' list"])
+
+    desired_reqs, unparseable = _parse_requirements_txt(requirements_path)
+    if unparseable:
+        return ("needs_regen", unparseable)
+
+    existing_by_canon = {}
+    for mod in data["modules"]:
+        req = _extract_module_requirement(mod)
+        if req is None:
+            mod_name = mod.get("name", "<unknown>") if isinstance(mod, dict) else "<invalid>"
+            return ("needs_regen", [f"unrecognized module format: {mod_name}"])
+        canon = _normalize_pkg_name(req.name)
+        if canon in existing_by_canon:
+            return ("needs_regen", [f"duplicate module for package: {canon}"])
+        existing_by_canon[canon] = (mod, req)
+
+    normalized_runtime = (
+        {_normalize_pkg_name(k): str(v) for k, v in runtime_packages.items()}
+        if runtime_packages is not None
+        else None
+    )
+
+    missing_or_changed = []
+    for canon, desired_req in desired_reqs.items():
+        if canon in existing_by_canon:
+            _, existing_req = existing_by_canon[canon]
+            if not _requirements_equivalent(desired_req, existing_req):
+                missing_or_changed.append(str(desired_req))
+            continue
+
+        if normalized_runtime is None:
+            queried = _query_flatpak_runtime_packages(flatpak_manifest_path)
+            normalized_runtime = queried if queried is not None else {}
+
+        runtime_ver = normalized_runtime.get(canon)
+        satisfied_by_runtime = (
+            runtime_ver is not None
+            and not desired_req.extras
+            and not desired_req.url
+            and desired_req.marker is None
+            and desired_req.specifier.contains(runtime_ver, prereleases=True)
+        )
+        if not satisfied_by_runtime:
+            missing_or_changed.append(str(desired_req))
+
+    if missing_or_changed:
+        return ("needs_regen", missing_or_changed)
+
+    pruned_names = []
+    kept_modules = []
+    for mod in data["modules"]:
+        req = _extract_module_requirement(mod)
+        assert req is not None
+        canon = _normalize_pkg_name(req.name)
+        if canon not in desired_reqs:
+            pruned_names.append(str(mod.get("name", canon)))
+        else:
+            kept_modules.append(mod)
+
+    if pruned_names:
+        data["modules"] = kept_modules
+        with open(python_reqs_json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            f.write("\n")
+        return ("pruned", pruned_names)
+
+    return ("up_to_date", [])
+
+
 def run_cmd(cmd, **kwargs):
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True, **kwargs)
 
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Sync local environment and Flatpak Python/Node dependency manifests."
+    )
+    parser.add_argument(
+        "--reconcile-python",
+        action="store_true",
+        help=(
+            "Check whether compile/python3-requirements.json already satisfies requirements.txt "
+            "(pruning removed packages in place). Exits 0 if satisfied, 2 if full regeneration is needed."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.reconcile_python:
+        compile_dir = os.path.dirname(os.path.abspath(__file__))
+        req_path = os.path.join(compile_dir, "..", "requirements.txt")
+        py_reqs_json = os.path.join(compile_dir, "python3-requirements.json")
+        manifest_path = os.path.join(compile_dir, "com.openamity.OpenAmity.json")
+        try:
+            status, details = reconcile_python_requirements(
+                req_path, py_reqs_json, flatpak_manifest_path=manifest_path
+            )
+        except ImportError as exc:
+            print(f"Reconcile Python requirements fallback (missing dependency: {exc}); regeneration required.")
+            sys.exit(2)
+
+        if status == "up_to_date":
+            print("All Python requirements in requirements.txt are already satisfied by python3-requirements.json.")
+            sys.exit(0)
+        if status == "pruned":
+            print(f"Pruned removed Python module(s) from python3-requirements.json: {', '.join(details)}")
+            sys.exit(0)
+        print(f"Python Flatpak manifest requires full regeneration for: {', '.join(details)}")
+        sys.exit(2)
+
     # 1. Sync the local environment
     print("=== Syncing Local Environment ===")
     
@@ -58,7 +306,7 @@ def main():
     filtered_lines = []
     for line in desired_lines:
         line_clean = line.strip().lower()
-        if 'pyside' not in line_clean and 'google-antigravity' not in line_clean:
+        if 'pyside' not in line_clean:
             filtered_lines.append(line)
             
     with open(FLATPAK_REQS_FILE, 'w') as f:
@@ -96,11 +344,11 @@ def main():
                 pkg_name = line.split("==")[0]
                 all_packages.append(pkg_name)
         # Add some known ones just in case they aren't explicitly in freeze
-        all_packages.extend(["ctranslate2", "google-antigravity", "onnxruntime", "hf_xet", "hf-xet"])
+        all_packages.extend(["ctranslate2", "onnxruntime", "hf_xet", "hf-xet"])
         prefer_wheels_arg = "--prefer-wheels=" + ",".join(set(all_packages))
     except Exception as e:
         print(f"Warning: Could not get pip freeze: {e}")
-        prefer_wheels_arg = "--prefer-wheels=ctranslate2,google-antigravity,onnxruntime,cryptography,bcrypt,numpy,grpcio,pillow,av,pydantic-core,chromadb,mempalace,pypika,frozenlist,yarl,multidict,MarkupSafe,cffi,tokenizers,rpds-py,orjson,psutil,httptools,uvloop,websockets,hf_xet"
+        prefer_wheels_arg = "--prefer-wheels=ctranslate2,onnxruntime,cryptography,bcrypt,numpy,grpcio,pillow,av,pydantic-core,chromadb,mempalace,pypika,frozenlist,yarl,multidict,MarkupSafe,cffi,tokenizers,rpds-py,orjson,psutil,httptools,uvloop,websockets,hf_xet"
 
     generator_cmd = [
         python_exe,

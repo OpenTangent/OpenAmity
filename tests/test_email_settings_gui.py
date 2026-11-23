@@ -76,8 +76,20 @@ def test_settings_panel_email_widget_initialization(qapp):
     assert hasattr(panel, "ui_email_test_status")
     assert hasattr(panel, "ui_email_archive_local")
     assert hasattr(panel, "ui_email_delete_from_server")
+    assert hasattr(panel, "ui_email_pulse_adv_toggle_btn")
+    assert hasattr(panel, "ui_email_pulse_adv_container")
+    assert hasattr(panel, "ui_email_check_interval")
+    assert hasattr(panel, "ui_email_buffer")
+    assert hasattr(panel, "ui_email_pulse_all")
+    assert hasattr(panel, "ui_email_whitelist_container")
+    assert hasattr(panel, "ui_email_whitelist")
     assert panel.ui_email_archive_local.isChecked() is True
     assert panel.ui_email_delete_from_server.isChecked() is False
+    assert panel.ui_email_check_interval.value() == 60
+    assert panel.ui_email_check_interval.minimum() == 15
+    assert panel.ui_email_buffer.value() == 30
+    assert panel.ui_email_pulse_all.isChecked() is False
+    assert panel.ui_email_pulse_adv_container.isHidden()
 
     # Wording check
     assert panel.ui_email_auth_password_radio.text() == "Password"
@@ -248,6 +260,10 @@ def test_settings_load_and_save_email_roundtrip(qapp):
     assert stored_env["EMAIL_DELETE_FROM_SERVER"] == "true"
     mock_settings.set.assert_any_call("core.tools.email_archive_local", False)
     mock_settings.set.assert_any_call("core.tools.email_delete_from_server", True)
+    mock_settings.set.assert_any_call("core.auto-pulse.email.pulse-all-emails", False)
+    mock_settings.set.assert_any_call("core.auto-pulse.email.whitelist", [])
+    mock_settings.set.assert_any_call("core.auto-pulse.email.check-interval-seconds", 60)
+    mock_settings.set.assert_any_call("core.auto-pulse.email.buffer-seconds", 30)
 
 
 def test_settings_panel_archive_and_purge_toggle(qapp):

@@ -27,6 +27,10 @@ class ChatroomWatchNotifier:
         # Pending agent timers: (room_id, agent_uid) -> threading.Timer
         self._pending_timers: Dict[tuple, threading.Timer] = {}
 
+        self.start()
+
+    def start(self):
+        """Registers the chatroom event listener (idempotent)."""
         self.chatroom_manager.register_listener(self._on_chatroom_event)
 
     def stop(self):

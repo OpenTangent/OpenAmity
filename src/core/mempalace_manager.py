@@ -2,6 +2,7 @@ from core.state_barrier import memory_state_operation
 import os
 import re
 import json
+import math
 import time
 import copy
 import logging
@@ -11,15 +12,51 @@ import threading
 import hashlib
 import fcntl
 import contextlib
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from core.settings_manager import SettingsManager
 from core.file_utils import atomic_json_write
 from core.memory_records import MemoryHit, MemoryRecord, MemoryResult
+from core.palace_fts import PalaceFTSIndex, extract_query_centered_snippet, fuse_rrf
 
 from mempalace.layers import MemoryStack
 
+_CHUNK_RE = re.compile(r"^(.*)_chunk_\d+$")
+
+
+def _safe_float(val: Any, default: float, min_val: Optional[float] = None, max_val: Optional[float] = None) -> float:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        f = float(val)
+    except (ValueError, TypeError):
+        return default
+    if not math.isfinite(f):
+        return default
+    if min_val is not None and f < min_val:
+        return min_val
+    if max_val is not None and f > max_val:
+        return max_val
+    return f
+
+
+def _safe_int(val: Any, default: int, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+    if val is None or isinstance(val, bool):
+        return default
+    if isinstance(val, float) and not val.is_integer():
+        return default
+    try:
+        i = int(val)
+    except (ValueError, TypeError):
+        return default
+    if min_val is not None and i < min_val:
+        return min_val
+    if max_val is not None and i > max_val:
+        return max_val
+    return i
+
 SPHERE_LEVEL_MIN = 1
 SPHERE_LEVEL_MAX = 10
+MAX_STM_CONTENT_CHARS = 600
 
 SPHERE_LABELS: Dict[int, str] = {
     1: "Self",
@@ -125,10 +162,13 @@ class MemPalaceManager:
         self.identity_path = os.path.join(self.palace_path, "identity.txt")
         self._sync_identity()
 
-        # Morphological Memory (MemPalace v2) configuration
+        # Morphological Memory & MemPalace v2 configuration
         self._turn_touched = []
         self.morpho_layer = None
+        self.fts_index = None
+        self._fts_empty_checked_rev = None
         self._load_morpho_settings()
+        self._load_mempalace_settings()
 
         # Initialize the stack with narrow diagnostics (M3 task 4)
         try:
@@ -175,6 +215,10 @@ class MemPalaceManager:
                 logging.error(f"MemPalaceManager: Transient error initializing MemoryStack: {e}")
                 self.stack = None
                 self._degraded = True
+
+        # Initialize FTS5 lexical sidecar AFTER authoritative storage is healthy (works even when morpho is disabled)
+        if not self._degraded:
+            self._init_fts_index()
 
         # Initialize/reconcile morphology AFTER authoritative storage is healthy (M3 task 4)
         if not self._degraded and self._morpho_enabled:
@@ -261,6 +305,149 @@ class MemPalaceManager:
         if not isinstance(self._morpho_settings, dict):
             self._morpho_settings = {}
         self._morpho_enabled = self._morpho_settings.get("enabled", True)
+
+    def _load_mempalace_settings(self):
+        settings = SettingsManager(agent_id=self.agent_id)
+        raw = settings.get("core.mempalace")
+        if not isinstance(raw, dict):
+            raw = {}
+        self._mempalace_settings = dict(raw)
+
+    @staticmethod
+    def _canonical_id(raw_id: Any) -> str:
+        if not raw_id:
+            return ""
+        s = str(raw_id)
+        m = _CHUNK_RE.match(s)
+        return m.group(1) if m else s
+
+    def _init_fts_index(self):
+        try:
+            self.fts_index = PalaceFTSIndex(self.palace_path)
+            self._fts_empty_checked_rev = None
+        except Exception as e:
+            logging.warning(f"Failed to initialize PalaceFTSIndex (falling back to dense-only): {e}")
+            self.fts_index = None
+
+    def _ensure_fts_backfilled(self, col) -> int:
+        """Lazily backfill FTS5 index from authoritative ChromaDB drawers if FTS is empty."""
+        fts_idx = getattr(self, "fts_index", None)
+        if fts_idx is None or not fts_idx.available or col is None:
+            return 0
+        try:
+            if fts_idx.count() > 0:
+                return 0
+            total_col = col.count() if hasattr(col, "count") and callable(col.count) else None
+            if total_col == 0:
+                fts_idx.consume_needs_backfill()
+                return 0
+            cur_rev = self.get_corpus_revision()
+            if getattr(self, "_fts_empty_checked_rev", None) == cur_rev and not fts_idx.consume_needs_backfill():
+                return 0
+
+            all_ids = []
+            all_docs = []
+            all_metas = []
+            batch_size = 250
+            current_offset = 0
+            supports_offset = True
+            while True:
+                kwargs = {"include": ["documents", "metadatas"], "limit": batch_size}
+                if supports_offset and current_offset > 0:
+                    kwargs["offset"] = current_offset
+                try:
+                    batch = col.get(**kwargs)
+                except TypeError as te:
+                    if "offset" in str(te):
+                        supports_offset = False
+                        kwargs.pop("offset", None)
+                        kwargs.pop("limit", None)
+                        batch = col.get(**kwargs)
+                        all_ids = batch.get("ids") or []
+                        all_docs = batch.get("documents") or []
+                        all_metas = batch.get("metadatas") or []
+                        break
+                    raise
+                b_ids = batch.get("ids") or []
+                if not b_ids:
+                    break
+                all_ids.extend(b_ids)
+                all_docs.extend(batch.get("documents") or [None] * len(b_ids))
+                all_metas.extend(batch.get("metadatas") or [{}] * len(b_ids))
+                if not supports_offset or len(b_ids) < batch_size:
+                    break
+                current_offset += len(b_ids)
+                if total_col is not None and current_offset >= total_col:
+                    break
+
+            grouped: Dict[str, List[Tuple[int, str, str, Dict[str, Any]]]] = {}
+            for pid, doc, meta in zip(all_ids, all_docs, all_metas):
+                meta = meta or {}
+                lid = meta.get("parent_drawer_id") or self._canonical_id(pid)
+                if not lid:
+                    continue
+                raw_idx = meta.get("chunk_index", 0)
+                try:
+                    c_idx = int(raw_idx) if raw_idx is not None else 0
+                except (ValueError, TypeError):
+                    c_idx = 0
+                grouped.setdefault(lid, []).append((c_idx, str(pid), str(doc or ""), meta))
+
+            records: List[Dict[str, str]] = []
+            for lid, chunks in grouped.items():
+                chunks.sort(key=lambda x: (x[0], x[1]))
+                full_content = "".join(x[2] for x in chunks)
+                if not full_content.strip():
+                    continue
+                meta = chunks[0][3] or {}
+                ts = str(meta.get("authored_at") or meta.get("filed_at") or meta.get("timestamp") or meta.get("created_at") or "")
+                records.append({
+                    "drawer_id": lid,
+                    "wing": str(meta.get("wing", "default") or "default"),
+                    "room": str(meta.get("room", "general") or "general"),
+                    "source_file": str(meta.get("source_file", "") or ""),
+                    "authored_at": ts[:10],
+                    "content": full_content,
+                })
+
+            rebuilt = fts_idx.rebuild_from_records(records)
+            self._fts_empty_checked_rev = cur_rev if rebuilt == 0 else None
+            return rebuilt
+        except Exception as e:
+            logging.warning(f"PalaceFTSIndex lazy backfill warning: {e}")
+            return 0
+
+    def _hydrate_drawer_brief(self, drawer_id: str) -> Optional[Dict[str, Any]]:
+        """Hydrates canonical logical drawer content and metadata for associative hints and priming."""
+        cid = self._canonical_id(drawer_id)
+        if not cid:
+            return None
+        fts_idx = getattr(self, "fts_index", None)
+        if fts_idx is not None and fts_idx.available:
+            row = fts_idx.get_drawer(cid)
+            if row and row.get("content"):
+                return {
+                    "drawer_id": cid,
+                    "content": str(row["content"]),
+                    "wing": row.get("wing", "default"),
+                    "room": row.get("room", "general"),
+                    "source_file": os.path.basename(str(row.get("source_file") or "")),
+                    "authored_at": str(row.get("authored_at") or "")[:10],
+                }
+        rec_res = self.get_memory_record(cid, offset=0, limit=4000)
+        if not rec_res.success or rec_res.record is None:
+            return None
+        meta = rec_res.record.metadata or {}
+        src = str(meta.get("source_file") or "")
+        ts = str(meta.get("authored_at") or meta.get("filed_at") or meta.get("timestamp") or meta.get("created_at") or "")
+        return {
+            "drawer_id": cid,
+            "content": str(rec_res.record.content or ""),
+            "wing": rec_res.record.wing,
+            "room": rec_res.record.room,
+            "source_file": os.path.basename(src) if src else "",
+            "authored_at": ts[:10],
+        }
 
     def _validate_budget(self, val: Any, name: str, default: int, min_val: int = 100, max_val: int = 50000) -> int:
         if val is None:
@@ -448,7 +635,7 @@ class MemPalaceManager:
         with self._cache_lock:
             for did in drawer_ids:
                 if did:
-                    cid = self.morpho_layer._canonical_id(did) if self.morpho_layer else str(did)
+                    cid = self._canonical_id(did)
                     if cid and cid not in self._turn_touched:
                         self._turn_touched.append(cid)
 
@@ -461,6 +648,9 @@ class MemPalaceManager:
         if hasattr(self, 'stack') and hasattr(self.stack, 'l0'):
             self.stack.l0._text = None
         self._load_morpho_settings()
+        self._load_mempalace_settings()
+        if not getattr(self, "_degraded", False) and getattr(self, "fts_index", None) is None:
+            self._init_fts_index()
 
         if self._morpho_enabled:
             if not self.morpho_layer:
@@ -587,7 +777,7 @@ class MemPalaceManager:
         """Returns Layer 0 Identity string for the static system prompt prefix."""
         return self._get_l0_identity_raw()
 
-    def _wake_up_dynamic_raw(self, wing: str = None) -> str:
+    def _wake_up_dynamic_raw(self, wing: str = None, active_perspectives: Optional[List[str]] = None) -> str:
         """Returns dynamic wake context wrapped in [OPENAMITY_MEMORY_BEGIN]...[OPENAMITY_MEMORY_END]."""
         def _bound_section(text: str, max_chars: int, label: str) -> str:
             if not text or len(text) <= max_chars:
@@ -628,7 +818,10 @@ class MemPalaceManager:
             try:
                 self.step_temporal_decay()
                 prospective_limit = self._get_budget("prospective_max_chars", 2400)
-                prospective_section = self._get_prospective_memory_context(max_chars=prospective_limit)
+                prospective_section = self._get_prospective_memory_context(
+                    max_chars=prospective_limit,
+                    active_perspectives=active_perspectives,
+                )
                 if prospective_section:
                     base_context += f"\n\n{_bound_section(prospective_section, prospective_limit, 'Prospective Attractors')}"
             except Exception as e:
@@ -638,9 +831,9 @@ class MemPalaceManager:
         return base_context + "\n" + MEMORY_END
 
     @memory_state_operation
-    def wake_up_dynamic(self, wing: str = None) -> str:
+    def wake_up_dynamic(self, wing: str = None, active_perspectives: Optional[List[str]] = None) -> str:
         """Returns dynamic wake memory block wrapped in MEMORY_BEGIN..MEMORY_END."""
-        return self._wake_up_dynamic_raw(wing=wing)
+        return self._wake_up_dynamic_raw(wing=wing, active_perspectives=active_perspectives)
 
     @memory_state_operation
     def wake_up(self, wing: str = None) -> str:
@@ -650,36 +843,101 @@ class MemPalaceManager:
         return l0_raw + "\n\n" + dynamic
 
     @memory_state_operation
-    def _get_prospective_memory_context(self, max_chars: Optional[int] = None) -> str:
+    def _get_prospective_memory_context(
+        self,
+        max_chars: Optional[int] = None,
+        active_perspectives: Optional[List[str]] = None,
+    ) -> str:
         if not self._morpho_enabled or not self.morpho_layer:
             return ""
 
         try:
             from config import paths
             traj_path = os.path.join(paths.get_base_dir_for(self.agent_id), "trajectory.json")
-            if not os.path.exists(traj_path):
-                return ""
-
-            with open(traj_path, "r", encoding="utf-8") as f:
-                traj_data = json.load(f)
+            traj_data = {}
+            if os.path.exists(traj_path):
+                with open(traj_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        traj_data = loaded
 
             goals = []
+            asp_sphere_by_id: Dict[str, int] = {}
             aspirations = traj_data.get("aspirations", {})
             for tier in ["short_term", "medium_term", "long_term"]:
                 for asp in aspirations.get(tier, []):
+                    if not isinstance(asp, dict):
+                        continue
+                    raw_sphere = asp.get("sphere_level", 1)
+                    try:
+                        sphere_lvl = max(1, min(10, int(raw_sphere))) if not isinstance(raw_sphere, bool) else 1
+                    except (ValueError, TypeError):
+                        sphere_lvl = 1
+                    asp_id = asp.get("id")
+                    if asp_id:
+                        asp_sphere_by_id[asp_id] = sphere_lvl
                     if asp.get("status") == "active" and asp.get("description"):
-                        raw_sphere = asp.get("sphere_level", 1)
-                        try:
-                            sphere_lvl = max(1, min(10, int(raw_sphere))) if not isinstance(raw_sphere, bool) else 1
-                        except (ValueError, TypeError):
-                            sphere_lvl = 1
-                        goals.append((asp.get("id", f"asp_{uuid.uuid4().hex[:6]}"), asp["description"], sphere_lvl))
+                        asp_why = str(asp.get("why", "") or "").strip()
+                        goal_text = f"{asp['description']} — Why: {asp_why}" if asp_why else asp["description"]
+                        goals.append((asp_id or f"asp_{uuid.uuid4().hex[:6]}", goal_text, sphere_lvl))
 
             for task in traj_data.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
                 if task.get("status") == "in_progress" and task.get("description"):
-                    goals.append((task.get("id", f"tsk_{uuid.uuid4().hex[:6]}"), task["description"], 1))
+                    task_sphere = asp_sphere_by_id.get(task.get("aspiration_id"), 1)
+                    task_why = str(task.get("why", "") or "").strip()
+                    task_text = f"{task['description']} — Why: {task_why}" if task_why else task["description"]
+                    goals.append((task.get("id", f"tsk_{uuid.uuid4().hex[:6]}"), task_text, task_sphere))
 
-            if not goals:
+            perspective_injections: Dict[str, int] = {}
+            if active_perspectives:
+                try:
+                    mirrors = self._load_mirrors()
+                except Exception:
+                    mirrors = {}
+                active_norms = []
+                for ap in active_perspectives:
+                    if isinstance(ap, str) and ap.strip():
+                        ap_norm = ap.strip().lower()
+                        ap_first = ap_norm.split()[0] if ap_norm else ""
+                        active_norms.append((ap_norm, ap_first, " " in ap_norm))
+                if active_norms and isinstance(mirrors, dict):
+                    for m_name, m_entry in mirrors.items():
+                        if not isinstance(m_entry, dict):
+                            continue
+                        m_norm = str(m_name or "").strip().lower()
+                        if not m_norm:
+                            continue
+                        m_first = m_norm.split()[0]
+                        m_multi = " " in m_norm
+                        matched_perspective = False
+                        for ap_norm, ap_first, ap_multi in active_norms:
+                            if m_norm == ap_norm:
+                                matched_perspective = True
+                                break
+                            if ap_multi and not m_multi and len(ap_first) >= 3 and m_norm == ap_first:
+                                matched_perspective = True
+                                break
+                            if m_multi and not ap_multi and len(m_first) >= 3 and ap_norm == m_first:
+                                matched_perspective = True
+                                break
+                        if not matched_perspective:
+                            continue
+                        raw_msphere = m_entry.get("sphere_level", 2)
+                        try:
+                            m_sphere = max(1, min(10, int(raw_msphere))) if not isinstance(raw_msphere, bool) else 2
+                        except (ValueError, TypeError):
+                            m_sphere = 2
+                        for ref in m_entry.get("evidence_refs", []) or []:
+                            ref_str = str(ref or "").strip()
+                            if ref_str.startswith("drawer_"):
+                                cid = self.morpho_layer._canonical_id(ref_str)
+                                if cid:
+                                    if cid not in perspective_injections or m_sphere < perspective_injections[cid]:
+                                        perspective_injections[cid] = m_sphere
+
+            if not goals and not perspective_injections:
                 return ""
 
             col = self._get_collection(create=False)
@@ -837,7 +1095,7 @@ class MemPalaceManager:
                 all_target_drawers.extend(target_drawers)
 
             all_target_drawers = list(dict.fromkeys(all_target_drawers))
-            if not all_target_drawers:
+            if not all_target_drawers and not perspective_injections:
                 return ""
 
             from core.morphological_layer import SPHERE_COUPLING_WEIGHTS
@@ -846,11 +1104,18 @@ class MemPalaceManager:
                 for did, lvl in drawer_spheres.items()
             }
 
-            top_k = int(self._morpho_settings.get("top_k", 5))
+            if "min_potential" in self._morpho_settings and self._morpho_settings.get("min_potential") is not None:
+                min_potential = _safe_float(self._morpho_settings.get("min_potential"), 0.25, 0.0, 1.0)
+            else:
+                min_potential = _safe_float(self._morpho_settings.get("prospective_min_potential", 0.25), 0.25, 0.0, 1.0)
+
+            top_k = _safe_int(self._morpho_settings.get("top_k", 5), 5, min_val=1)
             results = self.morpho_layer.relax_setpoint(
                 all_target_drawers,
                 top_k=top_k,
                 sphere_weights=sphere_weights,
+                perspective_injections=perspective_injections,
+                min_potential=min_potential,
             )
             if not results or not col:
                 return ""
@@ -866,6 +1131,8 @@ class MemPalaceManager:
             total_chars = len(header)
 
             for did, potential in results:
+                if float(potential) < min_potential:
+                    continue
                 doc_text = ""
                 try:
                     res = col.get(ids=[did], include=["documents"])
@@ -1114,7 +1381,7 @@ class MemPalaceManager:
 
     @memory_state_operation
     def search_records(self, query: str, wing: str = None, room: str = None, limit: int = 5, offset: int = 0) -> MemoryResult:
-        """Structured L3 semantic search returning a typed MemoryResult containing MemoryHit objects."""
+        """Structured L3 hybrid (ChromaDB dense + FTS5 BM25 RRF) search returning typed MemoryResult."""
         col = self._get_collection(create=False)
         if not col:
             return MemoryResult(success=False, status="store_failure", error="No palace collection available.")
@@ -1122,25 +1389,41 @@ class MemPalaceManager:
         if not query or not str(query).strip():
             return MemoryResult(success=False, status="error", error="Query string is required.")
 
-        from mempalace.layers import build_where_filter
+        from mempalace.layers import build_where_filter, _distance_to_similarity, _metric_for_collection
         where = build_where_filter(wing, room)
 
-        total_items = col.count() if hasattr(col, "count") and callable(col.count) else None
-        target_logical_needed = offset + limit + 1
-        chunk_re = re.compile(r"^(.*)_chunk_\d+$")
+        mp_cfg = getattr(self, "_mempalace_settings", None) or {}
+        hybrid_enabled = bool(mp_cfg.get("hybrid_search", True))
+        rrf_k = _safe_float(mp_cfg.get("rrf_k", 60.0), 60.0, min_val=1.0)
+        snippet_centered = bool(mp_cfg.get("snippet_query_centered", True))
+        snippet_max_chars = _safe_int(mp_cfg.get("snippet_max_chars", 450), 450, min_val=50, max_val=4000)
 
-        from mempalace.layers import _distance_to_similarity, _metric_for_collection
+        fts_idx = getattr(self, "fts_index", None)
+        fts_available = bool(fts_idx is not None and fts_idx.available)
+        use_hybrid = hybrid_enabled and fts_available
+
+        if use_hybrid or (snippet_centered and fts_available):
+            self._ensure_fts_backfilled(col)
+
+        total_items = col.count() if hasattr(col, "count") and callable(col.count) else None
+        cand_k = max(30, (offset + limit) * 4)
+        target_logical_needed = cand_k if use_hybrid else (offset + limit + 1)
+
         try:
             metric = _metric_for_collection(col)
         except Exception:
             metric = "cosine"
 
-        fetch_limit = max((offset + limit) * 3, 20)
+        fetch_limit = max(cand_k, 30) if use_hybrid else max((offset + limit) * 3, 20)
         collection_exhausted = False
         logical_groups: Dict[str, MemoryHit] = {}
+        best_chunk_text: Dict[str, Tuple[float, str]] = {}
 
         while True:
             actual_n = min(total_items, fetch_limit) if total_items is not None else fetch_limit
+            if total_items == 0:
+                collection_exhausted = True
+                break
             kwargs = {
                 "query_texts": [query],
                 "n_results": actual_n,
@@ -1166,13 +1449,15 @@ class MemPalaceManager:
             raw_dists = dists_list[0] if dists_list else []
 
             if not raw_ids:
-                return MemoryResult(success=True, status="no_results", hits=[], total_count=0, offset=offset, limit=limit, has_more=False)
+                collection_exhausted = True
+                break
 
             logical_groups.clear()
+            best_chunk_text.clear()
             for pid, doc, meta, dist in zip(raw_ids, raw_docs, raw_metas, raw_dists):
                 meta = meta or {}
                 doc = doc or ""
-                lid = meta.get("parent_drawer_id") or (chunk_re.match(pid).group(1) if chunk_re.match(pid) else pid)
+                lid = meta.get("parent_drawer_id") or self._canonical_id(pid)
 
                 try:
                     sim = round(_distance_to_similarity(dist, metric), 3)
@@ -1185,6 +1470,7 @@ class MemPalaceManager:
                 full_ts = str(meta.get("authored_at") or meta.get("filed_at") or meta.get("timestamp") or meta.get("created_at") or "")
 
                 if lid not in logical_groups:
+                    best_chunk_text[lid] = (sim, doc)
                     logical_groups[lid] = MemoryHit(
                         logical_id=lid,
                         chunk_ids=[pid],
@@ -1203,6 +1489,8 @@ class MemPalaceManager:
                     existing.chunk_ids.append(pid)
                     if sim > (existing.score or 0.0):
                         existing.score = sim
+                    if sim > best_chunk_text[lid][0]:
+                        best_chunk_text[lid] = (sim, doc)
 
             if len(raw_ids) < actual_n or (total_items is not None and actual_n >= total_items):
                 collection_exhausted = True
@@ -1222,15 +1510,109 @@ class MemPalaceManager:
 
             fetch_limit = fetch_limit * 2
 
-        sorted_hits = sorted(logical_groups.values(), key=lambda h: (-(h.score or 0.0), h.logical_id))
-        if collection_exhausted:
-            total_count = len(sorted_hits)
-            has_more = (offset + limit) < total_count
+        bm25_rows: List[Dict[str, Any]] = []
+        bm25_map: Dict[str, Dict[str, Any]] = {}
+        if use_hybrid:
+            try:
+                bm25_rows = fts_idx.search(query, wing=wing, room=room, limit=cand_k)
+                if fts_idx.consume_needs_backfill():
+                    self._ensure_fts_backfilled(col)
+                    bm25_rows = fts_idx.search(query, wing=wing, room=room, limit=cand_k)
+            except Exception as fe:
+                logging.warning(f"PalaceFTSIndex search failed; falling back to dense-only: {fe}")
+                bm25_rows = []
+
+        if not logical_groups and not bm25_rows:
+            return MemoryResult(success=True, status="no_results", hits=[], total_count=0, offset=offset, limit=limit, has_more=False)
+
+        if use_hybrid and bm25_rows:
+            dense_sorted = sorted(logical_groups.values(), key=lambda h: (-(h.score or 0.0), h.logical_id))
+            dense_ids = [h.logical_id for h in dense_sorted]
+            bm25_ids: List[str] = []
+            for row in bm25_rows:
+                did = row["drawer_id"]
+                if did not in bm25_map:
+                    bm25_map[did] = row
+                    bm25_ids.append(did)
+
+            fused = fuse_rrf(dense_ids, bm25_ids, w_dense=1.0, w_bm25=1.0, k=rrf_k)
+            sorted_hits: List[MemoryHit] = []
+            for did, _rrf_score in fused:
+                if did in logical_groups:
+                    sorted_hits.append(logical_groups[did])
+                else:
+                    row = bm25_map[did]
+                    src_raw = str(row.get("source_file", "") or "")
+                    src_base = os.path.basename(src_raw) if src_raw else ""
+                    auth = str(row.get("authored_at", "") or "")[:10]
+                    w_val = row.get("wing", "default") or "default"
+                    r_val = row.get("room", "general") or "general"
+                    sorted_hits.append(MemoryHit(
+                        logical_id=did,
+                        chunk_ids=[did],
+                        preview="",
+                        is_truncated=False,
+                        score=None,
+                        metric="bm25",
+                        wing=w_val,
+                        room=r_val,
+                        source_file=src_base,
+                        authored_at=auth,
+                        metadata={
+                            "wing": w_val,
+                            "room": r_val,
+                            "source_file": src_raw,
+                            "authored_at": auth,
+                            "bm25_score": row.get("bm25_score"),
+                        },
+                    ))
+            if collection_exhausted and len(bm25_rows) < cand_k:
+                total_count = len(sorted_hits)
+                has_more = (offset + limit) < total_count
+            else:
+                total_count = None
+                has_more = len(sorted_hits) > (offset + limit)
         else:
-            total_count = None
-            has_more = len(sorted_hits) > (offset + limit)
+            sorted_hits = sorted(logical_groups.values(), key=lambda h: (-(h.score or 0.0), h.logical_id))
+            if collection_exhausted:
+                total_count = len(sorted_hits)
+                has_more = (offset + limit) < total_count
+            else:
+                total_count = None
+                has_more = len(sorted_hits) > (offset + limit)
 
         hits = sorted_hits[offset:offset + limit]
+
+        # WP2: Hydrate query-centered snippets (or baseline naive snippets if toggled off)
+        if hits:
+            if snippet_centered:
+                need_fts = [h.logical_id for h in hits if h.logical_id not in bm25_map]
+                fts_docs = fts_idx.get_drawers(need_fts) if (fts_available and need_fts) else {}
+                for hit in hits:
+                    fts_row = bm25_map.get(hit.logical_id) or fts_docs.get(hit.logical_id)
+                    if fts_row and fts_row.get("content"):
+                        full_text = str(fts_row["content"])
+                        clean_full = re.sub(r"\s+", " ", full_text).strip()
+                        hit.preview = extract_query_centered_snippet(full_text, query, max_len=snippet_max_chars)
+                        hit.is_truncated = len(clean_full) > snippet_max_chars
+                    else:
+                        fallback_doc = best_chunk_text.get(hit.logical_id, (0.0, ""))[1]
+                        clean_full = re.sub(r"\s+", " ", fallback_doc).strip()
+                        hit.preview = extract_query_centered_snippet(fallback_doc, query, max_len=snippet_max_chars)
+                        hit.is_truncated = (
+                            len(clean_full) > snippet_max_chars
+                            or bool((hit.metadata or {}).get("parent_drawer_id"))
+                        )
+            else:
+                for hit in hits:
+                    raw_doc = (
+                        bm25_map.get(hit.logical_id, {}).get("content")
+                        or best_chunk_text.get(hit.logical_id, (0.0, ""))[1]
+                        or ""
+                    )
+                    clean_text = str(raw_doc).strip().replace("\n", " ")
+                    hit.preview = clean_text[:297] + "..." if len(clean_text) > 300 else clean_text
+                    hit.is_truncated = len(clean_text) > 300 or bool((hit.metadata or {}).get("parent_drawer_id"))
 
         # Touch drawers with CANONICAL LOGICAL IDs only
         if self._morpho_enabled and self.morpho_layer:
@@ -1247,7 +1629,7 @@ class MemPalaceManager:
         )
 
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
-        """Single-pass L3 semantic search returning stable logical IDs and structured previews."""
+        """Single-pass L3 hybrid search returning stable logical IDs, structured previews, and non-displacing associative hint."""
         res = self.search_records(query, wing=wing, room=room, limit=n_results)
         if not res.success:
             return res.error or "Search error."
@@ -1256,7 +1638,7 @@ class MemPalaceManager:
 
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
         for i, hit in enumerate(res.hits, 1):
-            sim_str = f"{hit.score:.3f}" if hit.score is not None else "N/A"
+            sim_str = f"{hit.score:.3f}" if hit.score is not None else "N/A, kw"
             trunc_marker = " [truncated]" if hit.is_truncated else ""
             lines.append(f"  [{i}] [Drawer #{hit.logical_id}] {hit.wing}/{hit.room} (sim={sim_str})")
             lines.append(f"      {hit.preview}{trunc_marker}")
@@ -1264,6 +1646,53 @@ class MemPalaceManager:
                 lines.append(f"      src: {hit.source_file}")
             if hit.authored_at:
                 lines.append(f"      authored: {hit.authored_at}")
+
+        # WP4.2: Non-displacing cross-session Morphological Associative Highway hint
+        morpho_cfg = getattr(self, "_morpho_settings", None) or {}
+        if (
+            getattr(self, "_morpho_enabled", False)
+            and getattr(self, "morpho_layer", None) is not None
+            and bool(morpho_cfg.get("search_associative_hint", True))
+            and res.hits
+        ):
+            try:
+                min_pot = _safe_float(morpho_cfg.get("search_associative_min_potential", 0.35), 0.35, 0.0, 1.0)
+                seed_ids = [h.logical_id for h in res.hits[:3]]
+                neighbors = self.morpho_layer.relax_setpoint(seed_ids, top_k=3, min_potential=min_pot)
+                seen_ids = {h.logical_id for h in res.hits}
+                seen_sources = {
+                    os.path.basename(str(h.source_file or (h.metadata or {}).get("source_file", "") or "")).strip()
+                    for h in res.hits
+                } - {""}
+                mp_cfg = getattr(self, "_mempalace_settings", None) or {}
+                snippet_centered = bool(mp_cfg.get("snippet_query_centered", True))
+
+                for nid, pot in neighbors:
+                    if nid in seen_ids or float(pot) < min_pot:
+                        continue
+                    rec = self._hydrate_drawer_brief(nid)
+                    if not rec or not rec.get("content"):
+                        continue
+                    if wing and rec.get("wing") != wing:
+                        continue
+                    if room and rec.get("room") != room:
+                        continue
+                    rec_src = os.path.basename(str(rec.get("source_file") or "")).strip()
+                    if rec_src and rec_src in seen_sources:
+                        continue
+                    if snippet_centered:
+                        snip = extract_query_centered_snippet(str(rec["content"]), query, max_len=240)
+                    else:
+                        clean_rec = str(rec["content"]).strip().replace("\n", " ")
+                        snip = clean_rec[:237] + "..." if len(clean_rec) > 240 else clean_rec
+                    src_part = f" ({rec_src})" if rec_src else ""
+                    lines.append(
+                        f"  [Associative Highway] [Drawer #{nid}] {rec.get('wing', 'default')}/{rec.get('room', 'general')} "
+                        f"(V={float(pot):.2f}){src_part}: {snip}"
+                    )
+                    break
+            except Exception as he:
+                logging.debug(f"Associative highway hint skipped in search(): {he}")
 
         return "\n".join(lines)
 
@@ -1283,7 +1712,7 @@ class MemPalaceManager:
         except (ValueError, TypeError):
             offset, limit = 0, 2000
 
-        canon_id = self.morpho_layer._canonical_id(drawer_id) if self.morpho_layer else drawer_id
+        canon_id = self._canonical_id(drawer_id)
 
         # 1. Try fetching directly by ID
         try:
@@ -1436,6 +1865,7 @@ class MemPalaceManager:
                 "epistemic_boundary": "",
                 "ripple_notes": "",
                 "prediction_error_note": "",
+                "open_curiosity": "",
                 "confidence": 1.0,
                 "provenance": "unknown",
                 "evidence_refs": [],
@@ -1481,6 +1911,7 @@ class MemPalaceManager:
             "epistemic_boundary",
             "ripple_notes",
             "prediction_error_note",
+            "open_curiosity",
         ):
             val = entry.get(str_field)
             entry[str_field] = str(val).strip() if val is not None else ""
@@ -1609,6 +2040,7 @@ class MemPalaceManager:
         epistemic_boundary: Optional[str] = None,
         ripple_notes: Optional[str] = None,
         prediction_error_note: Optional[str] = None,
+        open_curiosity: Optional[str] = None,
     ) -> dict:
         """
         Surgically updates a mirror record with Concentric Spheres of Consciousness (v2)
@@ -1654,11 +2086,29 @@ class MemPalaceManager:
                 final_sphere = 1
                 final_etype = "self"
             else:
-                final_sphere = (
-                    sphere_level
-                    if sphere_level is not None
-                    else existing.get("sphere_level", def_sphere)
-                )
+                if not existing and sphere_level is None:
+                    primary_user = ""
+                    try:
+                        from core.config_manager import ConfigManager
+                        primary_user = (ConfigManager().get("user-full-name", "") or "").strip()
+                    except Exception:
+                        primary_user = ""
+                    norm_p = perspective.strip().lower()
+                    norm_u = primary_user.lower()
+                    first_word = norm_u.split()[0] if norm_u else ""
+                    is_primary_user = bool(
+                        norm_u and (norm_p == norm_u or (len(first_word) >= 3 and norm_p == first_word))
+                    )
+                    if is_primary_user:
+                        final_sphere = 2
+                    else:
+                        final_sphere = def_sphere if def_sphere != 2 else 4
+                else:
+                    final_sphere = (
+                        sphere_level
+                        if sphere_level is not None
+                        else existing.get("sphere_level", def_sphere)
+                    )
                 final_etype = (
                     entity_type
                     if entity_type is not None
@@ -1744,6 +2194,11 @@ class MemPalaceManager:
                     if prediction_error_note is not None
                     else existing.get("prediction_error_note", "")
                 ),
+                "open_curiosity": (
+                    open_curiosity.strip()
+                    if open_curiosity is not None
+                    else existing.get("open_curiosity", "")
+                ),
                 "confidence": final_conf,
                 "provenance": final_prov,
                 "evidence_refs": final_ev,
@@ -1766,13 +2221,15 @@ class MemPalaceManager:
     ) -> str:
         """
         Formats mirrors ordered deterministically by concentric sphere priority:
-        (sphere_level ASC, -confidence ASC, timestamp DESC, perspective_name ASC).
-        Enforces strict character budget clamping while protecting S1:Self and S2:Immediate.
+        (sphere_level ASC, timestamp DESC, perspective_name ASC).
+        Enforces strict character budget clamping while protecting S1:Self through S3:Household.
         """
         if not mirrors:
             return ""
 
         budget = max_chars if max_chars is not None else self._get_budget("mirrors", 4800)
+        if budget <= 0:
+            return ""
 
         def _extract_ts(entry: Any) -> str:
             if not isinstance(entry, dict):
@@ -1788,22 +2245,22 @@ class MemPalaceManager:
                 )
             )
 
+        def _clamp_field(val: str, max_len: int = 180) -> str:
+            if len(val) <= max_len:
+                return val
+            return val[: max_len - 3] + "..."
+
         items = [
             (name, self._normalize_mirror_entry(name, data))
             for name, data in mirrors.items()
         ]
         # Multi-pass stable sort:
-        # 4. Perspective name ASC
+        # 3. Perspective name ASC
         items.sort(key=lambda item: item[0])
-        # 3. Timestamp DESC (most recent first among equal sphere & confidence)
+        # 2. Timestamp DESC (most recent first within each sphere)
         items.sort(key=lambda item: _extract_ts(item[1]), reverse=True)
-        # 1 & 2. sphere_level ASC, confidence DESC
-        items.sort(
-            key=lambda item: (
-                int(item[1].get("sphere_level", 2)),
-                -float(item[1].get("confidence", 1.0)),
-            )
-        )
+        # 1. sphere_level ASC
+        items.sort(key=lambda item: int(item[1].get("sphere_level", 2)))
 
         if limit is not None and limit > 0:
             items = items[:limit]
@@ -1813,6 +2270,7 @@ class MemPalaceManager:
         current_len = len(header_title)
         tensions: List[str] = []
 
+        built: List[Dict[str, Any]] = []
         for name, entry in items:
             sphere = int(entry.get("sphere_level", 2))
             sphere_label = SPHERE_LABELS.get(sphere, f"S{sphere}")
@@ -1841,6 +2299,9 @@ class MemPalaceManager:
             pred_err = entry.get("prediction_error_note", "")
             if pred_err:
                 block_lines.append(f"  Prediction Error: {pred_err}")
+            open_cur = entry.get("open_curiosity", "")
+            if open_cur:
+                block_lines.append(f"  Open Curiosity: {open_cur}")
 
             block_lines.append(f"  Provenance: {prov} | Confidence: {conf:.2f}")
 
@@ -1848,6 +2309,7 @@ class MemPalaceManager:
             if ev_refs:
                 block_lines.append(f"  Evidence: {', '.join(str(r) for r in ev_refs)}")
             contra = entry.get("contradicted_by", [])
+            entry_tensions: List[str] = []
             if contra:
                 block_lines.append(f"  Tensions/Contradictions: {', '.join(str(c) for c in contra)}")
                 for target in contra:
@@ -1860,25 +2322,69 @@ class MemPalaceManager:
                         )
                     else:
                         target_view = str(target_entry) if target_entry else "(no record)"
-                    tensions.append(
+                    entry_tensions.append(
                         f"- Dissonance between '{name}' and '{target}':\n"
                         f"  * {name}'s view: \"{subj}\"\n"
                         f"  * {target}'s view: \"{target_view}\""
                     )
 
-            block = "\n".join(block_lines)
-            add_len = len(block) + 2  # +2 for "\n\n" separator
-            if current_len + add_len > budget:
-                # Ensure inner spheres (S1:Self and S2:Immediate) get at least a truncated slice if budget permits
-                if sphere in (1, 2):
+            compact_lines = [header]
+            if subj:
+                compact_lines.append(f"  Subjective View (Self-in-Other): {_clamp_field(subj, 180)}")
+            if cone:
+                compact_lines.append(f"  Perspective Cone (Other-in-Self): {_clamp_field(cone, 180)}")
+            if open_cur:
+                compact_lines.append(f"  Open Curiosity: {_clamp_field(open_cur, 180)}")
+            compact_lines.append(f"  Provenance: {prov} | Confidence: {conf:.2f}")
+
+            built.append({
+                "sphere": sphere,
+                "header": header,
+                "full_block": "\n".join(block_lines),
+                "compact_block": "\n".join(compact_lines),
+                "tensions": entry_tensions,
+            })
+
+        for idx, rec in enumerate(built):
+            sphere = rec["sphere"]
+            header = rec["header"]
+            full_block = rec["full_block"]
+            compact_block = rec["compact_block"]
+
+            if sphere <= 3:
+                remaining_inner = [b for b in built[idx + 1:] if b["sphere"] <= 3]
+                remaining_inner_compact_needed = sum(len(b["compact_block"]) + 2 for b in remaining_inner)
+                use_compact = (
+                    (current_len + len(full_block) + 2 > budget)
+                    or (
+                        budget >= 1200
+                        and len(remaining_inner) > 0
+                        and (
+                            (len(full_block) + 2) > int(budget * 0.45)
+                            or (current_len + len(full_block) + 2 + remaining_inner_compact_needed > budget)
+                        )
+                    )
+                )
+                chosen = compact_block if use_compact else full_block
+                add_len = len(chosen) + 2
+                if current_len + add_len <= budget:
+                    out_blocks.append(chosen)
+                    current_len += add_len
+                    tensions.extend(rec["tensions"])
+                else:
                     avail = budget - current_len - 2 - len("\n  ...[clamped]")
                     if avail > len(header) + 10:
-                        out_blocks.append(block[:avail] + "\n  ...[clamped]")
+                        out_blocks.append(chosen[:avail] + "\n  ...[clamped]")
                         current_len = len("\n\n".join(out_blocks))
-                break
-
-            out_blocks.append(block)
-            current_len += add_len
+                        tensions.extend(rec["tensions"])
+                    break
+            else:
+                add_len = len(full_block) + 2
+                if current_len + add_len > budget:
+                    break
+                out_blocks.append(full_block)
+                current_len += add_len
+                tensions.extend(rec["tensions"])
 
         if tensions:
             tension_lines = [
@@ -1907,6 +2413,31 @@ class MemPalaceManager:
         if not mirrors:
             return ""
         return self._format_mirrors(mirrors, max_chars=max_chars, limit=limit)
+
+    @memory_state_operation
+    def get_top_open_curiosity(self, max_sphere: int = 4) -> Optional[Dict[str, Any]]:
+        """Returns the oldest unanswered inner-sphere open curiosity hook, or None."""
+        mirrors = self._load_mirrors()
+        if not mirrors:
+            return None
+        candidates = []
+        for name, entry in mirrors.items():
+            if not isinstance(entry, dict):
+                continue
+            sphere = int(entry.get("sphere_level", 2))
+            curiosity = str(entry.get("open_curiosity", "") or "").strip()
+            if 2 <= sphere <= max_sphere and curiosity:
+                ts = str(entry.get("updated_at") or entry.get("last_updated") or "")
+                candidates.append((sphere, ts, str(name), curiosity))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        sphere, _, name, curiosity = candidates[0]
+        return {
+            "perspective": name,
+            "sphere_level": sphere,
+            "open_curiosity": curiosity,
+        }
 
     @memory_state_operation
     def initialize_short_term_memory(self):
@@ -1981,6 +2512,57 @@ class MemPalaceManager:
             atomic_json_write(path, to_save)
             self._short_term_cache = to_save
 
+    @staticmethod
+    def _is_stm_expired(m: dict, now_dt: datetime.datetime, now_iso: str) -> bool:
+        """Timezone-aware check whether a short-term memory record has passed its expiry."""
+        exp = m.get("expiry")
+        if not exp:
+            return False
+        try:
+            exp_dt = datetime.datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
+            return exp_dt < now_dt
+        except Exception:
+            return str(exp) < now_iso
+
+    def _archive_short_term_items(self, evicted_items: list, now_iso: str, ensure_file: bool = False):
+        """Persists evicted STM items to short_term_archive.json BEFORE mutating active storage."""
+        archive_path = os.path.join(self.palace_path, "short_term_archive.json")
+        archived_records = []
+        if os.path.exists(archive_path):
+            try:
+                with open(archive_path, "r", encoding="utf-8") as af:
+                    archived_records = json.load(af)
+                if not isinstance(archived_records, list):
+                    raise ValueError(f"Expected list, got {type(archived_records).__name__}")
+            except Exception as read_err:
+                corrupt_backup = f"{archive_path}.corrupt.{int(time.time())}"
+                try:
+                    import shutil
+                    shutil.copy2(archive_path, corrupt_backup)
+                    logging.warning(f"Preserved corrupt short_term_archive.json to {corrupt_backup}")
+                except Exception:
+                    pass
+                logging.error(f"Cannot read existing short_term_archive.json: {read_err}")
+                raise RuntimeError(
+                    f"short_term_archive.json is corrupted: {read_err}. "
+                    f"Preserved as {corrupt_backup}. Preserving active records and aborting eviction."
+                ) from read_err
+
+        if evicted_items:
+            existing_archive_ids = {r.get("id") for r in archived_records if isinstance(r, dict)}
+            for item in evicted_items:
+                if item.get("id") not in existing_archive_ids:
+                    item_copy = dict(item)
+                    item_copy["archived_at"] = now_iso
+                    archived_records.append(item_copy)
+                    existing_archive_ids.add(item.get("id"))
+            # Write archive to disk BEFORE updating active memories!
+            atomic_json_write(archive_path, archived_records)
+        elif ensure_file and not os.path.exists(archive_path):
+            atomic_json_write(archive_path, [])
+
     @memory_state_operation
     def add_short_term_memory(self, content: str, supersedes: list = None, priority: str = "normal", status: str = "active", expiry: Optional[str] = None) -> dict:
         """Appends a new short-term memory with metadata and prunes prioritizing active/unresolved records."""
@@ -1991,6 +2573,18 @@ class MemPalaceManager:
 
             if supersedes:
                 memories = [m for m in memories if m.get("id") not in supersedes]
+
+            truncation_warning = None
+            if (
+                len(content) > MAX_STM_CONTENT_CHARS
+                and status != "unresolved"
+                and "CRITICAL_CORRECTION" not in content
+            ):
+                content = content[:MAX_STM_CONTENT_CHARS - 3] + "..."
+                truncation_warning = (
+                    "Truncated to 600 chars; store detailed reports in "
+                    "~/Documents/<AgentName>/ or long-term MemPalace drawers."
+                )
 
             mem_id = str(uuid.uuid4())[:8]
             now_iso = datetime.datetime.now().isoformat()
@@ -2015,17 +2609,6 @@ class MemPalaceManager:
 
             # R2: Timezone-aware expiry check
             now_dt = datetime.datetime.now(datetime.timezone.utc)
-            def is_expired(m):
-                exp = m.get("expiry")
-                if not exp:
-                    return False
-                try:
-                    exp_dt = datetime.datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
-                    if exp_dt.tzinfo is None:
-                        exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
-                    return exp_dt < now_dt
-                except Exception:
-                    return str(exp) < now_iso
 
             # Identify candidates for eviction: NEVER evict unresolved commitments!
             remaining_memories = list(memories)
@@ -2033,7 +2616,7 @@ class MemPalaceManager:
             if len(remaining_memories) > max_memories:
                 prio_map = {"low": 1, "normal": 2, "high": 3, "critical": 4}
                 def evict_score(m):
-                    if is_expired(m):
+                    if self._is_stm_expired(m, now_dt, now_iso):
                         s = 0
                     elif m.get("status") in ("completed", "resolved", "cancelled", "done"):
                         s = 1
@@ -2055,49 +2638,85 @@ class MemPalaceManager:
                     evicted_items.append(evicted)
 
             # R2 & Verification 3: PERSIST ARCHIVE FIRST BEFORE REMOVING FROM ACTIVE STORAGE!
-            archive_path = os.path.join(self.palace_path, "short_term_archive.json")
-            archived_records = []
-            if os.path.exists(archive_path):
-                try:
-                    with open(archive_path, "r", encoding="utf-8") as af:
-                        archived_records = json.load(af)
-                    if not isinstance(archived_records, list):
-                        raise ValueError(f"Expected list, got {type(archived_records).__name__}")
-                except Exception as read_err:
-                    corrupt_backup = f"{archive_path}.corrupt.{int(time.time())}"
-                    try:
-                        import shutil
-                        shutil.copy2(archive_path, corrupt_backup)
-                        logging.warning(f"Preserved corrupt short_term_archive.json to {corrupt_backup}")
-                    except Exception:
-                        pass
-                    logging.error(f"Cannot read existing short_term_archive.json: {read_err}")
-                    raise RuntimeError(f"short_term_archive.json is corrupted: {read_err}. Preserved as {corrupt_backup}. Preserving active records and aborting eviction.") from read_err
-
-            if evicted_items:
-                existing_archive_ids = {r.get("id") for r in archived_records if isinstance(r, dict)}
-                for item in evicted_items:
-                    if item.get("id") not in existing_archive_ids:
-                        item_copy = dict(item)
-                        item_copy["archived_at"] = now_iso
-                        archived_records.append(item_copy)
-                        existing_archive_ids.add(item.get("id"))
-                # Write archive to disk BEFORE updating active memories!
-                atomic_json_write(archive_path, archived_records)
-            elif not os.path.exists(archive_path):
-                atomic_json_write(archive_path, [])
+            self._archive_short_term_items(evicted_items, now_iso, ensure_file=True)
 
             # Active storage is updated ONLY after archive persistence has succeeded!
             self._save_short_term_memories(remaining_memories)
             self._increment_corpus_revision()
 
             resp = {"success": True, "id": mem_id, "date": now_iso}
+            if truncation_warning:
+                resp["warning"] = truncation_warning
             if len(remaining_memories) > max_memories:
                 resp["overflow"] = True
                 resp["unresolved_count"] = len([m for m in remaining_memories if m.get("status") == "unresolved"])
             if evicted_items:
                 resp["archived_count"] = len(evicted_items)
             return resp
+
+    @memory_state_operation
+    def compact_short_term_for_sleep(self, max_active: int = 5) -> dict:
+        """
+        Post-sleep distillation compaction: archives expired, completed, and overflow normal
+        short-term items BEFORE updating active storage, while retaining all unresolved items.
+        """
+        with self._cache_lock:
+            memories = self._load_short_term_memories()
+            if not memories:
+                return {
+                    "success": True,
+                    "kept_count": 0,
+                    "kept_unresolved_count": 0,
+                    "kept_active_count": 0,
+                    "archived_count": 0,
+                }
+
+            eff_max_active = max(0, int(max_active))
+            now_iso = datetime.datetime.now().isoformat()
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            prio_map = {"low": 1, "normal": 2, "high": 3, "critical": 4}
+
+            unresolved_indices = []
+            archive_indices = set()
+            active_candidates = []
+
+            for idx, m in enumerate(memories):
+                status = m.get("status")
+                if status == "unresolved":
+                    unresolved_indices.append(idx)
+                elif self._is_stm_expired(m, now_dt, now_iso) or status in ("completed", "resolved", "cancelled", "done"):
+                    archive_indices.add(idx)
+                else:
+                    active_candidates.append(idx)
+
+            # Rank active candidates by (priority DESC, date DESC), keeping at most max_active
+            active_candidates.sort(
+                key=lambda idx: (
+                    prio_map.get(str(memories[idx].get("priority", "normal")).lower(), 2),
+                    str(memories[idx].get("date", "")),
+                ),
+                reverse=True,
+            )
+            kept_active_indices = active_candidates[:eff_max_active]
+            for overflow_idx in active_candidates[eff_max_active:]:
+                archive_indices.add(overflow_idx)
+
+            kept_index_set = set(unresolved_indices) | set(kept_active_indices)
+            kept_memories = [m for idx, m in enumerate(memories) if idx in kept_index_set]
+            to_archive = [m for idx, m in enumerate(memories) if idx in archive_indices]
+
+            if to_archive:
+                self._archive_short_term_items(to_archive, now_iso, ensure_file=False)
+                self._save_short_term_memories(kept_memories)
+                self._increment_corpus_revision()
+
+            return {
+                "success": True,
+                "kept_count": len(kept_memories),
+                "kept_unresolved_count": len(unresolved_indices),
+                "kept_active_count": len(kept_active_indices),
+                "archived_count": len(to_archive),
+            }
 
     @memory_state_operation
     def get_archived_short_term_memories(self, memory_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -2214,6 +2833,14 @@ class MemPalaceManager:
                     "id_recipe": 2
                 }
 
+                fts_idx = getattr(self, "fts_index", None)
+                existing_fts_count = None
+                if fts_idx is not None and fts_idx.available:
+                    try:
+                        existing_fts_count = fts_idx.count()
+                    except Exception:
+                        existing_fts_count = None
+
                 if len(content) <= chunk_size:
                     col.upsert(
                         ids=[drawer_id],
@@ -2221,6 +2848,7 @@ class MemPalaceManager:
                         metadatas=[{**base_meta, "chunk_index": 0}]
                     )
                     res = {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room, "chunks": 1}
+                    added_chunks = 1
                 else:
                     chunk_ids = []
                     chunk_docs = []
@@ -2232,6 +2860,24 @@ class MemPalaceManager:
                         chunk_metas.append({**base_meta, "chunk_index": idx, "parent_drawer_id": drawer_id})
                     col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
                     res = {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room, "chunks": len(chunk_ids), "chunk_ids": chunk_ids}
+                    added_chunks = len(chunk_ids)
+
+                if fts_idx is not None and fts_idx.available:
+                    try:
+                        col_total = col.count() if hasattr(col, "count") and callable(col.count) else added_chunks
+                        if existing_fts_count == 0 and col_total > added_chunks:
+                            self._ensure_fts_backfilled(col)
+                        else:
+                            fts_idx.upsert_drawer(
+                                drawer_id,
+                                content,
+                                wing=wing,
+                                room=room,
+                                source_file=source_file or "",
+                                authored_at=now_iso[:10],
+                            )
+                    except Exception as fe:
+                        logging.warning(f"PalaceFTSIndex failed to upsert drawer {drawer_id}: {fe}")
 
                 if self._morpho_enabled and self.morpho_layer:
                     try:
@@ -2254,7 +2900,7 @@ class MemPalaceManager:
                 if not col:
                     return {"success": False, "error": "No palace collection available."}
 
-                canon_id = self.morpho_layer._canonical_id(drawer_id) if self.morpho_layer else drawer_id
+                canon_id = self._canonical_id(drawer_id)
                 ids_to_delete = []
 
                 try:
@@ -2276,6 +2922,13 @@ class MemPalaceManager:
                     return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
                 col.delete(ids=ids_to_delete)
+
+                fts_idx = getattr(self, "fts_index", None)
+                if fts_idx is not None and fts_idx.available:
+                    try:
+                        fts_idx.delete_drawer(canon_id)
+                    except Exception as fe:
+                        logging.warning(f"PalaceFTSIndex failed to delete drawer {canon_id}: {fe}")
 
                 if self._morpho_enabled and self.morpho_layer:
                     try:
@@ -2336,6 +2989,7 @@ class MemPalaceManager:
                         epistemic_boundary=mirror.get('epistemic_boundary'),
                         ripple_notes=mirror.get('ripple_notes'),
                         prediction_error_note=mirror.get('prediction_error_note'),
+                        open_curiosity=mirror.get('open_curiosity'),
                     )
 
             for community in social.get("communities", []):
@@ -2355,6 +3009,8 @@ class MemPalaceManager:
             logging.info("Sanctuary initialized successfully.")
         except Exception as e:
             logging.error(f"Error initializing sanctuary: {e}", exc_info=True)
+        finally:
+            self.flush_turn_coactivation(is_sleep_cycle=True)
 
     _init_sanctuary = initialize_sanctuary
 
@@ -2689,3 +3345,215 @@ class MemPalaceManager:
         except Exception as e:
             logging.warning(f"Error unlinking setpoint: {e}")
             return False
+
+    @memory_state_operation
+    def consolidate_semantic_bridges(self, sem_threshold: float = 0.60, top_k: int = 2) -> Dict[str, Any]:
+        """
+        WP4.3: Sleep-time sparse cross-session semantic bridge consolidation.
+        Reuses stored ChromaDB embeddings (zero re-embedding cost) and excludes same-session pairs.
+        """
+        if not getattr(self, "_morpho_enabled", False) or not getattr(self, "morpho_layer", None):
+            return {"status": "disabled", "edges_upserted": 0}
+        col = self._get_collection(create=False)
+        if not col:
+            return {"status": "no_collection", "edges_upserted": 0}
+
+        try:
+            import numpy as np
+            from core.morphological_layer import compute_cross_session_semantic_bridges
+
+            all_ids = []
+            all_embs = []
+            all_metas = []
+            batch_size = 500
+            current_offset = 0
+            supports_offset = True
+            total_items = col.count() if hasattr(col, "count") and callable(col.count) else None
+
+            while True:
+                kwargs = {"include": ["embeddings", "metadatas"], "limit": batch_size}
+                if supports_offset and current_offset > 0:
+                    kwargs["offset"] = current_offset
+                try:
+                    batch = col.get(**kwargs)
+                except TypeError as te:
+                    if "offset" in str(te):
+                        supports_offset = False
+                        kwargs.pop("offset", None)
+                        kwargs.pop("limit", None)
+                        batch = col.get(**kwargs)
+                        b_ids = batch.get("ids") or []
+                        b_embs = batch.get("embeddings")
+                        b_metas = batch.get("metadatas") or [{}] * len(b_ids)
+                        all_ids.extend(b_ids)
+                        if b_embs is not None and len(b_embs) > 0:
+                            all_embs.extend(list(b_embs))
+                        all_metas.extend(b_metas)
+                        break
+                    raise
+
+                b_ids = batch.get("ids") or []
+                if not b_ids:
+                    break
+                b_embs = batch.get("embeddings")
+                b_metas = batch.get("metadatas") or [{}] * len(b_ids)
+                all_ids.extend(b_ids)
+                if b_embs is not None and len(b_embs) > 0:
+                    all_embs.extend(list(b_embs))
+                all_metas.extend(b_metas)
+                if not supports_offset or len(b_ids) < batch_size:
+                    break
+                current_offset += len(b_ids)
+                if total_items is not None and current_offset >= total_items:
+                    break
+
+            if len(all_ids) < 2 or len(all_embs) != len(all_ids):
+                return {"status": "noop", "drawers": len(all_ids), "edges_upserted": 0}
+
+            grouped_vecs: Dict[str, List[np.ndarray]] = {}
+            grouped_keys: Dict[str, str] = {}
+            for pid, emb, meta in zip(all_ids, all_embs, all_metas):
+                if emb is None:
+                    continue
+                meta = meta or {}
+                lid = meta.get("parent_drawer_id") or self._canonical_id(pid)
+                if not lid:
+                    continue
+                grouped_vecs.setdefault(lid, []).append(np.asarray(emb, dtype=np.float32))
+                if lid not in grouped_keys:
+                    src_raw = str(meta.get("source_file") or "").strip()
+                    src_base = os.path.basename(src_raw) if src_raw else ""
+                    if not src_base or src_base == "agent_thoughts":
+                        ts = str(meta.get("authored_at") or meta.get("filed_at") or meta.get("timestamp") or meta.get("created_at") or "")
+                        day = ts[:10] if ts else ""
+                        grouped_keys[lid] = f"{src_base or 'thought'}:{day}" if day else f"__id:{lid}"
+                    else:
+                        grouped_keys[lid] = src_base
+
+            logical_ids = list(grouped_vecs.keys())
+            if len(logical_ids) < 2:
+                return {"status": "noop", "drawers": len(logical_ids), "edges_upserted": 0}
+
+            emb_matrix = np.stack([np.mean(grouped_vecs[lid], axis=0) for lid in logical_ids], axis=0)
+            group_keys = [grouped_keys[lid] for lid in logical_ids]
+            edges = compute_cross_session_semantic_bridges(
+                logical_ids,
+                emb_matrix,
+                group_keys,
+                sem_threshold=float(sem_threshold),
+                top_k=int(top_k),
+            )
+            upserted = self.morpho_layer.upsert_semantic_bridges(edges)
+            return {"status": "ok", "drawers": len(logical_ids), "edges_upserted": upserted}
+        except Exception as e:
+            logging.warning(f"Morphological semantic bridge consolidation warning: {e}")
+            return {"status": "error", "error": str(e), "edges_upserted": 0}
+
+    @memory_state_operation
+    def prime_for_input(self, user_text: str, exclude_drawer_ids: Optional[Set[str]] = None) -> str:
+        """
+        WP5: KV-cache-safe Perturbation-Driven Prospective Priming for real user input.
+        Silence-by-default: skips touch_drawers so silent probes never pollute co-activation.
+        """
+        morpho_cfg = getattr(self, "_morpho_settings", None) or {}
+        if (
+            not getattr(self, "_morpho_enabled", False)
+            or not getattr(self, "morpho_layer", None)
+            or not bool(morpho_cfg.get("perturbation_priming", True))
+        ):
+            return ""
+
+        try:
+            from core.morphological_layer import prime_for_input as _morpho_prime_for_input
+
+            sim_strong = _safe_float(morpho_cfg.get("priming_sim_strong", 0.45), 0.45, 0.0, 1.0)
+            sim_corr = _safe_float(morpho_cfg.get("priming_sim_corroborated", 0.35), 0.35, 0.0, 1.0)
+            morpho_min_pot = _safe_float(morpho_cfg.get("priming_morpho_min_potential", 0.32), 0.32, 0.0, 1.0)
+            max_chars = _safe_int(morpho_cfg.get("priming_max_chars", 750), 750, 80, 4000)
+
+            def _dense_search(q_text: str, k: int) -> List[Dict[str, Any]]:
+                col = self._get_collection(create=False)
+                if not col:
+                    return []
+                from mempalace.layers import _distance_to_similarity, _metric_for_collection
+                try:
+                    metric = _metric_for_collection(col)
+                except Exception:
+                    metric = "cosine"
+                total_items = col.count() if hasattr(col, "count") and callable(col.count) else None
+                if total_items == 0:
+                    return []
+                n_req = min(total_items, max(k * 3, 15)) if total_items is not None else max(k * 3, 15)
+                res = col.query(query_texts=[q_text], n_results=n_req, include=["documents", "metadatas", "distances"])
+                raw_ids = (res.get("ids") or [[]])[0] or []
+                raw_docs = (res.get("documents") or [[]])[0] or []
+                raw_metas = (res.get("metadatas") or [[]])[0] or []
+                raw_dists = (res.get("distances") or [[]])[0] or []
+                if not raw_ids:
+                    return []
+
+                by_lid: Dict[str, Dict[str, Any]] = {}
+                for pid, doc, meta, dist in zip(raw_ids, raw_docs, raw_metas, raw_dists):
+                    meta = meta or {}
+                    lid = meta.get("parent_drawer_id") or self._canonical_id(pid)
+                    try:
+                        sim = float(_distance_to_similarity(dist, metric))
+                    except Exception:
+                        sim = max(0.0, min(1.0, 1.0 - float(dist))) if dist is not None else 1.0
+                    existing = by_lid.get(lid)
+                    if existing is None or sim > existing["score"]:
+                        by_lid[lid] = {
+                            "drawer_id": lid,
+                            "score": sim,
+                            "content": str(doc or ""),
+                            "source_file": os.path.basename(str(meta.get("source_file") or "")),
+                            "wing": meta.get("wing", "default"),
+                            "room": meta.get("room", "general"),
+                        }
+
+                ranked = sorted(by_lid.values(), key=lambda r: (-r["score"], r["drawer_id"]))[:k]
+                fts_idx = getattr(self, "fts_index", None)
+                if fts_idx is not None and fts_idx.available and ranked:
+                    try:
+                        full_rows = fts_idx.get_drawers([r["drawer_id"] for r in ranked])
+                        for r in ranked:
+                            fr = full_rows.get(r["drawer_id"])
+                            if fr and fr.get("content"):
+                                r["content"] = str(fr["content"])
+                                if fr.get("source_file"):
+                                    r["source_file"] = os.path.basename(str(fr["source_file"]))
+                    except Exception:
+                        pass
+                return ranked
+
+            def _bm25_search(q_text: str, k: int) -> List[Dict[str, Any]]:
+                fts_idx = getattr(self, "fts_index", None)
+                if fts_idx is None or not fts_idx.available:
+                    return []
+                col = self._get_collection(create=False)
+                if col is not None:
+                    self._ensure_fts_backfilled(col)
+                rows = fts_idx.search(q_text, limit=k)
+                if fts_idx.consume_needs_backfill() and col is not None:
+                    self._ensure_fts_backfilled(col)
+                    rows = fts_idx.search(q_text, limit=k)
+                return rows
+
+            def _morpho_relax(seeds: List[str], k: int) -> List[Tuple[str, float]]:
+                return self.morpho_layer.relax_setpoint(seeds, top_k=k, min_potential=morpho_min_pot)
+
+            return _morpho_prime_for_input(
+                user_text,
+                dense_search_fn=_dense_search,
+                bm25_search_fn=_bm25_search,
+                morpho_relax_fn=_morpho_relax,
+                hydrate_fn=self._hydrate_drawer_brief,
+                sim_gate_strong=sim_strong,
+                sim_gate_corroborated=sim_corr,
+                morpho_potential_gate=morpho_min_pot,
+                max_chars=max_chars,
+                exclude_drawer_ids=list(exclude_drawer_ids) if exclude_drawer_ids else None,
+            )
+        except Exception as e:
+            logging.debug(f"Perturbation priming skipped: {e}")
+            return ""

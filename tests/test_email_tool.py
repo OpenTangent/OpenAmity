@@ -84,6 +84,8 @@ def test_fetch_emails_moves_to_archive_and_purges_server(email_tool_fixture):
 
     # Verify IMAP operations
     mock_imap.select.assert_called_with('"INBOX"', readonly=False)
+    # Must fetch with BODY.PEEK[] (never RFC822) so server never sets \Seen on sync
+    mock_imap.uid.assert_any_call("fetch", b"101", "(BODY.PEEK[] FLAGS)")
     # Check that it stored \Deleted and expunged
     mock_imap.uid.assert_any_call("store", b"101", "+FLAGS", "\\Deleted")
     mock_imap.expunge.assert_called_once()
@@ -124,23 +126,39 @@ def test_fetch_emails_returns_local_archive_when_server_empty(email_tool_fixture
     assert "[READ]" in res
 
 
-def test_read_email_reads_from_local_archive(email_tool_fixture):
+def test_read_email_reads_from_local_archive_without_marking_read(email_tool_fixture):
     tool, env, _ = email_tool_fixture
 
-    # Pre-populate archive
+    # Pre-populate archive with an unread email
     raw_email = create_sample_rfc822(subject="Quarterly Goals", body="Here are the Q4 goals.")
     arc_id = tool.archive.save_email(folder="INBOX", raw_bytes=raw_email, is_read=False)
 
-    # read_email should read directly from local archive without needing IMAP
+    # read_email must NEVER auto-mark as read (even if legacy mark_as_read=True is passed)
     res = tool.execute("read_email", email_id=str(arc_id), folder="INBOX", mark_as_read=True)
 
     assert f"=== Email Details (ID: {arc_id}) ===" in res
+    assert "Status: UNREAD" in res
+    assert "Email_mark_as_read" in res
     assert "Quarterly Goals" in res
     assert "Here are the Q4 goals." in res
 
-    # Verify marked as read in local archive
+    # Verify still unread in local archive
     em = tool.archive.get_email(str(arc_id))
-    assert em["is_read"] == 1
+    assert em["is_read"] == 0
+
+    # Agent explicitly marks as read
+    mark_res = tool.execute("mark_as_read", email_id=str(arc_id), folder="INBOX")
+    assert f"Email '{arc_id}' marked as read." in mark_res
+    assert tool.archive.get_email(str(arc_id))["is_read"] == 1
+
+    # Subsequent read reports Status: READ
+    res_after = tool.execute("read_email", email_id=str(arc_id), folder="INBOX")
+    assert "Status: READ" in res_after
+
+    # Agent can explicitly mark back as unread (including stringified boolean)
+    unread_res = tool.execute("mark_as_read", email_id=str(arc_id), read="false", folder="INBOX")
+    assert f"Email '{arc_id}' marked as unread." in unread_res
+    assert tool.archive.get_email(str(arc_id))["is_read"] == 0
 
 
 def test_search_emails_searches_local_archive(email_tool_fixture):
@@ -317,4 +335,177 @@ def test_read_email_surfaces_sync_error_on_missing_email(email_tool_fixture):
 
     assert "IMAP server sync failed" in res
     assert "socket error: EOF" in res
+
+
+def test_imap_sync_uses_body_peek_so_rfc3501_server_never_sets_seen(email_tool_fixture):
+    """
+    Simulates a strict RFC 3501 IMAP server that implicitly sets \\Seen whenever
+    RFC822 or non-PEEK BODY[] is fetched on a read-write selected mailbox.
+    Verifies fetch_emails(unread_only=True) moves the message off IMAP while
+    preserving it as UNREAD in the local archive and returning it to the agent.
+    """
+    tool, env, _ = email_tool_fixture
+    raw_email = create_sample_rfc822(
+        subject="Test Email",
+        body="Important body mentioning FLAGS (\\Seen) literally inside text.",
+    )
+
+    state = {"readonly": True, "flags": {"\\Recent"}, "deleted": False}
+    mock_imap = MagicMock()
+
+    def fake_select(folder, readonly=False):
+        state["readonly"] = bool(readonly)
+        return ("OK", [b"1"])
+
+    def fake_uid(cmd, *args):
+        if cmd == "search":
+            return ("OK", [b"21"])
+        if cmd == "fetch":
+            fetch_spec = args[1]
+            # Strict RFC 3501 behavior: non-PEEK RFC822/BODY[] sets \Seen in read-write mode
+            if not state["readonly"] and ("RFC822" in fetch_spec or ("BODY[" in fetch_spec and "BODY.PEEK[" not in fetch_spec)):
+                state["flags"].add("\\Seen")
+            flags_rendered = " ".join(sorted(state["flags"])).encode("ascii")
+            return ("OK", [(b"1 (UID 21 BODY[] {123}", raw_email), b" FLAGS (" + flags_rendered + b"))"])
+        if cmd == "store":
+            if args[1] == "+FLAGS" and "\\Deleted" in args[2]:
+                state["deleted"] = True
+            return ("OK", [b"21"])
+        return ("NO", [])
+
+    mock_imap.select.side_effect = fake_select
+    mock_imap.uid.side_effect = fake_uid
+    mock_imap.expunge.return_value = ("OK", [b"21"])
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap)):
+        res = tool.execute("fetch_emails", folder="INBOX", unread_only=True, limit=15)
+
+    assert "\\Seen" not in state["flags"]
+    assert state["deleted"] is True
+    mock_imap.expunge.assert_called_once()
+    assert "Found 1 unread email(s) in 'INBOX':" in res
+    assert "[UNREAD]" in res
+    assert "Test Email" in res
+
+    archived = tool.archive.get_emails(folder="INBOX", unread_only=True)
+    assert len(archived) == 1
+    assert archived[0]["is_read"] == 0
+
+
+def test_imap_sync_parses_post_literal_seen_flag_accurately(email_tool_fixture):
+    tool, env, _ = email_tool_fixture
+    raw_seen = create_sample_rfc822(subject="Already Read Earlier", body="Old read mail")
+
+    mock_imap = MagicMock()
+    mock_imap.select.return_value = ("OK", [b"1"])
+    mock_imap.uid.side_effect = [
+        ("OK", [b"30"]),
+        # IMAP server puts FLAGS after the message body literal
+        ("OK", [(b"1 (UID 30 BODY[] {100}", raw_seen), b" FLAGS (\\Seen \\Recent))"]),
+        ("OK", [b"30"]),
+    ]
+    mock_imap.expunge.return_value = ("OK", [b"30"])
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap)):
+        tool.execute("sync_emails", folder="INBOX")
+
+    archived = tool.archive.get_emails(folder="INBOX", unread_only=False)
+    assert len(archived) == 1
+    assert archived[0]["is_read"] == 1
+
+
+def test_direct_imap_read_and_download_use_body_peek_and_never_mark_read(email_tool_fixture):
+    tool, env, downloads_dir = email_tool_fixture
+    env["EMAIL_ARCHIVE_LOCAL"] = "false"
+
+    raw_att = create_sample_rfc822(subject="Direct Unread", body="Read me safely.", has_att=True)
+
+    # 1. read_email in direct IMAP mode must be strictly read-only with BODY.PEEK[]
+    mock_imap_read = MagicMock()
+    mock_imap_read.select.return_value = ("OK", [b"1"])
+    mock_imap_read.uid.return_value = ("OK", [(b"1 (UID 77 FLAGS (\\Recent) BODY[] {200}", raw_att), b")"])
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap_read)):
+        read_res = tool.execute("read_email", email_id="77", folder="INBOX", mark_as_read=True)
+
+    mock_imap_read.select.assert_called_once_with('"INBOX"', readonly=True)
+    mock_imap_read.uid.assert_called_once_with("fetch", b"77", "(BODY.PEEK[] FLAGS)")
+    assert "Status: UNREAD" in read_res
+    assert "Read me safely." in read_res
+
+    # 2. download_attachment in direct IMAP mode uses BODY.PEEK[]
+    mock_imap_dl = MagicMock()
+    mock_imap_dl.select.return_value = ("OK", [b"1"])
+    mock_imap_dl.uid.return_value = ("OK", [(b"1 (UID 77 BODY[] {200}", raw_att), b")"])
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap_dl)):
+        dl_res = tool.execute("download_attachment", email_id="77", attachment_filename="invoice.pdf", folder="INBOX")
+
+    mock_imap_dl.select.assert_called_once_with('"INBOX"', readonly=True)
+    mock_imap_dl.uid.assert_called_once_with("fetch", b"77", "(BODY.PEEK[])")
+    assert "Attachment successfully downloaded" in dl_res
+
+    # 3. Only explicit mark_as_read mutates \Seen on IMAP
+    mock_imap_mark = MagicMock()
+    mock_imap_mark.select.return_value = ("OK", [b"1"])
+    mock_imap_mark.uid.return_value = ("OK", [b"77"])
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap_mark)):
+        mark_res = tool.execute("mark_as_read", email_id="77", read=True, folder="INBOX")
+
+    mock_imap_mark.select.assert_called_once_with('"INBOX"', readonly=False)
+    mock_imap_mark.uid.assert_called_once_with("store", b"77", "+FLAGS", "\\Seen")
+    assert "Email '77' marked as read." in mark_res
+
+
+def test_mark_as_read_missing_email_and_cloud_best_effort_sync(email_tool_fixture):
+    tool, env, _ = email_tool_fixture
+
+    # Missing email in local archive must return an error, not false success
+    missing_res = tool.execute("mark_as_read", email_id="9999", folder="INBOX")
+    assert "Error: Email '9999' not found" in missing_res
+
+    # Cloud provider (delete_from_server=False): explicit mark_as_read mirrors \Seen to IMAP
+    env["EMAIL_DELETE_FROM_SERVER"] = "false"
+    raw = create_sample_rfc822(subject="Cloud Mail", body="Keep copy on server.")
+    arc_id = tool.archive.save_email(folder="INBOX", raw_bytes=raw, server_uid="420", is_read=False)
+
+    mock_imap_mark = MagicMock()
+    mock_imap_mark.select.return_value = ("OK", [b"1"])
+    mock_imap_mark.uid.return_value = ("OK", [b"420"])
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap_mark)):
+        res = tool.execute("mark_as_read", email_id=str(arc_id), read=True, folder="INBOX")
+
+    assert f"Email '{arc_id}' marked as read." in res
+    assert tool.archive.get_email(str(arc_id))["is_read"] == 1
+    mock_imap_mark.select.assert_called_once_with('"INBOX"', readonly=False)
+    mock_imap_mark.uid.assert_called_once_with("store", b"420", "+FLAGS", "\\Seen")
+
+    # Mark back as unread locally, then re-sync where server still reports \Seen:
+    # local unread status MUST be preserved!
+    tool.archive.mark_as_read(str(arc_id), is_read=False, folder="INBOX")
+    mock_imap_resync = MagicMock()
+    mock_imap_resync.select.return_value = ("OK", [b"1"])
+    mock_imap_resync.uid.side_effect = [
+        ("OK", [b"420"]),
+        ("OK", [(b"1 (UID 420 FLAGS (\\Seen) BODY[] {100}", raw), b")"]),
+    ]
+
+    with patch.object(tool, "_get_imap_connection", return_value=(True, mock_imap_resync)):
+        fetch_res = tool.execute("fetch_emails", folder="INBOX", unread_only=True)
+
+    assert "Found 1 unread email(s) in 'INBOX':" in fetch_res
+    assert "Cloud Mail" in fetch_res
+    assert tool.archive.get_email(str(arc_id))["is_read"] == 0
+
+
+def test_email_read_email_declaration_requires_explicit_mark_as_read(email_tool_fixture):
+    tool, _, _ = email_tool_fixture
+    decls = {d["name"]: d for d in tool.get_tool_declarations()}
+    read_decl = decls["Email_read_email"]
+    assert "mark_as_read" not in read_decl["parameters"]["properties"]
+    assert "Email_mark_as_read" in read_decl["description"]
+    assert "Email_mark_as_read" in decls
+
 

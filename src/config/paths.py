@@ -1,5 +1,113 @@
 import os
 import shutil
+import sys
+
+FLATPAK_APP_ID = "com.openamity.OpenAmity"
+DEV_DESKTOP_APP_ID = "com.openamity.OpenAmity.Devel"
+_DESKTOP_EXEC_RESERVED_CHARS = set(" \t\n\"'\\><~|&;$*?#()`")
+
+
+def get_desktop_app_id() -> str:
+    """Returns the desktop application ID for window matching on Linux/Wayland."""
+    flatpak_id = os.environ.get("FLATPAK_ID")
+    if flatpak_id:
+        return flatpak_id
+    return DEV_DESKTOP_APP_ID
+
+
+def _escape_desktop_string(value: str) -> str:
+    """Escapes a string value according to the FreeDesktop Desktop Entry spec."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\r", "\\r")
+    )
+
+
+def _escape_desktop_exec_arg(arg: str) -> str:
+    """Escapes a single Exec argument according to the FreeDesktop Desktop Entry spec."""
+    escaped = arg.replace("%", "%%")
+    if any(ch in _DESKTOP_EXEC_RESERVED_CHARS for ch in escaped):
+        quoted = (
+            escaped.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("`", "\\`")
+            .replace("$", "\\$")
+        )
+        escaped = f'"{quoted}"'
+    return _escape_desktop_string(escaped)
+
+
+def ensure_dev_desktop_entry() -> str | None:
+    """Registers or refreshes a local .Devel desktop entry outside Flatpak on Linux.
+
+    This allows Wayland/GNOME Shell to resolve the development app icon in the dock
+    without creating a `com.openamity.OpenAmity.desktop` file that would shadow the
+    official Flatpak package.
+    """
+    if os.environ.get("FLATPAK_ID") or not sys.platform.startswith("linux"):
+        return None
+
+    icon_path = os.path.abspath(get_icon_path())
+    if not os.path.isfile(icon_path):
+        return None
+
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    launcher_script = os.path.join(repo_root, "run_OpenAmity.sh")
+    if os.path.isfile(launcher_script):
+        exec_value = _escape_desktop_exec_arg(launcher_script)
+    else:
+        main_script = os.path.join(repo_root, "src", "main.py")
+        exec_value = f"{_escape_desktop_exec_arg(sys.executable)} {_escape_desktop_exec_arg(main_script)}"
+
+    content = (
+        "[Desktop Entry]\n"
+        "Version=1.0\n"
+        "Type=Application\n"
+        "Name=Open Amity (Dev)\n"
+        "GenericName=AI Companion & Multi-Agent Framework\n"
+        "Comment=Proactive multi-agent AI desktop companion and team orchestration framework\n"
+        f"Exec={exec_value}\n"
+        f"Icon={_escape_desktop_string(icon_path)}\n"
+        "Terminal=false\n"
+        "Categories=Network;Chat;InstantMessaging;Utility;\n"
+        "StartupNotify=true\n"
+        f"StartupWMClass={DEV_DESKTOP_APP_ID}\n"
+        "NoDisplay=true\n"
+    )
+
+    xdg_data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    apps_dir = os.path.join(xdg_data_home, "applications")
+    desktop_file = os.path.join(apps_dir, f"{DEV_DESKTOP_APP_ID}.desktop")
+    tmp_path = os.path.join(apps_dir, f".{DEV_DESKTOP_APP_ID}.desktop.{os.getpid()}.tmp")
+
+    try:
+        if os.path.isfile(desktop_file):
+            with open(desktop_file, "r", encoding="utf-8") as existing:
+                if existing.read() == content:
+                    return desktop_file
+
+        os.makedirs(apps_dir, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, desktop_file)
+        return desktop_file
+    except Exception as e:
+        import logging
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        logging.getLogger("config.paths").warning(
+            f"Failed to register dev desktop entry at {desktop_file}: {e}"
+        )
+        return None
 
 
 def get_app_data_dir() -> str:
@@ -75,7 +183,7 @@ def get_assets_dir() -> str:
 
 def get_icon_path() -> str:
     """Returns the path to the application icon"""
-    return os.path.join(get_assets_dir(), "Open Amity.png")
+    return os.path.join(get_assets_dir(), "com.openamity.OpenAmity.png")
 
 
 def get_mempalace_dir(agent_id: str) -> str:
@@ -147,6 +255,11 @@ def get_audio_cache_dir(agent_id: str = None) -> str:
     if agent_id:
         return os.path.join(get_base_dir_for(agent_id), "audio_cache")
     return os.path.join(get_app_data_dir(), "audio_cache")
+
+
+def get_speech_transcript_cache_dir(agent_id: str = None) -> str:
+    """Returns the writable 24-hour cached speech transcript audio directory."""
+    return os.path.join(get_audio_cache_dir(agent_id), "transcripts")
 
 
 def get_generated_media_dir(agent_id: str = None) -> str:

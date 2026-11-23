@@ -151,8 +151,8 @@ def test_full_content_inspection_and_get_memory(temp_memory_env):
     mgr = MemPalaceManager(agent_id="inspect-agent")
     tool = MemPalaceTool(orchestrator=MagicMock(mempalace_manager=mgr, agent_id="inspect-agent"))
 
-    # Add memory whose critical correction is beyond char 300
-    prefix = "A" * 350
+    # Add memory whose critical correction is beyond char 450
+    prefix = "A" * 500
     decisive_correction = "CRITICAL_CORRECTION: The server port is 9999 not 8080."
     full_text = prefix + " " + decisive_correction
     res = mgr.add_memory(full_text, wing="office", room="specs")

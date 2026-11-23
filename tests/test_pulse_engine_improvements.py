@@ -28,7 +28,12 @@ def test_pulse_purpose_in_chat_log():
     orch.set_busy_state = MagicMock()
 
     appended_messages = []
-    orch.append_to_conversation = lambda sender, text: appended_messages.append((sender, text))
+
+    def _append_to_conversation(sender, text, message_type=""):
+        appended_messages.append((sender, text))
+        return {"id": None, "sender": sender, "content": text, "message_type": message_type}
+
+    orch.append_to_conversation = _append_to_conversation
 
     # 1. Pulse with prewritten category passed
     orch.process_pulse("Sample prompt text", purpose="Scheduled task")

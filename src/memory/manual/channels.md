@@ -27,5 +27,10 @@ Always inspect `[CHANNEL: ...]`, `[SOURCE_ID: ...]`, and `[TYPE: ...]` tags befo
 * **`WHATSAPP_DM`:** Reply privately via WhatsApp.
 * **`WHATSAPP_GROUP`:** Reply **only** to that exact `SOURCE_ID` group; never leak context across groups or DMs.
 
+## `EMAIL`
+* `Email_fetch_emails` and `Email_sync_emails` move/archive incoming IMAP mail locally without setting `\Seen`, so unseen emails stay `[UNREAD]` until you handle them.
+* **`Email_read_email` is strictly read-only:** opening an email does **NOT** mark it as read.
+* **Explicit Read Marking Required:** Call `Email_mark_as_read(email_id="...")` explicitly after you have read and handled an email (or leave it unread / pass `read=False` if follow-up is still pending). Look up addresses via `Contacts_lookup_contact` before `Email_send_email`.
+
 ## `SYSTEM_CONTEMPLATION`
 Internal cycle (e.g., Memory Consolidation / Sleep). You MUST NOT speak or call any `Speaker_*` command during sleep cycles.

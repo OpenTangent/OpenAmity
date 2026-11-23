@@ -11,8 +11,10 @@ MEMORY_BEGIN = "[OPENAMITY_MEMORY_BEGIN]"
 MEMORY_END = "[OPENAMITY_MEMORY_END]"
 
 WORKER_CRITICAL_INSTRUCTION = (
-    "CRITICAL INSTRUCTION: Output your internal reasoning as plain text BEFORE invoking any tool(s), "
-    "and emit native tool call(s) in the EXACT SAME TURN—never end a turn with reasoning alone when acting."
+    "CRITICAL INSTRUCTION: You must output your internal reasoning as plain text BEFORE invoking any tool(s). "
+    "You MUST invoke your intended tool(s) as native structured tool calls in the EXACT SAME TURN immediately following your reasoning "
+    "(never write plain-text '[Tool invocation: ...]' or '🔧Called ...' imitations). "
+    "If you intend to use tools don't end your turn after your reasoning, you must emit the tool call(s) in that same turn."
 )
 WORKER_AUTONOMOUS_SPEECH_INSTRUCTION = (
     "AUTONOMOUS SPEECH INSTRUCTION: You are fully autonomous regarding your speech and will NOT speak automatically. "
@@ -63,8 +65,6 @@ def format_prompt_footprint(system_instruction: str, tool_declarations=None) -> 
 
 
 def selected_provider(settings):
-    if settings.get("core.antigravity.agy-mode", False):
-        return "antigravity"
     provider = settings.get("core.api-provider", "gemini")
     return "chatgpt" if provider == "openai" else provider
 

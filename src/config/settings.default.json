@@ -86,16 +86,6 @@
         "openrouter/free"
       ]
     },
-    "antigravity": {
-      "agy-mode": false,
-      "model": "Gemini 3.8 Flash (High)",
-      "light-model": "Gemini 3.5 Flash (High)",
-      "thinking-level": "low",
-      "agy-models": [
-        "Gemini 3.8 Flash (High)",
-        "Gemini 3.5 Flash (High)"
-      ]
-    },
     "agent": {
       "creation-date": "",
       "uid": "",
@@ -169,6 +159,12 @@
       "max-recording-time": 60,
       "silence-timeout": 3.0
     },
+    "mempalace": {
+      "hybrid_search": true,
+      "rrf_k": 60.0,
+      "snippet_query_centered": true,
+      "snippet_max_chars": 450
+    },
     "morphological_memory": {
       "enabled": true,
       "top_k": 5,
@@ -179,7 +175,15 @@
       "leak": 0.8,
       "dissipation": 0.05,
       "dt": 0.1,
-      "n_steps": 25
+      "n_steps": 25,
+      "prospective_min_potential": 0.25,
+      "perturbation_priming": true,
+      "priming_sim_strong": 0.45,
+      "priming_sim_corroborated": 0.35,
+      "priming_morpho_min_potential": 0.32,
+      "priming_max_chars": 750,
+      "search_associative_hint": true,
+      "search_associative_min_potential": 0.35
     },
     "memory_budgets": {
       "sanctuary_max_chars": 4800,
@@ -198,7 +202,13 @@
       "pulse-all-groups": false,
       "pulse-on-mentions": false,
       "buffer-seconds": 30,
-      "idle-timeout-minutes": 1
+      "idle-timeout-minutes": 1,
+      "email": {
+        "pulse-all-emails": false,
+        "whitelist": [],
+        "check-interval-seconds": 60,
+        "buffer-seconds": 30
+      }
     },
     "logging": {
       "retention-days": 7,

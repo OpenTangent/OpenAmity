@@ -37,12 +37,16 @@ def test_metainfo_xml_structure_and_schema(repo_root):
     # Name and summary
     name_el = root.find("name")
     assert name_el is not None and name_el.text == "Open Amity"
+    assert len(name_el.text.strip()) < 20
 
     summary_el = root.find("summary")
     assert summary_el is not None and summary_el.text
-    # Flathub quality guidelines: no trailing period, concise summary
-    assert not summary_el.text.strip().endswith(".")
-    assert "Open Amity" not in summary_el.text
+    # Flathub quality guidelines: <35 chars, sentence case, no trailing period, don't repeat name
+    summary_text = summary_el.text.strip()
+    assert len(summary_text) < 35, f"Summary '{summary_text}' is {len(summary_text)} chars; must be < 35"
+    assert not summary_text.endswith(".")
+    assert "Open Amity" not in summary_text
+    assert not summary_text.lower().startswith(("a ", "an ", "the "))
 
     # Launchable
     launchable = root.find("launchable")
@@ -56,6 +60,7 @@ def test_metainfo_xml_structure_and_schema(repo_root):
     colors = {c.attrib.get("scheme_preference"): c.text for c in branding.findall("color")}
     assert "light" in colors and colors["light"].startswith("#")
     assert "dark" in colors and colors["dark"].startswith("#")
+    assert colors["light"].lower() != colors["dark"].lower()
 
     # Content rating
     content_rating = root.find("content_rating")
@@ -234,6 +239,7 @@ def test_deploy_script_checks_version_release(repo_root):
     assert "gh pr create" in deploy_content
     assert "flathub/com.openamity.OpenAmity" in deploy_content
     assert "git push origin master" not in deploy_content
+    assert "--reconcile-python" in deploy_content
 
 
 def test_local_stt_imports_without_pyav(monkeypatch):
@@ -361,4 +367,246 @@ def test_github_installer_dry_run_migration_commands(repo_root, monkeypatch):
     assert len(cleanup_cmds) == 1
     assert f"flatpak uninstall --user -y --noninteractive --force-remove {mod.MASTER_REF}" in cleanup_cmds[0][2]
     assert f"flatpak remote-delete --user --force {mod.LEGACY_REMOTE}" in cleanup_cmds[0][2]
+
+
+def test_desktop_app_id_flatpak_vs_dev(monkeypatch):
+    """Outside Flatpak, uses the .Devel app ID so dev windows never shadow Flatpak."""
+    from config import paths
+
+    monkeypatch.delenv("FLATPAK_ID", raising=False)
+    assert paths.get_desktop_app_id() == "com.openamity.OpenAmity.Devel"
+
+    monkeypatch.setenv("FLATPAK_ID", "com.openamity.OpenAmity")
+    assert paths.get_desktop_app_id() == "com.openamity.OpenAmity"
+
+
+def test_ensure_dev_desktop_entry_creates_valid_file_without_shadowing_flatpak(tmp_path, monkeypatch):
+    """Registers a valid NoDisplay .Devel desktop file with an absolute icon path."""
+    from config import paths
+
+    monkeypatch.delenv("FLATPAK_ID", raising=False)
+    monkeypatch.setattr(paths.sys, "platform", "linux")
+    xdg_data = tmp_path / "xdg_data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+
+    desktop_path = paths.ensure_dev_desktop_entry()
+    expected_path = xdg_data / "applications" / "com.openamity.OpenAmity.Devel.desktop"
+    assert desktop_path == str(expected_path)
+    assert expected_path.is_file()
+    assert not (xdg_data / "applications" / "com.openamity.OpenAmity.desktop").exists()
+
+    content = expected_path.read_text(encoding="utf-8")
+    assert "Name=Open Amity (Dev)" in content
+    assert "StartupWMClass=com.openamity.OpenAmity.Devel" in content
+    assert "NoDisplay=true" in content
+    assert f"Icon={os.path.abspath(paths.get_icon_path())}" in content
+    exec_lines = [line for line in content.splitlines() if line.startswith("Exec=")]
+    assert len(exec_lines) == 1 and len(exec_lines[0]) > len("Exec=")
+
+    if shutil.which("desktop-file-validate"):
+        result = subprocess.run(
+            ["desktop-file-validate", str(expected_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"desktop-file-validate failed: {result.stdout} {result.stderr}"
+
+    first_mtime = expected_path.stat().st_mtime_ns
+    assert paths.ensure_dev_desktop_entry() == str(expected_path)
+    assert expected_path.stat().st_mtime_ns == first_mtime
+
+
+def test_ensure_dev_desktop_entry_skipped_inside_flatpak(tmp_path, monkeypatch):
+    """Inside Flatpak, host desktop entries must never be created or overwritten."""
+    from config import paths
+
+    xdg_data = tmp_path / "xdg_data"
+    monkeypatch.setenv("FLATPAK_ID", "com.openamity.OpenAmity")
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+
+    assert paths.ensure_dev_desktop_entry() is None
+    assert not (xdg_data / "applications").exists()
+
+
+def test_desktop_exec_escaping_with_spaces_and_special_chars(tmp_path):
+    """Desktop Exec argument escaping handles spaces and special characters cleanly."""
+    from config import paths
+
+    spaced_path = "/tmp/My Projects/Open Amity/run_OpenAmity.sh"
+    escaped_spaced = paths._escape_desktop_exec_arg(spaced_path)
+    assert escaped_spaced == f'"{spaced_path}"'
+
+    special_path = '/tmp/My Projects/100% "Amity" $dev/run.sh'
+    escaped_special = paths._escape_desktop_exec_arg(special_path)
+    assert "%%" in escaped_special
+
+    temp_desktop = tmp_path / "com.openamity.OpenAmity.Devel.desktop"
+    temp_desktop.write_text(
+        "[Desktop Entry]\n"
+        "Version=1.0\n"
+        "Type=Application\n"
+        "Name=Open Amity (Dev)\n"
+        f"Exec={escaped_spaced}\n"
+        "Icon=com.openamity.OpenAmity\n"
+        "Terminal=false\n"
+        "NoDisplay=true\n",
+        encoding="utf-8",
+    )
+
+    if shutil.which("desktop-file-validate"):
+        result = subprocess.run(
+            ["desktop-file-validate", str(temp_desktop)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"desktop-file-validate failed: {result.stdout} {result.stderr}"
+
+
+def _load_sync_requirements_module(repo_root):
+    import importlib.util
+
+    script_path = os.path.join(repo_root, "compile", "sync_requirements.py")
+    spec = importlib.util.spec_from_file_location("sync_requirements", script_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _make_pyreq_payload(entries):
+    return {
+        "name": "python3-requirements",
+        "buildsystem": "simple",
+        "build-commands": [],
+        "modules": [
+            {
+                "name": f"python3-{mod_name}",
+                "buildsystem": "simple",
+                "build-commands": [
+                    f'pip3 install --verbose --exists-action=i --no-index --find-links="file://${{PWD}}" --prefix=${{FLATPAK_DEST}} "{req_spec}" --no-build-isolation'
+                ],
+                "sources": [],
+            }
+            for mod_name, req_spec in entries
+        ],
+    }
+
+
+def test_reconcile_python_requirements_absent_removal_and_runtime_pkg(tmp_path, repo_root):
+    """Removing a requirement not present in python3-requirements.json and keeping runtime-provided markdown returns up_to_date without rewriting."""
+    mod = _load_sync_requirements_module(repo_root)
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text(
+        "PySide6<6.12.0,>=6.11.0\n"
+        "markdown\n"
+        "requests\n"
+        "anthropic>=2.6.0\n",
+        encoding="utf-8",
+    )
+    pyreq_file = tmp_path / "python3-requirements.json"
+    original_text = json.dumps(
+        _make_pyreq_payload([("requests", "requests"), ("anthropic", "anthropic>=2.6.0")]),
+        indent=4,
+    ) + "\n"
+    pyreq_file.write_text(original_text, encoding="utf-8")
+
+    status, details = mod.reconcile_python_requirements(
+        str(req_file),
+        str(pyreq_file),
+        runtime_packages={"Markdown": "3.11.2"},
+    )
+    assert status == "up_to_date"
+    assert details == []
+    assert pyreq_file.read_text(encoding="utf-8") == original_text
+
+
+def test_reconcile_python_requirements_prunes_removed_module_in_place(tmp_path, repo_root):
+    """Removing a package that exists in python3-requirements.json prunes only that module in place."""
+    mod = _load_sync_requirements_module(repo_root)
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("requests\nanthropic>=2.6.0\n", encoding="utf-8")
+
+    pyreq_file = tmp_path / "python3-requirements.json"
+    pyreq_file.write_text(
+        json.dumps(
+            _make_pyreq_payload(
+                [
+                    ("requests", "requests"),
+                    ("obsolete-pkg", "obsolete_pkg==1.2.3"),
+                    ("anthropic", "anthropic>=2.6.0"),
+                ]
+            ),
+            indent=4,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status, details = mod.reconcile_python_requirements(
+        str(req_file),
+        str(pyreq_file),
+        runtime_packages={},
+    )
+    assert status == "pruned"
+    assert details == ["python3-obsolete-pkg"]
+
+    updated = json.loads(pyreq_file.read_text(encoding="utf-8"))
+    assert [m["name"] for m in updated["modules"]] == ["python3-requests", "python3-anthropic"]
+
+
+def test_reconcile_python_requirements_detects_added_package(tmp_path, repo_root):
+    """Adding a new package to requirements.txt triggers needs_regen without modifying the manifest."""
+    mod = _load_sync_requirements_module(repo_root)
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("requests\nhttpx>=0.28\n", encoding="utf-8")
+
+    pyreq_file = tmp_path / "python3-requirements.json"
+    original_text = json.dumps(_make_pyreq_payload([("requests", "requests")]), indent=4) + "\n"
+    pyreq_file.write_text(original_text, encoding="utf-8")
+
+    status, details = mod.reconcile_python_requirements(
+        str(req_file),
+        str(pyreq_file),
+        runtime_packages={"Markdown": "3.11.2"},
+    )
+    assert status == "needs_regen"
+    assert "httpx>=0.28" in details
+    assert pyreq_file.read_text(encoding="utf-8") == original_text
+
+
+def test_reconcile_python_requirements_detects_changed_specifier_extras_or_runtime(tmp_path, repo_root):
+    """Changed version bounds, extras, or unsatisfied runtime packages trigger needs_regen."""
+    mod = _load_sync_requirements_module(repo_root)
+    pyreq_file = tmp_path / "python3-requirements.json"
+    original_text = json.dumps(
+        _make_pyreq_payload([("anthropic", "anthropic>=2.6.0"), ("camoufox", "camoufox[geoip]>=0.5.9")]),
+        indent=4,
+    ) + "\n"
+    pyreq_file.write_text(original_text, encoding="utf-8")
+
+    req_file = tmp_path / "requirements.txt"
+
+    # 1. Version bump on existing package
+    req_file.write_text("anthropic>=2.7.0\ncamoufox[geoip]>=0.5.9\n", encoding="utf-8")
+    status, details = mod.reconcile_python_requirements(
+        str(req_file), str(pyreq_file), runtime_packages={}
+    )
+    assert status == "needs_regen"
+    assert "anthropic>=2.7.0" in details
+
+    # 2. Extras changed on existing package
+    req_file.write_text("anthropic>=2.6.0\ncamoufox>=0.5.9\n", encoding="utf-8")
+    status, details = mod.reconcile_python_requirements(
+        str(req_file), str(pyreq_file), runtime_packages={}
+    )
+    assert status == "needs_regen"
+    assert "camoufox>=0.5.9" in details
+
+    # 3. Tightened runtime-provided package
+    req_file.write_text("anthropic>=2.6.0\ncamoufox[geoip]>=0.5.9\nmarkdown>=99.0\n", encoding="utf-8")
+    status, details = mod.reconcile_python_requirements(
+        str(req_file), str(pyreq_file), runtime_packages={"Markdown": "3.11.2"}
+    )
+    assert status == "needs_regen"
+    assert "markdown>=99.0" in details
+    assert pyreq_file.read_text(encoding="utf-8") == original_text
 

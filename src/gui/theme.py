@@ -1,4 +1,5 @@
 # Centralised theme settings for the GUI
+import os
 from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import QApplication, QStyleFactory, QStyle, QProxyStyle
 from PySide6.QtCore import Qt
@@ -50,6 +51,7 @@ pre {{
     color: #e6edf3;
     margin-top: 6px;
     margin-bottom: 6px;
+    white-space: pre-wrap;
 }}
 code {{
     background-color: #2c2c32;
@@ -63,10 +65,12 @@ pre code {{
     background-color: transparent;
     color: #e6edf3;
     padding: 0;
+    white-space: pre-wrap;
 }}
 blockquote {{
     border-left: 3px solid {SECONDARY_ACCENT_COLOR};
     margin-left: 0px;
+    margin-right: 0px;
     margin-top: 6px;
     margin-bottom: 6px;
     padding-left: 12px;
@@ -80,7 +84,7 @@ table {{
 }}
 th, td {{
     border: 1px solid #444444;
-    padding: 6px 10px;
+    padding: 5px 8px;
     text-align: left;
 }}
 th {{
@@ -110,6 +114,7 @@ h4 {{ font-size: 18px; }}
 ul, ol {{
     margin-top: 4px;
     margin-bottom: 6px;
+    margin-right: 0px;
     padding-left: 24px;
 }}
 li {{
@@ -262,9 +267,22 @@ class OpenAmityProxyStyle(QProxyStyle):
         return super().styleHint(hint, option, widget, returnData)
 
 
+def get_icon_css(icon_filename: str) -> str:
+    """Returns a Qt stylesheet image rule for a bundled icon in assets/icons/."""
+    try:
+        from config.paths import get_assets_dir
+        assets_dir = get_assets_dir()
+    except Exception:
+        assets_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+    icon_path = os.path.join(assets_dir, "icons", icon_filename)
+    if os.path.exists(icon_path):
+        normalized = icon_path.replace("\\", "/")
+        return f'image: url("{normalized}");'
+    return ""
+
+
 def setup_app_theme(app: QApplication):
     """Applies the centralized Fusion style, dark palette, and modern scrollbars to the application."""
-    import os
     fusion_style = QStyleFactory.create("Fusion")
     if fusion_style:
         app.setStyle(OpenAmityProxyStyle(fusion_style))
@@ -272,28 +290,8 @@ def setup_app_theme(app: QApplication):
         app.setStyle(OpenAmityProxyStyle())
     app.setPalette(get_dark_palette())
 
-    checkmark_path = ""
-    radio_dot_path = ""
-    try:
-        from config.paths import get_assets_dir
-        assets_dir = get_assets_dir()
-    except Exception:
-        assets_dir = str(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"))
-
-    cand_chk = os.path.join(assets_dir, "icons", "checkmark.svg")
-    if not os.path.exists(cand_chk):
-        cand_chk = os.path.join(assets_dir, "checkmark.svg")
-    if os.path.exists(cand_chk):
-        checkmark_path = cand_chk.replace("\\", "/")
-
-    cand_radio = os.path.join(assets_dir, "icons", "radio_dot.svg")
-    if not os.path.exists(cand_radio):
-        cand_radio = os.path.join(assets_dir, "radio_dot.svg")
-    if os.path.exists(cand_radio):
-        radio_dot_path = cand_radio.replace("\\", "/")
-
-    chk_img_css = f'image: url("{checkmark_path}");' if checkmark_path else ""
-    radio_img_css = f'image: url("{radio_dot_path}");' if radio_dot_path else ""
+    chk_img_css = get_icon_css("checkmark.svg")
+    radio_img_css = get_icon_css("radio_dot.svg")
 
     app.setStyleSheet(f"""
         QToolTip {{

@@ -53,9 +53,7 @@ class VerbosityFilter(logging.Filter):
             record.levelname = "DEBUG"
 
         if record.levelno == logging.INFO:
-            is_sdk_root = record.name == "root" and "google/antigravity" in record.pathname.replace(
-                '\\', '/')
-            if is_sdk_root or record.name.startswith(("httpx", "httpcore", "mempalace", "urllib3", "google_genai", "google.antigravity")):
+            if record.name.startswith(("httpx", "httpcore", "mempalace", "urllib3", "google_genai")):
                 record.levelno = logging.DEBUG
                 record.levelname = "DEBUG"
 
@@ -79,8 +77,6 @@ class BaseFormatter(logging.Formatter):
 
         if "/src/core/gemini_worker.py" in path:
             return "geminiworker.Main"
-        elif "/src/core/agy_worker.py" in path:
-            return "agyworker.Main"
         elif "/src/core/" in path:
             if filename == "__init__.py":
                 return "core.Init"
@@ -178,7 +174,6 @@ class ColorFormatter(BaseFormatter):
     SECTION_COLORS = {
         "core.TTS": "\x1b[38;2;128;128;0m",
         "geminiworker": "\x1b[38;2;155;89;182m",
-        "agyworker": "\x1b[38;2;224;64;251m",
     }
 
     FALLBACK_PALETTE = [
@@ -217,8 +212,6 @@ class ColorFormatter(BaseFormatter):
             return self.grey  # Light Grey matches INFO logs
         elif primary_section == "geminiworker":
             return "\x1b[38;2;155;89;182m"  # Amethyst
-        elif primary_section == "agyworker":
-            return "\x1b[38;2;224;64;251m"  # Purple
 
         h = sum(ord(c) for c in source)
         return self.FALLBACK_PALETTE[h % len(self.FALLBACK_PALETTE)]

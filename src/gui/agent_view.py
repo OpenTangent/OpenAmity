@@ -1,8 +1,8 @@
 from datetime import datetime, timezone
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QTextEdit, QTextBrowser, QProgressBar)
 from PySide6.QtCore import Signal, Qt, QTimer, QUrl
-from PySide6.QtGui import QTextCursor, QTextBlockFormat, QDesktopServices
+from PySide6.QtGui import QTextCursor, QTextBlockFormat, QDesktopServices, QTextTable
 
 from gui.visualizer import SoundWaveVisualizer
 from gui.chat_formatter import (
@@ -10,9 +10,14 @@ from gui.chat_formatter import (
     render_markdown_to_html,
     render_user_message_content,
     render_thought_card_html,
+    thought_card_id_at_viewport_pos,
     wrap_in_isolated_container,
     insert_message_into_log,
+    SpeechCardBlockData,
 )
+from gui.speech_card_controls import SpeechCardButtonManager
+from core.audio_output import SpeechPlaybackController, build_speech_cache_key
+from core.events import Signal as CoreSignal
 from core.orchestrator import AmityOrchestrator
 from core.config_manager import ConfigManager
 from gui.tool_pips import ToolPipManager
@@ -25,8 +30,121 @@ except ImportError:
     MODERN_SCROLLBAR_STYLE = ""
 
 
+class ThoughtCardBrowser(QTextBrowser):
+    """QTextBrowser making entire Thoughts cards clickable while preserving drag-to-select."""
+
+    thought_card_clicked = Signal(str)
+    viewport_layout_changed = Signal()
+    _SELECTION_JITTER_PX = 4
+
+    def scrollContentsBy(self, dx: int, dy: int):
+        super().scrollContentsBy(dx, dy)
+        self.viewport_layout_changed.emit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.viewport_layout_changed.emit()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_pos = None
+        self._press_card_id = None
+        self._dragged = False
+        self._saw_dblclick = False
+        self._hovering_thought_card = False
+        self._thought_toggle_seq = 0
+        self.anchorClicked.connect(self._on_internal_anchor_clicked)
+
+    def _on_internal_anchor_clicked(self, url: QUrl):
+        if url.toString().startswith("thought:toggle:"):
+            self._thought_toggle_seq += 1
+
+    def _drag_distance(self, pos) -> int:
+        if self._press_pos is None:
+            return 0
+        return (pos - self._press_pos).manhattanLength()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.position().toPoint()
+            self._press_pos = pos
+            self._press_card_id = thought_card_id_at_viewport_pos(self, pos)
+            self._dragged = False
+            self._saw_dblclick = False
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._saw_dblclick = True
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if (event.buttons() & Qt.LeftButton) and self._press_pos is not None:
+            if self._drag_distance(pos) > QApplication.startDragDistance():
+                self._dragged = True
+
+        super().mouseMoveEvent(event)
+
+        if event.buttons() & Qt.LeftButton:
+            if self._hovering_thought_card:
+                self.viewport().setCursor(Qt.IBeamCursor)
+            return
+
+        if thought_card_id_at_viewport_pos(self, pos) is not None:
+            self.viewport().setCursor(Qt.PointingHandCursor)
+            self._hovering_thought_card = True
+        elif self._hovering_thought_card:
+            self._hovering_thought_card = False
+            if not self.anchorAt(pos):
+                self.viewport().unsetCursor()
+
+    def leaveEvent(self, event):
+        if self._hovering_thought_card:
+            self._hovering_thought_card = False
+            self.viewport().unsetCursor()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        press_pos = self._press_pos
+        press_card_id = self._press_card_id
+        dragged = self._dragged
+        saw_dblclick = self._saw_dblclick
+        if event.button() == Qt.LeftButton:
+            self._press_pos = None
+            self._press_card_id = None
+            self._dragged = False
+            self._saw_dblclick = False
+
+        seq_before = self._thought_toggle_seq
+        super().mouseReleaseEvent(event)
+
+        if event.button() != Qt.LeftButton:
+            return
+        if self._thought_toggle_seq != seq_before:
+            return
+        if saw_dblclick or dragged or press_card_id is None:
+            return
+
+        release_pos = event.position().toPoint()
+        dist = (release_pos - press_pos).manhattanLength() if press_pos is not None else 0
+        if dist > QApplication.startDragDistance():
+            return
+
+        cursor = self.textCursor()
+        if cursor.hasSelection() and (dist > self._SELECTION_JITTER_PX or len(cursor.selectedText()) > 1):
+            return
+        if self.anchorAt(release_pos):
+            return
+
+        release_card_id = thought_card_id_at_viewport_pos(self, release_pos)
+        if release_card_id is not None and release_card_id == press_card_id:
+            self.thought_card_clicked.emit(release_card_id)
+
+
 class AgentView(QWidget):
     ui_message_appended = Signal(str, str)
+    ui_message_record_appended = Signal(object)
     ui_thought_card_updated = Signal(object, str, bool)
     ui_busy_state_changed = Signal(bool, bool)
     ui_amplitude_emitted = Signal(float)
@@ -36,6 +154,7 @@ class AgentView(QWidget):
     ui_tool_started = Signal(str, str, str, str, str, bool)
     ui_tool_finished = Signal(str)
     ui_listening_state_changed = Signal(bool)
+    ui_speech_playback_state_changed = Signal(object)
 
     def __init__(self, orchestrator: AmityOrchestrator, parent=None):
         super().__init__(parent)
@@ -50,6 +169,7 @@ class AgentView(QWidget):
         self._has_more_history = True
         self._is_loading_history = False
         self._at_bottom = True
+        self._local_speech_card_seq = 0
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -68,12 +188,13 @@ class AgentView(QWidget):
         self.main_layout.addWidget(self.loading_bar)
 
         # Conversation Log
-        self.conversation_log = QTextBrowser()
+        self.conversation_log = ThoughtCardBrowser()
         self.conversation_log._auto_scroll_on_range_change = False
         setup_chat_browser(self.conversation_log)
         self.conversation_log.setOpenExternalLinks(False)
         self.conversation_log.setOpenLinks(False)
         self.conversation_log.anchorClicked.connect(self.on_anchor_clicked)
+        self.conversation_log.thought_card_clicked.connect(self.toggle_thought_card)
         self.conversation_log.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self.conversation_log.verticalScrollBar().rangeChanged.connect(self._on_scroll_range_changed)
         self.main_layout.addWidget(self.conversation_log, 1)
@@ -85,6 +206,19 @@ class AgentView(QWidget):
 
         # Floating Tool-Call Pip Manager
         self.pip_manager = ToolPipManager(self.conversation_log, self)
+
+        # Speech Transcript Play/Stop Button Manager
+        self.speech_button_manager = SpeechCardButtonManager(
+            self.conversation_log,
+            agent_id=getattr(orchestrator, "agent_id", None),
+            parent=self,
+        )
+        self.conversation_log.viewport_layout_changed.connect(self.speech_button_manager.sync_buttons)
+        self.conversation_log.document().documentLayout().documentSizeChanged.connect(
+            self._on_document_size_changed
+        )
+        self.speech_button_manager.play_requested.connect(self._on_speech_card_play_requested)
+        self.speech_button_manager.stop_requested.connect(self._on_speech_card_stop_requested)
 
         # Console Log (limited to 1,000 blocks for memory conservation)
         self.console_log = QTextEdit()
@@ -138,7 +272,7 @@ class AgentView(QWidget):
         self.btn_mic.setFixedSize(40, 40)
         self.btn_mic.clicked.connect(self.toggle_mic)
         self.btn_mic.setStyleSheet(
-            "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
+            "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 4px; } QPushButton:hover { background-color: #444; }")
         self.footer_layout.addWidget(self.btn_mic)
 
         self.btn_mute = QPushButton()
@@ -151,19 +285,29 @@ class AgentView(QWidget):
             self.btn_mute.setText("🔇︎")
             self.btn_mute.setToolTip("Unmute Agent")
             self.btn_mute.setStyleSheet(
-                "QPushButton { background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #2a2a2a; }")
+                "QPushButton { background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 5px; } QPushButton:hover { background-color: #2a2a2a; }")
         else:
             self.btn_mute.setText("🔊︎")
             self.btn_mute.setToolTip("Mute Agent")
             self.btn_mute.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 5px; } QPushButton:hover { background-color: #444; }")
         self.footer_layout.addWidget(self.btn_mute)
 
         self.main_layout.addWidget(self.footer_widget)
 
         # Connect signals through PySide6 thread-safe signals
-        self.ui_message_appended.connect(self.append_to_conversation)
-        self.orchestrator.on_message_appended.connect(self.ui_message_appended.emit)
+        if isinstance(getattr(self.orchestrator, 'on_message_record_appended', None), CoreSignal):
+            self.ui_message_record_appended.connect(self.append_message_record)
+            self.orchestrator.on_message_record_appended.connect(self.ui_message_record_appended.emit)
+        else:
+            self.ui_message_appended.connect(self.append_to_conversation)
+            self.orchestrator.on_message_appended.connect(self.ui_message_appended.emit)
+
+        self.ui_speech_playback_state_changed.connect(self._on_speech_playback_state_changed)
+        SpeechPlaybackController.instance().playback_state_changed.connect(
+            self.ui_speech_playback_state_changed.emit
+        )
+        self._on_speech_playback_state_changed(SpeechPlaybackController.instance().get_state())
 
         self.ui_thought_card_updated.connect(self.update_thought_card)
         if hasattr(self.orchestrator, 'on_thought_card_updated'):
@@ -199,22 +343,35 @@ class AgentView(QWidget):
         self.load_history()
 
     def cleanup(self):
-        try:
-            self.orchestrator.on_message_appended.disconnect(self.ui_message_appended.emit)
-            if hasattr(self.orchestrator, 'on_thought_card_updated'):
-                self.orchestrator.on_thought_card_updated.disconnect(self.ui_thought_card_updated.emit)
-            self.orchestrator.on_busy_state_changed.disconnect(self.ui_busy_state_changed.emit)
-            self.orchestrator.on_amplitude_emitted.disconnect(self.ui_amplitude_emitted.emit)
-            if hasattr(self.orchestrator, 'on_waveform_emitted'):
-                self.orchestrator.on_waveform_emitted.disconnect(self.ui_waveform_emitted.emit)
-            self.orchestrator.on_paused_state_changed.disconnect(self.ui_paused_state_changed.emit)
-            self.orchestrator.on_pause_pending.disconnect(self.ui_pause_pending_changed.emit)
-            self.orchestrator.on_tool_started.disconnect(self.ui_tool_started.emit)
-            self.orchestrator.on_tool_finished.disconnect(self.ui_tool_finished.emit)
-            if hasattr(self.orchestrator, 'on_listening_state_changed'):
-                self.orchestrator.on_listening_state_changed.disconnect(self.ui_listening_state_changed.emit)
-        except Exception:
-            pass
+        def _safe_disconnect(signal_obj, slot):
+            if signal_obj is None:
+                return
+            try:
+                signal_obj.disconnect(slot)
+            except Exception:
+                pass
+
+        if isinstance(getattr(self.orchestrator, 'on_message_record_appended', None), CoreSignal):
+            _safe_disconnect(self.orchestrator.on_message_record_appended, self.ui_message_record_appended.emit)
+        else:
+            _safe_disconnect(getattr(self.orchestrator, 'on_message_appended', None), self.ui_message_appended.emit)
+
+        _safe_disconnect(
+            SpeechPlaybackController.instance().playback_state_changed,
+            self.ui_speech_playback_state_changed.emit,
+        )
+        _safe_disconnect(getattr(self.orchestrator, 'on_thought_card_updated', None), self.ui_thought_card_updated.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_busy_state_changed', None), self.ui_busy_state_changed.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_amplitude_emitted', None), self.ui_amplitude_emitted.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_waveform_emitted', None), self.ui_waveform_emitted.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_paused_state_changed', None), self.ui_paused_state_changed.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_pause_pending', None), self.ui_pause_pending_changed.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_tool_started', None), self.ui_tool_started.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_tool_finished', None), self.ui_tool_finished.emit)
+        _safe_disconnect(getattr(self.orchestrator, 'on_listening_state_changed', None), self.ui_listening_state_changed.emit)
+
+        if hasattr(self, 'speech_button_manager') and self.speech_button_manager:
+            self.speech_button_manager.cleanup()
         if hasattr(self, 'pip_manager') and self.pip_manager:
             self.pip_manager.clear()
 
@@ -251,16 +408,23 @@ class AgentView(QWidget):
             self.btn_pause.setText("▶")
             self.btn_pause.setToolTip("Resume Agent")
             self.btn_pause.setStyleSheet(
-                "QPushButton { background-color: #4a3b10; color: #FFD700; border: 1px solid #AA8800; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #5c4914; }"
+                "QPushButton { background-color: #1b3820; color: #81c784; border: 1px solid #2e7d32; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-bottom: 4px; } QPushButton:hover { background-color: #244b2a; border: 1px solid #388e3c; color: #a5d6a7; }"
             )
             self.text_input.setEnabled(False)
             self.text_input.setPlaceholderText("Agent is paused...")
             self.btn_send.setEnabled(False)
             self.btn_send.setToolTip("Send")
             self.btn_mic.setEnabled(False)
+            playback_state = SpeechPlaybackController.instance().get_state()
+            is_this_agent_playing = (
+                bool(playback_state.get("is_active"))
+                and playback_state.get("agent_id") == getattr(self.orchestrator, "agent_id", None)
+                and playback_state.get("phase") == "playing"
+            )
             self.loading_bar.hide()
-            self.visualizer.set_active(False)
-            self.visualizer.hide()
+            if not is_this_agent_playing:
+                self.visualizer.set_active(False)
+                self.visualizer.hide()
         else:
             self.text_input.setEnabled(True)
             self.btn_send.setEnabled(True)
@@ -277,11 +441,24 @@ class AgentView(QWidget):
         if scroll_bar:
             scroll_bar.setValue(scroll_bar.maximum())
 
+    def _set_visualizer_visible(self, visible: bool):
+        if visible:
+            was_at_bottom = self._at_bottom
+            self.loading_bar.hide()
+            self.visualizer.show()
+            self.visualizer.set_active(True)
+            if was_at_bottom:
+                self._scroll_conversation_to_bottom()
+                QTimer.singleShot(0, self._scroll_conversation_to_bottom)
+        else:
+            self.visualizer.set_active(False)
+            self.visualizer.hide()
+        QTimer.singleShot(0, self.speech_button_manager.sync_buttons)
+
     def set_busy_state(self, busy: bool, speaking: bool = False):
         if self.orchestrator.is_paused:
             self.loading_bar.hide()
-            self.visualizer.set_active(False)
-            self.visualizer.hide()
+            self._set_visualizer_visible(bool(speaking))
             return
 
         if busy:
@@ -301,26 +478,20 @@ class AgentView(QWidget):
                 self.btn_mic.setText("⏺")
                 self.btn_mic.setToolTip("Voice Interject")
                 self.btn_mic.setStyleSheet(
-                    "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+                    "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 4px; } QPushButton:hover { background-color: #444; }"
                 )
 
             if speaking:
-                self._at_bottom = True
-                self.loading_bar.hide()
-                self.visualizer.show()
-                self.visualizer.set_active(True)
-                self._scroll_conversation_to_bottom()
-                QTimer.singleShot(0, self._scroll_conversation_to_bottom)
+                self._set_visualizer_visible(True)
             else:
-                self.visualizer.set_active(False)
-                self.visualizer.hide()
+                self._set_visualizer_visible(False)
                 self.loading_bar.show()
         else:
             # When idle, pause button is Pause Agent (❚❚)
             self.btn_pause.setText("❚❚")
             self.btn_pause.setToolTip("Pause Agent")
             self.btn_pause.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 13px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 10px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
             )
 
             self.text_input.setEnabled(True)
@@ -332,12 +503,11 @@ class AgentView(QWidget):
                 self.btn_mic.setText("⏺")
                 self.btn_mic.setToolTip("Mic")
                 self.btn_mic.setStyleSheet(
-                    "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+                    "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 4px; } QPushButton:hover { background-color: #444; }"
                 )
 
             self.loading_bar.hide()
-            self.visualizer.set_active(False)
-            self.visualizer.hide()
+            self._set_visualizer_visible(bool(speaking))
 
     def set_listening_state(self, is_listening: bool):
         self._is_listening = is_listening
@@ -345,14 +515,14 @@ class AgentView(QWidget):
             self.btn_mic.setText("⏹")
             self.btn_mic.setToolTip("Finish Recording")
             self.btn_mic.setStyleSheet(
-                "QPushButton { background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #CC0000; }"
+                "QPushButton { background-color: #AA0000; color: #FFF; border: 1px solid #FF5555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 4px; } QPushButton:hover { background-color: #CC0000; }"
             )
         else:
             is_busy = getattr(self.orchestrator, 'is_busy', False)
             self.btn_mic.setText("⏺")
             self.btn_mic.setToolTip("Voice Interject" if is_busy else "Mic")
             self.btn_mic.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }"
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 4px; } QPushButton:hover { background-color: #444; }"
             )
 
     def toggle_mic(self):
@@ -367,12 +537,12 @@ class AgentView(QWidget):
             self.btn_mute.setText("🔇︎")
             self.btn_mute.setToolTip("Unmute Agent")
             self.btn_mute.setStyleSheet(
-                "QPushButton { background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #2a2a2a; }")
+                "QPushButton { background-color: #1a1a1a; color: #FFF; border: 1px inset #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 5px; } QPushButton:hover { background-color: #2a2a2a; }")
         else:
             self.btn_mute.setText("🔊︎")
             self.btn_mute.setToolTip("Mute Agent")
             self.btn_mute.setStyleSheet(
-                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; } QPushButton:hover { background-color: #444; }")
+                "QPushButton { background-color: #333; color: #FFF; border: 1px solid #555; border-radius: 5px; font-size: 16px; font-family: 'Ubuntu', 'DejaVu Sans', 'Noto Sans Symbols', 'Noto Sans Symbols2', 'FreeSans', sans-serif; padding-top: 5px; } QPushButton:hover { background-color: #444; }")
 
     def send_text_prompt(self):
         if self.orchestrator.is_paused:
@@ -460,10 +630,58 @@ class AgentView(QWidget):
         finally:
             self._is_loading_history = False
 
+    def _on_document_size_changed(self, _size=None):
+        self.speech_button_manager.sync_buttons()
+
+    def _on_speech_playback_state_changed(self, state):
+        self.speech_button_manager.set_playback_state(state)
+
+    def _on_speech_card_play_requested(self, card_key: str, message_id, transcript_text: str):
+        if hasattr(self.orchestrator, "replay_transcript"):
+            self.orchestrator.replay_transcript(
+                transcript_text,
+                message_id=message_id,
+                card_key=card_key,
+            )
+
+    def _on_speech_card_stop_requested(self):
+        SpeechPlaybackController.instance().stop_all_speech()
+
+    def _get_user_display_name(self) -> str:
+        try:
+            return self.config_manager.get("user-full-name", "").strip() or "User"
+        except Exception:
+            return "User"
+
+    def _classify_sender(self, sender: str, user_name: str) -> str:
+        if sender == "Thoughts":
+            return "thoughts"
+        if sender in ("User (Interjection)", f"{user_name} (Interjection)") or sender.endswith("(Interjection)"):
+            return "interjection"
+        if sender in ("User", user_name):
+            return "user"
+        if sender.startswith("System"):
+            return "system"
+        return "agent"
+
+    def _is_speech_transcript_message(self, m: dict) -> bool:
+        if not isinstance(m, dict):
+            return False
+        sender = m.get("sender", "Agent")
+        content = (m.get("content") or "").strip()
+        if not content:
+            return False
+        user_name = self._get_user_display_name()
+        if self._classify_sender(sender, user_name) != "agent":
+            return False
+        msg_type = (m.get("message_type") or "").strip().lower()
+        return msg_type != "text"
+
     def _render_all_loaded_messages(self):
         self.conversation_log.clear()
         for m in self._loaded_messages:
             self._render_message(m)
+        self.speech_button_manager.sync_buttons()
 
     def _rerender_messages(self, scroll_to_bottom: bool = False):
         scroll_bar = self.conversation_log.verticalScrollBar()
@@ -587,27 +805,25 @@ class AgentView(QWidget):
             insert_message_into_log(self.conversation_log, isolated_html)
             return
 
-        user_name = "User"
-        try:
-            user_name = self.config_manager.get("user-full-name", "").strip() or "User"
-        except Exception:
-            pass
+        user_name = self._get_user_display_name()
+        role = self._classify_sender(sender, user_name)
+        is_speech_card = self._is_speech_transcript_message(m)
 
-        if sender in ["User (Interjection)", f"{user_name} (Interjection)"] or sender.endswith("(Interjection)"):
+        if role == "interjection":
             display_name = f"{user_name} (Interjection)"
             name_color = PRIMARY_ACCENT_COLOR
             text_color = "#888888"
             bg_color = "#1f1818"
             border_color = "#422424"
             formatted_text = render_user_message_content(text)
-        elif sender in ["User", user_name]:
+        elif role == "user":
             display_name = user_name
             name_color = PRIMARY_ACCENT_COLOR
             text_color = "#888888"
             bg_color = "#19191b"
             border_color = "#28282c"
             formatted_text = render_user_message_content(text)
-        elif sender.startswith("System"):
+        elif role == "system":
             display_name = sender
             name_color = "#666666"
             text_color = "#777777"
@@ -638,8 +854,9 @@ class AgentView(QWidget):
         else:
             time_display = datetime.now().strftime("%H:%M")
 
+        header_pad = " padding-right: 28px;" if is_speech_card else ""
         inner_html = f"""
-        <div style="margin-bottom: 4px; text-align: left;">
+        <div style="margin-bottom: 4px; text-align: left;{header_pad}">
             <span style="color: {name_color}; font-weight: bold; font-size: 14px;">{display_name}</span>
         </div>
         <div style="color: {text_color}; font-size: 18px; line-height: 1.65;">
@@ -659,12 +876,51 @@ class AgentView(QWidget):
         )
         insert_message_into_log(self.conversation_log, isolated_html)
 
-    def append_to_conversation(self, sender, text):
+        if is_speech_card:
+            if m.get("id") is not None:
+                card_key = build_speech_cache_key(message_id=m.get("id"), text=text)
+            else:
+                if "_ui_card_key" not in m:
+                    self._local_speech_card_seq += 1
+                    m["_ui_card_key"] = f"local_{self._local_speech_card_seq}"
+                card_key = m["_ui_card_key"]
+
+            root_tables = [
+                frame
+                for frame in self.conversation_log.document().rootFrame().childFrames()
+                if isinstance(frame, QTextTable) and frame.rows() >= 1 and frame.columns() >= 1
+            ]
+            if root_tables:
+                first_block = root_tables[-1].cellAt(0, 0).firstCursorPosition().block()
+                if first_block.isValid():
+                    first_block.setUserData(
+                        SpeechCardBlockData(
+                            card_key=card_key,
+                            message_id=m.get("id"),
+                            transcript_text=text,
+                        )
+                    )
+
+    def append_message_record(self, record: dict):
+        if not isinstance(record, dict):
+            return
+        msg = dict(record)
+        if not msg.get("timestamp"):
+            msg["timestamp"] = datetime.now(timezone.utc).isoformat()
+        self._append_message_dict(msg)
+
+    def append_to_conversation(self, sender, text, message_id=None, message_type: str = ""):
         msg = {
             "sender": sender,
             "content": text,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message_type": message_type,
         }
+        if message_id is not None:
+            msg["id"] = message_id
+        self._append_message_dict(msg)
+
+    def _append_message_dict(self, msg: dict):
         scroll_bar = self.conversation_log.verticalScrollBar()
         was_at_bottom = True
         old_val = 0
@@ -680,6 +936,7 @@ class AgentView(QWidget):
             self._rerender_messages(scroll_to_bottom=was_at_bottom)
         else:
             self._render_message(msg)
+            self.speech_button_manager.sync_buttons()
             if scroll_bar:
                 if was_at_bottom:
                     self._at_bottom = True

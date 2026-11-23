@@ -23,7 +23,8 @@ def test_provider_accordion_initial_state(qapp):
     panel = SettingsPanelWidget()
     assert hasattr(panel, "provider_cards")
     expected_providers = ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]
-    assert "antigravity" not in panel.provider_cards
+    assert set(panel.provider_cards.keys()) == set(expected_providers)
+    assert len(panel.provider_button_group.buttons()) == 5
     for pid in expected_providers:
         assert pid in panel.provider_cards
     # OpenRouter card must be first in the list on the Provider Setup panel
@@ -117,17 +118,17 @@ def test_provider_accordion_load_settings_synchronization(qapp, tmp_path, monkey
         assert panel.provider_cards[pid].is_expanded is False
         assert panel.provider_cards[pid].header_widget.badge.isHidden()
 
-    # Now load settings with Antigravity mode (configured in settings file)
-    sm.set("core.antigravity.agy-mode", True)
+    # Now load settings with OpenRouter selected
+    sm.set("core.api-provider", "openrouter")
     sm.save()
     panel.load_settings(settings_manager=sm)
 
-    # Antigravity card is removed from GUI, but hidden radio state is preserved
-    assert "antigravity" not in panel.provider_cards
-    assert panel.ui_agy_mode.isChecked() is True
-    assert panel.provider_cards["chatgpt"].is_expanded is False
-    for pid in ["gemini", "claude", "chatgpt", "deepseek", "openrouter"]:
+    assert panel.provider_cards["openrouter"].is_expanded is True
+    assert not panel.provider_cards["openrouter"].header_widget.badge.isHidden()
+    assert panel.ui_use_openrouter_api.isChecked() is True
+    for pid in ["gemini", "claude", "chatgpt", "deepseek"]:
         assert panel.provider_cards[pid].is_expanded is False
+        assert panel.provider_cards[pid].header_widget.badge.isHidden()
 
     panel.deleteLater()
 

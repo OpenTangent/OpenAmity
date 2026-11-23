@@ -24,7 +24,6 @@ from core.claude_worker import ClaudeWorker
 from core.chatgpt_worker import ChatGptWorker
 from core.deepseek_worker import DeepSeekWorker
 from core.openrouter_worker import OpenRouterWorker
-from core.agy_worker import AgyWorker
 from core.backup_manager import EXCLUDED_FILE_NAMES
 
 
@@ -404,16 +403,6 @@ def test_worker_history_export_import_all_providers(temp_agent_dir):
     hist_or = orw.get_session_history()
     assert len(hist_or) == 2
 
-    # 6. AgyWorker
-    aw = AgyWorker.__new__(AgyWorker)
-    aw.agent_id = "test_agy"
-    aw.settings = SettingsManager(agent_id="test_agy")
-    aw.history = []
-    aw.set_session_history(test_turns)
-    assert len(aw.history) == 2
-    hist_a = aw.get_session_history()
-    assert len(hist_a) == 2
-
 
 def test_main_window_close_event_skips_sleep_cycle(qapp, temp_agent_dir):
     from gui.main_window import MainWindow
@@ -445,3 +434,192 @@ def test_main_window_close_event_skips_sleep_cycle(qapp, temp_agent_dir):
 def test_backup_excludes_session_cache():
     assert "session_cache.json" in EXCLUDED_FILE_NAMES
     assert "somatic_state.json" in EXCLUDED_FILE_NAMES
+
+
+def test_reconstruct_and_restore_native_tool_calls_all_providers(temp_agent_dir):
+    from google.genai import types
+    from core.session_cache import reconstruct_structured_session_turns
+
+    cached_messages = [
+        {"role": "user", "content": "Check bearings and greet me."},
+        {
+            "role": "assistant",
+            "content": (
+                "Checking bearings now.\n"
+                "[Tool invocation: Trajectory_get_bearings({})]\n"
+                '[Tool invocation: Speaker_speak_aloud({"text": "Hello (world) [ok]!"})]'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                '[Tool Result: Trajectory_get_bearings -> {"result": "Fatigue 1%"}]\n\n'
+                '[Tool Result: {"result": "Speech queued."}]\n\n'
+                "[CHANNEL: LOCAL_GUI]\nFollow-up question."
+            ),
+        },
+    ]
+
+    structured = reconstruct_structured_session_turns(cached_messages, close_trailing_user=True)
+    assert structured[1]["role"] == "assistant"
+    assert structured[1]["content"] == "Checking bearings now."
+    assert len(structured[1]["tool_calls"]) == 2
+    assert structured[1]["tool_calls"][0]["name"] == "Trajectory_get_bearings"
+    assert structured[1]["tool_calls"][1]["name"] == "Speaker_speak_aloud"
+    assert structured[1]["tool_calls"][1]["args"] == {"text": "Hello (world) [ok]!"}
+    assert structured[2]["role"] == "tool_results"
+    assert structured[3]["role"] == "assistant"
+    assert structured[4]["role"] == "user"
+    assert "Follow-up question." in structured[4]["content"]
+    assert structured[5]["role"] == "assistant"
+    assert "[Turn interrupted" in structured[5]["content"]
+
+    # 1. ClaudeWorker preserves tool_use / tool_result blocks cleanly
+    cw = ClaudeWorker.__new__(ClaudeWorker)
+    cw.agent_id = "test_claude_tools"
+    cw.settings = SettingsManager(agent_id="test_claude_tools")
+    cw._history_lock = MagicMock()
+    cw._history_lock.__enter__ = MagicMock()
+    cw._history_lock.__exit__ = MagicMock()
+    cw.history = []
+    cw.set_session_history(cached_messages)
+    asst_blocks = cw.history[1]["content"]
+    assert [b["type"] for b in asst_blocks] == ["text", "tool_use", "tool_use"]
+    assert "[Tool invocation:" not in asst_blocks[0]["text"]
+    assert cw.history[2]["role"] == "user"
+    assert [b["type"] for b in cw.history[2]["content"]] == ["tool_result", "tool_result"]
+
+    # 2. OpenAI-style workers (ChatGPT, DeepSeek, OpenRouter) restore native tool_calls & tool messages
+    for cls, aid in (
+        (ChatGptWorker, "test_cgpt_tools"),
+        (DeepSeekWorker, "test_ds_tools"),
+        (OpenRouterWorker, "test_or_tools"),
+    ):
+        w = cls.__new__(cls)
+        w.agent_id = aid
+        w.settings = SettingsManager(agent_id=aid)
+        w.history = []
+        w.set_session_history(cached_messages)
+        assert "[Tool invocation:" not in w.history[1]["content"]
+        assert len(w.history[1]["tool_calls"]) == 2
+        assert w.history[1]["tool_calls"][1]["function"]["name"] == "Speaker_speak_aloud"
+        assert w.history[2]["role"] == "tool"
+        assert w.history[3]["role"] == "tool"
+        assert w.history[2]["tool_call_id"] == w.history[1]["tool_calls"][0]["id"]
+        assert all("[Tool invocation:" not in str(m.get("content", "")) for m in w.history if m["role"] == "assistant")
+
+    # 3. GeminiWorker restores Part.function_call (with thought_signature sentinel) & Part.function_response
+    mock_client = MagicMock()
+    gw = GeminiWorker.__new__(GeminiWorker)
+    gw.agent_id = "test_gemini_tools"
+    gw.settings = SettingsManager(agent_id="test_gemini_tools")
+    gw.available = True
+    gw.client = mock_client
+    gw.current_thinker_model = "gemini-4-argon"
+    gw.thinker_config = None
+    gw._chat_lock = MagicMock()
+    gw._chat_lock.__enter__ = MagicMock()
+    gw._chat_lock.__exit__ = MagicMock()
+    gw.set_session_history(cached_messages)
+
+    sdk_history = mock_client.chats.create.call_args.kwargs["history"]
+    model_parts = sdk_history[1].parts
+    assert sdk_history[1].role == "model"
+    assert model_parts[0].text == "Checking bearings now."
+    assert model_parts[1].function_call.name == "Trajectory_get_bearings"
+    assert model_parts[1].thought_signature == b"skip_thought_signature_validator"
+    assert model_parts[2].function_call.name == "Speaker_speak_aloud"
+    assert model_parts[2].function_call.args == {"text": "Hello (world) [ok]!"}
+    user_tool_parts = sdk_history[2].parts
+    assert isinstance(user_tool_parts[0], types.Part)
+    assert user_tool_parts[0].function_response.name == "Trajectory_get_bearings"
+
+
+def test_unpaired_fake_tool_invocations_stripped_everywhere(temp_agent_dir):
+    from core.session_cache import (
+        has_fake_tool_invocation_text,
+        sanitize_fake_tool_assistant_text,
+    )
+
+    poisoned_messages = [
+        {"role": "user", "content": "Sweep messages please."},
+        {
+            "role": "assistant",
+            "content": (
+                "Sweeping now.\n"
+                "[Tool invocation: WhatsApp_unread({})]\n"
+                "🔧Called `Trajectory_get_bearings` with `{}`"
+            ),
+        },
+        {"role": "user", "content": "[System Notice: You have not responded to the user.]"},
+    ]
+
+    norm = normalize_session_messages(poisoned_messages, close_trailing_user=True)
+    assert "[Tool invocation:" not in norm[1]["content"]
+    assert "🔧Called" not in norm[1]["content"]
+    assert norm[1]["content"] == "Sweeping now."
+
+    orw = OpenRouterWorker.__new__(OpenRouterWorker)
+    orw.agent_id = "test_or_strip"
+    orw.settings = SettingsManager(agent_id="test_or_strip")
+    orw.history = []
+    orw.set_session_history(poisoned_messages)
+    assert all(not has_fake_tool_invocation_text(m.get("content", "")) for m in orw.history)
+    assert sanitize_fake_tool_assistant_text('[Tool invocation: WhatsApp_unread({})]') == (
+        "[Attempted plain-text tool imitation; no native tool call emitted]"
+    )
+
+
+def test_orchestrator_detects_fake_tool_text_and_nudges_explicitly(temp_agent_dir):
+    agent_id = "test_fake_nudge_orch"
+    sm = SettingsManager(agent_id=agent_id)
+    sm.set("core.api-provider", "gemini")
+    sm.save()
+
+    def _make_orch(is_user_interaction: bool):
+        orch = AmityOrchestrator.__new__(AmityOrchestrator)
+        orch.agent_id = agent_id
+        orch.settings_manager = sm
+        orch.is_paused = False
+        orch._shutdown_flag = False
+        orch._is_user_interaction = is_user_interaction
+        orch._speaker_invoked_in_cycle = False
+        orch._user_turn_nudged = False
+        orch._fake_tool_turn_nudged = False
+        orch.accumulated_thoughts = ""
+        orch._thought_card_lock = MagicMock()
+        orch._thought_card_lock.__enter__ = MagicMock()
+        orch._thought_card_lock.__exit__ = MagicMock()
+        orch._append_to_thought_card = MagicMock()
+        orch._get_interjection_lock = MagicMock()
+        orch._get_interjection_lock.return_value.__enter__ = MagicMock()
+        orch._get_interjection_lock.return_value.__exit__ = MagicMock()
+        orch._get_pending_interjections = MagicMock(return_value=[])
+        orch.finish_thinking = MagicMock()
+        orch.gemini_worker = MagicMock()
+        orch.gemini_worker.running = True
+        return orch
+
+    # User turn with fake plain-text Speaker + read calls
+    orch_user = _make_orch(is_user_interaction=True)
+    orch_user.handle_gemini_thought(
+        'Acknowledging.\n[Tool invocation: Speaker_speak_aloud({"text": "Hi"})]',
+        [],
+    )
+    orch_user.gemini_worker.send_prompt.assert_called_once()
+    nudge_msg = orch_user.gemini_worker.send_prompt.call_args.args[0]
+    assert "[System Error: ZERO native tool calls were received" in nudge_msg
+    assert "Speaker_speak_aloud" in nudge_msg
+    assert not orch_user.finish_thinking.called
+
+    # Second consecutive failure stops instead of looping infinitely
+    orch_user.handle_gemini_thought('[Tool invocation: Speaker_speak_aloud({"text": "Retry"})]', [])
+    assert orch_user.finish_thinking.called
+
+    # Pulse turn with fake plain-text call also receives corrective nudge
+    orch_pulse = _make_orch(is_user_interaction=False)
+    orch_pulse.handle_gemini_thought('[Tool invocation: WhatsApp_unread({})]', [])
+    orch_pulse.gemini_worker.send_prompt.assert_called_once()
+    pulse_nudge = orch_pulse.gemini_worker.send_prompt.call_args.args[0]
+    assert "[System Error: ZERO native tool calls were received" in pulse_nudge
+    assert not orch_pulse.finish_thinking.called

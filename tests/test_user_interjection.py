@@ -167,7 +167,7 @@ def test_mid_batch_tool_execution_pauses_remaining_tools():
 def test_audio_service_direct_multimodal_and_finish_listening():
     service = AudioService(agent_id="test_agent")
     service.settings = MagicMock()
-    service.settings.get.side_effect = lambda k, default=None: False if "low-token" in k or "agy-mode" in k else (60 if "max-recording-time" in k else 3.0)
+    service.settings.get.side_effect = lambda k, default=None: False if "low-token" in k else (60 if "max-recording-time" in k else 3.0)
 
     ready_payloads = []
     service.audio_prompt_ready.connect(lambda text, wav: ready_payloads.append((text, wav)))
@@ -213,8 +213,11 @@ def test_gui_coupled_controls_and_interjection_badge():
     # 1. Idle state: Pause button is ❚❚, Mic button is ⏺ with "Mic"
     assert view.btn_pause.text() == "❚❚"
     assert view.btn_pause.toolTip() == "Pause Agent"
+    assert "font-size: 10px" in view.btn_pause.styleSheet()
+    assert "padding-bottom" not in view.btn_pause.styleSheet()
     assert view.btn_mic.text() == "⏺"
     assert view.btn_mic.toolTip() == "Mic"
+    assert "padding-top: 4px" in view.btn_mic.styleSheet()
     assert view.text_input.placeholderText() == "Type a message..."
 
     # 2. Busy state: Pause button couples into Stop Agent (⏹) in red
@@ -223,6 +226,7 @@ def test_gui_coupled_controls_and_interjection_badge():
     assert view.btn_pause.toolTip() == "Stop Agent"
     assert "AA0000" in view.btn_pause.styleSheet()
     assert view.btn_mic.toolTip() == "Voice Interject"
+    assert "padding-top: 4px" in view.btn_mic.styleSheet()
     assert view.text_input.placeholderText() == "Interject while agent is working..."
     assert view.btn_send.toolTip() == "Interject"
 
@@ -231,9 +235,11 @@ def test_gui_coupled_controls_and_interjection_badge():
     assert view.btn_mic.text() == "⏹"
     assert view.btn_mic.toolTip() == "Finish Recording"
     assert "AA0000" in view.btn_mic.styleSheet()
+    assert "padding-top: 4px" in view.btn_mic.styleSheet()
 
     view.set_listening_state(False)
     assert view.btn_mic.text() == "⏺"
+    assert "padding-top: 4px" in view.btn_mic.styleSheet()
 
     # 4. Stop processing on pause button click when busy
     orch.stop_all_processing = MagicMock()

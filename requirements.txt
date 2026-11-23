@@ -10,7 +10,6 @@ pyspellchecker
 Mastodon.py
 piper-tts
 requests
-google-antigravity
 qrcode
 faster-whisper
 psutil

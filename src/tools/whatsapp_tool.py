@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import requests
@@ -6,6 +7,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any
 from core.cerebrum import Tool
 from core.cache_manager import CacheManager
+from core.whatsapp_daemon import extract_whatsapp_stanza_id, is_visible_whatsapp_message
 
 
 class WhatsAppSkill(Tool):
@@ -34,6 +36,7 @@ class WhatsAppSkill(Tool):
         agent_id = self.orchestrator.agent_id if self.orchestrator else None
         self.daemon = WhatsAppDaemon(agent_id=agent_id)
         self.daemon.message_callback = self._on_message_received
+        self.daemon.message_revoked_callback = self._on_message_revoked
         self.daemon.status_callback = self._on_status_notice
         self.base_url = self.daemon.base_url
         self.data_dir = self.daemon.data_dir
@@ -50,6 +53,79 @@ class WhatsAppSkill(Tool):
     def _on_message_received(self, sender_id, sender_name, **kwargs):
         if hasattr(self, 'message_received_callback') and self.message_received_callback:
             self.message_received_callback(sender_id, sender_name, **kwargs)
+
+    def _on_message_revoked(self, **kwargs):
+        if hasattr(self, 'message_revoked_callback') and self.message_revoked_callback:
+            self.message_revoked_callback(**kwargs)
+
+    def get_visible_unread_count(self, chat_ids=None, msg_ids=None, stanza_ids=None, has_untracked: bool = False) -> int:
+        """Returns the count of visible unread user messages matching the pending pulse batch (fail-closed to 0)."""
+        if getattr(self.daemon, "is_downloading_chrome", False) is True:
+            return 0
+
+        clean_chat_ids = [str(c).strip() for c in (chat_ids or []) if str(c or "").strip()]
+        clean_msg_ids = [str(m).strip() for m in (msg_ids or []) if str(m or "").strip()]
+        clean_stanza_ids = [str(s).strip() for s in (stanza_ids or []) if str(s or "").strip()]
+
+        try:
+            res = requests.post(
+                f"{self.base_url}/unread/visible_count",
+                json={
+                    "chatIds": clean_chat_ids,
+                    "msgIds": clean_msg_ids,
+                    "stanzaIds": clean_stanza_ids,
+                    "hasUntracked": bool(has_untracked),
+                },
+                timeout=10,
+            )
+            if res.status_code == 200:
+                data = res.json()
+                val = data.get("visibleCount", 0)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    return max(0, int(val))
+                return 0
+
+            if res.status_code == 404:
+                unread_res = requests.get(f"{self.base_url}/unread", timeout=10)
+                if unread_res.status_code != 200:
+                    return 0
+                unread_data = unread_res.json()
+                raw_unread = unread_data.get("unread")
+                if "error" in unread_data or not isinstance(raw_unread, list):
+                    return 0
+                visible_msgs = [m for m in raw_unread if is_visible_whatsapp_message(m)]
+
+                chat_id_set = set(clean_chat_ids)
+                msg_id_set = set(clean_msg_ids)
+                stanza_id_set = set(clean_stanza_ids)
+                matched_msg_count = 0
+                matched_chat_count = 0
+                for m in visible_msgs:
+                    m_id = str(m.get("id") or "").strip()
+                    m_stanza = extract_whatsapp_stanza_id(m.get("id"))
+                    m_chat_candidates = {
+                        str(m.get(k) or "").strip()
+                        for k in ("chatId", "sender", "from")
+                        if m.get(k)
+                    }
+                    if (m_id and m_id in msg_id_set) or (m_stanza and m_stanza in stanza_id_set):
+                        matched_msg_count += 1
+                    if m_chat_candidates & chat_id_set:
+                        matched_chat_count += 1
+
+                if not has_untracked and (msg_id_set or stanza_id_set):
+                    return matched_msg_count
+                if chat_id_set:
+                    return matched_chat_count
+                return len(visible_msgs)
+
+            logging.debug(
+                f"WhatsAppSkill: /unread/visible_count returned HTTP {res.status_code}; treating visible unread count as 0."
+            )
+            return 0
+        except Exception as e:
+            logging.debug(f"WhatsAppSkill: Failed to verify visible unread count: {e}")
+            return 0
 
     def get_tool_declarations(self) -> List[Dict[str, Any]]:
         return [
@@ -363,7 +439,7 @@ class WhatsAppSkill(Tool):
                 if "error" in data:
                     return f"Error: {data['error']}"
 
-                unread = data.get("unread", [])
+                unread = [m for m in data.get("unread", []) if is_visible_whatsapp_message(m)]
 
                 if hasattr(self, 'orchestrator') and self.orchestrator:
                     is_low_token = self.orchestrator.settings_manager.get(
